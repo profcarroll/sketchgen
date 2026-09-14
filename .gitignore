@@ -4,3 +4,4 @@
 __pycache__/
 .gate/
 *.pyc
+writepath/.wrangler/
