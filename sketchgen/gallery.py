@@ -595,6 +595,159 @@ def _brief_line(text: str) -> str:
     return f'<p class="score-brief">{_esc(text)}</p>' if text else ""
 
 
+# ---------------------------------------------------------------------------
+# The card's standing bars (packet 5.4)
+#
+# Two lines of "1.39 over 1 pair · 0.85 over 12 pairs" asked a reader to hold
+# four numbers and a scale nobody explained. The card shows position instead:
+# where this entry sits in the pool that population has actually scored, one
+# track per question. The numbers do not go away, they go into the hover text.
+# ---------------------------------------------------------------------------
+
+#: The two questions, in the order the card asks them, with the words the card
+#: uses for each. 'look' first because it is the gallery's headline question.
+_BAR_ROWS = (("look", "rather look at it"), ("brief", "closer to its brief"))
+
+#: Below this distance in percentile the two populations are reading the entry
+#: the same way. A third of the pool apart is the line; it is a judgement call,
+#: made once here rather than differently on every card.
+_AGREE_WITHIN = 0.34
+
+
+def _standing(table: dict, entry_id: int) -> dict | None:
+    """Where one entry stands in one population's scored pool.
+
+    ``{"pct", "rank", "pool", "score", "n"}``, or ``None`` when this population
+    has not judged the entry: absent from the table is absent from the pool,
+    not bottom of it. Rank is by score descending with ties broken by entry id,
+    so a second render of an unchanged database places the marks identically.
+    ``pct`` runs 0.0 at the weakest entry to 1.0 at the strongest, and is 0.5 in
+    a pool of one, which has nothing to be stronger or weaker than.
+    """
+    row = table.get(entry_id)
+    if row is None:
+        return None
+    order = sorted(
+        table.items(), key=lambda item: (-float(item[1]["score"]), int(item[0]))
+    )
+    pool = len(order)
+    rank = next(
+        i for i, (other, _) in enumerate(order, 1) if int(other) == int(entry_id)
+    )
+    return {
+        "pct": 0.5 if pool == 1 else (pool - rank) / (pool - 1),
+        "rank": rank,
+        "pool": pool,
+        "score": float(row["score"]),
+        "n": int(row["n"]),
+    }
+
+
+def _evidence_opacity(n: int) -> float:
+    """How solid a mark is drawn: the number of pairs behind it, in four steps.
+
+    A mark placed on one pair and a mark placed on twenty would otherwise look
+    equally certain, and the first is nearly a guess. Opacity is the only thing
+    that carries this on the card; the exact count is in the mark's title.
+    """
+    if n <= 0:
+        return 0.0
+    if n == 1:
+        return 0.4
+    if n <= 3:
+        return 0.6
+    if n <= 7:
+        return 0.8
+    return 1.0
+
+
+def _ordinal(n: int) -> str:
+    """1st, 2nd, 3rd, 4th … 11th, 12th, 13th. For the marks' hover text."""
+    if 11 <= n % 100 <= 13:
+        return f"{n}th"
+    return f"{n}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th') }"
+
+
+def _pairs_phrase(n: int) -> str:
+    return f"{n} pair{'' if n == 1 else 's'}"
+
+
+def _mark(stand: dict, population: str, css_class: str) -> str:
+    """One population's mark on one track, at its percentile, with the facts."""
+    title = (
+        f"{population}: {_ordinal(stand['rank'])} of {stand['pool']} · "
+        f"{stand['score']:.2f} over {_pairs_phrase(stand['n'])}"
+    )
+    return (
+        f'<span class="mark {css_class}" style="left:{stand["pct"] * 100:.1f}%;'
+        f'opacity:{_evidence_opacity(stand["n"])}" title="{_esc(title)}"></span>'
+    )
+
+
+def _standing_bars(scores: dict[str, dict[str, dict]], entry_id: int) -> str:
+    """The card's two tracks: the pool weakest to strongest, and where this is.
+
+    A filled dot is where the humans put the entry, a ring is where the agents
+    put it, and the short bar between them is the distance between the two
+    readings. A question neither population has judged says so rather than
+    drawing a mark at zero.
+    """
+    rows = []
+    for question, label in _BAR_ROWS:
+        human = _standing(scores["human"][question], entry_id)
+        agent = _standing(scores["agent"][question], entry_id)
+        marks = ""
+        if human is not None and agent is not None:
+            low, high = sorted((human["pct"], agent["pct"]))
+            marks += (
+                f'<span class="gap" style="left:{low * 100:.1f}%;'
+                f'width:{(high - low) * 100:.1f}%"></span>'
+            )
+        for stand, population, css_class in (
+            (human, "humans", "human"),
+            (agent, "agents", "agent"),
+        ):
+            if stand is not None:
+                marks += _mark(stand, population, css_class)
+        if not marks:
+            marks = f'<span class="none-note">{_esc(NO_PAIRS)}</span>'
+        rows.append(
+            f'<div class="bar-row"><span class="bar-label">{_esc(label)}</span>'
+            f'<span class="track">{marks}</span></div>'
+        )
+    legend = (
+        '<p class="legend" title="Each mark sits at the entry\'s percentile among '
+        'the entries that population has scored on that question — the pool is the '
+        'population\'s own, not the whole gallery.">'
+        '<span class="mark human inline"></span> humans '
+        '<span class="mark agent inline"></span> agents '
+        "· fainter = fewer pairs</p>"
+    )
+    return '<div class="standing">' + "".join(rows) + legend + "</div>"
+
+
+def _agreement(scores: dict[str, dict[str, dict]], entry_id: int) -> str:
+    """The chip that says whether the two populations read this entry alike.
+
+    On the *look* question alone: that is the card's headline question (see
+    :func:`_score_slot`), and a chip that averaged the two would be answering
+    neither. Nothing at all when neither population has judged the entry —
+    there is no disagreement to report, only silence.
+    """
+    human = _standing(scores["human"]["look"], entry_id)
+    agent = _standing(scores["agent"]["look"], entry_id)
+    if human is not None and agent is not None:
+        close = abs(human["pct"] - agent["pct"]) < _AGREE_WITHIN
+        word, css_class = ("agree", "agree") if close else ("disagree", "disagree")
+    elif human is not None:
+        word, css_class = "humans only", "only"
+    elif agent is not None:
+        word, css_class = "agents only", "only"
+    else:
+        return ""
+    return f' <span class="chip {css_class}">{word}</span>'
+
+
 def _attribution(row: sqlite3.Row, config: Config) -> str:
     """The CC BY 4.0 attribution line, generated from the entry's provenance."""
     prompt = " ".join(str(row["prompt"] or "").split())
@@ -1023,18 +1176,7 @@ def _card(
     scores: dict[str, dict[str, dict]],
 ) -> str:
     entry_id = int(row["id"])
-    human_value, human_brief, _ = _score_slot(scores, "human", entry_id)
-    agent_value, agent_brief, _ = _score_slot(scores, "agent", entry_id)
     prompt = " ".join(str(row["prompt"] or f"entry {entry_id}").split())
-    # The card's headline pair is the 'look' score; the 'brief' score goes on
-    # its own line beneath, and the line is absent rather than empty when
-    # neither population has judged this entry.
-    parts = [
-        f"humans {_esc(human_brief)}" if human_brief else "",
-        f"agents {_esc(agent_brief)}" if agent_brief else "",
-    ]
-    kept = [part for part in parts if part]
-    briefs = f'<p class="card-briefs">{" · ".join(kept)}</p>' if kept else ""
     reason = ""
     chip = ""
     if failed:
@@ -1057,9 +1199,10 @@ def _card(
         # brief reaches a grid page.
         search=_search_text(entry_id, row),
         submitted_by=_esc(row["submitted_by"] or "unknown"),
-        human=_esc(human_value),
-        agent=_esc(agent_value),
-        briefs=briefs,
+        # Two tracks and a chip in place of two lines of numbers: where the
+        # entry stands in each population's pool, and whether the two agree.
+        standing=_standing_bars(scores, entry_id),
+        agreement=_agreement(scores, entry_id),
         reason=reason,
     )
 

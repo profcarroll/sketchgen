@@ -125,6 +125,14 @@ file, executor and submitter — composes with the filters, and keeps its query 
 URL as `?q=`. With JavaScript off the grid is still newest first, the filters are
 still plain links, and the search box is a form that reloads the page it is on.
 
+A card carries two standing bars in place of its scores in words: the track runs
+from the weakest entry in the pool to the strongest, a filled dot is where the
+humans place this entry and a ring is where the agents place it — each at its
+percentile among the entries that population has scored on that question — and a
+fainter mark has fewer pairs behind it. Hover a mark for the rank and the
+Bradley–Terry score itself; the chip beside the tags says whether the two
+populations agree about which you would rather look at.
+
 A kept rejection's `compare` link judges it against a random published entry — the
 status quo — and says which side was rejected only after both answers are in.
 

@@ -934,6 +934,164 @@ class GridSearchTests(GalleryTestCase):
         self.assertIn(rough.lower(), card_search(page)[str(self.ids[0])])
 
 
+class StandingTests(unittest.TestCase):
+    """The percentile maths behind a mark, on tables built by hand.
+
+    _standing is pure: one scores() table in, one place in the pool out. These
+    are the cases the render depends on and a browser cannot show us — the tie,
+    the pool of one, and the entry nobody judged.
+    """
+
+    #: two entries tied on score, so the id has to break it
+    TABLE = {
+        7: {"score": 2.0, "n": 4, "wins": 3, "losses": 1, "ties": 0},
+        3: {"score": 1.0, "n": 1, "wins": 0, "losses": 1, "ties": 0},
+        5: {"score": 1.0, "n": 9, "wins": 4, "losses": 4, "ties": 1},
+        9: {"score": 0.5, "n": 2, "wins": 0, "losses": 2, "ties": 0},
+    }
+
+    def test_the_strongest_entry_tops_the_pool(self):
+        stand = gallery._standing(self.TABLE, 7)
+        self.assertEqual((stand["rank"], stand["pool"]), (1, 4))
+        self.assertAlmostEqual(stand["pct"], 1.0)
+        self.assertEqual((stand["score"], stand["n"]), (2.0, 4))
+
+    def test_the_weakest_entry_sits_at_zero(self):
+        stand = gallery._standing(self.TABLE, 9)
+        self.assertEqual((stand["rank"], stand["pool"]), (4, 4))
+        self.assertAlmostEqual(stand["pct"], 0.0)
+
+    def test_a_tie_is_broken_by_entry_id_so_the_render_is_stable(self):
+        lower, higher = gallery._standing(self.TABLE, 3), gallery._standing(self.TABLE, 5)
+        self.assertEqual((lower["rank"], higher["rank"]), (2, 3))
+        self.assertAlmostEqual(lower["pct"], 2 / 3)
+        self.assertAlmostEqual(higher["pct"], 1 / 3)
+
+    def test_a_pool_of_one_sits_in_the_middle(self):
+        stand = gallery._standing({4: {"score": 1.4, "n": 1}}, 4)
+        self.assertEqual((stand["rank"], stand["pool"]), (1, 1))
+        self.assertAlmostEqual(stand["pct"], 0.5)
+
+    def test_an_entry_the_population_never_judged_has_no_standing(self):
+        self.assertIsNone(gallery._standing(self.TABLE, 11))
+        self.assertIsNone(gallery._standing({}, 7))
+
+    def test_opacity_is_the_evidence_in_four_steps(self):
+        for n, expected in ((0, 0.0), (1, 0.4), (2, 0.6), (3, 0.6),
+                            (4, 0.8), (7, 0.8), (8, 1.0), (40, 1.0)):
+            with self.subTest(n=n):
+                self.assertEqual(gallery._evidence_opacity(n), expected)
+
+
+class CardMarksTests(GalleryTestCase):
+    """What the two tracks on a card say, and what the chip beside them says.
+
+    The fixture database holds no judgments, so each test seeds exactly the
+    ones it is about: a judgment is one row per (judge, pair, question), which
+    is what db.record_judgment writes.
+    """
+
+    def judge(self, question, kind, judge_id, a, b, choice):
+        db.record_judgment(self.conn, a, b, kind, judge_id, question, choice)
+
+    def cards(self, name="index.html"):
+        """{entry id: that card's HTML} from one rendered grid page."""
+        page = (self.dest / name).read_text(encoding="utf-8")
+        out = {}
+        for chunk in page.split('<div class="card"')[1:]:
+            depth, cut = 1, len(chunk)
+            for at in range(len(chunk)):
+                if chunk.startswith("<div", at):
+                    depth += 1
+                elif chunk.startswith("</div>", at):
+                    depth -= 1
+                    if depth == 0:
+                        cut = at
+                        break
+            body = chunk[:cut]
+            entry_id = body.split('data-entry="')[1].split('"')[0]
+            out[int(entry_id)] = body
+        return out
+
+    def test_a_card_judged_by_both_populations_carries_both_marks(self):
+        one, two, _ = self.ids
+        for question in ("look", "brief"):
+            self.judge(question, "human", "profcarroll", one, two, "A")
+            self.judge(question, "agent", "qwen3.5:4b", one, two, "A")
+        self.render()
+        card = self.cards()[one]
+        self.assertEqual(card.count('class="bar-row"'), 2)
+        self.assertEqual(card.count('class="mark human"'), 2)
+        self.assertEqual(card.count('class="mark agent"'), 2)
+        self.assertEqual(card.count('class="gap"'), 2)
+        self.assertNotIn(gallery.NO_PAIRS, card)
+        # every mark is placed by percentage and says where it stands: this
+        # entry won both questions in both populations, so all four sit at the
+        # strong end of a pool of two
+        self.assertEqual(card.count("left:100.0%;opacity:"), 4)
+        self.assertIn('title="humans: 1st of 2 · ', card)
+        self.assertIn('title="agents: 1st of 2 · ', card)
+        self.assertIn("over 1 pair", card)
+        # one pair behind a mark is one pair's worth of certainty
+        self.assertIn("opacity:0.4", card)
+        self.assertNotIn("opacity:1.0", card)
+
+    def test_an_entry_no_population_has_judged_says_so_in_both_rows(self):
+        self.render()
+        card = self.cards()[self.ids[0]]
+        self.assertEqual(card.count(gallery.NO_PAIRS), 2)
+        self.assertNotIn('class="mark human"', card)
+        self.assertNotIn('class="mark agent"', card)
+        for chip in ("agree", "disagree", "humans only", "agents only"):
+            self.assertNotIn(f">{chip}<", card)
+
+    def test_the_chip_says_which_populations_looked_and_whether_they_agree(self):
+        one, two, _ = self.ids
+        cases = (
+            # both populations, same order: agree
+            ((("human", "profcarroll", "A"), ("agent", "qwen3.5:4b", "A")), "agree"),
+            # both populations, opposite orders: the pool's two ends
+            ((("human", "profcarroll", "A"), ("agent", "qwen3.5:4b", "B")), "disagree"),
+            ((("human", "profcarroll", "A"),), "humans only"),
+            ((("agent", "qwen3.5:4b", "A"),), "agents only"),
+        )
+        for votes, expected in cases:
+            with self.subTest(chip=expected):
+                self.conn.execute("DELETE FROM judgments")
+                for kind, judge_id, choice in votes:
+                    self.judge("look", kind, judge_id, one, two, choice)
+                shutil.rmtree(self.dest, True)
+                self.dest.mkdir()
+                self.render()
+                card = self.cards()[one]
+                self.assertIn(f">{expected}</span>", card)
+                for other in ("agree", "disagree", "humans only", "agents only"):
+                    if other != expected and not expected.startswith(other):
+                        self.assertNotIn(f">{other}</span>", card)
+
+    def test_the_rejections_page_gets_the_bars_too(self):
+        self.render()
+        card = self.cards("rejections.html")[self.ids[2]]
+        self.assertIn('class="standing"', card)
+        self.assertEqual(card.count('class="bar-row"'), 2)
+
+    def test_the_score_sentences_left_the_grid_but_not_the_entry_page(self):
+        one, two, _ = self.ids
+        for question in ("look", "brief"):
+            self.judge(question, "human", "profcarroll", one, two, "A")
+        self.render()
+        index = (self.dest / "index.html").read_text(encoding="utf-8")
+        entry = (self.dest / "e" / str(one) / "index.html").read_text(encoding="utf-8")
+        for gone in ('class="card-scores"', 'class="card-briefs"',
+                     'class="score-value"', "closer to its brief:"):
+            with self.subTest(gone=gone):
+                self.assertNotIn(gone, index)
+        # the entry page is untouched: the numbers are still spelled out there
+        self.assertIn("over 1 pair", entry)
+        self.assertIn("closer to its brief:", entry)
+        self.assertNotIn('class="standing"', entry)
+
+
 class GuardTests(GalleryTestCase):
 
     def test_an_email_in_a_statement_is_refused_and_nothing_is_left(self):
