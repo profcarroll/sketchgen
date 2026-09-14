@@ -495,6 +495,15 @@ def template(name: str) -> string.Template:
     return _TEMPLATES[name]
 
 
+REFUSAL_MARKS = ("refused", "failed", "nothing changed", "nothing spawned", "not installed")
+
+
+def is_refusal(flash: str | None) -> bool:
+    """Whether a flash message reports that nothing happened, or something broke."""
+    text = (flash or "").lower()
+    return any(mark in text for mark in REFUSAL_MARKS)
+
+
 def render(name: str, **fields: Any) -> str:
     """Fill one template. ``safe_substitute``: a stray ``$`` is not an error."""
     return template(name).safe_substitute(**fields)
@@ -549,8 +558,11 @@ def layout(
         for path, label in NAV
     )
     nav += f'<a href="{esc(GALLERY_URL)}" target="_blank" rel="noopener">Gallery ↗</a>'
+    # A refusal is not a success in the same quiet box: the operator has
+    # already clicked, and "nothing changed" has to be the first thing seen.
     flash_html = (
-        f'<div class="flash">{esc(flash)}</div>' if flash else ""
+        f'<div class="{"flash warn" if is_refusal(flash) else "flash"}">{esc(flash)}</div>'
+        if flash else ""
     )
     return render(
         "op_layout",
@@ -1910,8 +1922,8 @@ def spawn_child(conn: sqlite3.Connection, entry_id: int, form: dict) -> str:
         return f"spawn failed: {exc}"
     if job_id is None:
         return (
-            f"entry {entry_id} is {row['state']}, not published — nothing "
-            "spawned, and a line grows from a published or failed-kept entry only"
+            f"refused: entry {entry_id} is {row['state']} — nothing spawned; "
+            "a line grows from a held, published or kept entry, not a rejected one"
         )
     job = db.get_job(conn, job_id)
     generation = lineage.generation_of(conn, entry_id) + 1

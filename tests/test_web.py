@@ -642,30 +642,55 @@ class TestSpawn(WebTestCase):
         self.assertEqual("review", row["needs"])
         self.assertEqual("hold", row["publication"])
 
-    def test_spawning_from_a_held_entry_changes_nothing(self):
-        conn = self.db()
-        try:
-            before = conn.execute(
-                "SELECT COUNT(*) AS c FROM jobs WHERE parent_entry_id = ?",
-                (self.entry_id,),
-            ).fetchone()["c"]
-        finally:
-            conn.close()
+    def test_spawning_from_a_held_entry_queues_a_child(self):
+        # A revision is how a person decides whether a held parent is worth
+        # publishing (instructor, 2026-09-14), so the held card's form works.
         status, location = self.post(
             f"/entry/{self.entry_id}/spawn",
             {"critique": "slower and warmer", "critique_by": "profcarroll"},
         )
         self.assertEqual(303, status)
-        self.assertIn("nothing", location)
+        self.assertIn("Queued", location)
         conn = self.db()
         try:
-            after = conn.execute(
-                "SELECT COUNT(*) AS c FROM jobs WHERE parent_entry_id = ?",
+            child = conn.execute(
+                "SELECT id, state, publication FROM jobs WHERE parent_entry_id = ? "
+                "ORDER BY id DESC LIMIT 1",
                 (self.entry_id,),
-            ).fetchone()["c"]
+            ).fetchone()
+            self.assertIsNotNone(child)
+            self.assertEqual("queued", child["state"])
+            self.assertEqual("hold", child["publication"])
+            conn.execute("DELETE FROM jobs WHERE id = ?", (child["id"],))
+            conn.commit()
         finally:
             conn.close()
-        self.assertEqual(before, after)
+
+    def test_a_refusal_flashes_as_a_warning(self):
+        conn = self.db()
+        try:
+            job = db.enqueue(conn, "a closed one", "student-two")
+            conn.execute("UPDATE jobs SET state = 'rejected' WHERE id = ?", (job,))
+            closed = db.create_entry(conn, job, "rejected", prompt="a closed one")
+            conn.commit()
+        finally:
+            conn.close()
+        try:
+            status, location = self.post(
+                f"/entry/{closed}/spawn",
+                {"critique": "slower", "critique_by": "profcarroll"},
+            )
+            self.assertEqual(303, status)
+            self.assertIn("refused", location)
+            page = self.text(location[location.index("/"):])
+            self.assertIn('class="flash warn"', page)
+            self.assertIn("nothing spawned", page)
+        finally:
+            conn = self.db()
+            conn.execute("DELETE FROM entries WHERE id = ?", (closed,))
+            conn.execute("DELETE FROM jobs WHERE id = ?", (job,))
+            conn.commit()
+            conn.close()
 
     def test_the_form_is_on_the_held_cards_and_on_the_job_page(self):
         held = self.text("/held")

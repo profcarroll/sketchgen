@@ -79,7 +79,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
             state = row["state"] if row else "not an entry"
             message = (
                 f"nothing spawned: entry {args.parent} is {state}; a line grows "
-                "from a published or failed-kept entry only"
+                "from a held, published or kept entry, not a rejected one"
             )
             if args.json:
                 print(json.dumps({"job_id": None, "parent_entry_id": args.parent,
@@ -227,7 +227,7 @@ def register(top: argparse._SubParsersAction) -> None:
         description=(
             "Compose the parent's prompt with the critique under 'Revise:' and "
             "queue it as a child job with the parent recorded. Exits 1 and "
-            "writes nothing when the parent is not published or failed-kept."
+            "writes nothing when the parent is a rejected entry."
         ),
     )
     spawn.add_argument("--parent", type=int, required=True, metavar="ID",
