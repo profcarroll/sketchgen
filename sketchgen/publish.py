@@ -437,10 +437,14 @@ def publish(
             raise PublishFailed(pushed.stderr.strip() or "git push failed")
 
         now = db.utc_now()
+        # Only a held entry becomes 'published'. A kept rejection stays
+        # 'failed-kept' — that is what puts it on the rejections page rather
+        # than the grid — and gains the timestamp and commit like any other.
+        new_state = "published" if entry["state"] == "held" else entry["state"]
         conn.execute(
-            "UPDATE entries SET state = 'published', published_utc = ?, "
+            "UPDATE entries SET state = ?, published_utc = ?, "
             "publish_commit = ? WHERE id = ?",
-            (now, sha, entry_id),
+            (new_state, now, sha, entry_id),
         )
         conn.commit()
         # The entry is public. Now the grid, the failures page, compare and the

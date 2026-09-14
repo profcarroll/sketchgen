@@ -225,7 +225,8 @@ class PublishTests(PublishTestCase):
         )
         result = self.publish_cli()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.entry_row()["state"], "published")
+        self.assertEqual(self.entry_row()["state"], "failed-kept")
+        self.assertIsNotNone(self.entry_row()["publish_commit"])
 
     def test_rejected_entries_do_not_publish(self):
         self.conn.execute(
