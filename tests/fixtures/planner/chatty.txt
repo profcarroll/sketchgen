@@ -1,0 +1,16 @@
+Sure! Here is the plan for this sketch. I have kept the brief short and picked
+the assertions from the list you gave me.
+
+**Brief**
+A dense mesh of pale lines rotates slowly in three dimensions above a dark
+ground, so its silhouette is never the same twice. Dragging the mouse turns the
+mesh with the cursor, and letting go leaves it turning on its own again from
+wherever it was left.
+
+**Assertions**
+- motion(idle)
+- responds(drag)
+- uses(webgl)
+
+I chose uses(webgl) because the mesh is described as three-dimensional. Let me
+know if you would like me to add a size, or to make the sketch still instead!

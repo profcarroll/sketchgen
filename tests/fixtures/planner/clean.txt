@@ -1,0 +1,7 @@
+Brief
+A field of small translucent circles drifts slowly across a dark blue canvas, each one turning a little as it goes, so the whole surface reads as a slow current rather than as separate objects. Clicking anywhere pushes the nearest circles outward in a soft ring that settles again over a second or two. The canvas is 800 by 600 pixels and the palette stays cool: blues, a single warm accent that appears only where two circles overlap.
+
+Assertions
+motion(idle)
+responds(click)
+size(800,600)
