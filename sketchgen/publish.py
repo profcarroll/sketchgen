@@ -34,6 +34,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -446,6 +447,12 @@ def publish(
             "publish_commit = ? WHERE id = ?",
             (new_state, now, sha, entry_id),
         )
+        # The job's row follows its entry, so the queue stops saying "held"
+        # about work that is public. A job already past held is left alone.
+        if new_state == "published" and entry["job_id"] is not None:
+            job = db.get_job(conn, entry["job_id"])
+            if job is not None and job.state == "held":
+                db.transition(conn, job.id, "published")
         conn.commit()
         # The entry is public. Now the grid, the failures page, compare and the
         # line pages must know about it: re-render the index and push it as a
@@ -577,6 +584,25 @@ def _publish_index(
     if committed.returncode != 0:
         return None, f"index commit failed: {committed.stderr.strip()}"
     sha = _git_out(checkout, "rev-parse", "HEAD")
+    # Seen once on the node (2026-09-14, entry 4 from the operator UI): the
+    # checkout was left with a modified pairs.json after this commit, which
+    # made the next publish refuse as dirty. Not reproduced from the CLI. A
+    # second pass commits any leftover generated file and says so, rather
+    # than leaving a landmine for the next publish.
+    leftover = (_git_out(checkout, "status", "--porcelain") or "").strip()
+    if leftover:
+        _git(checkout, "add", "-A", "--", ".")
+        second = subprocess.run(
+            ["git", "commit", "-F", "-"],
+            cwd=str(checkout),
+            input=f"gallery index after entry {entry_id}, second pass\n\n{leftover}\n",
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if second.returncode == 0:
+            sha = _git_out(checkout, "rev-parse", "HEAD")
+            print(f"sketchgen: index second pass committed: {leftover.replace(chr(10), '; ')}", file=sys.stderr)
     pushed = _git(checkout, "push", target, f"HEAD:refs/heads/{branch}", env=env)
     if pushed.returncode != 0:
         _undo(checkout, before)
@@ -617,6 +643,9 @@ def reject(
             f"entry {entry_id} is {entry['state']}; only held can be rejected"
         )
     conn.execute("UPDATE entries SET state = 'rejected' WHERE id = ?", (entry_id,))
+    job = db.get_job(conn, entry["job_id"]) if entry["job_id"] is not None else None
+    if job is not None and job.state == "held":
+        db.transition(conn, job.id, "rejected", last_error=f"entry rejected: {reason or ''}".rstrip(": "))
     if reason:
         conn.execute(
             "UPDATE jobs SET last_error = ?, updated_utc = ? WHERE id = ?",
