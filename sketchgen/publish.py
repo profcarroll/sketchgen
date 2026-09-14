@@ -578,6 +578,10 @@ def _publish_index(
     try:
         render_index(conn, checkout)
     except Exception as exc:  # the generator's own refusal, reported
+        # The generator undoes what it wrote, but the checkout is git's: put
+        # it back exactly at the entry commit, so the next publish is not
+        # refused for a dirty tree that this one left behind.
+        _undo(checkout, before)
         return None, f"index render failed: {exc}"
     if not any((checkout / p).exists() for p in INDEX_PATHS):
         return None, "index render wrote nothing"
@@ -624,11 +628,18 @@ def _publish_index(
 
 
 def _undo(checkout: Path, before: str | None) -> None:
-    """Put the checkout back where it was before the failed publish."""
+    """Put the checkout back where it was before the failed publish.
+
+    Tracked files go back to ``before``; untracked ones the failed render
+    created are removed too, because the next publish refuses any dirty
+    tree, untracked included. Everything in the checkout is generated
+    output, so there is nothing of a person's to protect here.
+    """
     if before:
         _git(checkout, "reset", "--hard", before)
     else:  # pragma: no cover - a gallery with no commit at all
         _git(checkout, "reset", "--hard", "HEAD~1")
+    _git(checkout, "clean", "-fdq", "--", ".")
 
 
 def _os_user() -> str:
