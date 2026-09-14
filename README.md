@@ -10,9 +10,13 @@ Python 3.12, standard library only. No dependencies, no framework.
 ## Layout
 
 ```
-sketchgen/       the package: __init__.py, db.py (schema, helpers, state machine)
+sketchgen/       the package: db.py (schema, helpers, state machine), planner.py,
+                 executor.py, worker.py (the loop)
 migrations/      001_init.sql and everything after it, applied in order
-bin/sketchgen    the one CLI: db init | db status  (later packets add subcommands)
+prompts/         executor.md, planner.md and the two rules files, versioned
+bin/sketchgen    the one CLI: db | enqueue | worker | control | execute | plan |
+                 install-unit | keygen  (later packets add publish, web, judge)
+systemd/         the worker's user unit and its timer
 tests/           stdlib unittest
 ```
 
@@ -47,6 +51,33 @@ A job's legal moves are enforced in `sketchgen/db.py` (`TRANSITIONS`), not in SQ
 `needs-laptop` off to the side, three terminal states, and a `requeue` path back to
 `queued` for the worker's stop-now control. An illegal move raises
 `IllegalTransition` and changes nothing.
+
+## The worker
+
+One job at a time, from the queue to `held` or to a kept failure:
+
+```
+python3 bin/sketchgen enqueue --prompt "sixty drifting circles" --by octocat
+python3 bin/sketchgen worker --once
+```
+
+`worker --once` reads the control row, fences the inference slot (`pgrep -af
+opencode`; a model left resident by `KEEP_ALIVE` is not contention), claims the
+oldest queued job, plans it if it arrived without a brief, then executes and gates
+it up to `max_attempts` times, feeding the gate's evidence back into the next
+attempt. Every step is stamped in UTC on stderr and in `<jobs>/<id>/job.log`, and
+every attempt is a row in `attempts`. Without `--once` it stays resident, which is
+systemd's job — see `docs/OPERATIONS.md`. Paths come from `$SKETCHGEN_DB`,
+`$SKETCHGEN_JOBS`, `$SKETCHGEN_GATE` and `$OLLAMA_HOST_URL`, the same four the unit
+sets.
+
+Pause, stop and resume are database rows, not signals:
+
+```
+python3 bin/sketchgen control pause --reason "someone else wants the slot"
+python3 bin/sketchgen control stop            # abort the attempt, re-queue the job
+python3 bin/sketchgen control resume
+```
 
 ## Tests
 

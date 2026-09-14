@@ -145,7 +145,9 @@ class UnitFileTests(unittest.TestCase):
         self.assertEqual(set(sections), {"Unit", "Service", "Install"})
         for key in ("Type", "ExecStart", "WorkingDirectory", "Restart", "RestartSec"):
             self.assertIn(key, sections["Service"])
-        self.assertEqual(sections["Service"].count("Environment"), 3)
+        # four paths, and they are the four sketchgen/worker.py reads:
+        # SKETCHGEN_DB, SKETCHGEN_JOBS, SKETCHGEN_GATE, OLLAMA_HOST_URL
+        self.assertEqual(sections["Service"].count("Environment"), 4)
 
     def test_timer_is_well_formed(self):
         sections = self.parse(UNIT_DIR / "sketchgen-worker.timer")

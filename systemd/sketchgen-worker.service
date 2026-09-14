@@ -35,8 +35,9 @@
 # one slot. Pause and resume are the DB control row, not systemctl: see
 # docs/OPERATIONS.md.
 #
-# `sketchgen worker` is packet 2.3's subcommand and does not exist yet. This unit
-# names it; installing it before 2.3 lands gives you a unit that fails to start.
+# `sketchgen worker` is packet 2.3's subcommand. The four Environment= lines below
+# are the only configuration it has; the same four names, with the same defaults,
+# are what sketchgen/worker.py reads when no unit set them.
 
 [Unit]
 Description=sketchgen worker: one p5.js sketch job at a time, slot-fenced
@@ -47,6 +48,7 @@ After=network-online.target
 Type=simple
 WorkingDirectory=%h/sketchgen/app
 Environment=SKETCHGEN_DB=%h/sketchgen/sketchgen.db
+Environment=SKETCHGEN_JOBS=%h/sketchgen/jobs
 Environment=SKETCHGEN_GATE=%h/sketchgen/gate/sketch_gate.py
 Environment=OLLAMA_HOST_URL=http://127.0.0.1:11434
 ExecStart=%h/sketchgen/.venv/bin/python3 %h/sketchgen/app/bin/sketchgen worker

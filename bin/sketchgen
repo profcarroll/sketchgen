@@ -2,8 +2,7 @@
 """sketchgen — the one CLI.
 
 Today: `db init`, `db status`, `execute`, `plan`, `install-unit`, `keygen`,
-`publish` and `reject`. Later packets add subcommands (worker, web, judge) by
-adding a parser and one function each, below.
+`publish`, `reject`, `worker`, `control` and `enqueue`. Later packets add subcommands
 
 Exit codes: 0 success, 1 failure, 3 refused.
 """
@@ -24,6 +23,7 @@ from sketchgen import db  # noqa: E402
 from sketchgen import executor  # noqa: E402
 from sketchgen import planner  # noqa: E402
 from sketchgen import publish as publication  # noqa: E402
+from sketchgen import worker  # noqa: E402
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -51,6 +51,16 @@ KEY_ROLES = {
 def _add_path_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--path",
+        default=db.DEFAULT_DB_PATH,
+        metavar="P",
+        help="database file (default: $SKETCHGEN_DB, else ~/sketchgen/sketchgen.db)",
+    )
+
+
+def _add_db_option(parser: argparse.ArgumentParser) -> None:
+    """`--db` for the subcommands that are not under `db`, same default."""
+    parser.add_argument(
+        "--db",
         default=db.DEFAULT_DB_PATH,
         metavar="P",
         help="database file (default: $SKETCHGEN_DB, else ~/sketchgen/sketchgen.db)",
@@ -117,6 +127,127 @@ def cmd_db_status(args: argparse.Namespace) -> int:
         return EXIT_FAIL
     finally:
         conn.close()
+    return EXIT_OK
+
+
+def _open_db(path: str) -> "sqlite3.Connection | None":
+    """Open an initialised database, or print why we cannot and return None."""
+    if not os.path.exists(path):
+        print(
+            f"sketchgen: no database at {path} (run: sketchgen db init)",
+            file=sys.stderr,
+        )
+        return None
+    conn = db.connect(path)
+    if db.schema_version(conn) == 0:
+        conn.close()
+        print(
+            f"sketchgen: {path} has no schema (run: sketchgen db init)",
+            file=sys.stderr,
+        )
+        return None
+    return conn
+
+
+def cmd_enqueue(args: argparse.Namespace) -> int:
+    """Put one job on the queue. A thin wrapper over db.enqueue, nothing more."""
+    conn = _open_db(args.db)
+    if conn is None:
+        return EXIT_FAIL
+    options: dict = {"max_attempts": args.max_attempts, "publication": args.publication}
+    if args.planner:
+        options["planner"] = args.planner
+    if args.rules:
+        options["rules_file"] = args.rules
+    if args.parent is not None:
+        options["parent_entry_id"] = args.parent
+    try:
+        job_id = db.enqueue(conn, args.prompt, args.by, **options)
+    except sqlite3.Error as exc:
+        print(f"sketchgen: enqueue failed: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+    finally:
+        conn.close()
+    print(f"queued job {job_id}: {args.prompt}")
+    return EXIT_OK
+
+
+def cmd_worker(args: argparse.Namespace) -> int:
+    """Run the worker: one pass with --once, or resident (systemd's mode)."""
+    conn = _open_db(args.db)
+    if conn is None:
+        return EXIT_FAIL
+    executor_fn = None
+    planner_fn = None
+    probe = None
+    if args.stub_executor:
+        executor_fn = worker.stub_executor(args.stub_executor)
+        # A stubbed run calls no model, so it cannot contend for the inference
+        # slot: the fence observes and reports but does not refuse. A real run
+        # gets the real fence.
+        probe = worker.observing_probe(args.host)
+        print(
+            "sketchgen: TEST MODE — the executor is stubbed; no model is called, "
+            "and the fence observes the slot without refusing on it",
+            file=sys.stderr,
+        )
+    if args.stub_planner_assert:
+        planner_fn = worker.stub_planner(args.stub_planner_assert)
+        print(
+            "sketchgen: TEST MODE — the planner is stubbed; no model is called",
+            file=sys.stderr,
+        )
+    runner = worker.Worker(
+        conn,
+        jobs_dir=os.path.expanduser(args.jobs_dir),
+        gate_path=os.path.expanduser(args.gate),
+        host=args.host,
+        executor_fn=executor_fn,
+        planner_fn=planner_fn,
+        probe=probe,
+    )
+    try:
+        if args.once:
+            return runner.run_once()
+        return runner.run_forever(args.sleep)
+    except KeyboardInterrupt:  # pragma: no cover - operator's Ctrl-C
+        print("sketchgen: interrupted", file=sys.stderr)
+        return EXIT_FAIL
+    finally:
+        conn.close()
+
+
+def cmd_control(args: argparse.Namespace) -> int:
+    """Set the operator's switch: pause, stop (stop now), or resume.
+
+    `stop` is written as control state 'pausing' with a reason beginning
+    'stop' — see sketchgen/worker.py's docstring for why it is a reason rather
+    than a new state value.
+    """
+    conn = _open_db(args.db)
+    if conn is None:
+        return EXIT_FAIL
+    try:
+        if args.action == "pause":
+            control = db.set_control(conn, "pausing", args.reason or "pause")
+        elif args.action == "stop":
+            reason = f"stop: {args.reason}" if args.reason else "stop"
+            control = db.set_control(conn, "pausing", reason)
+        else:
+            control = db.set_control(conn, "running", args.reason)
+    except sqlite3.Error as exc:
+        print(f"sketchgen: control failed: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+    finally:
+        conn.close()
+    print(
+        f"control: {control.state}  reason: {control.reason or '-'}  "
+        f"updated_utc: {control.updated_utc}"
+    )
+    if args.action == "pause":
+        print("the worker finishes the attempt in flight, then settles into paused")
+    elif args.action == "stop":
+        print("the worker aborts the attempt in flight and re-queues the job")
     return EXIT_OK
 
 
@@ -459,6 +590,96 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.set_defaults(func=cmd_db_status)
 
     db_parser.set_defaults(_parser=db_parser)
+
+    enqueue_parser = top.add_parser(
+        "enqueue",
+        help="put one prompt on the queue",
+        description=(
+            "Add one job to the queue. A thin wrapper over db.enqueue: it "
+            "validates nothing the schema does not already validate, and it "
+            "calls no model. GitHub usernames only for --by."
+        ),
+    )
+    enqueue_parser.add_argument("--prompt", required=True, metavar="TEXT",
+                                help="what to make")
+    enqueue_parser.add_argument("--by", required=True, metavar="USERNAME",
+                                help="GitHub username of the submitter")
+    enqueue_parser.add_argument("--planner", choices=("local", "paid"), default=None,
+                                help="who writes the brief; 'paid' stops the job at "
+                                     "needs-laptop (DECIDE[credential-model] B)")
+    enqueue_parser.add_argument("--rules", choices=("control", "treatment", "random"),
+                                default=None,
+                                help="rules file for the executor; 'random' resolves "
+                                     "per job id at execute time (spec §9)")
+    enqueue_parser.add_argument("--publication", choices=("hold", "auto"),
+                                default="hold",
+                                help="hold for a person (default) or auto-publish "
+                                     "later; both land in held for now")
+    enqueue_parser.add_argument("--max-attempts", dest="max_attempts", type=int,
+                                default=3, metavar="N",
+                                help="execute+gate attempts before failed (default 3)")
+    enqueue_parser.add_argument("--parent", type=int, default=None, metavar="ID",
+                                help="entry id this prompt came from (lineage)")
+    _add_db_option(enqueue_parser)
+    enqueue_parser.set_defaults(func=cmd_enqueue, _parser=enqueue_parser)
+
+    worker_parser = top.add_parser(
+        "worker",
+        help="claim one queued job and take it to held or failed",
+        description=(
+            "The worker loop. Without --once it stays resident and polls, which "
+            "is what the systemd user unit runs; never start that from a tool "
+            "call, it dies with the call. It fences the inference slot before "
+            "claiming anything and refuses (exit 3) while another client holds "
+            "it, and it honours the control row: pause finishes the attempt in "
+            "flight, stop aborts and re-queues."
+        ),
+    )
+    worker_parser.add_argument("--once", action="store_true",
+                               help="one pass, at most one job, then exit")
+    _add_db_option(worker_parser)
+    worker_parser.add_argument("--jobs-dir", dest="jobs_dir",
+                               default=worker.DEFAULT_JOBS_DIR, metavar="D",
+                               help="per-job directories and job.log "
+                                    "(default: $SKETCHGEN_JOBS, else ~/sketchgen/jobs)")
+    worker_parser.add_argument("--gate", default=worker.DEFAULT_GATE_PATH, metavar="PATH",
+                               help="sketch_gate.py (default: $SKETCHGEN_GATE, else "
+                                    "~/sketchgen/gate/sketch_gate.py)")
+    worker_parser.add_argument("--host", default=worker.DEFAULT_HOST, metavar="URL",
+                               help="Ollama base URL (default: $OLLAMA_HOST_URL, else "
+                                    "http://127.0.0.1:11434)")
+    worker_parser.add_argument("--sleep", type=float, default=worker.DEFAULT_SLEEP_S,
+                               metavar="S",
+                               help="seconds between passes when resident "
+                                    f"(default {worker.DEFAULT_SLEEP_S:.0f})")
+    worker_parser.add_argument("--stub-executor", dest="stub_executor", default=None,
+                               metavar="DIR",
+                               help="TEST ONLY: copy DIR as the executor's output "
+                                    "instead of calling the model; the run calls no "
+                                    "model, so the fence reports the slot without "
+                                    "refusing on it")
+    worker_parser.add_argument("--stub-planner-assert", dest="stub_planner_assert",
+                               action="append", default=[], metavar="WORD",
+                               help="TEST ONLY: plan with the job's own prompt as the "
+                                    "brief and these assertions; repeatable")
+    worker_parser.set_defaults(func=cmd_worker, _parser=worker_parser)
+
+    control_parser = top.add_parser(
+        "control",
+        help="pause, stop now, or resume the worker",
+        description=(
+            "The operator's one switch, held in the database so it survives a "
+            "worker restart and does not fight systemd. pause: finish the "
+            "attempt in flight, then stop. stop: abort the attempt in flight "
+            "and re-queue the job. resume: take jobs again."
+        ),
+    )
+    control_parser.add_argument("action", choices=("pause", "stop", "resume"),
+                                help="what to ask the worker for")
+    control_parser.add_argument("--reason", default=None, metavar="TEXT",
+                                help="why, for the record and for the console")
+    _add_db_option(control_parser)
+    control_parser.set_defaults(func=cmd_control, _parser=control_parser)
 
     ex = top.add_parser(
         "execute",
