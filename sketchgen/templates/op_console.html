@@ -1,0 +1,84 @@
+<h1>Console <span class="dim" style="font-size:13px">— $shape · $cores_n cores · source
+   <span id="console-source">$source</span> · read $generated · collected $collector_ms ms</span></h1>
+
+<div class="grid">
+
+  <section class="panel" id="vitals">
+    <h2>Node</h2>
+    <div class="meter">
+      <div class="lab"><span>cpu</span><span>$cpu_total busy across all cores</span></div>
+      <div class="bar">$cpu_total_bar</div>
+    </div>
+    <div class="cores">
+$cores
+    </div>
+    <div style="margin-top:12px">
+$meters
+    </div>
+    <h3>Top three</h3>
+    <table>
+      <thead><tr><th class="n">pid</th><th>process</th><th class="n">cpu %</th><th class="n">mem %</th></tr></thead>
+      <tbody>
+$top_rows
+      </tbody>
+    </table>
+  </section>
+
+  <section class="panel" id="model">
+    <h2>Model and slot</h2>
+    <div class="tiles">
+$model_tiles
+    </div>
+    <h3>Resident <span class="dim" style="font-weight:400">— ollama $ollama_version</span></h3>
+    <table>
+      <thead><tr><th>model</th><th class="n">GB</th><th>processor</th>
+        <th class="n">ctx</th><th>until (UTC)</th></tr></thead>
+      <tbody>
+$resident_rows
+      </tbody>
+    </table>
+    <h3>Worker</h3>
+    <div class="tiles">
+$worker_tiles
+    </div>
+  </section>
+
+</div>
+
+<section class="panel">
+  <h2>Odometer</h2>
+  <div class="tiles">
+$odometer
+  </div>
+</section>
+
+<div class="grid">
+  <section class="panel">
+    <h2>Funnel</h2>
+    <table>
+      <thead><tr><th>stage</th><th class="n">now</th><th class="n">session</th>
+        <th class="n">per day</th><th class="n">total</th></tr></thead>
+      <tbody>
+$funnel_rows
+      </tbody>
+    </table>
+  </section>
+
+  <section class="panel">
+    <h2>Per sketch</h2>
+    <div style="overflow-x:auto">
+      <table>
+        <thead><tr><th>scope</th><th class="n">attempts</th><th class="n">wall s</th>
+          <th class="n">gate s</th><th class="n">tok in</th><th class="n">tok out</th>
+          <th class="n">lines</th><th class="n">1st pass</th>
+          <th class="n">$cost_a</th><th class="n">$cost_b</th></tr></thead>
+        <tbody>
+$per_sketch_rows
+        </tbody>
+      </table>
+    </div>
+    <p class="dim" style="font-size:12px">The two cost columns are the same wall time
+      at the two node shapes — MEASURE[cost-per-sketch]. 4/24 reads 0.0000 while the
+      tenancy is inside its trial credit.</p>
+  </section>
+</div>
