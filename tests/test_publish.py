@@ -373,3 +373,18 @@ class PublishIndexTests(PublishTestCase):
         )
         self.assertIsNone(sha2)
         self.assertEqual(why2, "site unchanged")
+
+
+class ScanTests(unittest.TestCase):
+    def test_binary_files_are_not_scanned_for_addresses(self):
+        import tempfile, pathlib
+        from sketchgen import publish as publication
+        with tempfile.TemporaryDirectory() as tmp:
+            d = pathlib.Path(tmp)
+            # PNG bytes that happen to spell an address: a real strip did this.
+            (d / "strip.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 16 + b"ab@cd.ef" + b"\x00" * 8)
+            (d / "sketch.js").write_text("let x = 1;\n", encoding="utf-8")
+            publication.scan_for_personal_data(d)  # must not raise
+            (d / "sketch.js").write_text("// mail me at someone@example.org\n", encoding="utf-8")
+            with self.assertRaises(publication.PublishRefused):
+                publication.scan_for_personal_data(d)
