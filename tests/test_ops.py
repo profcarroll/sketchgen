@@ -20,7 +20,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI = REPO_ROOT / "bin" / "sketchgen"
 UNIT_DIR = REPO_ROOT / "systemd"
-UNIT_FILES = ("sketchgen-worker.service", "sketchgen-worker.timer")
+UNIT_FILES = ("sketchgen-worker.service", "sketchgen-worker.timer", "sketchgen-web.service")
 
 SECTION_RE = re.compile(r"^\[[A-Za-z][A-Za-z0-9]*\]$")
 KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*=")
@@ -169,3 +169,16 @@ class UnitFileTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WebUnitTests(unittest.TestCase):
+    """The operator UI's unit binds loopback only and carries no secret."""
+
+    def test_web_unit_binds_loopback_and_names_the_port(self):
+        text = (UNIT_DIR / "sketchgen-web.service").read_text(encoding="utf-8")
+        self.assertIn("--bind 127.0.0.1", text)
+        self.assertIn("--port 8081", text)
+        self.assertNotIn("0.0.0.0", text)
+        for secret in ("KEY=", "TOKEN=", "SECRET=", "PASSWORD="):
+            self.assertNotIn(secret, text.upper().replace("SKETCHGEN_GATE=", ""))
+        self.assertIn("WantedBy=default.target", text)
