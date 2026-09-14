@@ -257,15 +257,19 @@ Each item in that top bar carries a small live summary of its own page, so the n
 never out of sight while you are standing somewhere else. **Console** has a
 five-segment meter: lit segments are the node's one-minute load per core as a
 percentage, in fifths — the first two green, the third amber, the last two red — and
-hovering it names the CPU figure and who holds the inference slot. **Queue** has three
-counts, `queued · in flight · failed`: amber is waiting, green is moving, and the red
+hovering it names the CPU figure and who holds the inference slot; beside the meter the
+tokens gauge is a sparkline of tokens completed per five-minute bin over the last two
+hours — flat on the floor while the worker idles, one spike per job — labelled with the
+current decode rate in tok/s, which on this node barely moves and so is the label rather
+than the line, and drawn again wider in the Console's own model panel. **Queue** has
+three counts, `queued · in flight · failed`: amber is waiting, green is moving, and the red
 one is failures **since the worker last started** (the worker stamps
 `meta.worker_started_utc` when it comes up), not the all-time total, which would only
 ever grow — so a red zero means this session has been clean, and restarting the worker
 clears it. **Held** has an amber superscript, the number waiting for you to publish or
 reject, with the kept rejections below them named on hover. **Gallery** has a dim
 superscript: everything that is public, published entries and kept rejections
-together. All five are rendered by the server on every page load and repainted by the
+together. All of them are rendered by the server on every page load and repainted by the
 same two-second poll that keeps the worker pill honest.
 
 ## The write-path sync as a timer
