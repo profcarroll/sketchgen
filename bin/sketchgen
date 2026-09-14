@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """sketchgen — the one CLI.
 
-Today: `db init` and `db status`. Later packets add subcommands (worker,
-publish, web, judge) by adding a parser and one function each, below.
+Today: `db init`, `db status` and `execute`. Later packets add subcommands
+(worker, publish, web, judge) by adding a parser and one function each, below.
 
 Exit codes: 0 success, 1 failure, 3 refused.
 """
@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sketchgen import __version__  # noqa: E402
 from sketchgen import db  # noqa: E402
+from sketchgen import executor  # noqa: E402
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -95,6 +96,37 @@ def cmd_db_status(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_execute(args: argparse.Namespace) -> int:
+    """Run one single-shot execute attempt, or replay a saved response."""
+    try:
+        result = executor.run(
+            brief=args.brief,
+            assertions=args.assertions,
+            rules_file=args.rules,
+            seed=args.seed,
+            model=args.model,
+            host=args.host,
+            num_ctx=args.num_ctx,
+            out_dir=args.out,
+            stub=args.stub,
+        )
+    except executor.ExecutorRefused as exc:
+        print(f"sketchgen: refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    except OSError as exc:
+        print(f"sketchgen: execute failed: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+    if args.json:
+        sys.stdout.write(result.to_json())
+    elif result.ok:
+        print(f"wrote {', '.join(result.files)} to {result.out_dir}")
+        print(f"blocks: {', '.join(result.blocks)}")
+    else:
+        print(f"sketchgen: {result.error}", file=sys.stderr)
+        print(f"raw response kept at {result.out_dir}/response.txt", file=sys.stderr)
+    return EXIT_OK if result.ok else EXIT_FAIL
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sketchgen",
@@ -115,6 +147,57 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.set_defaults(func=cmd_db_status)
 
     db_parser.set_defaults(_parser=db_parser)
+
+    ex = top.add_parser(
+        "execute",
+        help="one prompt in, one sketch out (single-shot, no agent loop)",
+        description=(
+            "Send one brief to the executor model and write sketch.js, index.html, "
+            "statement.md, response.txt and result.json into --out."
+        ),
+        epilog="assertion vocabulary: " + ", ".join(executor.VOCAB),
+    )
+    ex.add_argument("--brief", required=True, metavar="TEXT", help="what to make")
+    ex.add_argument(
+        "--assert",
+        dest="assertions",
+        action="append",
+        default=[],
+        metavar="WORD",
+        help="assertion the sketch must pass; repeatable",
+    )
+    ex.add_argument(
+        "--rules",
+        default="treatment",
+        metavar="R",
+        help="rules file: treatment, control, or a path (default: treatment)",
+    )
+    ex.add_argument(
+        "--model", default=executor.DEFAULT_MODEL, metavar="M", help="Ollama model tag"
+    )
+    ex.add_argument(
+        "--host", default=executor.DEFAULT_HOST, metavar="URL", help="Ollama base URL"
+    )
+    ex.add_argument("--out", required=True, metavar="DIR", help="output directory")
+    ex.add_argument(
+        "--stub",
+        metavar="FILE",
+        help="replay a saved raw response instead of calling the model",
+    )
+    ex.add_argument(
+        "--seed", type=int, default=executor.DEFAULT_SEED, metavar="N", help="p5 seed"
+    )
+    ex.add_argument(
+        "--num-ctx",
+        dest="num_ctx",
+        type=int,
+        default=executor.DEFAULT_NUM_CTX,
+        metavar="N",
+        help=f"context window (default: {executor.DEFAULT_NUM_CTX})",
+    )
+    ex.add_argument("--json", action="store_true", help="print result.json to stdout")
+    ex.set_defaults(func=cmd_execute, _parser=ex)
+
     parser.set_defaults(_parser=parser)
     return parser
 
