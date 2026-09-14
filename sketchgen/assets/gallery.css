@@ -173,6 +173,23 @@ summary.filter-label::before { content: "\25b8\a0"; }
 .sort { border: 1px solid transparent; color: var(--ink); font: inherit; line-height: inherit; }
 .filter[aria-current="true"], .sort[aria-current="true"] { background: var(--accent); color: var(--panel); }
 
+/* The search box rides at the far end of the sort row, a chip's height so the
+ * row stays one row. It narrows the grid; the sort reorders it; neither one
+ * knows about the other. */
+.search { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.5rem; margin-left: auto; }
+.search-label { color: var(--ink-soft); }
+.search input {
+  background: var(--chip);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  color: inherit;
+  font: inherit;
+  line-height: inherit;
+  min-width: 12rem;
+  padding: 0.15rem 0.7rem;
+}
+.search-count { color: var(--ink-soft); font-size: 0.85rem; }
+
 .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); }
 
 .card {

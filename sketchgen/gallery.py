@@ -990,6 +990,31 @@ def _write_entry(
 # ---------------------------------------------------------------------------
 
 
+def _search_text(entry_id: int, row: sqlite3.Row) -> str:
+    """Everything the grid's search box matches a card on, as one string.
+
+    Lowercased and whitespace-collapsed here so that the script does neither:
+    it lowercases the query once and asks for substrings, which is the whole
+    of the matching.
+
+    The brief is in here and nowhere else on the card. That is the point of
+    the attribute: a card shows a prompt, but the entry is *about* what the
+    brief says, so searching for a word from a brief ought to find it. The
+    statement stays out — it is paragraphs, and every card would carry them.
+    """
+    parts = [
+        # both ways someone writes an entry number
+        f"entry {entry_id}",
+        f"#{entry_id}",
+        row["prompt"] or "",
+        row["brief"] or "",
+        row["rules_file"] or "",
+        row["executor"] or "",
+        row["submitted_by"] or "",
+    ]
+    return _esc(" ".join(" ".join(str(part) for part in parts).split()).lower())
+
+
 def _card(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -1028,6 +1053,9 @@ def _card(
         # The sort control reads this attribute, so the order JavaScript puts
         # the cards in is the order the generator already put them in.
         published=_esc(row["published_utc"] or ""),
+        # ...and the search box reads this one, which is the only place the
+        # brief reaches a grid page.
+        search=_search_text(entry_id, row),
         submitted_by=_esc(row["submitted_by"] or "unknown"),
         human=_esc(human_value),
         agent=_esc(agent_value),
@@ -1090,6 +1118,9 @@ def _grid_page(
         heading=_esc(heading),
         heading_html=f"<h1>{_esc(heading)}</h1>" if heading else "",
         intro_html=f'<p class="intro">{_esc(intro)}</p>' if intro else "",
+        # With no JavaScript the search box is a form that submits to the page
+        # it is already on, which reloads it showing everything: harmless.
+        page=_esc(page),
         filters=_filters(rows, page),
         cards=cards,
     )

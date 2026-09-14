@@ -31,6 +31,11 @@
       <button type="button" class="sort" data-sort="random">random</button>
       <button type="button" class="sort" data-sort="liked">most liked</button>
     </p>
+    <form class="search" role="search" action="$page" method="get">
+      <label class="search-label" for="q">Search</label>
+      <input type="search" id="q" name="q" placeholder="search prompts" autocomplete="off" data-search>
+      <span class="search-count" data-search-count hidden></span>
+    </form>
   </div>
   <div class="grid">
     $cards

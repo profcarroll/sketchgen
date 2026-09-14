@@ -17,8 +17,9 @@
  * says votes are not being recorded. The generator never writes a number it
  * does not have, and neither does this file.
  *
- * It also owns the grid's order and its filters. Those ask nothing of anyone:
- * the cards are rendered newest first and the filters are plain links, so the
+ * It also owns the grid's order, its filters and its search box. Those ask
+ * nothing of anyone: the cards are rendered newest first, the filters are
+ * plain links and the search is a form that submits to its own page, so the
  * page is right before this file runs and stays right if it never does.
  *
  * Vanilla, no framework, no build step. The page sets window.SKETCHGEN_ROOT to
@@ -258,17 +259,61 @@
     return new URLSearchParams(cut === -1 ? "" : href.slice(cut + 1));
   }
 
-  function applyFilters() {
+  /* One parameter into the address bar without navigating: reload the page, or
+   * send it to someone, and the grid comes back the way it was left. An empty
+   * value drops the parameter rather than writing an empty one. */
+  function remember(name, value) {
+    if (!window.history || !window.history.replaceState) { return; }
+    var params = new URLSearchParams(window.location.search);
+    if (value) { params.set(name, value); } else { params.delete(name); }
+    var query = params.toString();
+    window.history.replaceState(
+      null, "", window.location.pathname + (query ? "?" + query : "") + window.location.hash
+    );
+  }
+
+  /* The filters are still plain links, so following one is a fresh page load:
+   * whatever the viewer chose here has to ride along in the href or it is lost
+   * at the click. The sort does this, and so does the search. */
+  function carryOnLinks(name, value) {
+    Array.prototype.forEach.call(document.querySelectorAll("a.filter"), function (link) {
+      var href = link.getAttribute("href") || "";
+      var cut = href.indexOf("?");
+      var params = linkParams(link);
+      if (value) { params.set(name, value); } else { params.delete(name); }
+      var query = params.toString();
+      link.setAttribute("href", (cut === -1 ? href : href.slice(0, cut)) + (query ? "?" + query : ""));
+    });
+  }
+
+  /* The one place a card is hidden or shown, because two places would fight:
+   * the filter links and the search box each answer half of the question and a
+   * card is visible only if it passes both halves. Returns how many cards the
+   * page has at all, which is none on an empty grid. */
+  function applyVisibility() {
     var cards = document.querySelectorAll(".card[data-entry]");
-    if (cards.length === 0) { return; }
+    if (cards.length === 0) { return 0; }
     var params = new URLSearchParams(window.location.search);
     var rules = params.get("rules");
     var executor = params.get("executor");
+    var words = queryTerms(currentQuery());
+    var shown = 0;
     Array.prototype.forEach.call(cards, function (card) {
       var keep = (!rules || card.getAttribute("data-rules") === rules) &&
-                 (!executor || card.getAttribute("data-executor") === executor);
+                 (!executor || card.getAttribute("data-executor") === executor) &&
+                 searchMatches(card, words);
       card.hidden = !keep;
+      if (keep) { shown += 1; }
     });
+    paintSearchCount(words.length > 0, shown, cards.length);
+    return cards.length;
+  }
+
+  function applyFilters() {
+    if (applyVisibility() === 0) { return; }
+    var params = new URLSearchParams(window.location.search);
+    var rules = params.get("rules");
+    var executor = params.get("executor");
     Array.prototype.forEach.call(document.querySelectorAll("a.filter"), function (link) {
       var own = linkParams(link);
       var active = (own.get("rules") || "") === (rules || "") &&
@@ -280,6 +325,82 @@
      * filter it is showing, so the URL opens it. */
     var block = document.querySelector("details.filters");
     if (block && (rules || executor)) { block.open = true; }
+  }
+
+  /* ---- the grid's search box ------------------------------------------- */
+
+  /* Every card carries a data-search attribute the generator built out of the
+   * entry's number, its prompt, its brief, its rules file, its executor and
+   * whoever submitted it — already lowercased and collapsed, so the matching
+   * here is: lowercase the query, split it on spaces, and keep a card whose
+   * attribute contains every one of those terms. Nothing is fetched and no
+   * index is built; the whole grid is on the page already.
+   *
+   * With this script absent the box is a form that submits to the page it is
+   * already on, which reloads it showing everything. Nothing is broken. */
+  function searchBox() {
+    return document.querySelector("input[type=\"search\"][data-search]");
+  }
+
+  /* The box is the truth once the page has one, and the URL fills the box on
+   * load; that way ?q= works and so does a browser with no replaceState. */
+  function currentQuery() {
+    var box = searchBox();
+    if (box) { return box.value; }
+    return new URLSearchParams(window.location.search).get("q") || "";
+  }
+
+  function queryTerms(query) {
+    return String(query || "").toLowerCase().split(/\s+/).filter(function (word) {
+      return word !== "";
+    });
+  }
+
+  function searchMatches(card, words) {
+    var haystack = card.getAttribute("data-search") || "";
+    for (var index = 0; index < words.length; index++) {
+      if (haystack.indexOf(words[index]) === -1) { return false; }
+    }
+    return true;
+  }
+
+  /* "12 of 41" while a query is being made of the grid, and nothing at all
+   * when it is not: an unsearched grid needs no commentary. */
+  function paintSearchCount(active, shown, total) {
+    var slot = document.querySelector("[data-search-count]");
+    if (!slot) { return; }
+    slot.textContent = active ? shown + " of " + total : "";
+    slot.hidden = !active;
+  }
+
+  function wireSearch() {
+    var box = searchBox();
+    if (!box) { return; }
+    box.value = new URLSearchParams(window.location.search).get("q") || "";
+
+    function search() {
+      var query = box.value.replace(/^\s+|\s+$/g, "");
+      remember("q", query);
+      carryOnLinks("q", query);
+      applyVisibility();
+    }
+
+    // Small grids, one attribute each: there is nothing here to debounce.
+    box.addEventListener("input", search);
+    box.addEventListener("keydown", function (event) {
+      if (event.key === "Escape" || event.keyCode === 27) {
+        box.value = "";
+        search();
+      }
+    });
+    if (box.form) {
+      // Enter must not reload the page out from under a live result.
+      box.form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        search();
+      });
+    }
+    if (box.value) { carryOnLinks("q", box.value); }
   }
 
   /* ---- the grid's order ------------------------------------------------ */
@@ -363,29 +484,15 @@
     grid.appendChild(order);
   }
 
-  /* The chosen sort goes in the address bar without navigating: reload it,
-   * or send it to someone, and the grid comes back in the same order. */
+  /* The chosen sort goes in the address bar without navigating, and on the
+   * filter links so a click keeps it. Newest is the default, so it is the one
+   * the URL says nothing about: an empty value drops the parameter. */
   function rememberSort(name) {
-    if (!window.history || !window.history.replaceState) { return; }
-    var params = new URLSearchParams(window.location.search);
-    if (name === DEFAULT_SORT) { params.delete("sort"); } else { params.set("sort", name); }
-    var query = params.toString();
-    window.history.replaceState(
-      null, "", window.location.pathname + (query ? "?" + query : "") + window.location.hash
-    );
+    remember("sort", name === DEFAULT_SORT ? "" : name);
   }
 
-  /* The filters are still plain links, so following one is a fresh page load:
-   * the sort has to ride along in the href or it is lost at the click. */
   function carrySort(name) {
-    Array.prototype.forEach.call(document.querySelectorAll("a.filter"), function (link) {
-      var href = link.getAttribute("href") || "";
-      var cut = href.indexOf("?");
-      var params = linkParams(link);
-      if (name === DEFAULT_SORT) { params.delete("sort"); } else { params.set("sort", name); }
-      var query = params.toString();
-      link.setAttribute("href", (cut === -1 ? href : href.slice(0, cut)) + (query ? "?" + query : ""));
-    });
+    carryOnLinks("sort", name === DEFAULT_SORT ? "" : name);
   }
 
   function wireSort() {
@@ -655,6 +762,9 @@
     claimTokenFromHash();
     var sort = currentSort();
     if (sort !== DEFAULT_SORT) { carrySort(sort); }
+    // Before applyFilters: this is what fills the box from ?q=, and the grid's
+    // visibility is decided by the filters and that query together.
+    wireSearch();
     applyFilters();
     applySort(sort);
     wireSort();
