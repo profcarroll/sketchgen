@@ -1,0 +1,37 @@
+# sketchgen-worker.timer — the drip alternative to a resident worker.
+#
+# Enable THIS and leave sketchgen-worker.service disabled:
+#   systemctl --user enable --now sketchgen-worker.timer
+#   systemctl --user list-timers --all
+#
+# Enable the SERVICE instead (and not this timer) for a resident daemon. Both
+# modes run the same ExecStart; they differ only in who starts it and when.
+#
+# OnBootSec=2min      first wake two minutes after the node comes up, so a reboot
+#                     does not race ollama and the tunnel.
+# OnUnitActiveSec=5min five minutes after the previous run finished — measured from
+#                     the last activation, not from a wall clock, so a long job
+#                     never has a second run stacked behind it.
+# Persistent=true     a wake missed while the node was down fires once on the next
+#                     boot rather than being skipped silently.
+#
+# A note on the pairing: a drip only drips if the worker exits when the queue is
+# empty. The service as shipped runs `sketchgen worker`, which is resident; if the
+# instructor wants a true drip, override the ExecStart to packet 2.3's
+# `sketchgen worker --once` with `systemctl --user edit sketchgen-worker.service`
+# rather than by editing the shipped unit. In drip mode Restart=on-failure in the
+# service also still applies: a failing run retries in 30 s instead of waiting for
+# the next tick.
+
+[Unit]
+Description=sketchgen worker drip: wake the worker on a schedule instead of leaving it resident
+Documentation=file:%h/sketchgen/app/docs/OPERATIONS.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=sketchgen-worker.service
+
+[Install]
+WantedBy=timers.target
