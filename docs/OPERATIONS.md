@@ -148,6 +148,32 @@ parsed. Only a reply with no prose at all fails the job, with
 executor and the gate are the same: whatever goes wrong becomes an attempt row
 with evidence, and the worker carries on.
 
+**A failed gate is read for one bug before the evidence goes back.** Seven of
+the eleven crashing attempts the gate has recorded were the same collision: the
+sketch declares a variable whose name is a p5 global — `for (let line of lines)`,
+`const scale = …` — which hides the library's own function, and then calls it.
+All the browser says is `line is not a function`, and the executor reads that as
+a bug in the drawing code: job 16 spent all three attempts on `line`, job 34 two
+on `scale`. So whenever the gate exits non-zero the worker runs a deterministic
+scan of `sketch.js` (`sketchgen/preflight.py`, no browser and no model) and puts
+what it finds at the top of the evidence, above everything the gate said:
+
+```
+job 16: preflight: your variable `line` hides p5's `line()` function; rename it (sketch.js line 31)
+```
+
+The gate remains the authority on the verdict — the pre-flight only explains the
+console error it reported, adds nothing when the gate passes, and is dropped with
+a log line if the scan itself fails. A hidden *function* is reported only when
+the sketch also calls it, so the harmless `let hue = …` beside the real bug stays
+quiet. Run the same scan by hand over any attempt directory:
+
+```
+python3 bin/sketchgen preflight ~/sketchgen/jobs/16/attempt-1
+```
+
+Exit 0 is clean, 1 is something shadowed, 2 is a directory with no `sketch.js`.
+
 **A job nobody is attending goes back on the queue.** At startup, and again on
 every idle cycle, the worker re-queues any job left in `planning`, `executing`,
 `gating` or `repairing` that has not moved for `SKETCHGEN_STUCK_MINUTES`
