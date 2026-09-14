@@ -153,12 +153,27 @@ class UnknownEntry(Exception):
 
 
 class _Written:
-    """Every path one render created, so a refusal can undo all of it."""
+    """Every path one render touched, so a refusal can undo all of it.
+
+    Created files are removed on undo; a file that already existed gets its
+    previous bytes back. The distinction was learned the hard way: a render
+    that died half-way through the index (2026-09-14, entry 71, the web
+    process running one version of this module against the next version's
+    templates) unlinked assets/ and config.json it had only overwritten, and
+    every publish after it was refused for a dirty checkout.
+    """
 
     def __init__(self, dest: Path) -> None:
         self.dest = dest
         self.files: list[Path] = []
         self.dirs: list[Path] = []
+        self.previous: dict[Path, bytes] = {}
+
+    def _remember(self, path: Path) -> None:
+        if path in self.previous or path in self.files:
+            return
+        if path.is_file():
+            self.previous[path] = path.read_bytes()
 
     def mkdir(self, path: Path) -> Path:
         missing: list[Path] = []
@@ -172,12 +187,14 @@ class _Written:
 
     def write_text(self, path: Path, text: str) -> Path:
         self.mkdir(path.parent)
+        self._remember(path)
         path.write_text(text, encoding="utf-8")
         self.files.append(path)
         return path
 
     def copy(self, src: Path, dst: Path) -> Path:
         self.mkdir(dst.parent)
+        self._remember(dst)
         shutil.copyfile(src, dst)
         self.files.append(dst)
         return dst
@@ -185,7 +202,10 @@ class _Written:
     def undo(self) -> None:
         for path in self.files:
             try:
-                path.unlink()
+                if path in self.previous:
+                    path.write_bytes(self.previous[path])
+                else:
+                    path.unlink()
             except OSError:
                 pass
         for directory in reversed(self.dirs):
@@ -195,6 +215,7 @@ class _Written:
                 pass
         self.files.clear()
         self.dirs.clear()
+        self.previous.clear()
 
 
 def _violations(paths: Iterable[Path]) -> list[str]:
@@ -517,8 +538,24 @@ def _esc(value: Any) -> str:
     return html.escape(str(value), quote=True)
 
 
+_TEMPLATES: dict[str, Template] = {}
+
+
 def _template(name: str) -> Template:
-    return Template((TEMPLATE_DIR / name).read_text(encoding="utf-8"))
+    """A template, read once per process.
+
+    Read once so a long-running process (the operator UI, which publishes
+    from inside itself) renders with the templates that match the code it
+    loaded, not with whatever a later `git pull` put on disk. The version skew
+    is what killed the index render for entry 71 on 2026-09-14: old code
+    filling a template that asked for placeholders it did not know. A
+    restart picks up both halves together.
+    """
+    template = _TEMPLATES.get(name)
+    if template is None:
+        template = Template((TEMPLATE_DIR / name).read_text(encoding="utf-8"))
+        _TEMPLATES[name] = template
+    return template
 
 
 def _paragraphs(text: str, empty: str) -> str:

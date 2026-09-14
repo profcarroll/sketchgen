@@ -1105,6 +1105,32 @@ class GuardTests(GalleryTestCase):
         self.assertFalse((self.dest / "e" / str(self.ids[0])).exists())
         self.assertEqual(list(self.dest.iterdir()), [])
 
+    def test_a_refused_second_render_keeps_what_the_first_wrote(self):
+        # The web process rendered entry 71's index half-way and died
+        # (2026-09-14); the undo then unlinked assets/ and config.json it had
+        # only overwritten. A refusal must leave the previous render intact.
+        self.render()
+        kept = {
+            name: (self.dest / name).read_bytes()
+            for name in ("assets/gallery.css", "assets/gallery.js", "config.json", "index.html")
+        }
+        self.conn.execute(
+            "UPDATE entries SET brief = ? WHERE id = ?",
+            ("Write to nobody@example.invalid with notes.", self.ids[0]),
+        )
+        self.conn.commit()
+        with self.assertRaises(gallery.Unsafe):
+            gallery.render_index(self.conn, self.dest, self.config)
+        for name, before in kept.items():
+            with self.subTest(name=name):
+                self.assertTrue((self.dest / name).exists())
+                self.assertEqual(before, (self.dest / name).read_bytes())
+
+    def test_templates_are_read_once_per_process(self):
+        # So a running process never fills this version's template with the
+        # last version's code, or the other way round; a restart takes both.
+        self.assertIs(gallery._template("card.html"), gallery._template("card.html"))
+
     def test_a_hostname_in_a_brief_is_refused(self):
         self.conn.execute(
             "UPDATE entries SET brief = ? WHERE id = ?",
