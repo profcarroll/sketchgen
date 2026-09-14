@@ -97,6 +97,9 @@ class PublishTestCase(unittest.TestCase):
         self.conn = db.connect(self.db_path)
         self.addCleanup(self.conn.close)
         self.job_id = db.enqueue(self.conn, PROMPT, "profcarroll")
+        # A real held entry belongs to a held job; the publisher moves both.
+        self.conn.execute("UPDATE jobs SET state = 'held' WHERE id = ?", (self.job_id,))
+        self.conn.commit()
         self.entry_id = db.create_entry(
             self.conn,
             self.job_id,
@@ -210,6 +213,8 @@ class PublishTests(PublishTestCase):
         row = self.entry_row()
         self.assertEqual(row["state"], "published")
         self.assertEqual(row["publish_commit"], entry_sha)
+        # The job's row follows its entry: the queue must not say "held".
+        self.assertEqual(db.get_job(self.conn, self.job_id).state, "published")
         self.assertTrue(row["published_utc"].endswith("Z"), row["published_utc"])
 
     def test_publishing_twice_refuses(self):
@@ -330,6 +335,7 @@ class RejectTests(PublishTestCase):
         self.assertEqual(self.head(self.gallery), before)
         self.assertFalse((self.gallery / "e").exists())
         job = db.get_job(self.conn, self.job_id)
+        self.assertEqual(job.state, "rejected")
         self.assertIn("off brief", job.last_error)
 
     def test_rejecting_a_published_entry_refuses(self):
