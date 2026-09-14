@@ -1,0 +1,1861 @@
+"""web.py — the operator's five screens, on 127.0.0.1 and nowhere else.
+
+Packet 4.2 of the sketchgen build. One ``ThreadingHTTPServer``, server-rendered
+HTML from ``sketchgen/templates/op_*.html``, no framework, no JS build, no CDN:
+the only script on any page is the few lines at the bottom of the layout that
+keep the worker pill honest, plus the console's own two-second refetch. The
+whole thing is reached over the SSH tunnel that already carries ``preview`` on
+8080, so this one takes 8081.
+
+The five screens are the wireframe's:
+
+  ``/``            Console — node vitals, the slot, the odometer, the funnel
+  ``/queue``       the tiles and the jobs table
+  ``/new``         the form that writes a queued row
+  ``/job/<id>``    transcript, per-attempt gate report, artefacts, provenance
+  ``/held``        what is waiting for a person to publish or reject
+
+and every one of them carries the worker-state pill and the Pause / Stop now /
+Resume control in its header, because the operator needs that switch wherever
+they happen to be standing (spec §4).
+
+Four decisions worth writing down rather than leaving in the code:
+
+**No auth, and therefore no other bind.** Single user, over a tunnel, so there is
+no login and no CSRF token. That is only safe while the socket is on the
+loopback interface, so ``--bind`` accepts ``127.0.0.1`` and refuses anything else
+with exit 3 rather than trusting the operator's typing. Open WebUI on 3000 and
+the agent's own server both bound ``0.0.0.0``; the spec says do not copy them.
+
+**Stop-now is the worker's own representation, not a new one.** The button posts
+``action=stop``; this module writes ``set_control('pausing', 'stop')``, which is
+exactly what ``bin/sketchgen control stop`` writes and exactly what
+:func:`sketchgen.worker.is_stop_now` reads. The UI does not get its own dialect.
+
+**The console document comes from packet 4.1 if it is installed, and from
+``tests/fixtures/console/sample.json`` if it is not.** The import is lazy and the
+JSON says which one you are looking at (``"source": "live"`` or ``"sample"``), so
+a console with no collector behind it is obvious at a glance instead of quietly
+plausible. Every field is read through :func:`_dig`, which returns ``None`` for
+anything missing, so a collector whose document has grown a field or lost one
+renders a dash rather than a traceback.
+
+**Publishing is somebody else's code.** ``POST /held/<id>/publish`` imports
+``sketchgen.publish`` lazily (packet 3.2); when it is not there the page says
+"publisher not installed" and nothing changes — the entry stays held, which is
+the safe direction for a gate whose whole point is that a person decides
+(spec §9). Its failures are flash messages too: a missing gallery checkout or
+deploy key is something to read on the page, not a traceback in the log.
+"""
+
+from __future__ import annotations
+
+import html
+import inspect
+import json
+import os
+import re
+import sqlite3
+import string
+import sys
+import threading
+import urllib.parse
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Callable, Iterable
+
+from sketchgen import db
+from sketchgen import planner
+from sketchgen import worker
+
+# Packet 4.1, built on another branch at the same time as this one. Lazy by
+# construction: when it is absent the console serves the sample document.
+try:  # pragma: no cover - exercised both ways, but only one way per checkout
+    from sketchgen import console  # type: ignore[attr-defined]
+except ImportError:  # pragma: no cover
+    console = None  # type: ignore[assignment]
+
+__all__ = [
+    "DEFAULT_BIND",
+    "DEFAULT_PORT",
+    "GALLERY_URL",
+    "Refused",
+    "console_document",
+    "make_server",
+    "serve",
+]
+
+EXIT_OK = 0
+EXIT_FAIL = 1
+EXIT_REFUSED = 3
+
+#: The only address this server will bind. See the module docstring.
+DEFAULT_BIND = "127.0.0.1"
+#: 8080 is `preview` on the tunnel already.
+DEFAULT_PORT = 8081
+DEFAULT_JOBS_DIR = worker.DEFAULT_JOBS_DIR
+
+GALLERY_URL = "https://profcarroll.github.io/sketchgen-gallery/"
+
+PACKAGE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = PACKAGE_DIR.parent
+TEMPLATE_DIR = PACKAGE_DIR / "templates"
+SAMPLE_CONSOLE = REPO_ROOT / "tests" / "fixtures" / "console" / "sample.json"
+
+#: How long ``--once-for-test`` serves before it gives up and exits by itself.
+ONCE_TIMEOUT_S = 60.0
+
+LOG_TAIL_LINES = 200
+
+#: What ``GET /jobs/…`` will serve out of the jobs directory, and as what.
+SERVABLE = {
+    ".png": "image/png",
+    ".json": "application/json; charset=utf-8",
+    ".log": "text/plain; charset=utf-8",
+    ".txt": "text/plain; charset=utf-8",
+}
+
+#: GitHub usernames and nothing else ever goes in ``submitted_by`` (course policy).
+USERNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+
+TERMINAL_STATES = frozenset({"published", "rejected", "failed"})
+
+
+class Refused(Exception):
+    """A refusal, in delegate.py's sense: exit 3, one line, nothing done."""
+
+
+# ---------------------------------------------------------------------------
+# Configuration carried by the server object
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class App:
+    """Everything a request handler needs that is not in the request."""
+
+    db_path: str
+    jobs_dir: str
+    once_for_test: bool = False
+    quit_event: threading.Event | None = None
+
+    def connect(self) -> sqlite3.Connection:
+        return db.connect(self.db_path)
+
+    @property
+    def jobs_root(self) -> Path:
+        return Path(self.jobs_dir).expanduser()
+
+
+def check_bind(bind: str) -> str:
+    """The loopback check. Anything but 127.0.0.1 is a refusal, not a warning."""
+    if bind != DEFAULT_BIND:
+        raise Refused(
+            f"--bind {bind}: this UI has no authentication and binds "
+            f"{DEFAULT_BIND} only"
+        )
+    return bind
+
+
+# ---------------------------------------------------------------------------
+# Small formatting helpers. Everything from the database goes through esc().
+# ---------------------------------------------------------------------------
+
+
+def esc(value: Any) -> str:
+    """HTML-escape anything, including None, quotes included."""
+    if value is None:
+        return ""
+    return html.escape(str(value), quote=True)
+
+
+def _dig(doc: Any, path: str, default: Any = None) -> Any:
+    """Walk a dotted path through dicts and lists; missing is ``default``.
+
+    The same path string is written into ``data-k``/``data-bar`` attributes, so
+    the refresh script walks the identical route through the identical document.
+    """
+    current = doc
+    for part in path.split("."):
+        if current is None:
+            return default
+        if isinstance(current, list):
+            try:
+                current = current[int(part)]
+            except (ValueError, IndexError):
+                return default
+        elif isinstance(current, dict):
+            if part not in current:
+                return default
+            current = current[part]
+        else:
+            return default
+    return default if current is None else current
+
+
+def _fmt(value: Any, kind: str = "str") -> str:
+    """Format one value. Mirrored, kind for kind, by ``fmt()`` in the page script.
+
+    The collector's document is the unit of record and nothing here rewrites
+    it: ``gb`` prints the megabytes it reports as gigabytes, ``pct01`` prints a
+    rate in 0..1 as a percentage, ``pct`` one that is already 0..100.
+    """
+    if value is None:
+        return "—"
+    try:
+        if kind == "int":
+            return f"{int(round(float(value))):,}"
+        if kind == "f1":
+            return f"{float(value):.1f}"
+        if kind == "f2":
+            return f"{float(value):.2f}"
+        if kind == "f4":
+            return f"{float(value):.4f}"
+        if kind == "pct":
+            return f"{float(value):.1f}%"
+        if kind == "pct01":
+            return f"{float(value) * 100.0:.1f}%"
+        if kind == "hours":
+            return f"{float(value) / 3600.0:.1f}"
+        if kind == "gb":
+            return f"{float(value) / 1024.0:.1f}"
+    except (TypeError, ValueError):
+        return esc(value)
+    return str(value)
+
+
+def field(doc: Any, path: str, kind: str = "str") -> str:
+    """One live-patched span: the value now, and where to find it next time."""
+    return (
+        f'<span data-k="{esc(path)}" data-fmt="{esc(kind)}">'
+        f"{esc(_fmt(_dig(doc, path), kind))}</span>"
+    )
+
+
+def _width(value: Any) -> float:
+    try:
+        return min(100.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def bar(doc: Any, path: str, css_class: str = "") -> str:
+    """One live-patched bar segment, from a value that is already a percentage."""
+    klass = f' class="{esc(css_class)}"' if css_class else ""
+    return (
+        f'<span{klass} data-bar="{esc(path)}" '
+        f'style="width:{_width(_dig(doc, path)):.1f}%"></span>'
+    )
+
+
+def ratio_bar(doc: Any, num: str, den: str, css_class: str = "") -> str:
+    """One live-patched bar segment from two paths: numerator over denominator.
+
+    The collector reports memory in megabytes and load as a number of runnable
+    processes, not as percentages of anything — the bar is the page's idea, so
+    the page does the division, here and identically in the refresh script.
+    """
+    top, bottom = _dig(doc, num), _dig(doc, den)
+    try:
+        width = _width(float(top) / float(bottom) * 100.0)
+    except (TypeError, ValueError, ZeroDivisionError):
+        width = 0.0
+    klass = f' class="{esc(css_class)}"' if css_class else ""
+    return (
+        f'<span{klass} data-bar-num="{esc(num)}" data-bar-den="{esc(den)}" '
+        f'style="width:{width:.1f}%"></span>'
+    )
+
+
+def _parse_utc(stamp: str | None) -> datetime | None:
+    if not stamp:
+        return None
+    try:
+        return datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except ValueError:
+        return None
+
+
+def human_seconds(seconds: float | None) -> str:
+    """A duration a person reads at a glance: 42s, 7m 12s, 2h 04m, 3d 5h."""
+    if seconds is None:
+        return "—"
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60:02d}s"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+
+
+def elapsed_for(job: db.Job) -> str:
+    """Wall time so far for a job in flight; total wall time for a finished one."""
+    start = _parse_utc(job.created_utc)
+    if start is None:
+        return "—"
+    end = (
+        _parse_utc(job.updated_utc)
+        if job.state in TERMINAL_STATES or job.state == "held"
+        else datetime.now(timezone.utc)
+    )
+    if end is None:
+        return "—"
+    return human_seconds((end - start).total_seconds())
+
+
+def truncate(text: str | None, limit: int = 90) -> str:
+    if not text:
+        return ""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+# ---------------------------------------------------------------------------
+# The console document: packet 4.1 if it is installed, the sample if it is not
+# ---------------------------------------------------------------------------
+
+
+#: ``console.collect()`` keeps one /proc/stat sample in a module global and
+#: wants the previous document back so it can skip the 100 ms second reading.
+#: One page and its two-second refresh are several threads, so both the call
+#: and the cache it feeds are serialised here.
+_COLLECT_LOCK = threading.Lock()
+_LAST_DOCUMENT: dict[str, dict[str, Any]] = {}
+
+
+def _call_matching(fn: Callable[..., Any], **available: Any) -> Any:
+    """Call ``fn`` with whichever of ``available`` its signature actually names.
+
+    Three modules in this build land on three branches and are merged later;
+    this is how one of them calls another without pinning a signature it cannot
+    see yet. A required parameter we cannot supply is a TypeError, which the
+    caller turns into a flash message rather than a traceback in the browser.
+    """
+    try:
+        signature = inspect.signature(fn)
+    except (TypeError, ValueError):  # pragma: no cover - builtins
+        return fn()
+    kwargs: dict[str, Any] = {}
+    for name, parameter in signature.parameters.items():
+        if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
+            continue
+        if name in available:
+            kwargs[name] = available[name]
+        elif parameter.default is parameter.empty:
+            raise TypeError(f"{getattr(fn, '__name__', fn)} needs {name!r}")
+    return fn(**kwargs)
+
+
+def console_document(app: App | None = None) -> dict[str, Any]:
+    """One console document, with ``source`` saying where it came from.
+
+    ``live`` means packet 4.1's collector answered. ``sample`` means it is not
+    installed, or it raised, or the database it needs is not there yet — and
+    you are looking at ``tests/fixtures/console/sample.json``, which is the
+    contract's own document.
+    """
+    collect = getattr(console, "collect", None) if console is not None else None
+    if callable(collect):
+        db_path = app.db_path if app else db.DEFAULT_DB_PATH
+        jobs_dir = app.jobs_dir if app else DEFAULT_JOBS_DIR
+        conn = None
+        try:
+            conn = db.connect(db_path)
+            with _COLLECT_LOCK:
+                document = _call_matching(
+                    collect,
+                    conn=conn,
+                    jobs_dir=jobs_dir,
+                    prev=_LAST_DOCUMENT.get(db_path),
+                )
+                if isinstance(document, dict):
+                    _LAST_DOCUMENT[db_path] = document
+            if isinstance(document, dict):
+                document = dict(document)
+                document["source"] = "live"
+                return document
+        except Exception as exc:  # the console must never take the UI down
+            sys.stderr.write(f"{db.utc_now()} console collector failed: {exc}\n")
+        finally:
+            if conn is not None:
+                conn.close()
+    try:
+        document = json.loads(SAMPLE_CONSOLE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {"source": "sample", "error": f"no console document: {exc}"}
+    document["source"] = "sample"
+    return document
+
+
+# ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
+
+_TEMPLATES: dict[str, string.Template] = {}
+
+
+def template(name: str) -> string.Template:
+    if name not in _TEMPLATES:
+        path = TEMPLATE_DIR / f"{name}.html"
+        _TEMPLATES[name] = string.Template(path.read_text(encoding="utf-8"))
+    return _TEMPLATES[name]
+
+
+def render(name: str, **fields: Any) -> str:
+    """Fill one template. ``safe_substitute``: a stray ``$`` is not an error."""
+    return template(name).safe_substitute(**fields)
+
+
+NAV = (
+    ("/", "Console"),
+    ("/queue", "Queue"),
+    ("/new", "New job"),
+    ("/held", "Held"),
+)
+
+
+def pill_for(control: db.Control | None) -> tuple[str, str, str]:
+    """The worker-state pill: (text, css class, tooltip).
+
+    Read from the same control row the worker reads, through the worker's own
+    :func:`sketchgen.worker.is_stop_now`, so the pill cannot drift from the
+    behaviour it is describing.
+    """
+    if control is None:
+        return ("UNKNOWN", "paused", "no control row in this database")
+    if control.state == "running":
+        return ("RUNNING", "running", "the worker claims jobs as they arrive")
+    if control.state == "paused":
+        return ("PAUSED", "paused", control.reason or "the worker is stopped")
+    if worker.is_stop_now(control):
+        return (
+            "STOPPING",
+            "stopping",
+            "abort the attempt in flight and re-queue the job",
+        )
+    return ("PAUSING", "pausing", control.reason or "finishing the attempt in flight")
+
+
+def layout(
+    *,
+    title: str,
+    here: str,
+    body: str,
+    control: db.Control | None,
+    back: str,
+    flash: str | None = None,
+    page_script: str = "",
+) -> str:
+    text, css, tooltip = pill_for(control)
+    state = control.state if control else "unknown"
+    stop_now = worker.is_stop_now(control)
+    nav = "".join(
+        '<a href="%s"%s>%s</a>'
+        % (esc(path), ' class="here"' if path == here else "", esc(label))
+        for path, label in NAV
+    )
+    nav += f'<a href="{esc(GALLERY_URL)}" target="_blank" rel="noopener">Gallery ↗</a>'
+    flash_html = (
+        f'<div class="flash">{esc(flash)}</div>' if flash else ""
+    )
+    return render(
+        "op_layout",
+        title=esc(title),
+        nav=nav,
+        pill_text=esc(text),
+        pill_class=esc(css),
+        pill_title=esc(tooltip),
+        back=esc(back),
+        pause_dis=" disabled" if state != "running" else "",
+        stop_dis=" disabled" if (state == "paused" or stop_now) else "",
+        resume_dis=" disabled" if state == "running" else "",
+        flash=flash_html,
+        body=body,
+        page_script=page_script,
+    )
+
+
+# ---------------------------------------------------------------------------
+# The console page
+# ---------------------------------------------------------------------------
+
+CONSOLE_SCRIPT = """<script>
+// Two seconds, one GET, no reload: every element that carries data-k gets its
+// text patched and every data-bar gets its width. The paths are the ones the
+// server wrote, so this stays in step with the page without knowing the page.
+(function () {
+  function dig(doc, path) {
+    var current = doc, parts = path.split(".");
+    for (var i = 0; i < parts.length; i++) {
+      if (current === null || current === undefined) return null;
+      current = current[parts[i]];
+    }
+    return current === undefined ? null : current;
+  }
+  function fmt(value, kind) {
+    if (value === null || value === undefined) return "\\u2014";
+    var n = Number(value);
+    if (kind === "int") return isNaN(n) ? String(value) : Math.round(n).toLocaleString("en-US");
+    if (kind === "f1") return n.toFixed(1);
+    if (kind === "f2") return n.toFixed(2);
+    if (kind === "f4") return n.toFixed(4);
+    if (kind === "pct") return n.toFixed(1) + "%";
+    if (kind === "pct01") return (n * 100).toFixed(1) + "%";
+    if (kind === "hours") return (n / 3600).toFixed(1);
+    if (kind === "gb") return (n / 1024).toFixed(1);
+    return String(value);
+  }
+  function width(el, value) {
+    if (value === null || isNaN(value)) return;
+    el.style.width = Math.max(0, Math.min(100, value)).toFixed(1) + "%";
+  }
+  function tick() {
+    fetch("/api/console.json", {cache: "no-store"}).then(function (r) {
+      return r.json();
+    }).then(function (doc) {
+      var src = document.getElementById("console-source");
+      if (src && doc.source) src.textContent = doc.source;
+      document.querySelectorAll("[data-k]").forEach(function (el) {
+        var text = fmt(dig(doc, el.getAttribute("data-k")), el.getAttribute("data-fmt") || "str");
+        if (el.textContent !== text) el.textContent = text;
+      });
+      document.querySelectorAll("[data-bar]").forEach(function (el) {
+        width(el, Number(dig(doc, el.getAttribute("data-bar"))));
+      });
+      // Memory is megabytes and load is a count of processes: the ratio is the
+      // page's arithmetic, done here exactly as ratio_bar() does it server-side.
+      document.querySelectorAll("[data-bar-num]").forEach(function (el) {
+        var top = Number(dig(doc, el.getAttribute("data-bar-num")));
+        var bottom = Number(dig(doc, el.getAttribute("data-bar-den")));
+        width(el, bottom ? (top / bottom) * 100 : 0);
+      });
+    }).catch(function () {});
+  }
+  setInterval(tick, 2000);
+})();
+</script>"""
+
+
+def _meter(label: str, detail: str, segments: str) -> str:
+    return (
+        f'<div class="meter"><div class="lab"><span>{label}</span>'
+        f"<span>{detail}</span></div>"
+        f'<div class="bar">{segments}</div></div>'
+    )
+
+
+def _tile(key: str, value: str, sub: str = "") -> str:
+    return (
+        f'<div class="tile"><div class="k">{key}</div>'
+        f'<div class="v">{value}</div><div class="sub">{sub}</div></div>'
+    )
+
+
+#: The funnel's stages, in the order the pipeline walks them (spec §2). Any
+#: stage the collector adds later is rendered after these, under its own key.
+FUNNEL_ORDER = (
+    ("generated", "generated"),
+    ("revised", "revised"),
+    ("passed_gate", "passed gate"),
+    ("published", "published"),
+    ("held", "held"),
+    ("rejected", "rejected"),
+    ("failed_kept", "failed, kept"),
+    ("children", "children"),
+)
+
+#: The per-sketch table: one row per scope, one column per measurement.
+PER_SKETCH_SCOPES = (("last", "last"), ("session", "session"), ("all", "all"))
+PER_SKETCH_COLUMNS = (
+    ("attempts_to_pass", "f2"),
+    ("wall_s", "f1"),
+    ("gate_s", "f2"),
+    ("tokens_in", "int"),
+    ("tokens_out", "int"),
+    ("sketch_lines", "int"),
+    ("first_attempt_pass_rate", "pct01"),
+    ("cost_usd_16_96", "f4"),
+    ("cost_usd_4_24", "f4"),
+)
+
+
+def console_page(doc: dict[str, Any]) -> str:
+    """The wireframe's Console, rendered from packet 4.1's document.
+
+    Every value is read by its path through :func:`_dig`, and every path is
+    written into the element as ``data-k`` / ``data-bar`` / ``data-bar-num`` so
+    the two-second refresh patches the same places without re-rendering. A key
+    the collector does not have renders as a dash and patches to a dash.
+    """
+    per_core = _dig(doc, "node.cpu_pct", []) or []
+    cores: list[str] = []
+    for index in range(len(per_core)):
+        path = f"node.cpu_pct.{index}"
+        cores.append(
+            f'<div class="core" data-core="{index}">'
+            f"<span>c{index}</span>"
+            f'<span class="bar">{bar(doc, path)}</span>'
+            f"{field(doc, path, 'pct')}</div>"
+        )
+
+    meters = "".join(
+        [
+            _meter(
+                "memory",
+                f"{field(doc, 'node.mem_mb.used', 'gb')} used + "
+                f"{field(doc, 'node.mem_mb.cache', 'gb')} cache of "
+                f"{field(doc, 'node.mem_mb.total', 'gb')} GB, "
+                f"{field(doc, 'node.mem_mb.available', 'gb')} available",
+                ratio_bar(doc, "node.mem_mb.used", "node.mem_mb.total")
+                + ratio_bar(doc, "node.mem_mb.cache", "node.mem_mb.total", "cache"),
+            ),
+            _meter(
+                "swap",
+                f"{field(doc, 'node.swap_mb.used', 'gb')} of "
+                f"{field(doc, 'node.swap_mb.total', 'gb')} GB",
+                ratio_bar(doc, "node.swap_mb.used", "node.swap_mb.total"),
+            ),
+            _meter(
+                "disk",
+                f"{field(doc, 'node.disk_gb.used', 'f1')} used, "
+                f"{field(doc, 'node.disk_gb.free', 'f1')} free of "
+                f"{field(doc, 'node.disk_gb.total', 'f1')} GB — "
+                f"{field(doc, 'node.disk_gb.models', 'f1')} models, "
+                f"{field(doc, 'node.disk_gb.chromium', 'f1')} chromium",
+                ratio_bar(doc, "node.disk_gb.used", "node.disk_gb.total"),
+            ),
+            _meter(
+                "load",
+                f"{field(doc, 'node.load.0', 'f2')} / "
+                f"{field(doc, 'node.load.1', 'f2')} / "
+                f"{field(doc, 'node.load.2', 'f2')} on "
+                f"{field(doc, 'node.cores', 'int')} cores",
+                ratio_bar(doc, "node.load.0", "node.cores"),
+            ),
+        ]
+    )
+
+    top = _dig(doc, "node.top", []) or []
+    top_rows = []
+    for index in range(min(3, len(top))):
+        base = f"node.top.{index}"
+        top_rows.append(
+            "<tr>"
+            f"<td class=\"n mono\">{field(doc, base + '.pid', 'int')}</td>"
+            f"<td class=\"mono\">{field(doc, base + '.cmd')}</td>"
+            f"<td class=\"n\">{field(doc, base + '.cpu_pct', 'f1')}</td>"
+            f"<td class=\"n\">{field(doc, base + '.mem_pct', 'f1')}</td>"
+            "</tr>"
+        )
+    if not top_rows:
+        top_rows.append('<tr><td colspan="4" class="dim">nothing running</td></tr>')
+
+    model_tiles = "".join(
+        [
+            _tile(
+                "slot",
+                field(doc, "model.slot.state"),
+                field(doc, "model.slot.holder"),
+            ),
+            _tile(
+                "prefill",
+                field(doc, "model.instant.prefill_tok_s", "f1")
+                + ' <span class="dim" style="font-size:12px">tok/s</span>',
+                "from attempt " + field(doc, "model.instant.from_attempt_id", "int"),
+            ),
+            _tile(
+                "decode",
+                field(doc, "model.instant.decode_tok_s", "f1")
+                + ' <span class="dim" style="font-size:12px">tok/s</span>',
+                field(doc, "model.instant.at_utc"),
+            ),
+            _tile(
+                "gate launch",
+                field(doc, "model.gate_launch_s", "f2")
+                + ' <span class="dim" style="font-size:12px">s</span>',
+                "chromium, from the last report",
+            ),
+        ]
+    )
+
+    resident = _dig(doc, "model.resident", []) or []
+    resident_rows = []
+    for index in range(len(resident)):
+        base = f"model.resident.{index}"
+        resident_rows.append(
+            "<tr>"
+            f"<td class=\"mono\">{field(doc, base + '.name')}</td>"
+            f"<td class=\"n\">{field(doc, base + '.size_gb', 'f2')}</td>"
+            f"<td>{field(doc, base + '.processor')}</td>"
+            f"<td class=\"n\">{field(doc, base + '.context', 'int')}</td>"
+            f"<td class=\"mono dim\">{field(doc, base + '.until_utc')}</td>"
+            "</tr>"
+        )
+    if not resident_rows:
+        resident_rows.append(
+            '<tr><td colspan="5" class="dim">no model resident</td></tr>'
+        )
+
+    worker_tiles = "".join(
+        [
+            _tile(
+                "control",
+                field(doc, "worker.control"),
+                field(doc, "worker.reason"),
+            ),
+            _tile(
+                "job in flight",
+                field(doc, "worker.job_in_flight", "int"),
+                "since " + field(doc, "worker.updated_utc"),
+            ),
+            _tile(
+                "worker up since",
+                field(doc, "worker.started_utc"),
+                "a systemd --user unit, not a tool call",
+            ),
+        ]
+    )
+
+    odometer = "".join(
+        [
+            _tile(
+                "session tokens in",
+                field(doc, "odometer.session.in", "int"),
+                "since " + field(doc, "odometer.session.since_utc"),
+            ),
+            _tile(
+                "session tokens out",
+                field(doc, "odometer.session.out", "int"),
+                "kept apart from in, on purpose",
+            ),
+            _tile(
+                "session wall",
+                field(doc, "odometer.session.wall_s", "hours")
+                + ' <span class="dim">h</span>',
+                "worker time this session",
+            ),
+            _tile(
+                "slot ours",
+                field(doc, "odometer.session.slot_ours_pct", "pct"),
+                "the rest of the session was somebody else's",
+            ),
+            _tile(
+                "total tokens in",
+                field(doc, "odometer.total.in", "int"),
+                "every job, all time",
+            ),
+            _tile(
+                "total tokens out",
+                field(doc, "odometer.total.out", "int"),
+                "every job, all time",
+            ),
+            _tile(
+                "total wall",
+                field(doc, "odometer.total.wall_s", "hours")
+                + ' <span class="dim">h</span>',
+                "MEASURE[job-wall-time]",
+            ),
+        ]
+    )
+
+    funnel = _dig(doc, "funnel", {}) or {}
+    names = [key for key, _ in FUNNEL_ORDER if key in funnel]
+    names += [key for key in funnel if key not in dict(FUNNEL_ORDER)]
+    labels = dict(FUNNEL_ORDER)
+    funnel_rows = []
+    for name in names:
+        base = f"funnel.{name}"
+        funnel_rows.append(
+            "<tr>"
+            f"<td>{esc(labels.get(name, name.replace('_', ' ')))}</td>"
+            f"<td class=\"n\">{field(doc, base + '.now', 'int')}</td>"
+            f"<td class=\"n\">{field(doc, base + '.session', 'int')}</td>"
+            f"<td class=\"n\">{field(doc, base + '.per_day', 'f1')}</td>"
+            f"<td class=\"n\">{field(doc, base + '.total', 'int')}</td>"
+            "</tr>"
+        )
+    if not funnel_rows:
+        funnel_rows.append('<tr><td colspan="5" class="dim">no jobs yet</td></tr>')
+
+    per_sketch_rows = []
+    for scope, label in PER_SKETCH_SCOPES:
+        cells = "".join(
+            f'<td class="n">{field(doc, f"per_sketch.{scope}.{column}", kind)}</td>'
+            for column, kind in PER_SKETCH_COLUMNS
+        )
+        per_sketch_rows.append(f"<tr><td>{esc(label)}</td>{cells}</tr>")
+
+    return render(
+        "op_console",
+        shape=esc(_dig(doc, "node.shape", "shape unknown")),
+        cores_n=field(doc, "node.cores", "int"),
+        source=esc(doc.get("source", "sample")),
+        generated=field(doc, "utc"),
+        collector_ms=field(doc, "collector_ms", "f1"),
+        cpu_total=field(doc, "node.cpu_total_pct", "pct"),
+        cpu_total_bar=bar(doc, "node.cpu_total_pct"),
+        cores="\n".join(cores),
+        meters=meters,
+        top_rows="\n".join(top_rows),
+        model_tiles=model_tiles,
+        ollama_version=field(doc, "model.ollama_version"),
+        resident_rows="\n".join(resident_rows),
+        worker_tiles=worker_tiles,
+        odometer=odometer,
+        funnel_rows="\n".join(funnel_rows),
+        per_sketch_rows="\n".join(per_sketch_rows),
+        cost_a="cost 16/96",
+        cost_b="cost 4/24",
+    )
+
+
+# ---------------------------------------------------------------------------
+# The queue page
+# ---------------------------------------------------------------------------
+
+
+def _attempt_counts(conn: sqlite3.Connection) -> dict[int, int]:
+    return {
+        int(row["job_id"]): int(row["n"])
+        for row in conn.execute(
+            "SELECT job_id, COUNT(*) AS n FROM attempts GROUP BY job_id"
+        )
+    }
+
+
+def _count(conn: sqlite3.Connection, sql: str, args: Iterable[Any] = ()) -> int:
+    row = conn.execute(sql, tuple(args)).fetchone()
+    return int(row[0]) if row else 0
+
+
+def queue_page(conn: sqlite3.Connection, doc: dict[str, Any], control) -> str:
+    jobs = list(reversed(db.list_jobs(conn)))
+    counts = _attempt_counts(conn)
+    today = db.utc_now()[:10]
+    pill_text, pill_class, _ = pill_for(control)
+
+    def tile(key: str, value: str, sub: str) -> str:
+        return (
+            f'<div class="tile"><div class="k">{key}</div>'
+            f'<div class="v">{value}</div><div class="sub">{sub}</div></div>'
+        )
+
+    tiles = "".join(
+        [
+            tile(
+                "slot",
+                esc(_dig(doc, "model.slot.state", "—")),
+                esc(truncate(_dig(doc, "model.slot.holder", "nobody"), 40)),
+            ),
+            tile(
+                "worker",
+                f'<span class="pill {esc(pill_class)}">{esc(pill_text)}</span>',
+                esc((control.reason if control else None) or "—"),
+            ),
+            tile(
+                "depth",
+                str(_count(conn, "SELECT COUNT(*) FROM jobs WHERE state = 'queued'")),
+                "queued, waiting for the slot",
+            ),
+            tile(
+                "today",
+                "%d / %d"
+                % (
+                    _count(
+                        conn,
+                        "SELECT COUNT(*) FROM jobs WHERE state = 'published' "
+                        "AND updated_utc LIKE ?",
+                        (today + "%",),
+                    ),
+                    _count(
+                        conn,
+                        "SELECT COUNT(*) FROM jobs WHERE state = 'failed' "
+                        "AND updated_utc LIKE ?",
+                        (today + "%",),
+                    ),
+                ),
+                "published / failed",
+            ),
+            tile("shape", esc(_dig(doc, "node.shape", "—")), "the machine underneath"),
+            tile(
+                "needs laptop",
+                str(
+                    _count(
+                        conn, "SELECT COUNT(*) FROM jobs WHERE state = 'needs-laptop'"
+                    )
+                ),
+                "waiting on the paid path",
+            ),
+        ]
+    )
+
+    rows = []
+    for job in jobs:
+        attempts = counts.get(job.id, 0)
+        rows.append(
+            f'<tr class="job" onclick="location=\'/job/{job.id}\'">'
+            f'<td class="n"><a href="/job/{job.id}">{job.id}</a></td>'
+            f"<td>{esc(truncate(job.prompt))}</td>"
+            f'<td><span class="pill {esc(job.state)}">{esc(job.state)}</span></td>'
+            f'<td class="n">{attempts}/{esc(job.max_attempts)}</td>'
+            f"<td class=\"mono\">{esc(job.executor or '—')}</td>"
+            f"<td>{esc(job.rules_file or '—')}</td>"
+            f'<td class="n">{esc(elapsed_for(job))}</td>'
+            f"<td>{esc(job.submitted_by)}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append(
+            '<tr><td colspan="8" class="dim">nothing queued yet — '
+            '<a href="/new">write the first job</a></td></tr>'
+        )
+
+    return render("op_queue", tiles=tiles, rows="\n".join(rows))
+
+
+# ---------------------------------------------------------------------------
+# The new-job form
+# ---------------------------------------------------------------------------
+
+PLANNER_CHOICES = (
+    ("local", f"local — {worker.DEFAULT_PLANNER_MODEL}"),
+    ("paid", "paid — the laptop claims it (needs-laptop)"),
+)
+RULES_CHOICES = (
+    ("treatment", "treatment — the rules the course teaches"),
+    ("control", "control — the A/B control file"),
+    ("random", "random — resolved per attempt, for MEASURE[agents-md-ab]"),
+)
+PUBLICATION_CHOICES = (
+    ("hold", "hold — a person publishes it"),
+    ("auto", "auto — publish on a green gate"),
+)
+
+
+def _options(choices: Iterable[tuple[str, str]], selected: str) -> str:
+    return "".join(
+        f'<option value="{esc(value)}"'
+        f'{" selected" if value == selected else ""}>{esc(label)}</option>'
+        for value, label in choices
+    )
+
+
+def _chips(picked: set[str], size_w: str, size_h: str) -> str:
+    chips = []
+    for word in planner.VOCAB:
+        if word == "size(w,h)":
+            checked = " checked" if "size" in picked else ""
+            chips.append(
+                '<label class="chip"><input type="checkbox" name="assert" '
+                f'value="size"{checked}>size('
+                f'<input type="number" name="size_w" min="1" max="4096" '
+                f'value="{esc(size_w)}"> , '
+                f'<input type="number" name="size_h" min="1" max="4096" '
+                f'value="{esc(size_h)}">)</label>'
+            )
+            continue
+        checked = " checked" if word in picked else ""
+        chips.append(
+            '<label class="chip"><input type="checkbox" name="assert" '
+            f'value="{esc(word)}"{checked}>{esc(word)}</label>'
+        )
+    return "\n".join(chips)
+
+
+def new_page(form: dict[str, list[str]] | None = None, error: str | None = None) -> str:
+    form = form or {}
+
+    def one(name: str, default: str = "") -> str:
+        values = form.get(name) or []
+        return values[0] if values else default
+
+    picked = set(form.get("assert") or [])
+    return render(
+        "op_new",
+        error=f'<p class="err">{esc(error)}</p>' if error else "",
+        prompt=esc(one("prompt")),
+        submitted_by=esc(one("submitted_by")),
+        planner_options=_options(PLANNER_CHOICES, one("planner", "local")),
+        parent_entry_id=esc(one("parent_entry_id")),
+        chips=_chips(picked, one("size_w", "400"), one("size_h", "400")),
+        rules_options=_options(RULES_CHOICES, one("rules", "treatment")),
+        publication_options=_options(PUBLICATION_CHOICES, one("publication", "hold")),
+        max_attempts=esc(one("max_attempts", "3")),
+    )
+
+
+def _assertions_from(form: dict[str, list[str]]) -> tuple[list[str], str | None]:
+    """The ticked chips, as vocabulary words. Returns (words, error)."""
+    ticked = form.get("assert") or []
+    if not ticked:
+        # Nothing ticked means no override: the planner proposes the list later.
+        # (planner.validate() would helpfully add motion(idle) here, which would
+        # turn "no opinion" into an assertion the operator never made.)
+        return [], None
+    words: list[str] = []
+    for value in ticked:
+        if value == "size":
+            width = (form.get("size_w") or ["400"])[0]
+            height = (form.get("size_h") or ["400"])[0]
+            if not (width.isdigit() and height.isdigit()):
+                return [], "size(w,h) needs two whole numbers"
+            words.append(f"size({int(width)},{int(height)})")
+        else:
+            words.append(value)
+    ok, rejected = planner.validate(words)
+    if rejected:
+        names = ", ".join(str(item.get("word", item)) for item in rejected)
+        return [], f"not in the gate's vocabulary: {names}"
+    return ok, None
+
+
+def create_job(conn: sqlite3.Connection, form: dict[str, list[str]]) -> tuple[int, int]:
+    """Validate the form and enqueue. Returns (job id, queue position).
+
+    Raises ValueError with the message the form should show.
+    """
+
+    def one(name: str, default: str = "") -> str:
+        values = form.get(name) or []
+        return (values[0] if values else default).strip()
+
+    prompt = one("prompt")
+    if not prompt:
+        raise ValueError("a job needs a prompt")
+    submitted_by = one("submitted_by")
+    if not USERNAME_RE.match(submitted_by):
+        raise ValueError(
+            "submitted by must be a GitHub username — letters, digits and "
+            "hyphens, nothing else (course policy: no personal data)"
+        )
+    planner_choice = one("planner", "local")
+    if planner_choice not in {value for value, _ in PLANNER_CHOICES}:
+        raise ValueError("planner must be local or paid")
+    rules = one("rules", "treatment")
+    if rules not in {value for value, _ in RULES_CHOICES}:
+        raise ValueError("rules must be control, treatment or random")
+    publication = one("publication", "hold")
+    if publication not in {value for value, _ in PUBLICATION_CHOICES}:
+        raise ValueError("publication must be hold or auto")
+    raw_attempts = one("max_attempts", "3")
+    if not raw_attempts.isdigit() or not 1 <= int(raw_attempts) <= 10:
+        raise ValueError("max attempts must be a whole number from 1 to 10")
+
+    parent_raw = one("parent_entry_id")
+    parent: int | None = None
+    if parent_raw:
+        if not parent_raw.isdigit():
+            raise ValueError("parent entry id must be a number")
+        parent = int(parent_raw)
+        if not conn.execute(
+            "SELECT 1 FROM entries WHERE id = ?", (parent,)
+        ).fetchone():
+            raise ValueError(f"there is no entry {parent} to descend from")
+
+    words, problem = _assertions_from(form)
+    if problem:
+        raise ValueError(problem)
+
+    options: dict[str, Any] = {
+        "planner": (
+            "paid" if planner_choice == "paid" else worker.DEFAULT_PLANNER_MODEL
+        ),
+        "rules_file": rules,
+        "publication": publication,
+        "max_attempts": int(raw_attempts),
+        "parent_entry_id": parent,
+    }
+    if words:
+        options["assertions_json"] = json.dumps(words)
+    job_id = db.enqueue(conn, prompt, submitted_by, **options)
+    position = _count(
+        conn,
+        "SELECT COUNT(*) FROM jobs WHERE state = 'queued' AND "
+        "(created_utc, id) <= (SELECT created_utc, id FROM jobs WHERE id = ?)",
+        (job_id,),
+    )
+    return job_id, position
+
+
+# ---------------------------------------------------------------------------
+# The job page
+# ---------------------------------------------------------------------------
+
+
+def log_tail(path: Path, lines: int = LOG_TAIL_LINES) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            return "".join(handle.readlines()[-lines:])
+    except OSError:
+        return ""
+
+
+def _report_for(app: App, job_id: int, attempt: db.Attempt) -> dict[str, Any] | None:
+    candidates = []
+    if attempt.gate_report_path:
+        candidates.append(Path(attempt.gate_report_path))
+    candidates.append(
+        app.jobs_root / str(job_id) / f"attempt-{attempt.n}" / ".gate" / "report.json"
+    )
+    for candidate in candidates:
+        try:
+            return json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _check_list(report: dict[str, Any] | None) -> str:
+    if not report:
+        return '<p class="dim">no report.json for this attempt</p>'
+    items = []
+    for name, value in (report.get("checks") or {}).items():
+        mark, css = ("✓", "yes") if value is True else (
+            ("✗", "no") if value is False else ("–", "na")
+        )
+        items.append(
+            f'<li><span class="{css}">{mark}</span> <span class="mono">{esc(name)}</span></li>'
+        )
+    for name, value in (report.get("assertions") or {}).items():
+        passed = bool((value or {}).get("pass")) if isinstance(value, dict) else bool(value)
+        mark, css = ("✓", "yes") if passed else ("✗", "no")
+        detail = (value or {}).get("detail") if isinstance(value, dict) else None
+        items.append(
+            f'<li><span class="{css}">{mark}</span> <span class="mono">{esc(name)}</span>'
+            + (f' <span class="dim">— {esc(detail)}</span>' if detail else "")
+            + "</li>"
+        )
+    if not items:
+        return '<p class="dim">the report named no checks</p>'
+    return '<ul class="checks">' + "".join(items) + "</ul>"
+
+
+def _artefacts(app: App, job_id: int, attempt_n: int) -> str:
+    shots = []
+    gate_dir = app.jobs_root / str(job_id) / f"attempt-{attempt_n}" / ".gate"
+    for name, caption in (("strip.png", "four frames"), ("gate.png", "last frame")):
+        if (gate_dir / name).is_file():
+            url = f"/jobs/{job_id}/attempt-{attempt_n}/.gate/{name}"
+            shots.append(
+                f'<figure class="shot" style="margin:0"><img src="{esc(url)}" '
+                f'alt="{esc(caption)}" loading="lazy">'
+                f'<figcaption class="dim" style="font-size:12px">'
+                f'<a href="{esc(url)}">{esc(name)}</a> — {esc(caption)}</figcaption></figure>'
+            )
+    if not shots:
+        return '<p class="dim">no artefacts on disk for this attempt</p>'
+    return '<div class="cards">' + "".join(shots) + "</div>"
+
+
+def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
+    attempts = db.list_attempts(conn, job.id)
+    attempt_n = attempts[-1].n if attempts else 0
+
+    def tile(key: str, value: str) -> str:
+        return (
+            f'<div class="tile"><div class="k">{key}</div>'
+            f'<div class="v" style="font-size:14px">{value}</div></div>'
+        )
+
+    tiles = "".join(
+        [
+            tile("submitted by", esc(job.submitted_by)),
+            tile("executor", esc(job.executor or "—")),
+            tile("rules", esc(job.rules_file or "—")),
+            tile("publication", esc(job.publication)),
+            tile("elapsed", esc(elapsed_for(job))),
+            tile("needs", esc(job.needs or "—")),
+        ]
+    )
+
+    blocks = []
+    for attempt in attempts:
+        report = _report_for(app, job.id, attempt)
+        verdict = (
+            "passed"
+            if attempt.gate_exit == 0
+            else ("refused" if attempt.gate_exit == 3 else "failed")
+        )
+        if attempt.gate_exit is None:
+            verdict = "no gate run"
+        evidence = (
+            f"<h3>Evidence fed to the next attempt</h3><pre>{esc(attempt.evidence)}</pre>"
+            if attempt.evidence
+            else ""
+        )
+        blocks.append(
+            '<section class="panel">'
+            f"<h2>Attempt {attempt.n} — <span style='text-transform:none'>"
+            f"gate {esc(verdict)}"
+            + (f" (exit {attempt.gate_exit})" if attempt.gate_exit is not None else "")
+            + "</span></h2>"
+            f'<div class="grid"><div>{_check_list(report)}</div>'
+            f"<div>{_artefacts(app, job.id, attempt.n)}</div></div>"
+            f"{evidence}"
+            '<p class="dim" style="font-size:12px">'
+            f"model {esc(attempt.model or '—')} · rules {esc(attempt.rules_file or '—')} · "
+            f"prompt {esc(attempt.prompt_version or '—')} · "
+            f"{esc(attempt.prompt_tokens or 0)} in / {esc(attempt.completion_tokens or 0)} out · "
+            f"{esc(human_seconds(attempt.wall_s))} wall"
+            "</p></section>"
+        )
+    if not blocks:
+        blocks.append(
+            '<section class="panel"><h2>Attempts</h2>'
+            '<p class="dim">no attempt has run yet</p></section>'
+        )
+
+    rows = [
+        ("state", job.state),
+        ("prompt", job.prompt),
+        ("brief", job.brief or "— (the planner has not run)"),
+        ("assertions", ", ".join(job.assertions) or "—"),
+        ("planner", job.planner or "—"),
+        ("executor", job.executor or "—"),
+        ("rules file", job.rules_file or "—"),
+        ("parent entry", job.parent_entry_id if job.parent_entry_id else "—"),
+        ("submitted by", job.submitted_by),
+        ("created (UTC)", job.created_utc),
+        ("updated (UTC)", job.updated_utc),
+        ("last error", job.last_error or "—"),
+    ]
+    provenance = "".join(
+        f'<tr><th style="width:10em">{esc(key)}</th><td>{esc(value)}</td></tr>'
+        for key, value in rows
+    )
+
+    terminal = job.state in TERMINAL_STATES
+    return render(
+        "op_job",
+        id=job.id,
+        state=esc(job.state),
+        state_class=esc(job.state),
+        attempt_n=attempt_n,
+        max_attempts=esc(job.max_attempts),
+        prompt=esc(job.prompt),
+        tiles=tiles,
+        log_lines=LOG_TAIL_LINES,
+        log=esc(log_tail(app.jobs_root / str(job.id) / "job.log")),
+        attempts="\n".join(blocks),
+        provenance=provenance,
+        cancel_dis=" disabled" if terminal else "",
+        laptop_dis=(
+            "" if "needs-laptop" in db.TRANSITIONS.get(job.state, frozenset()) else " disabled"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# The held page
+# ---------------------------------------------------------------------------
+
+
+def _entry_rows(conn: sqlite3.Connection, state: str = "held") -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM entries WHERE state = ? ORDER BY created_utc DESC, id DESC",
+        (state,),
+    ).fetchall()
+
+
+def _entry_image(app: App, row: sqlite3.Row) -> str:
+    """The strip, but only when it really is inside the jobs directory."""
+    raw = row["strip_path"] or row["png_path"]
+    if not raw:
+        return '<p class="dim">no strip on disk</p>'
+    try:
+        resolved = Path(raw).resolve()
+        root = app.jobs_root.resolve()
+    except OSError:
+        return '<p class="dim">no strip on disk</p>'
+    if not resolved.is_file() or not resolved.is_relative_to(root):
+        return '<p class="dim">no strip on disk</p>'
+    url = "/jobs/" + "/".join(resolved.relative_to(root).parts)
+    return f'<img src="{esc(url)}" alt="frame strip" loading="lazy">'
+
+
+def _gate_summary(conn: sqlite3.Connection, job_id: int) -> str:
+    row = conn.execute(
+        "SELECT n, gate_exit, evidence FROM attempts WHERE job_id = ? "
+        "ORDER BY n DESC LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return "no attempt recorded"
+    if row["gate_exit"] == 0:
+        return f"gate passed on attempt {row['n']}"
+    first = (row["evidence"] or "").strip().splitlines()
+    return f"attempt {row['n']}: " + (first[0] if first else f"gate exit {row['gate_exit']}")
+
+
+def held_page(app: App, conn: sqlite3.Connection) -> str:
+    rows = _entry_rows(conn)
+    cards = []
+    for row in rows:
+        lineage = conn.execute(
+            "SELECT parent_entry_id, generation, critique_by FROM lineage "
+            "WHERE child_entry_id = ?",
+            (row["id"],),
+        ).fetchone()
+        if lineage is not None:
+            note = (
+                f"generation {lineage['generation']}, from entry "
+                f"{lineage['parent_entry_id']}"
+                + (f", critiqued by {lineage['critique_by']}" if lineage["critique_by"] else "")
+            )
+        elif row["parent_entry_id"]:
+            note = f"child of entry {row['parent_entry_id']}"
+        else:
+            note = "a root prompt, no lineage"
+        cards.append(
+            '<section class="panel card">'
+            f"<h2>Entry {row['id']} <span class='dim' style='text-transform:none'>"
+            f"— job <a href=\"/job/{row['job_id']}\">{row['job_id']}</a></span></h2>"
+            f"{_entry_image(app, row)}"
+            f"<p>{esc(truncate(row['prompt'], 200))}</p>"
+            f"<p class=\"dim\" style=\"font-size:12px\">{esc(_gate_summary(conn, row['job_id']))}"
+            f" · {esc(note)} · {esc(row['executor'] or '—')}"
+            f" · rules {esc(row['rules_file'] or '—')}</p>"
+            '<div class="actions">'
+            f'<form method="post" action="/held/{row["id"]}/publish">'
+            "<button type=\"submit\">Publish</button></form>"
+            f'<form method="post" action="/held/{row["id"]}/reject">'
+            '<input type="text" name="reason" placeholder="reason" '
+            'style="font:inherit;padding:4px 8px;border:1px solid var(--line);'
+            'border-radius:5px;background:var(--bg);color:var(--fg)">'
+            '<button type="submit" class="danger">Reject</button></form>'
+            "</div></section>"
+        )
+    if not cards:
+        cards.append(
+            '<section class="panel"><p class="dim">nothing is waiting. '
+            "A job reaches this page when its gate goes green and its "
+            "publication is <em>hold</em>.</p></section>"
+        )
+    return render("op_held", count=len(rows), cards="\n".join(cards))
+
+
+def publish_entry(app: App, conn: sqlite3.Connection, entry_id: int) -> str:
+    """Hand one held entry to packet 3.2. Returns the flash message."""
+    try:
+        from sketchgen import publish  # type: ignore[attr-defined]
+    except ImportError:
+        return "publisher not installed — nothing changed, the entry is still held"
+    # The packet guessed the name `publish_entry` before packet 3.2 existed;
+    # what 3.2 actually exports is `publish(conn, entry_id, ...)`. Both are
+    # accepted so this page does not have to be right about a name it could
+    # not see, and neither being present is still "not installed".
+    fn = next(
+        (
+            candidate
+            for candidate in (
+                getattr(publish, "publish_entry", None),
+                getattr(publish, "publish", None),
+            )
+            if callable(candidate)
+        ),
+        None,
+    )
+    if fn is None:
+        return "publisher not installed — nothing changed, the entry is still held"
+    try:
+        _call_matching(
+            fn,
+            conn=conn,
+            entry_id=entry_id,
+            id=entry_id,
+            db_path=app.db_path,
+            path=app.db_path,
+            jobs_dir=app.jobs_dir,
+        )
+    except Exception as exc:
+        return f"publish failed: {exc}"
+    return f"Entry {entry_id} handed to the publisher"
+
+
+def reject_entry(conn: sqlite3.Connection, entry_id: int, reason: str) -> str:
+    """Move one held entry to rejected, with its job. Returns the flash message."""
+    row = conn.execute(
+        "SELECT id, job_id, state FROM entries WHERE id = ?", (entry_id,)
+    ).fetchone()
+    if row is None:
+        return f"there is no entry {entry_id}"
+    if row["state"] != "held":
+        return f"entry {entry_id} is {row['state']}, not held — nothing changed"
+    reason = reason.strip() or "rejected by operator"
+    for name in ("reject_entry", "set_entry_state", "entry_transition"):
+        helper = getattr(db, name, None)
+        if callable(helper):
+            try:
+                _call_matching(
+                    helper,
+                    conn=conn,
+                    entry_id=entry_id,
+                    id=entry_id,
+                    state="rejected",
+                    new_state="rejected",
+                    reason=reason,
+                )
+                break
+            except Exception:
+                continue
+    else:
+        conn.execute(
+            "UPDATE entries SET state = 'rejected' WHERE id = ?", (entry_id,)
+        )
+    job = db.get_job(conn, int(row["job_id"]))
+    if job is not None and job.state == "held":
+        db.transition(conn, job.id, "rejected", last_error=reason)
+    return f"Entry {entry_id} rejected — {reason}"
+
+
+# ---------------------------------------------------------------------------
+# The server
+# ---------------------------------------------------------------------------
+
+ROUTES: list[tuple[str, re.Pattern[str], str]] = [
+    ("GET", re.compile(r"^/$"), "page_console"),
+    ("GET", re.compile(r"^/api/console\.json$"), "api_console"),
+    ("GET", re.compile(r"^/api/control\.json$"), "api_control"),
+    ("GET", re.compile(r"^/queue$"), "page_queue"),
+    ("GET", re.compile(r"^/new$"), "page_new"),
+    ("POST", re.compile(r"^/new$"), "post_new"),
+    ("GET", re.compile(r"^/job/(?P<job_id>\d+)$"), "page_job"),
+    ("POST", re.compile(r"^/job/(?P<job_id>\d+)/cancel$"), "post_cancel"),
+    ("POST", re.compile(r"^/job/(?P<job_id>\d+)/laptop$"), "post_laptop"),
+    ("GET", re.compile(r"^/held$"), "page_held"),
+    ("POST", re.compile(r"^/held/(?P<entry_id>\d+)/publish$"), "post_publish"),
+    ("POST", re.compile(r"^/held/(?P<entry_id>\d+)/reject$"), "post_reject"),
+    ("POST", re.compile(r"^/control$"), "post_control"),
+    ("GET", re.compile(r"^/jobs/(?P<rest>.*)$"), "serve_job_file"),
+    ("POST", re.compile(r"^/_quit$"), "post_quit"),
+]
+
+
+class OpHandler(BaseHTTPRequestHandler):
+    """One request, one thread, one line on stderr."""
+
+    server_version = "sketchgen-web"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+
+    # -- plumbing ----------------------------------------------------------
+
+    @property
+    def app(self) -> App:
+        return self.server.app  # type: ignore[attr-defined]
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        """Silenced: log_request below is the one line per request."""
+
+    def log_request(self, code: Any = "-", size: Any = "-") -> None:
+        status = getattr(code, "value", code)
+        sys.stderr.write(f"{db.utc_now()} {self.command} {self.path} {status}\n")
+        sys.stderr.flush()
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's spelling
+        self._dispatch("GET")
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._dispatch("POST")
+
+    def do_HEAD(self) -> None:  # noqa: N802
+        self._dispatch("GET", body=False)
+
+    def _dispatch(self, method: str, body: bool = True) -> None:
+        path = urllib.parse.urlsplit(self.path).path
+        matched_path = False
+        for route_method, pattern, handler_name in ROUTES:
+            if handler_name == "post_quit" and not self.app.once_for_test:
+                # Not a route at all outside --once-for-test: 404, not 405.
+                continue
+            match = pattern.match(path)
+            if not match:
+                continue
+            matched_path = True
+            if route_method != method:
+                continue
+            try:
+                getattr(self, handler_name)(**match.groupdict())
+            except BrokenPipeError:  # pragma: no cover - client went away
+                pass
+            except Exception as exc:  # pragma: no cover - defensive
+                sys.stderr.write(f"{db.utc_now()} 500 {path}: {exc}\n")
+                self.send_error(500, "server error")
+            return
+        if matched_path:
+            self.send_error(405, "method not allowed")
+        else:
+            self.send_error(404, "no such page")
+
+    # -- replies -----------------------------------------------------------
+
+    def _send(self, body: bytes, content_type: str, status: int = 200) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def html(self, text: str, status: int = 200) -> None:
+        self._send(text.encode("utf-8"), "text/html; charset=utf-8", status)
+
+    def json_out(self, document: Any, status: int = 200) -> None:
+        body = json.dumps(document, indent=2, sort_keys=False).encode("utf-8")
+        self._send(body, "application/json; charset=utf-8", status)
+
+    def redirect(self, location: str, flash: str | None = None) -> None:
+        if flash:
+            joiner = "&" if "?" in location else "?"
+            location = f"{location}{joiner}flash={urllib.parse.quote(flash)}"
+        self.send_response(303)
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    # -- request data ------------------------------------------------------
+
+    def query(self) -> dict[str, list[str]]:
+        return urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+
+    def flash(self) -> str | None:
+        values = self.query().get("flash")
+        return values[0] if values else None
+
+    def form(self) -> dict[str, list[str]]:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(min(length, 1 << 20)).decode("utf-8", "replace")
+        return urllib.parse.parse_qs(raw, keep_blank_values=True)
+
+    def back(self) -> str:
+        """Where a POST returns to: the form's own hint, or the queue."""
+        return "/queue"
+
+    # -- pages -------------------------------------------------------------
+
+    def page_console(self) -> None:
+        conn = self.app.connect()
+        try:
+            control = db.get_control(conn)
+        finally:
+            conn.close()
+        doc = console_document(self.app)
+        self.html(
+            layout(
+                title="Console",
+                here="/",
+                body=console_page(doc),
+                control=control,
+                back="/",
+                flash=self.flash(),
+                page_script=CONSOLE_SCRIPT,
+            )
+        )
+
+    def api_console(self) -> None:
+        self.json_out(console_document(self.app))
+
+    def api_control(self) -> None:
+        conn = self.app.connect()
+        try:
+            control = db.get_control(conn)
+        finally:
+            conn.close()
+        text, css, tooltip = pill_for(control)
+        self.json_out(
+            {
+                "state": control.state if control else None,
+                "reason": control.reason if control else None,
+                "updated_utc": control.updated_utc if control else None,
+                "stop_now": worker.is_stop_now(control),
+                "pill": text,
+                "pill_class": css,
+                "title": tooltip,
+            }
+        )
+
+    def page_queue(self) -> None:
+        conn = self.app.connect()
+        try:
+            control = db.get_control(conn)
+            body = queue_page(conn, console_document(self.app), control)
+        finally:
+            conn.close()
+        self.html(
+            layout(
+                title="Queue",
+                here="/queue",
+                body=body,
+                control=control,
+                back="/queue",
+                flash=self.flash(),
+            )
+        )
+
+    def page_new(self) -> None:
+        conn = self.app.connect()
+        try:
+            control = db.get_control(conn)
+        finally:
+            conn.close()
+        self.html(
+            layout(
+                title="New job",
+                here="/new",
+                body=new_page(),
+                control=control,
+                back="/new",
+                flash=self.flash(),
+            )
+        )
+
+    def post_new(self) -> None:
+        form = self.form()
+        conn = self.app.connect()
+        try:
+            control = db.get_control(conn)
+            try:
+                job_id, position = create_job(conn, form)
+            except (ValueError, sqlite3.Error) as exc:
+                self.html(
+                    layout(
+                        title="New job",
+                        here="/new",
+                        body=new_page(form, str(exc)),
+                        control=control,
+                        back="/new",
+                    ),
+                    status=400,
+                )
+                return
+        finally:
+            conn.close()
+        self.redirect("/queue", f"Queued as #{job_id} · position {position}")
+
+    def page_job(self, job_id: str) -> None:
+        conn = self.app.connect()
+        try:
+            job = db.get_job(conn, int(job_id))
+            if job is None:
+                self.send_error(404, "no such job")
+                return
+            control = db.get_control(conn)
+            body = job_page(self.app, conn, job)
+        finally:
+            conn.close()
+        self.html(
+            layout(
+                title=f"Job {job.id}",
+                here="/queue",
+                body=body,
+                control=control,
+                back=f"/job/{job.id}",
+                flash=self.flash(),
+            )
+        )
+
+    def post_cancel(self, job_id: str) -> None:
+        self.form()
+        conn = self.app.connect()
+        try:
+            try:
+                db.transition(
+                    conn, int(job_id), "failed", last_error="cancelled by operator"
+                )
+                message = f"Job {job_id} cancelled"
+            except db.IllegalTransition:
+                message = f"Job {job_id} has already finished — nothing changed"
+            except db.UnknownJob:
+                message = f"there is no job {job_id}"
+        finally:
+            conn.close()
+        self.redirect(f"/job/{job_id}", message)
+
+    def post_laptop(self, job_id: str) -> None:
+        self.form()
+        conn = self.app.connect()
+        try:
+            try:
+                db.transition(conn, int(job_id), "needs-laptop", needs="review")
+                message = f"Job {job_id} is waiting for the laptop (needs: review)"
+            except db.IllegalTransition:
+                message = f"Job {job_id} cannot go to needs-laptop from here"
+            except db.UnknownJob:
+                message = f"there is no job {job_id}"
+        finally:
+            conn.close()
+        self.redirect(f"/job/{job_id}", message)
+
+    def page_held(self) -> None:
+        conn = self.app.connect()
+        try:
+            control = db.get_control(conn)
+            body = held_page(self.app, conn)
+        finally:
+            conn.close()
+        self.html(
+            layout(
+                title="Held for publication",
+                here="/held",
+                body=body,
+                control=control,
+                back="/held",
+                flash=self.flash(),
+            )
+        )
+
+    def post_publish(self, entry_id: str) -> None:
+        self.form()
+        conn = self.app.connect()
+        try:
+            message = publish_entry(self.app, conn, int(entry_id))
+        finally:
+            conn.close()
+        self.redirect("/held", message)
+
+    def post_reject(self, entry_id: str) -> None:
+        form = self.form()
+        reason = (form.get("reason") or [""])[0]
+        conn = self.app.connect()
+        try:
+            message = reject_entry(conn, int(entry_id), reason)
+        finally:
+            conn.close()
+        self.redirect("/held", message)
+
+    def post_control(self) -> None:
+        form = self.form()
+        action = (form.get("action") or [""])[0]
+        back = (form.get("back") or ["/"])[0]
+        if not back.startswith("/") or back.startswith("//"):
+            back = "/"
+        conn = self.app.connect()
+        try:
+            if action == "pause":
+                db.set_control(conn, "pausing", "pause")
+                message = "Pausing — the worker finishes the attempt in flight"
+            elif action == "stop":
+                # The worker's own representation of stop-now; see worker.py.
+                db.set_control(conn, "pausing", "stop")
+                message = "Stopping now — the attempt is aborted and the job re-queued"
+            elif action == "resume":
+                db.set_control(conn, "running", None)
+                message = "Running — the worker claims jobs again"
+            else:
+                message = f"unknown control action {action!r} — nothing changed"
+        finally:
+            conn.close()
+        self.redirect(back, message)
+
+    def serve_job_file(self, rest: str) -> None:
+        root = self.app.jobs_root
+        try:
+            root = root.resolve()
+        except OSError:
+            self.send_error(404, "no such file")
+            return
+        raw = urllib.parse.unquote(rest)
+        if "\x00" in raw:
+            self.send_error(404, "no such file")
+            return
+        try:
+            target = (root / raw).resolve()
+        except (OSError, ValueError):
+            self.send_error(404, "no such file")
+            return
+        if target != root and not target.is_relative_to(root):
+            self.send_error(404, "no such file")
+            return
+        content_type = SERVABLE.get(target.suffix.lower())
+        if content_type is None or not target.is_file():
+            self.send_error(404, "no such file")
+            return
+        try:
+            body = target.read_bytes()
+        except OSError:
+            self.send_error(404, "no such file")
+            return
+        self._send(body, content_type)
+
+    def post_quit(self) -> None:
+        self.form()
+        self._send(b"stopping\n", "text/plain; charset=utf-8")
+        if self.app.quit_event is not None:
+            self.app.quit_event.set()
+
+
+def make_server(
+    *,
+    bind: str = DEFAULT_BIND,
+    port: int = DEFAULT_PORT,
+    db_path: str = db.DEFAULT_DB_PATH,
+    jobs_dir: str = DEFAULT_JOBS_DIR,
+    once_for_test: bool = False,
+) -> ThreadingHTTPServer:
+    """Build the server. Refuses any bind but the loopback one (exit 3)."""
+    check_bind(bind)
+    server = ThreadingHTTPServer((bind, port), OpHandler)
+    server.daemon_threads = True
+    server.app = App(  # type: ignore[attr-defined]
+        db_path=str(db_path),
+        jobs_dir=str(jobs_dir),
+        once_for_test=once_for_test,
+        quit_event=threading.Event(),
+    )
+    return server
+
+
+def serve(
+    *,
+    bind: str = DEFAULT_BIND,
+    port: int = DEFAULT_PORT,
+    db_path: str = db.DEFAULT_DB_PATH,
+    jobs_dir: str = DEFAULT_JOBS_DIR,
+    once_for_test: bool = False,
+    timeout_s: float = ONCE_TIMEOUT_S,
+) -> int:
+    """Run the UI. ``once_for_test`` serves until POST /_quit or ``timeout_s``."""
+    server = make_server(
+        bind=bind,
+        port=port,
+        db_path=db_path,
+        jobs_dir=jobs_dir,
+        once_for_test=once_for_test,
+    )
+    app: App = server.app  # type: ignore[attr-defined]
+    where = f"http://{bind}:{server.server_port}/"
+    sys.stderr.write(
+        f"{db.utc_now()} sketchgen web listening on {where} "
+        f"db={app.db_path} jobs={app.jobs_dir}"
+        + (f" once-for-test={timeout_s:.0f}s\n" if once_for_test else "\n")
+    )
+    sys.stderr.flush()
+    if not once_for_test:
+        try:
+            server.serve_forever(poll_interval=0.2)
+        except KeyboardInterrupt:
+            sys.stderr.write(f"{db.utc_now()} sketchgen web stopped\n")
+        finally:
+            server.server_close()
+        return EXIT_OK
+
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.2})
+    thread.daemon = True
+    thread.start()
+    reason = "POST /_quit" if app.quit_event.wait(timeout_s) else "timeout"
+    server.shutdown()
+    thread.join(timeout=5)
+    server.server_close()
+    sys.stderr.write(f"{db.utc_now()} sketchgen web exiting ({reason})\n")
+    sys.stderr.flush()
+    return EXIT_OK

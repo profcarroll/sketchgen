@@ -1,0 +1,55 @@
+<h1>New job</h1>
+$error
+<form class="stack" method="post" action="/new">
+  <section class="panel">
+    <label for="prompt">Prompt</label>
+    <textarea id="prompt" name="prompt" required
+      placeholder="one sentence the planner turns into a brief and an assertion list">$prompt</textarea>
+
+    <div class="row">
+      <div>
+        <label for="submitted_by">Submitted by (GitHub username)</label>
+        <input type="text" id="submitted_by" name="submitted_by" required
+               pattern="[A-Za-z0-9-]{1,39}" value="$submitted_by">
+      </div>
+      <div>
+        <label for="planner">Planner</label>
+        <select id="planner" name="planner">$planner_options</select>
+      </div>
+      <div>
+        <label for="parent_entry_id">Parent entry id</label>
+        <input type="number" id="parent_entry_id" name="parent_entry_id" min="1"
+               value="$parent_entry_id" placeholder="none">
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>Assertions</h2>
+    <p class="dim" style="font-size:12px">Optional overrides. The planner proposes the
+      assertion list later; anything ticked here is stored with the job and the
+      vocabulary is closed — the model does not get to invent words.</p>
+    <div class="chips">
+$chips
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="row">
+      <div>
+        <label for="rules">Rules file</label>
+        <select id="rules" name="rules">$rules_options</select>
+      </div>
+      <div>
+        <label for="publication">Publication</label>
+        <select id="publication" name="publication">$publication_options</select>
+      </div>
+      <div>
+        <label for="max_attempts">Max attempts</label>
+        <input type="number" id="max_attempts" name="max_attempts" min="1" max="10"
+               value="$max_attempts">
+      </div>
+    </div>
+    <div class="actions"><button type="submit">Queue it</button></div>
+  </section>
+</form>
