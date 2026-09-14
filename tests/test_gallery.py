@@ -616,6 +616,67 @@ class IndexTests(GalleryTestCase):
         self.assertEqual(1, line.count('class="critique"'))
 
 
+class GridOrderTests(GalleryTestCase):
+    """The grid's order, its sort control and its folded-away filters.
+
+    The order is in the HTML and not only in the script: the site is static,
+    someone may read it with JavaScript off, and the first paint should not
+    have to be rearranged before it is right.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.render()
+        self.index = (self.dest / "index.html").read_text(encoding="utf-8")
+        self.failed = (self.dest / "rejections.html").read_text(encoding="utf-8")
+
+    def test_the_index_is_newest_first(self):
+        one, two, _ = self.ids
+        # entry two was published nine minutes after entry one
+        self.assertLess(
+            self.index.index(f'data-entry="{two}"'),
+            self.index.index(f'data-entry="{one}"'),
+        )
+
+    def test_the_rejections_page_is_newest_first(self):
+        # one card is no order at all, so this page needs a second rejection
+        job = db.enqueue(self.conn, "a rejection published later", "profcarroll")
+        later = db.create_entry(
+            self.conn, job, state="failed-kept",
+            prompt="a rejection published later",
+            published_utc="2026-09-14T05:31:02Z",
+        )
+        dest = self.tmp / "again"
+        dest.mkdir()
+        gallery.render_index(self.conn, dest, self.config)
+        page = (dest / "rejections.html").read_text(encoding="utf-8")
+        self.assertLess(
+            page.index(f'data-entry="{later}"'),
+            page.index(f'data-entry="{self.ids[2]}"'),
+        )
+
+    def test_every_card_carries_the_stamp_a_sort_needs(self):
+        self.assertIn('data-published="2026-09-14T04:11:47Z"', self.index)
+        self.assertIn('data-published="2026-09-14T04:02:11Z"', self.index)
+        self.assertIn('data-published="2026-09-14T04:20:33Z"', self.failed)
+        for name, page in (("index", self.index), ("rejections", self.failed)):
+            with self.subTest(page=name):
+                self.assertEqual(page.count('class="card"'), page.count("data-published="))
+
+    def test_the_line_page_is_still_oldest_first(self):
+        # the grid reversed; the line pages did not, because a critique has to
+        # be read before the generation it produced
+        one, two, _ = self.ids
+        line = (self.dest / "lines" / f"{one}.html").read_text(encoding="utf-8")
+        self.assertLess(line.index(f'href="../e/{one}/"'), line.index(f'href="../e/{two}/"'))
+
+    def test_compare_still_embeds_the_entries_oldest_first(self):
+        compare = (self.dest / "compare.html").read_text(encoding="utf-8")
+        embedded = compare.split('type="application/json">')[1].split("</script>")[0]
+        entries = json.loads(embedded.replace("<\\/", "</"))
+        self.assertEqual([entry["id"] for entry in entries], list(self.ids[:2]))
+
+
 class GuardTests(GalleryTestCase):
 
     def test_an_email_in_a_statement_is_refused_and_nothing_is_left(self):
