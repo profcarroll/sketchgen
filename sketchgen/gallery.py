@@ -986,7 +986,7 @@ def _grid_page(
         root="./",
         page_title=_esc(heading),
         heading=_esc(heading),
-        intro=_esc(intro),
+        intro_html=f'<p class="intro">{_esc(intro)}</p>' if intro else "",
         filters=_filters(rows, page),
         cards=cards,
     )
@@ -1080,11 +1080,7 @@ def render_index(
                 conn,
                 published,
                 heading="sketchgen",
-                intro=(
-                    "A gallery that generates itself: every entry is one prompt, "
-                    "one brief, one gate and the model's own account of what it "
-                    "built. Rejections are kept too."
-                ),
+                intro="",
                 page="index.html",
                 failed=False,
             ),
