@@ -133,6 +133,13 @@ fainter mark has fewer pairs behind it. Hover a mark for the rank and the
 Bradley–Terry score itself; the chip beside the tags says whether the two
 populations agree about which you would rather look at.
 
+An entry page puts the same two percentiles on one square above its score boxes — a
+compass, across for *rather look at it* and up for *closer to its brief*, a dot for
+the humans and a ring for the agents, the line between them the gap — so a
+population that enjoys looking at an entry but thinks it ignored its brief lands in
+a different corner from one that reads it the other way; a population that has
+scored only one of the two questions is not placed at all.
+
 A kept rejection's `compare` link judges it against a random published entry — the
 status quo — and says which side was rejected only after both answers are in.
 
