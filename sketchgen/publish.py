@@ -468,8 +468,12 @@ def publish_index(
     *,
     key: str | None = None,
     remote: str | None = None,
+    write_path: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Re-render every published entry and the index, commit and push.
+
+    ``write_path`` overrides the gallery write-path URL recorded in the
+    checkout's config.json; the re-render carries it into every page.
 
     For template or asset changes: no entry's state changes. Returns
     (sha, None) on success or (None, why); refuses on a dirty checkout.
@@ -484,15 +488,23 @@ def publish_index(
     except ImportError as exc:
         raise PublishRefused("generator not present") from exc
     before = _git_out(checkout, "rev-parse", "HEAD")
+    config = gallery.Config.load(checkout)
+    if write_path is not None:
+        config = gallery.Config(
+            write_path=write_path.rstrip("/"),
+            gallery_url=config.gallery_url,
+            repository=config.repository,
+        )
     rows = conn.execute(
         "SELECT id FROM entries WHERE state IN ('published', 'failed-kept') ORDER BY id"
     ).fetchall()
     for row in rows:
-        gallery.render_entry(conn, row["id"], checkout)
-    gallery.render_index(conn, checkout)
-    present = [p for p in INDEX_PATHS if (checkout / p).exists()]
+        gallery.render_entry(conn, row["id"], checkout, config)
+    gallery.render_index(conn, checkout, config)
     _git(checkout, "rm", "-q", "--ignore-unmatch", "--", "failed.html")  # renamed to rejections.html
-    added = _git(checkout, "add", "-A", "--", "e", *present)
+    # Everything in the checkout is generated output (the generator also writes
+    # files INDEX_PATHS does not list, pairs.json for one), so stage it all.
+    added = _git(checkout, "add", "-A", "--", ".")
     if added.returncode != 0:
         return None, f"git add failed: {added.stderr.strip()}"
     if _git(checkout, "diff", "--cached", "--quiet").returncode == 0:
@@ -543,10 +555,9 @@ def _publish_index(
         render_index(conn, checkout)
     except Exception as exc:  # the generator's own refusal, reported
         return None, f"index render failed: {exc}"
-    present = [p for p in INDEX_PATHS if (checkout / p).exists()]
-    if not present:
+    if not any((checkout / p).exists() for p in INDEX_PATHS):
         return None, "index render wrote nothing"
-    added = _git(checkout, "add", "--", *present)
+    added = _git(checkout, "add", "-A", "--", ".")
     if added.returncode != 0:
         return None, f"git add of the index failed: {added.stderr.strip()}"
     if _git(checkout, "diff", "--cached", "--quiet").returncode == 0:
