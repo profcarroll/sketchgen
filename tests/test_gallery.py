@@ -626,7 +626,9 @@ class IndexTests(GalleryTestCase):
         self.assertIn('data-reveal hidden', compare)
         embedded = compare.split('type="application/json">')[1].split("</script>")[0]
         entries = json.loads(embedded.replace("<\\/", "</"))
-        self.assertEqual([entry["id"] for entry in entries], list(self.ids[:2]))
+        # every public entry, the kept rejection included: its own page links
+        # here with ?a=<itself> and the page has to know the id to honour it
+        self.assertEqual([entry["id"] for entry in entries], list(self.ids))
 
     def test_compare_can_run_either_sketch_in_place(self):
         """The strip is clickable and the JSON says where the sketch lives.
@@ -756,7 +758,94 @@ class GridOrderTests(GalleryTestCase):
         compare = (self.dest / "compare.html").read_text(encoding="utf-8")
         embedded = compare.split('type="application/json">')[1].split("</script>")[0]
         entries = json.loads(embedded.replace("<\\/", "</"))
-        self.assertEqual([entry["id"] for entry in entries], list(self.ids[:2]))
+        # the grid reversed and this did not: published oldest first, then the
+        # kept rejections, which is the order _public_rows walks
+        self.assertEqual([entry["id"] for entry in entries], list(self.ids))
+
+
+class CompareRejectionTests(GalleryTestCase):
+    """A kept rejection is comparable, and only where a person asks for it.
+
+    Every entry page — the rejections included — links to
+    ``compare.html?a=<itself>``. While that page was built from the published
+    rows only, a rejection's link arrived at a page that had never heard of the
+    id and quietly showed some other pair: the symptom was "judgment pairs
+    loads wrong pair". The fix widens the page's own JSON to the public set,
+    and stops there: the balanced spec §9 offer is still published-only, so a
+    rejection is compared when somebody asks and never by rotation.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.render()
+        self.compare = (self.dest / "compare.html").read_text(encoding="utf-8")
+
+    def entries(self, page=None):
+        block = (page or self.compare).split('type="application/json">')[1]
+        return json.loads(block.split("</script>")[0].replace("<\\/", "</"))
+
+    def test_the_compare_page_carries_the_kept_rejection_and_its_state(self):
+        three = self.ids[2]
+        by_id = {entry["id"]: entry for entry in self.entries()}
+        self.assertIn(three, by_id, "the rejection its own link names is missing")
+        self.assertEqual(by_id[three]["state"], "failed-kept")
+        self.assertEqual(by_id[three]["href"], f"e/{three}/")
+        # and the state is on every entry, not only the interesting one
+        for entry_id in self.ids[:2]:
+            with self.subTest(entry=entry_id):
+                self.assertEqual(by_id[entry_id]["state"], "published")
+
+    def test_a_kept_rejection_nobody_published_is_not_comparable(self):
+        # Same rule as every other page: the worker keeping it is not a person
+        # publishing it, and until someone does there is no e/<id>/ behind it.
+        job = db.enqueue(self.conn, "a rejection nobody has published", "profcarroll")
+        kept = db.create_entry(
+            self.conn, job, state="failed-kept",
+            prompt="a rejection nobody has published",
+        )
+        dest = self.tmp / "again"
+        dest.mkdir()
+        gallery.render_index(self.conn, dest, self.config)
+        page = (dest / "compare.html").read_text(encoding="utf-8")
+        self.assertNotIn(kept, [entry["id"] for entry in self.entries(page)])
+        self.assertIn(self.ids[2], [entry["id"] for entry in self.entries(page)])
+
+    def test_the_balanced_offer_stays_published_only(self):
+        """spec §9 is control against treatment; a rejection is on neither arm.
+
+        The offer is what the page hands a visitor who arrives with no
+        parameters, so a rejection in it would be a rejection put in front of
+        people who never asked for one.
+        """
+        three = self.ids[2]
+        offered = gallery._offered_pairs(self.conn)
+        self.assertTrue(offered, "two published entries should offer a pair")
+        for pair in offered:
+            with self.subTest(pair=pair):
+                self.assertNotIn(three, (pair["a"], pair["b"]))
+        baked = json.loads((self.dest / "pairs.json").read_text(encoding="utf-8"))
+        for pair in baked["pairs"]:
+            with self.subTest(pair=pair):
+                self.assertNotIn(three, (pair["a"], pair["b"]))
+
+    def test_the_reveal_holds_the_hook_the_rejection_note_is_written_into(self):
+        """Inside [data-reveal], above the verdicts, and empty in the HTML.
+
+        Spec §5 blinds the human until both answers are in, so the page the
+        generator writes must not say anywhere that a side was rejected; the
+        one line per rejected side is written by gallery.js into this hook,
+        which is hidden with the rest of the reveal until the second vote.
+        """
+        reveal = self.compare.split('<section class="reveal"')[1]
+        reveal = reveal.split("</section>")[0]
+        self.assertIn("data-rejected-note", reveal)
+        self.assertLess(
+            reveal.index("data-rejected-note"), reveal.index("data-agent-verdicts")
+        )
+        self.assertIn('data-reveal hidden', self.compare)
+        # nothing outside the reveal, and no verdict baked into the HTML
+        self.assertEqual(1, self.compare.count("data-rejected-note"))
+        self.assertNotIn("rejected by the gate", self.compare)
 
 
 class GridSearchTests(GalleryTestCase):

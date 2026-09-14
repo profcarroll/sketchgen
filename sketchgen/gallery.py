@@ -1127,12 +1127,25 @@ def _grid_page(
 
 
 def _compare_page(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> str:
+    """The compare shell over every *public* entry, kept rejections included.
+
+    ``rows`` is the public set — published entries plus the kept rejections a
+    person has published (:func:`_public_rows`) — which is exactly the set with
+    a page under ``e/``. Every entry page links here with ``?a=<itself>``, so
+    while this page knew only the published rows a rejection's link arrived at a
+    page that had never heard of that id and quietly showed some other pair
+    instead. ``state`` travels with each entry because the browser needs it
+    twice: to pick a *published* partner for a rejection, and to name the
+    rejection in the reveal — never before it (spec §5). The balanced offer
+    stays published-only; see :func:`_offered_pairs`.
+    """
     entries = [
         {
             "id": int(row["id"]),
             "prompt": " ".join(str(row["prompt"] or "").split()),
             "brief": row["brief"] or "",
             "seed": row["seed"],
+            "state": str(row["state"]),
             "strip": f"e/{int(row['id'])}/strip.png",
             "href": f"e/{int(row['id'])}/",
         }
@@ -1157,6 +1170,11 @@ def _offered_pairs(conn: sqlite3.Connection) -> list[dict[str, int]]:
     rather than the first two entries in the grid, which is how the balance
     rule (fewest judgments so far, control against treatment) reaches a static
     page at all.
+
+    Published entries only, and deliberately: this is the spec §9
+    control-against-treatment measurement, and a rejection is not on either arm
+    of it. A kept rejection is compared only when a person asks for it by
+    following its own compare link.
     """
     return pairs_mod.offer(conn)
 
@@ -1300,7 +1318,12 @@ def render_index(
             )
             + "\n",
         )
-        written.write_text(dest / "compare.html", _compare_page(conn, published))
+        # Every public entry, not just the published ones: a kept rejection's
+        # entry page links here with ?a=<itself> and the page has to know that
+        # id to honour it.
+        written.write_text(
+            dest / "compare.html", _compare_page(conn, _public_rows(conn))
+        )
         roots = sorted(
             {
                 _root_of(parent, entry_id)
