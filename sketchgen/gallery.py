@@ -304,6 +304,13 @@ def _resolve_config(dest_dir: Path, config: Config | None) -> Config:
 # ---------------------------------------------------------------------------
 
 
+def _state_chip(state: str) -> str:
+    """The chip a public entry wears: the gate's rejections say so on every page."""
+    if state == "failed-kept":
+        return '<span class="chip failed">rejected</span>'
+    return f'<span class="chip {_esc(state)}">{_esc(state)}</span>'
+
+
 def _entry(conn: sqlite3.Connection, entry_id: int, *, publishing: bool = False) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
     if row is None:
@@ -942,7 +949,7 @@ def _write_entry(
         failed_note=failed_note,
         frame=_frame(has_sketch, title),
         seed=_dash(meta["seed"]),
-        state_chip=f'<span class="chip {_esc(row["state"])}">{_esc(row["state"])}</span>',
+        state_chip=_state_chip(row["state"]),
         brief=_paragraphs(str(row["brief"] or ""), "No brief was recorded for this job."),
         statement_model=_esc(row["executor"] or "an unrecorded model"),
         statement=_paragraphs(statement, "The executor wrote no statement."),
@@ -1102,7 +1109,7 @@ def _line_node(
     public = entry_id in by_id
     head = (
         f'<a href="../e/{entry_id}/">entry {entry_id}</a> '
-        f'<span class="chip {_esc(item["state"])}">{_esc(item["state"])}</span>'
+        + _state_chip(item["state"])
         if public
         else f"entry {entry_id} <span class=\"chip\">not published</span>"
     )
