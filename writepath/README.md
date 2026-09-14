@@ -6,8 +6,8 @@ a small Cloudflare Worker over a D1 (SQLite) database, and the node's worker
 pulls them down on its own schedule with `sketchgen sync`. `GET /pull` is the
 only route the node ever calls; the node opens no port for any of this.
 
-- `worker.js` — the Worker. `/login` `/callback` `/me` `/vote` `/like` `/view`
-  `/counts` `/pull`. Its comments, not this file, are authoritative on behaviour.
+- `worker.js` — the Worker. `/login` `/callback` `/me` `/logout` `/vote` `/like`
+  `/view` `/counts` `/pull`. Its comments, not this file, are authoritative.
 - `schema.sql` — the D1 tables.
 - `wrangler.toml` — names and placeholders. No secret is ever written here.
 - `test/worker.test.js` — `node --test writepath/test/`. No npm install, no
@@ -20,12 +20,27 @@ A **GitHub username** is the only thing this service knows about a person. The
 OAuth access token is used inside `/callback` to read `login` and is discarded in
 the same function; nothing else from the GitHub user document is read or kept —
 no email, no display name, no avatar URL. No IP address and no request header
-that identifies a client is read or stored. The session cookie is
-`username.expiry.HMAC-SHA256(username.expiry, SESSION_KEY)`, HttpOnly, Secure,
-SameSite=Lax, 30 days; the server stores no session table, so there is nothing to
-leak. `view_log` holds SHA-256 of the cookie, never the cookie. Signed-out views
-are **not** de-duplicated, on purpose: the only way to do it would be to keep
-something that identifies the viewer.
+that identifies a client is read or stored.
+
+A **session** is one signed token,
+`username.expiry.HMAC-SHA256(username.expiry, SESSION_KEY)`, verified the same
+way wherever it comes from. It lives as a cookie on the Worker's domain
+(HttpOnly, Secure, SameSite=Lax, 30 days) **and in the viewer's browser storage
+for the gallery origin**, under `sketchgen_session` — because the gallery is a
+different site, a SameSite=Lax cookie is never sent on its calls, and
+SameSite=None would be dropped as a third-party cookie by Safari and
+increasingly by Chrome. `/callback` returns the token in the redirect fragment
+(never a query string, so it reaches no log and no `Referer`); the page strips it
+from the address bar on load and sends it as `Authorization: Bearer`.
+
+The token **carries no secret of the service** — a username, an expiry, a
+signature. The signing key never leaves the Worker, the token cannot mint
+another, and it opens nothing but this viewer's own votes and likes; `/pull`
+takes the node's separate `PULL_TOKEN` and refuses a session. There is no
+session table to leak: `/logout` clears the cookie and the page drops its copy.
+`view_log` holds SHA-256 of the token, never the token. Signed-out views are
+**not** de-duplicated, on purpose: the only way would be to keep something that
+identifies the viewer.
 
 `/counts` is public because the gallery shows view and like counts to human
 visitors. The agent-judge code (packet 5.2) must never call it — engagement is

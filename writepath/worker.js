@@ -12,6 +12,11 @@
  * in the same function; nothing else from the GitHub user document is read, kept
  * or derived. No request headers that identify a client are read or stored.
  *
+ * A session is a signed token, `username.expiry.HMAC(username.expiry)`, held
+ * either in this Worker's cookie or in the gallery's own browser storage and
+ * sent back as `Authorization: Bearer`. Both are verified the same way; see
+ * sessionToken() for why one of them is not enough.
+ *
  * JUDGE BLINDING (spec §5, plan packet 5.2): /counts is deliberately public,
  * because the gallery renders view and like counts to human visitors. The
  * agent-judge code must never call it. Engagement is not judgment: an agent that
@@ -180,7 +185,7 @@ export async function signSession(username, expiryEpoch, key) {
   return `${body}.${await hmac(body, key)}`;
 }
 
-/** The username carried by a valid, unexpired, untampered cookie, else null. */
+/** The username carried by a valid, unexpired, untampered token, else null. */
 export async function readSession(value, key, nowMs = Date.now()) {
   if (!value) return null;
   const parts = value.split(".");
@@ -206,6 +211,32 @@ function cookies(request) {
 
 function setCookie(name, value, seconds) {
   return `${name}=${value}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${seconds}`;
+}
+
+/** The bearer token a request offers, or "". */
+function bearer(request) {
+  const header = request.headers.get("Authorization") || "";
+  return header.startsWith("Bearer ") ? header.slice(7).trim() : "";
+}
+
+/**
+ * The session token a request offers: the cookie first, then the bearer header.
+ *
+ * Why both. The gallery is on github.io and this Worker is on workers.dev, so
+ * every call the gallery makes is cross-site. A SameSite=Lax cookie is not sent
+ * on those, and SameSite=None would be dropped anyway as a third-party cookie
+ * by Safari and, increasingly, Chrome — so a cookie alone cannot sign anyone in
+ * from the gallery. /callback therefore also hands the page the same signed
+ * token in the redirect fragment; the page keeps it in its own origin's storage
+ * and sends it back as a bearer. The token is identical either way and is
+ * checked by the same HMAC verification, so this is one trust path, not two.
+ *
+ * Which credential a route accepts is decided by the route, never by the shape
+ * of the header: /pull takes env.PULL_TOKEN and nothing else, and a session
+ * token presented there is refused like any other wrong value.
+ */
+function sessionToken(request) {
+  return cookies(request)[SESSION_COOKIE] || bearer(request) || null;
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +292,9 @@ function preflight(request, env) {
       "Access-Control-Allow-Origin": allowed,
       "Access-Control-Allow-Credentials": "true",
       "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
+      // Authorization, because the gallery sends the session as a bearer: a
+      // SameSite=Lax cookie never reaches a cross-site call (see sessionToken).
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
       "Access-Control-Max-Age": "600",
       Vary: "Origin",
     },
@@ -347,9 +380,24 @@ async function routeCallback(request, env, url) {
   }
 
   const expiry = Math.floor(Date.now() / 1000) + SESSION_SECONDS;
-  const cookie = await signSession(username, expiry, env.SESSION_KEY);
-  return redirect(env.GALLERY_URL, {
-    "Set-Cookie": setCookie(SESSION_COOKIE, cookie, SESSION_SECONDS),
+  const token = await signSession(username, expiry, env.SESSION_KEY);
+  // The cookie is set for same-site visits to this Worker, and the same token
+  // rides back to the gallery in the fragment for the cross-site case. A
+  // fragment, not a query string: it is never sent to a server, never logged by
+  // one, and never lands in a Referer header. The page stores it and strips it
+  // from the address bar on load.
+  const home = `${env.GALLERY_URL.replace(/\/+$/, "")}/#session=${encodeURIComponent(token)}`;
+  return redirect(home, {
+    "Set-Cookie": setCookie(SESSION_COOKIE, token, SESSION_SECONDS),
+  });
+}
+
+function routeLogout(request, env) {
+  // The page drops its own copy; this clears the Worker's cookie. There is no
+  // session table, so there is nothing else to revoke: the token simply stops
+  // being presented, and expires on its own inside 30 days either way.
+  return json({ ok: true }, 200, request, env, {
+    "Set-Cookie": setCookie(SESSION_COOKIE, "", 0),
   });
 }
 
@@ -480,12 +528,16 @@ export default {
     if (request.method === "GET" && path === "/login") return routeLogin(request, env);
     if (request.method === "GET" && path === "/callback") return routeCallback(request, env, url);
     if (request.method === "GET" && path === "/counts") return routeCounts(request, env, url);
+    // /pull is answered above the session block on purpose: it is the node's
+    // route, it takes env.PULL_TOKEN, and it never looks at a session.
     if (request.method === "GET" && path === "/pull") return routePull(request, env, url);
 
-    const sessionValue = cookies(request)[SESSION_COOKIE] || null;
+    const sessionValue = sessionToken(request);
     const username = sessionValue
       ? await readSession(sessionValue, env.SESSION_KEY)
       : null;
+
+    if (request.method === "GET" && path === "/logout") return routeLogout(request, env);
 
     if (request.method === "GET" && path === "/me") {
       return username
