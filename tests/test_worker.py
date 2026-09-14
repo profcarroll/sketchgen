@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -1079,6 +1080,48 @@ class TestSweep(WorkerTestCase):
         job_id = self.stuck("executing", minutes=5)
         self.assertEqual([], self.make_worker().sweep_stuck())
         self.assertEqual("executing", db.get_job(self.conn, job_id).state)
+
+    def test_at_start_a_fresh_orphan_is_swept_too(self):
+        # A restart killed the previous worker mid-attempt (job 58, 2026-09-14):
+        # the row is a minute old and nobody is attending it.
+        job_id = self.stuck("executing", minutes=1)
+        self.assertEqual([job_id], self.make_worker().sweep_stuck(everything=True))
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual("queued", job.state)
+        self.assertIn("swept at start", job.last_error)
+
+    def test_sigterm_mid_attempt_requeues_the_job_and_leaves_control_running(self):
+        import os
+        import signal
+        signal_seen = []
+
+        def executor_fn(**kwargs):
+            os.kill(os.getpid(), signal.SIGTERM)
+            signal_seen.append(True)  # pragma: no cover - the handler raises first
+            raise AssertionError("the SIGTERM handler should have raised StopNow")
+
+        job_id = self.enqueue()
+        run = self.make_worker(executor_fn=executor_fn)
+        self.assertTrue(run._install_signal_handlers())
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.SIG_DFL)
+        self.assertEqual(0, run.run_once())
+        self.assertTrue(run._terminating)
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual("queued", job.state)
+        self.assertIn("worker stopped", job.last_error)
+        self.assertEqual("running", db.get_control(self.conn).state)
+        self.assertEqual([], signal_seen)
+
+    def test_run_forever_returns_on_sigterm_while_idle(self):
+        import os
+        import signal
+        import threading
+        run = self.make_worker()
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.SIG_DFL)
+        threading.Timer(0.3, os.kill, args=(os.getpid(), signal.SIGTERM)).start()
+        started = time.monotonic()
+        self.assertEqual(0, run.run_forever(sleep_s=5.0))
+        self.assertLess(time.monotonic() - started, 4.0)
 
     def test_a_queued_or_finished_job_is_never_swept(self):
         queued = self.enqueue()

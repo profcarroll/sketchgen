@@ -109,6 +109,7 @@ import json
 import os
 import random
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -940,6 +941,7 @@ class Worker:
         #: Jobs this process has in flight. The sweep never touches these.
         self._owned: set[int] = set()
         self._swept = False
+        self._terminating = False
 
     # -- logging ---------------------------------------------------------
 
@@ -1032,7 +1034,10 @@ class Worker:
         try:
             return self._run_job(job)
         except StopNow:
-            self._stop_now(job.id)
+            if self._terminating:
+                self._abandon_for_restart(job.id)
+            else:
+                self._stop_now(job.id)
             return EXIT_OK
         except Exception as exc:
             # Last resort. Every step above already turns its own failures into
@@ -1057,20 +1062,29 @@ class Worker:
         """The resident mode systemd runs. Never start this from a tool call."""
         # Packet 4.1: the console's "session" column is everything since here.
         db.set_meta(self.conn, "worker_started_utc", db.utc_now())
+        self._install_signal_handlers()
         self.log(f"worker: resident, polling every {sleep_s:.0f}s")
-        while True:
+        # There is one worker. Anything in a running state at this moment was
+        # left there by the previous one and nobody is attending it, however
+        # recent its timestamp: back on the queue now, not in thirty minutes.
+        self.sweep_stuck(everything=True)
+        while not self._terminating:
             try:
                 code = self.run_once()
             except Exception as exc:  # keep the daemon alive; systemd logs it
                 self.log(f"worker: unhandled {type(exc).__name__}: {exc}")
                 code = EXIT_FAIL
+            if self._terminating:
+                break
             if code == EXIT_REFUSED:
                 self.log(f"worker: fenced; backing off {sleep_s:.0f}s")
-            time.sleep(sleep_s)
+            self._nap(sleep_s)
+        self.log("worker: stopped (SIGTERM); nothing left in flight")
+        return EXIT_OK
 
     # -- the sweep -------------------------------------------------------
 
-    def sweep_stuck(self, now: str | None = None) -> list[int]:
+    def sweep_stuck(self, now: str | None = None, *, everything: bool = False) -> list[int]:
         """Re-queue jobs left in a running state by a worker that is not coming
         back. Returns the job ids re-queued.
 
@@ -1083,8 +1097,12 @@ class Worker:
 
         Owned means in flight *here*: a job this process claimed in this pass is
         never swept, however long its own plan or gate takes.
+
+        ``everything=True`` is the start-up sweep: age is not consulted, because
+        at start nothing is owned and there is no other worker, so every job in
+        a running state is an orphan of the previous process.
         """
-        if self.stuck_minutes <= 0:
+        if self.stuck_minutes <= 0 and not everything:
             return []
         stamp = now or db.utc_now()
         try:
@@ -1102,22 +1120,22 @@ class Worker:
             if job_id in self._owned:
                 continue
             age = minutes_between(row["updated_utc"], stamp)
-            if age is None or age < self.stuck_minutes:
+            if everything:
+                reason = f"swept at start: left in {row['state']} by the previous worker"
+                said = f"sweep: job {job_id} left in {row['state']} by the previous worker; re-queued"
+            elif age is None or age < self.stuck_minutes:
                 continue
+            else:
+                reason = f"swept: left in {row['state']} for {age:.0f} minutes"
+                said = (f"sweep: job {job_id} sat in {row['state']} for {age:.0f} minutes "
+                        "with no worker attending it; re-queued")
             try:
-                db.requeue(
-                    self.conn,
-                    job_id,
-                    reason=f"swept: left in {row['state']} for {age:.0f} minutes",
-                )
+                db.requeue(self.conn, job_id, reason=reason)
             except (db.IllegalTransition, db.UnknownJob, sqlite3.Error) as exc:
                 self.log(f"sweep: job {job_id} could not be re-queued: {exc}")
                 continue
             swept.append(job_id)
-            self.log(
-                f"sweep: job {job_id} sat in {row['state']} for {age:.0f} minutes "
-                f"with no worker attending it; re-queued"
-            )
+            self.log(said)
         return swept
 
     # -- idle work (packet 5.4) ------------------------------------------
@@ -1319,6 +1337,47 @@ class Worker:
             self.log(f"job {job_id}: stop-now — nothing in flight to abort")
         db.set_control(self.conn, "paused", reason)
         self.log("control: paused")
+
+    def _abandon_for_restart(self, job_id: int) -> None:
+        """SIGTERM with a job in flight: re-queue it and leave control alone.
+
+        systemd's restart is not the operator's stop-now: the control row must
+        still say ``running`` when the next worker starts, or a routine deploy
+        would leave the queue paused until somebody noticed.
+        """
+        job = db.get_job(self.conn, job_id)
+        if job is not None and job.state in db.REQUEUABLE:
+            db.requeue(self.conn, job_id, reason="worker stopped: re-queued for the next worker")
+            self.log(f"job {job_id}: worker stopping — attempt abandoned, job re-queued")
+
+    def _on_terminate(self, signum: int, frame: Any) -> None:
+        """SIGTERM: finish nothing. A job in flight is re-queued on the way out.
+
+        Raising inside the model call or the gate is deliberate — an attempt
+        that took a minute is cheaper than a job row left in ``executing`` with
+        no worker, which is what a restart mid-attempt did on 2026-09-14 (job
+        58 sat orphaned while the new worker ran job 59 beside it).
+        """
+        self._terminating = True
+        if self._owned:
+            raise StopNow()
+
+    def _install_signal_handlers(self) -> bool:
+        try:
+            signal.signal(signal.SIGTERM, self._on_terminate)
+        except ValueError:  # not the main thread: tests, embedding
+            self.log("worker: SIGTERM handler not installed (not the main thread)")
+            return False
+        return True
+
+    def _nap(self, seconds: float) -> None:
+        """Sleep, in slices, so a SIGTERM while idle ends the loop promptly."""
+        deadline = time.monotonic() + seconds
+        while not self._terminating:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            time.sleep(min(1.0, left))
 
     def _pause_after_attempt(self, job_id: int) -> None:
         """The attempt is finished; settle into paused, leaving nothing stranded."""

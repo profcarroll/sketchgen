@@ -179,6 +179,8 @@ every idle cycle, the worker re-queues any job left in `planning`, `executing`,
 `gating` or `repairing` that has not moved for `SKETCHGEN_STUCK_MINUTES`
 (default 30) and that it is not working on itself. It says so in the log:
 
+**Restarting the worker is safe mid-job.** On SIGTERM (what `systemctl --user restart` sends) a worker with a job in flight abandons the attempt, puts the job back on the queue with the reason "worker stopped", and exits; the control row is left as it was, so the next worker resumes rather than starting paused. On start, the new worker re-queues anything still in a running state without waiting `SKETCHGEN_STUCK_MINUTES`: there is one worker, so a running row at start is an orphan of the previous one. Before this, a restart mid-attempt left the old job showing as executing beside the new one for half an hour (job 58, 2026-09-14).
+
 ```
 sweep: job 5 sat in planning for 47 minutes with no worker attending it; re-queued
 ```
