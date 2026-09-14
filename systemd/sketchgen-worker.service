@@ -1,0 +1,59 @@
+# sketchgen-worker.service — the worker, as a systemd **user** unit.
+#
+# Why a user unit and not something the model starts for itself:
+# on 2026-09-13 an agent on this node twice started a server from a tool call and
+# twice lost it. The second attempt bound 127.0.0.1 and was its own session leader
+# (sid == pid) and still died when the bash call returned, because session
+# leadership detaches a process from a controlling terminal and does nothing about
+# a parent that kills its children by pid (node-16x96-first-day.md §7). What
+# survives is a process init has adopted. A systemd --user unit is that, and it is
+# the only kind of long-lived process this system is allowed to have
+# (sketchgen-gallery.md §1, §4).
+#
+# `loginctl enable-linger` is ALREADY SET for this user on the node (checked
+# 2026-09-13; one user unit runs under it today), so this service survives logout
+# and comes back after a reboot. Nothing here needs sudo.
+#
+# No secrets in this file, ever. The deploy keys live in ~/.ssh with mode 0600 and
+# reach git through GIT_SSH_COMMAND; they are never an Environment= line, never a
+# DB column, never a log line (sketchgen-gallery.md §6).
+#
+# TWO MODES — pick one, and only one, at enable time:
+#
+#   daemon  the worker stays resident and takes jobs as they arrive:
+#             systemctl --user enable --now sketchgen-worker.service
+#           this is what the [Install] section below is for.
+#
+#   drip    a timer wakes the worker on a schedule (see sketchgen-worker.timer):
+#             systemctl --user enable --now sketchgen-worker.timer
+#           and leave THIS unit disabled — the timer starts it. Enabling both
+#           gives you a resident worker plus a timer that does nothing, which is
+#           not an error but is not a drip either.
+#
+# The worker fences the inference slot itself and backs off when another client
+# holds it (sketchgen-gallery.md §1), so neither mode needs to know about Ollama's
+# one slot. Pause and resume are the DB control row, not systemctl: see
+# docs/OPERATIONS.md.
+#
+# `sketchgen worker` is packet 2.3's subcommand and does not exist yet. This unit
+# names it; installing it before 2.3 lands gives you a unit that fails to start.
+
+[Unit]
+Description=sketchgen worker: one p5.js sketch job at a time, slot-fenced
+Documentation=file:%h/sketchgen/app/docs/OPERATIONS.md
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/sketchgen/app
+Environment=SKETCHGEN_DB=%h/sketchgen/sketchgen.db
+Environment=SKETCHGEN_GATE=%h/sketchgen/gate/sketch_gate.py
+Environment=OLLAMA_HOST_URL=http://127.0.0.1:11434
+ExecStart=%h/sketchgen/.venv/bin/python3 %h/sketchgen/app/bin/sketchgen worker
+Restart=on-failure
+RestartSec=30
+
+# Enabling this section is DAEMON mode. For drip mode enable the timer instead and
+# leave this unit disabled; systemd starts it from the timer either way.
+[Install]
+WantedBy=default.target
