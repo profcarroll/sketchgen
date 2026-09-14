@@ -53,6 +53,20 @@ header.top nav a.here { font-weight: 600; border-bottom: 2px solid var(--accent)
 .sup { font-size: 10px; font-weight: 700; vertical-align: super;
        line-height: 0; color: var(--dim); font-variant-numeric: tabular-nums; }
 .sup.warn { color: var(--warn); }
+/* The tokens gauge, after the meter: tokens completed per five-minute bin
+   over the last two hours, so the meter's "now" has the shape of the session
+   behind it. The accent, not the meter's amber — throughput is not a
+   warning — and the decode rate beside it in the dim colour, because on this
+   node that number barely moves and is a label rather than news. */
+.spark { vertical-align: -3px; margin-left: 2px; max-width: 100%; }
+.spark-area { fill: var(--accent); opacity: .18; }
+.spark-line { fill: none; stroke: var(--accent); stroke-width: 1.2;
+              stroke-linejoin: round; }
+.spark-now { fill: var(--accent); }
+.tok { font-size: 12px; color: var(--dim); }
+.tok .n { font-variant-numeric: tabular-nums; font-weight: 600; }
+.spark-wide .spark { display: block; margin: 2px 0; }
+.spark-wide .lab.dim { color: var(--dim); }
 .control { display: flex; gap: 8px; align-items: center; }
 .control form { display: flex; gap: 6px; margin: 0; }
 button {
@@ -195,6 +209,67 @@ $body
     el.title = "node CPU " + Math.round(cpu) + "% · slot " + nav.slot_state +
                (nav.slot_holder ? " (" + nav.slot_holder + ")" : "");
   }
+  // The sparkline's geometry — the same formula as _spark_points() in
+  // web.py, line for line, so a repainted bin lands exactly where the server
+  // drew it: x = 1 + i*(w-2)/(n-1), y = (h-1) - v/peak*(h-4), and a window
+  // with nothing in it flat on the baseline. Rounded to a tenth before it is
+  // printed, because toFixed and Python's %.1f break ties in opposite
+  // directions and the two sides have to agree as strings.
+  function sparkPoints(bins, w, h) {
+    var n = Math.max(1, bins.length), peak = 0, points = [], i, v, x, y;
+    for (i = 0; i < bins.length; i++) peak = Math.max(peak, Number(bins[i]) || 0);
+    var step = n > 1 ? (w - 2) / (n - 1) : 0;
+    for (i = 0; i < n; i++) {
+      v = Number(bins[i]) || 0;
+      x = 1 + i * step;
+      y = (h - 1) - (peak > 0 ? v / peak * (h - 4) : 0);
+      points.push((Math.round(x * 10) / 10).toFixed(1) + "," +
+                  (Math.round(y * 10) / 10).toFixed(1));
+    }
+    return points;
+  }
+  function num(value) {
+    return value === null || value === undefined
+      ? "\u2014" : Number(value).toFixed(1);
+  }
+  // Every gauge on the page, by the one hook: the header's, and on the
+  // Console the wider one, which /api/console.json does not carry bins for.
+  function sparks(nav) {
+    var tokens = nav.tokens;
+    if (!tokens || !tokens.bins) return;
+    var bins = tokens.bins, peak = 0, i;
+    for (i = 0; i < bins.length; i++) peak = Math.max(peak, Number(bins[i]) || 0);
+    var minutes = Number(tokens.bin_minutes) || 5;
+    var total = minutes * bins.length;
+    var span = total >= 60 ? (total / 60) + " h" : total + " min";
+    var title = "tokens completed, last " + span + " in " + minutes +
+                "-min bins · peak " + peak.toLocaleString("en-US") +
+                " · decode " + num(tokens.decode_tok_s) + " tok/s";
+    document.querySelectorAll('[data-nav="tokens"]').forEach(function (svg) {
+      var w = Number(svg.getAttribute("width")) || 72;
+      var h = Number(svg.getAttribute("height")) || 14;
+      var points = sparkPoints(bins, w, h);
+      var line = svg.querySelector(".spark-line");
+      var area = svg.querySelector(".spark-area");
+      var now = svg.querySelector(".spark-now");
+      if (line) line.setAttribute("d", "M" + points.join(" L"));
+      if (area) area.setAttribute("d", "M1," + (h - 1) + " L" + points.join(" L") +
+                                       " L" + (w - 1) + "," + (h - 1) + " Z");
+      if (now) {
+        var last = points[points.length - 1].split(",");
+        now.setAttribute("cx", last[0]);
+        now.setAttribute("cy", last[1]);
+      }
+      var label = svg.querySelector("title");
+      if (label) label.textContent = title;
+      svg.setAttribute("aria-label", title);
+    });
+    mark("decode", num(tokens.decode_tok_s));
+    // the wider gauge's caption, so the numbers under the line are the line's
+    mark("peak", peak.toLocaleString("en-US"));
+    mark("session-in", (Number(tokens.session_in) || 0).toLocaleString("en-US"));
+    mark("session-out", (Number(tokens.session_out) || 0).toLocaleString("en-US"));
+  }
   function tick() {
     fetch("/api/control.json", {cache: "no-store"}).then(function (r) {
       return r.json();
@@ -205,6 +280,7 @@ $body
       var nav = d.nav;
       if (!nav) return;
       meter(nav);
+      sparks(nav);
       mark("queued", nav.queued);
       mark("in-flight", nav.in_flight);
       mark("failed", nav.failed_session);
