@@ -491,6 +491,7 @@ def publish_index(
         gallery.render_entry(conn, row["id"], checkout)
     gallery.render_index(conn, checkout)
     present = [p for p in INDEX_PATHS if (checkout / p).exists()]
+    _git(checkout, "rm", "-q", "--ignore-unmatch", "--", "failed.html")  # renamed to rejections.html
     added = _git(checkout, "add", "-A", "--", "e", *present)
     if added.returncode != 0:
         return None, f"git add failed: {added.stderr.strip()}"
@@ -514,7 +515,7 @@ def publish_index(
     return sha, None
 
 
-INDEX_PATHS = ("index.html", "failed.html", "compare.html", "lines", "assets", "config.json")
+INDEX_PATHS = ("index.html", "rejections.html", "compare.html", "lines", "assets", "config.json")
 
 
 def _publish_index(

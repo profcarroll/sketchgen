@@ -377,7 +377,7 @@ class TreeTests(GalleryTestCase):
             f"e/{one}/strip.png",
             f"e/{two}/index.html",
             f"e/{three}/index.html",
-            "failed.html",
+            "rejections.html",
             "index.html",
             f"lines/{one}.html",
         ]
@@ -529,7 +529,7 @@ class IndexTests(GalleryTestCase):
         super().setUp()
         self.render()
         self.index = (self.dest / "index.html").read_text(encoding="utf-8")
-        self.failed = (self.dest / "failed.html").read_text(encoding="utf-8")
+        self.failed = (self.dest / "rejections.html").read_text(encoding="utf-8")
 
     def test_the_failed_entry_is_in_failed_html_only(self):
         one, two, three = self.ids
@@ -538,7 +538,7 @@ class IndexTests(GalleryTestCase):
         self.assertNotIn(f'data-entry="{three}"', self.index)
         self.assertIn(f'data-entry="{three}"', self.failed)
         self.assertNotIn(f'data-entry="{one}"', self.failed)
-        self.assertIn("FAILED", self.failed)
+        self.assertIn("REJECTED", self.failed)
         self.assertIn("AudioContext is suspended", self.failed)
 
     def test_the_cards_carry_what_the_grid_shows(self):
