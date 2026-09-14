@@ -584,6 +584,14 @@ class IndexTests(GalleryTestCase):
         self.assertIn(f'href="../e/{self.ids[1]}/"', line)
         self.assertNotIn(f'href="../e/{self.ids[2]}/"', line)
 
+    def test_the_line_page_carries_the_critique_and_who_wrote_it(self):
+        line = (self.dest / "lines" / f"{self.ids[0]}.html").read_text(encoding="utf-8")
+        # packet 5.3: the critique that produced a generation sits above it
+        self.assertIn("Revise: The motion is doing the work", line)
+        self.assertIn("critique by gemma4:e4b", line)
+        # and the root, which nobody critiqued into being, has no such line
+        self.assertEqual(1, line.count('class="critique"'))
+
 
 class GuardTests(GalleryTestCase):
 

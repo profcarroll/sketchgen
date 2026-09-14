@@ -57,6 +57,7 @@ from string import Template
 from typing import Any, Iterable
 
 from . import pairs as pairs_mod
+from . import lineage
 
 __all__ = [
     "DEFAULT_GALLERY_URL",
@@ -1086,26 +1087,58 @@ def _offered_pairs(conn: sqlite3.Connection) -> list[dict[str, int]]:
 
 
 def _line_node(
-    conn: sqlite3.Connection,
-    entry_id: int,
-    children: dict[int, list[int]],
+    item: dict[str, Any],
     by_id: dict[int, sqlite3.Row],
-    depth: int,
 ) -> str:
-    row = by_id.get(entry_id)
-    prompt = " ".join(str(row["prompt"] or "").split()) if row is not None else ""
-    state = row["state"] if row is not None else "unknown"
-    inner = "\n".join(
-        _line_node(conn, kid, children, by_id, depth + 1)
-        for kid in children.get(entry_id, [])
+    """One generation's card: the critique that asked for it, then the entry.
+
+    An entry that is not public — held at the publication gate, or rejected —
+    gets the card and nothing of its own: the generation, and that it is
+    waiting. The critique above it came from the public parent and is the reason
+    the child exists, so it stays (packet 5.3, spec §8.1).
+    """
+    entry_id = int(item["entry_id"])
+    depth = min(int(item["generation"]), 6)
+    public = entry_id in by_id
+    head = (
+        f'<a href="../e/{entry_id}/">entry {entry_id}</a> '
+        f'<span class="chip {_esc(item["state"])}">{_esc(item["state"])}</span>'
+        if public
+        else f"entry {entry_id} <span class=\"chip\">not published</span>"
+    )
+    critique = ""
+    if item["critique"]:
+        critique = (
+            f'<p class="critique">Revise: {_esc(item["critique"])} '
+            f'<span class="dim">— critique by '
+            f'{_esc(item["critique_by"] or "unknown")}</span></p>'
+        )
+    body = (
+        f'<p class="node-prompt">{_esc(" ".join(str(item["prompt"] or "").split()))}</p>'
+        if public
+        else '<p class="node-prompt">This generation has not been through the '
+        "publication gate, so the gallery shows the critique and nothing "
+        "else.</p>"
     )
     return (
-        f'<div class="node depth-{min(depth, 6)}">'
-        f'<p class="node-head"><a href="../e/{entry_id}/">entry {entry_id}</a> '
-        f'<span class="chip {_esc(state)}">{_esc(state)}</span></p>'
-        f'<p class="node-prompt">{_esc(prompt)}</p>'
-        f"{inner}</div>"
+        f'<div class="node depth-{depth}">'
+        f"{critique}"
+        f'<p class="node-head">{head} '
+        f'<span class="dim">generation {_esc(item["generation"])}</span></p>'
+        f"{body}</div>"
     )
+
+
+#: The card that closes a line standing at DECIDE[lineage-depth].
+_WAITS_CARD = (
+    '<div class="node depth-{depth} waits">'
+    '<p class="node-head">generation {generation} — waits for a person</p>'
+    '<p class="node-prompt">DECIDE[lineage-depth] is three: a self-prompted line '
+    "runs three generations on its own and then stops until somebody looks at it. "
+    "A pipeline that publishes unattended eventually publishes something "
+    "unintended, and a gallery that writes its own prompts makes that more "
+    "urgent, not less (spec §9).</p></div>"
+)
 
 
 def _line_page(
@@ -1114,7 +1147,14 @@ def _line_page(
     children: dict[int, list[int]],
     by_id: dict[int, sqlite3.Row],
 ) -> str:
-    count = 1 + len(_descendants(children, root))
+    generations = lineage.line(conn, root)
+    cards = [_line_node(item, by_id) for item in generations]
+    deepest = max((int(item["generation"]) for item in generations), default=0)
+    if any(item["at_limit"] for item in generations):
+        cards.append(
+            _WAITS_CARD.format(depth=min(deepest, 6), generation=deepest)
+        )
+    count = len(generations) or 1 + len(_descendants(children, root))
     return _template("line.html").substitute(
         root="../",
         page_title=f"Line from entry {root}",
@@ -1124,7 +1164,7 @@ def _line_page(
             "prompt for the next; this is what the gallery means by generating "
             "itself (spec §8.1)."
         ),
-        tree=_line_node(conn, root, children, by_id, 0),
+        tree="\n".join(cards),
     )
 
 

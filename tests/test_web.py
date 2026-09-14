@@ -511,6 +511,115 @@ class TestHeld(WebTestCase):
         self.assertEqual(job.last_error, "off brief")
 
 
+class TestSpawn(WebTestCase):
+    """POST /entry/<id>/spawn — packet 5.3's one write to the operator UI."""
+
+    def published_entry(self, prompt, parent=None, generation=None):
+        """A published entry, optionally already N generations into a line."""
+        conn = self.db()
+        try:
+            job_id = db.enqueue(conn, prompt, "student-two", rules_file="control")
+            db.transition(conn, job_id, "executing")
+            db.transition(conn, job_id, "gating")
+            db.transition(conn, job_id, "held")
+            db.transition(conn, job_id, "published")
+            entry_id = db.create_entry(
+                conn, job_id, "published", prompt=prompt,
+                parent_entry_id=parent, submitted_by="student-two",
+                rules_file="control",
+            )
+            if generation is not None:
+                db.add_lineage(
+                    conn, entry_id, parent, generation=generation,
+                    critique_by="gemma4:e4b", critique="an earlier critique",
+                )
+            return entry_id
+        finally:
+            conn.close()
+
+    def test_spawn_from_a_published_entry_queues_a_child_with_the_parent(self):
+        entry_id = self.published_entry("a field of circles that drift")
+        status, location = self.post(
+            f"/entry/{entry_id}/spawn",
+            {"critique": "let one circle fall out of phase",
+             "critique_by": "gemma4:e4b", "back": "/held"},
+        )
+        self.assertEqual(303, status)
+        self.assertTrue(location.startswith("/held?flash="), location)
+        self.assertIn("Queued%20as", location)
+
+        conn = self.db()
+        try:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE parent_entry_id = ?", (entry_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row)
+        self.assertEqual("queued", row["state"])
+        self.assertIsNone(row["needs"])
+        self.assertEqual("gemma4:e4b", row["critique_by"])
+        self.assertEqual("let one circle fall out of phase", row["critique"])
+        self.assertIn("Revise: let one circle fall out of phase", row["prompt"])
+        self.assertTrue(row["prompt"].startswith("a field of circles that drift"))
+
+    def test_at_the_depth_limit_the_child_is_held_and_needs_review(self):
+        root = self.published_entry("the root of a long line")
+        deep = self.published_entry(
+            "two critiques in already", parent=root, generation=2
+        )
+        status, location = self.post(
+            f"/entry/{deep}/spawn",
+            {"critique": "one more turn of the same idea",
+             "critique_by": "gemma4:e4b", "back": "/held"},
+        )
+        self.assertEqual(303, status)
+        self.assertIn("depth", location)
+
+        conn = self.db()
+        try:
+            row = conn.execute(
+                "SELECT * FROM jobs WHERE parent_entry_id = ?", (deep,)
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual("queued", row["state"])
+        self.assertEqual("review", row["needs"])
+        self.assertEqual("hold", row["publication"])
+
+    def test_spawning_from_a_held_entry_changes_nothing(self):
+        conn = self.db()
+        try:
+            before = conn.execute(
+                "SELECT COUNT(*) AS c FROM jobs WHERE parent_entry_id = ?",
+                (self.entry_id,),
+            ).fetchone()["c"]
+        finally:
+            conn.close()
+        status, location = self.post(
+            f"/entry/{self.entry_id}/spawn",
+            {"critique": "slower and warmer", "critique_by": "profcarroll"},
+        )
+        self.assertEqual(303, status)
+        self.assertIn("nothing", location)
+        conn = self.db()
+        try:
+            after = conn.execute(
+                "SELECT COUNT(*) AS c FROM jobs WHERE parent_entry_id = ?",
+                (self.entry_id,),
+            ).fetchone()["c"]
+        finally:
+            conn.close()
+        self.assertEqual(before, after)
+
+    def test_the_form_is_on_the_held_cards_and_on_the_job_page(self):
+        held = self.text("/held")
+        self.assertIn(f'action="/entry/{self.entry_id}/spawn"', held)
+        self.assertIn("Spawn a child", held)
+        job = self.text(f"/job/{self.held_id}")
+        self.assertIn(f'action="/entry/{self.entry_id}/spawn"', job)
+
+
 class TestStaticFiles(WebTestCase):
     def test_a_gate_png_is_served_as_a_png(self):
         status, content_type, body = self.get(

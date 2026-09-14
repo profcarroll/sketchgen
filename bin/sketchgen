@@ -51,8 +51,14 @@ KEY_ROLES = {
 
 
 def _add_path_option(parser: argparse.ArgumentParser) -> None:
+    # `--db` is the spelling every other subcommand uses and the one anybody
+    # coming from them will type first; it is an alias here rather than a
+    # second option, so `db status --db X` and `db status --path X` are the
+    # same flag and cannot disagree.
     parser.add_argument(
         "--path",
+        "--db",
+        dest="path",
         default=db.DEFAULT_DB_PATH,
         metavar="P",
         help="database file (default: $SKETCHGEN_DB, else ~/sketchgen/sketchgen.db)",
