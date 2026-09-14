@@ -89,6 +89,9 @@ LICENCE_URL = "https://creativecommons.org/licenses/by/4.0/"
 
 #: The states that get a directory under ``e/``. ``held`` and ``rejected`` are
 #: not public: publication holds for a person (spec §9, DECIDE[publication-gate]).
+#: A ``failed-kept`` row is public only once that person has published it, which
+#: is when the publisher stamps ``published_utc``; before that it is as private
+#: as a held entry, and ``_entries`` says so.
 PUBLIC_STATES = ("published", "failed-kept")
 
 #: Every key ``meta.json`` carries: the spec §7 provenance, plus the four the
@@ -328,13 +331,27 @@ def _entry(conn: sqlite3.Connection, entry_id: int, *, publishing: bool = False)
             f"entry {entry_id} is {row['state']}: only "
             f"{' and '.join(PUBLIC_STATES)} entries are public"
         )
+    if row["state"] == "failed-kept" and not row["published_utc"] and not publishing:
+        raise UnknownEntry(
+            f"entry {entry_id} is a kept rejection nobody has published yet: "
+            "publish it first (spec §9)"
+        )
     return row
 
 
 def _entries(conn: sqlite3.Connection, state: str) -> list[sqlite3.Row]:
+    """The rows in ``state`` that the publisher has put on the site.
+
+    ``published_utc`` is set by a successful push and by nothing else. The
+    worker marks a rejection ``failed-kept`` the moment the gate gives up, long
+    before anyone decides to show it; without this clause the index would
+    print a card, and a 404 behind it, for every rejection nobody published.
+    """
     return list(
         conn.execute(
-            "SELECT * FROM entries WHERE state = ? ORDER BY created_utc, id", (state,)
+            "SELECT * FROM entries WHERE state = ? AND published_utc IS NOT NULL "
+            "ORDER BY created_utc, id",
+            (state,),
         )
     )
 

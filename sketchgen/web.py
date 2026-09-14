@@ -1667,57 +1667,94 @@ def _held_preview(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
     return ""
 
 
-def held_page(app: App, conn: sqlite3.Connection) -> str:
-    rows = _entry_rows(conn)
-    cards = []
-    for row in rows:
-        lineage = conn.execute(
-            "SELECT parent_entry_id, generation, critique_by FROM lineage "
-            "WHERE child_entry_id = ?",
-            (row["id"],),
-        ).fetchone()
-        if lineage is not None:
-            note = (
-                f"generation {lineage['generation']}, from entry "
-                f"{lineage['parent_entry_id']}"
-                + (f", critiqued by {lineage['critique_by']}" if lineage["critique_by"] else "")
-            )
-        elif row["parent_entry_id"]:
-            note = f"child of entry {row['parent_entry_id']}"
-        else:
-            note = "a root prompt, no lineage"
-        cards.append(
-            '<section class="panel card">'
-            f"<h2>Entry {row['id']} <span class='dim' style='text-transform:none'>"
-            f"— job <a href=\"/job/{row['job_id']}\">{row['job_id']}</a></span></h2>"
-            # The sketch running, then the strip the gate saw. Publication is a
-            # person's decision (DECIDE[publication-gate]) and this is the part
-            # of it a still frame cannot carry.
-            f"{_held_preview(app, conn, row)}"
-            f"{_entry_image(app, row)}"
-            f"<p>{esc(truncate(row['prompt'], 200))}</p>"
-            f"<p class=\"dim\" style=\"font-size:12px\">{esc(_gate_summary(conn, row['job_id']))}"
-            f" · {esc(note)} · {esc(row['executor'] or '—')}"
-            f" · rules {esc(row['rules_file'] or '—')}</p>"
-            '<div class="actions">'
-            f'<form method="post" action="/held/{row["id"]}/publish">'
-            "<button type=\"submit\">Publish</button></form>"
+def _lineage_note(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    lineage = conn.execute(
+        "SELECT parent_entry_id, generation, critique_by FROM lineage "
+        "WHERE child_entry_id = ?",
+        (row["id"],),
+    ).fetchone()
+    if lineage is not None:
+        return (
+            f"generation {lineage['generation']}, from entry "
+            f"{lineage['parent_entry_id']}"
+            + (f", critiqued by {lineage['critique_by']}" if lineage["critique_by"] else "")
+        )
+    if row["parent_entry_id"]:
+        return f"child of entry {row['parent_entry_id']}"
+    return "a root prompt, no lineage"
+
+
+def _decision_card(
+    app: App, conn: sqlite3.Connection, row: sqlite3.Row, *, kept: bool
+) -> str:
+    """One entry waiting for a person: the sketch, the strip, the buttons.
+
+    A held entry can be published or rejected. A kept rejection — the gate
+    refused every attempt and the worker kept it (spec §9) — can only be
+    published, onto the rejections page rather than the grid, because it is
+    a rejection already.
+    """
+    reject = (
+        ""
+        if kept
+        else (
             f'<form method="post" action="/held/{row["id"]}/reject">'
             '<input type="text" name="reason" placeholder="reason" '
             'style="font:inherit;padding:4px 8px;border:1px solid var(--line);'
             'border-radius:5px;background:var(--bg);color:var(--fg)">'
             '<button type="submit" class="danger">Reject</button></form>'
-            "</div>"
-            f'<div class="actions">{spawn_form(row, "/held")}</div>'
-            "</section>"
         )
+    )
+    return (
+        '<section class="panel card">'
+        f"<h2>Entry {row['id']} <span class='dim' style='text-transform:none'>"
+        f"— job <a href=\"/job/{row['job_id']}\">{row['job_id']}</a></span></h2>"
+        # The sketch running, then the strip the gate saw. Publication is a
+        # person's decision (DECIDE[publication-gate]) and this is the part
+        # of it a still frame cannot carry.
+        f"{_held_preview(app, conn, row)}"
+        f"{_entry_image(app, row)}"
+        f"<p>{esc(truncate(row['prompt'], 200))}</p>"
+        f"<p class=\"dim\" style=\"font-size:12px\">{esc(_gate_summary(conn, row['job_id']))}"
+        f" · {esc(_lineage_note(conn, row))} · {esc(row['executor'] or '—')}"
+        f" · rules {esc(row['rules_file'] or '—')}</p>"
+        '<div class="actions">'
+        f'<form method="post" action="/held/{row["id"]}/publish">'
+        "<button type=\"submit\">Publish</button></form>"
+        f"{reject}"
+        "</div>"
+        f'<div class="actions">{spawn_form(row, "/held")}</div>'
+        "</section>"
+    )
+
+
+def held_page(app: App, conn: sqlite3.Connection) -> str:
+    rows = _entry_rows(conn)
+    cards = [_decision_card(app, conn, row, kept=False) for row in rows]
     if not cards:
         cards.append(
             '<section class="panel"><p class="dim">nothing is waiting. '
             "A job reaches this page when its gate goes green and its "
             "publication is <em>hold</em>.</p></section>"
         )
-    return render("op_held", count=len(rows), cards="\n".join(cards))
+    # Kept rejections wait for the same person. The worker marks them
+    # failed-kept the moment the gate gives up; they reach the gallery's
+    # rejections page only when somebody here publishes them, and the ones
+    # already published (published_utc set) have left this page.
+    kept = [row for row in _entry_rows(conn, "failed-kept") if not row["published_utc"]]
+    kept_cards = [_decision_card(app, conn, row, kept=True) for row in kept]
+    if not kept_cards:
+        kept_cards.append(
+            '<section class="panel"><p class="dim">no kept rejection is waiting.'
+            "</p></section>"
+        )
+    return render(
+        "op_held",
+        count=len(rows),
+        cards="\n".join(cards),
+        kept_count=len(kept),
+        kept_cards="\n".join(kept_cards),
+    )
 
 
 def publish_entry(app: App, conn: sqlite3.Connection, entry_id: int) -> str:

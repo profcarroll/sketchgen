@@ -324,6 +324,9 @@ def build_db(tmp: Path):
         assertions_json=json.dumps(["responds(audio)"]), attempts=2,
         prompt_tokens=2200, completion_tokens=1400, wall_s=142.4,
         shape="VM.Standard.A1.Flex 16/96", seed=1, submitted_by="astudent",
+        # kept by the worker, then published by a person: that stamp is what
+        # puts it on the rejections page
+        published_utc="2026-09-14T04:20:33Z", publish_commit=None,
         source_dir=str(failed_dirs[-1]),
         strip_path=str(failed_dirs[-1] / ".gate" / "strip.png"),
         png_path=str(failed_dirs[-1] / ".gate" / "gate.png"),
@@ -400,6 +403,26 @@ class TreeTests(GalleryTestCase):
         with self.assertRaises(gallery.UnknownEntry):
             gallery.render_entry(self.conn, held, self.dest, self.config)
         self.assertFalse((self.dest / "e" / str(held)).exists())
+
+    def test_a_kept_rejection_nobody_published_is_on_no_page(self):
+        # The worker keeps it the moment the gate gives up; a person has not
+        # published it (spec §9). Until then it is as private as a held entry:
+        # no directory, no card, no 404 behind a card.
+        job = db.enqueue(self.conn, "a rejection nobody has published", "profcarroll")
+        kept = db.create_entry(
+            self.conn, job, state="failed-kept",
+            prompt="a rejection nobody has published",
+        )
+        with self.assertRaises(gallery.UnknownEntry):
+            gallery.render_entry(self.conn, kept, self.dest, self.config)
+        self.render()
+        self.assertFalse((self.dest / "e" / str(kept)).exists())
+        failed = (self.dest / "rejections.html").read_text(encoding="utf-8")
+        self.assertNotIn(f'data-entry="{kept}"', failed)
+        self.assertNotIn(f"e/{kept}/", failed)
+        # the publisher, rendering ahead of its push, is still admitted
+        out = gallery.render_entry(self.conn, kept, self.dest, self.config, publishing=True)
+        self.assertTrue((out / "index.html").exists())
 
     def test_publisher_may_render_a_held_entry_as_published(self):
         # The publisher renders BEFORE the push that flips the row, so with
