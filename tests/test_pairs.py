@@ -569,12 +569,21 @@ class RenderedPageTests(unittest.TestCase):
         self.assertEqual(page.count("no pairs yet"), 2)
 
     def test_the_grid_cards_show_the_scores(self):
+        """The card shows the standing; the numbers ride in the marks' titles.
+
+        Packet 5.4 replaced the two sentences of score text with two tracks —
+        the score and its pair count moved into each mark's hover text, and the
+        'brief' question got a track of its own instead of a second line.
+        """
         index = self.read("index.html")
         table = pairs.scores(self.conn, population="human", question="look")
         for entry_id in self.ids[:2]:
             with self.subTest(entry=entry_id):
                 self.assertIn(f"{float(table[entry_id]['score']):.2f} over 3 pairs", index)
-        self.assertIn("card-briefs", index)
+        self.assertIn('class="standing"', index)
+        self.assertIn("closer to its brief</span>", index)
+        self.assertIn('title="humans: ', index)
+        self.assertNotIn("card-briefs", index)
         self.assertEqual(balance(self.dest / "index.html"), [])
 
     def test_the_agent_score_is_its_own_number(self):
