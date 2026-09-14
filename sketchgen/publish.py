@@ -515,8 +515,12 @@ def publish_index(
             gallery_url=config.gallery_url,
             repository=config.repository,
         )
+    # Only what a person has published: a kept rejection without a
+    # published_utc is still waiting for that decision (spec §9), and a
+    # re-render is not the place it gets made.
     rows = conn.execute(
-        "SELECT id FROM entries WHERE state IN ('published', 'failed-kept') ORDER BY id"
+        "SELECT id FROM entries WHERE state IN ('published', 'failed-kept') "
+        "AND published_utc IS NOT NULL ORDER BY id"
     ).fetchall()
     for row in rows:
         gallery.render_entry(conn, row["id"], checkout, config)

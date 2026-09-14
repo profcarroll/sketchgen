@@ -263,6 +263,37 @@ class TestPages(WebTestCase):
                 self.assertIn('value="stop"', page)
                 self.assertIn("Gallery", page)
 
+    def test_the_held_page_offers_kept_rejections_for_publishing(self):
+        # A gate rejection the worker kept waits here too (spec §9): it can
+        # be published onto the rejections page, but there is nothing to
+        # reject. One already published has left the page.
+        conn = self.db()
+        try:
+            job = db.enqueue(conn, "a kept rejection", "student-three")
+            conn.execute("UPDATE jobs SET state = 'failed' WHERE id = ?", (job,))
+            kept = db.create_entry(conn, job, "failed-kept", prompt="a kept rejection")
+            done_job = db.enqueue(conn, "a published rejection", "student-three")
+            conn.execute("UPDATE jobs SET state = 'failed' WHERE id = ?", (done_job,))
+            done = db.create_entry(
+                conn, done_job, "failed-kept", prompt="a published rejection",
+                published_utc="2026-09-14T13:00:00Z",
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        try:
+            page = self.text("/held")
+            self.assertIn(f'action="/held/{kept}/publish"', page)
+            self.assertNotIn(f'action="/held/{kept}/reject"', page)
+            self.assertNotIn(f'action="/held/{done}/publish"', page)
+            self.assertIn(f'action="/held/{self.entry_id}/reject"', page)
+        finally:
+            conn = self.db()
+            conn.execute("DELETE FROM entries WHERE id IN (?, ?)", (kept, done))
+            conn.execute("DELETE FROM jobs WHERE id IN (?, ?)", (job, done_job))
+            conn.commit()
+            conn.close()
+
     def test_console_json_is_json_and_says_its_source(self):
         status, content_type, body = self.get("/api/console.json")
         self.assertEqual(status, 200)
