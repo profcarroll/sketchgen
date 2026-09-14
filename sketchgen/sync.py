@@ -60,6 +60,7 @@ JUDGE_KIND = "human"
 PROMPT_VERSION = "gallery-v1"
 
 DEFAULT_URL = os.environ.get("SKETCHGEN_WRITEPATH_URL", "")
+USER_AGENT = "sketchgen-sync/1.0 (+https://github.com/profcarroll/sketchgen)"
 DEFAULT_TOKEN_FILE = str(Path.home() / "sketchgen" / "writepath.token")
 DEFAULT_TIMEOUT = 30.0
 
@@ -155,7 +156,13 @@ def fetch_changes(
     target = f"{base}/pull?" + urllib.parse.urlencode({"since": since})
     request = urllib.request.Request(
         target,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            # Cloudflare's browser integrity check answers 403 (error 1010) to
+            # Python-urllib's default agent; a named agent passes. Measured.
+            "User-Agent": USER_AGENT,
+        },
         method="GET",
     )
     try:

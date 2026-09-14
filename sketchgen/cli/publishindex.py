@@ -23,6 +23,7 @@ def cmd(args: argparse.Namespace) -> int:
             os.path.expanduser(args.gallery_dir),
             key=os.path.expanduser(args.key) if args.key else None,
             remote=args.remote,
+            write_path=args.write_path,
         )
     except publication.PublishRefused as exc:
         print(f"sketchgen: refused: {exc}", file=sys.stderr)
@@ -57,4 +58,11 @@ def register(top: argparse._SubParsersAction) -> None:
         help="deploy key for an ssh remote (default: ~/.ssh/sketchgen-gallery)",
     )
     p.add_argument("--remote", default=None, metavar="URL")
+    p.add_argument(
+        "--write-path",
+        dest="write_path",
+        default=os.environ.get("SKETCHGEN_WRITEPATH_URL") or None,
+        metavar="URL",
+        help="the gallery write-path base URL to record in config.json and every page",
+    )
     p.set_defaults(func=cmd, _parser=p)
