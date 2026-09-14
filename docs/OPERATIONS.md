@@ -128,3 +128,18 @@ entry with `--dry-run` before publishing it for real.
 Nothing to do. The unit encodes no core count, no memory figure and no
 concurrency: one job at a time, fenced against other clients. The node gets
 smaller, jobs get slower, the drip drips further apart.
+
+## The operator UI as a service
+
+`install-unit` also copies `systemd/sketchgen-web.service`. It runs `sketchgen web`
+on `127.0.0.1:8081` with no authentication, so it must only ever be reached over an
+SSH tunnel:
+
+```bash
+systemctl --user enable --now sketchgen-web.service      # on the node
+ssh -f -N -L 8081:127.0.0.1:8081 sld-cloud                # on the laptop
+```
+
+Then open http://localhost:8081/ — the Console; Queue, New job, Job detail (live
+transcript) and Held are in its top bar, with the worker's Pause / Stop now / Resume
+control upper right. Logs: `journalctl --user -u sketchgen-web -n 50`.
