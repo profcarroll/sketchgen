@@ -234,7 +234,7 @@ def scan_for_personal_data(source: Path) -> None:
             )
 
 
-def _render_with_generator(conn: sqlite3.Connection, entry_id: int, dest: Path) -> None:
+def _render_with_generator(conn: sqlite3.Connection, entry_id: int, dest: Path) -> Path:
     """Ask packet 3.1's generator for the entry's files, or refuse.
 
     This module never invents an entry's files: either the caller passes a
@@ -248,9 +248,12 @@ def _render_with_generator(conn: sqlite3.Connection, entry_id: int, dest: Path) 
     if render is None:
         raise PublishRefused("generator not present; pass --from")
     try:
-        render(conn, entry_id, dest, publishing=True)
+        # The generator takes the gallery ROOT and writes dest/e/<id>/, which it
+        # returns; that returned directory is the entry, and it is what we copy.
+        out = render(conn, entry_id, dest, publishing=True)
     except Exception as exc:  # the generator's own refusals, reported, not raised
         raise PublishRefused(f"generator refused entry {entry_id}: {exc}") from exc
+    return Path(out) if out else dest / "e" / str(entry_id)
 
 
 # ---------------------------------------------------------------------------
@@ -369,7 +372,7 @@ def publish(
         temporary = tempfile.mkdtemp(prefix="sketchgen-publish-")
         source = Path(temporary)
         try:
-            _render_with_generator(conn, entry_id, source)
+            source = _render_with_generator(conn, entry_id, source)
         except Exception:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
