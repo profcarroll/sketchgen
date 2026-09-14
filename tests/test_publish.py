@@ -402,6 +402,33 @@ class PublishIndexTests(PublishTestCase):
         self.assertNotIn(f'data-entry="{kept}"', index)
 
 
+    def test_a_failed_index_render_leaves_the_checkout_clean(self):
+        # The second pass died mid-render on the node (2026-09-14, entry 71)
+        # and every publish after it was refused for a dirty checkout.
+        result = self.publish_cli("--by", "profcarroll")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        head = self.head(self.gallery)
+        from sketchgen import gallery, publish as publication
+
+        def dies_half_way(conn, dest, config=None):
+            (Path(dest) / "config.json").write_text("{}", encoding="utf-8")
+            (Path(dest) / "stray.txt").write_text("half a render", encoding="utf-8")
+            raise RuntimeError("template asked for a placeholder this code does not know")
+
+        original = gallery.render_index
+        gallery.render_index = dies_half_way
+        try:
+            sha, why = publication._publish_index(
+                self.conn, self.gallery, "main", str(self.bare), None, self.entry_id
+            )
+        finally:
+            gallery.render_index = original
+        self.assertIsNone(sha)
+        self.assertIn("index render failed", why)
+        self.assertEqual(head, self.head(self.gallery))
+        self.assertEqual("", git(self.gallery, "status", "--porcelain").stdout.strip())
+
+
 class ScanTests(unittest.TestCase):
     def test_binary_files_are_not_scanned_for_addresses(self):
         import tempfile, pathlib
