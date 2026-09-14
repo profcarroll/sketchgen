@@ -11,11 +11,13 @@ Python 3.12, standard library only. No dependencies, no framework.
 
 ```
 sketchgen/       the package: db.py (schema, helpers, state machine), planner.py,
-                 executor.py, worker.py (the loop)
+                 executor.py, worker.py (the loop), console.py (the vitals)
+sketchgen/cli/   drop-in subcommands, one file per packet, exposing register(top)
 migrations/      001_init.sql and everything after it, applied in order
 prompts/         executor.md, planner.md and the two rules files, versioned
 bin/sketchgen    the one CLI: db | enqueue | worker | control | execute | plan |
-                 install-unit | keygen  (later packets add publish, web, judge)
+                 install-unit | keygen | console  (later packets add publish,
+                 web, judge)
 systemd/         the worker's user unit and its timer
 tests/           stdlib unittest
 ```
@@ -78,6 +80,33 @@ python3 bin/sketchgen control pause --reason "someone else wants the slot"
 python3 bin/sketchgen control stop            # abort the attempt, re-queue the job
 python3 bin/sketchgen control resume
 ```
+
+## The console
+
+```
+python3 bin/sketchgen console                 # one reading, as a terminal page
+python3 bin/sketchgen console --json          # the same document, for the web UI
+python3 bin/sketchgen console --watch 2       # one document every two seconds
+```
+
+`console` collects the node's vitals the way `htop` shows them (per-core CPU,
+memory split into what is used and what is page cache, swap, disk with the model
+blobs and the browser named, load against the core count, the top three
+processes), the resident model and who holds the inference slot, the instant
+prefill and decode rates from the last attempt that had them, the token odometer,
+the production funnel and the per-sketch averages with their cost at both node
+shapes. It reads `/proc`, the filesystem, Ollama's `/api/ps` and the database; it
+calls no model, writes nothing and needs no sudo, so it is safe to run while a job
+holds the slot. A source that is missing or unreachable is `null` in the document,
+never an exception. Process command lines are cut to the executable's basename
+and redacted: an argument containing `key`, `token`, `secret` or `password` — and
+the value after such a flag — never reaches the page.
+
+The `--json` document's key names are the contract the web UI reads;
+`tests/fixtures/console/sample.json` is a full example of it and `tests/test_console.py`
+fails if the two ever disagree. "Session" means since the resident worker's last
+start, which it stamps into `meta.worker_started_utc`; with no stamp, session and
+total are the same numbers.
 
 ## Tests
 

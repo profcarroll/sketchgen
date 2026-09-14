@@ -780,6 +780,8 @@ class Worker:
 
     def run_forever(self, sleep_s: float = DEFAULT_SLEEP_S) -> int:
         """The resident mode systemd runs. Never start this from a tool call."""
+        # Packet 4.1: the console's "session" column is everything since here.
+        db.set_meta(self.conn, "worker_started_utc", db.utc_now())
         self.log(f"worker: resident, polling every {sleep_s:.0f}s")
         while True:
             try:

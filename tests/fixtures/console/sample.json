@@ -1,0 +1,127 @@
+{
+  "utc": "2026-09-14T04:31:07Z",
+  "collector_ms": 118.4,
+  "node": {
+    "shape": "VM.Standard.A1.Flex 16/96",
+    "cores": 16,
+    "uptime_s": 191244.6,
+    "load": [1.94, 1.12, 0.78],
+    "cpu_pct": [
+      98.0, 96.1, 94.0, 91.2, 12.0, 7.9, 4.0, 2.0,
+      1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    ],
+    "cpu_total_pct": 25.5,
+    "mem_mb": {
+      "total": 96289.0,
+      "used": 22884.3,
+      "cache": 61402.7,
+      "free": 12002.0,
+      "available": 71553.1
+    },
+    "swap_mb": {
+      "total": 0.0,
+      "used": 0.0
+    },
+    "disk_gb": {
+      "total": 139.7,
+      "used": 107.8,
+      "free": 31.9,
+      "models": 71.94,
+      "chromium": 0.96
+    },
+    "top": [
+      {"pid": 1188, "cpu_pct": 389.4, "mem_pct": 22.1, "cmd": "ollama runner --model /usr/share/ollama/.ollama/…"},
+      {"pid": 40122, "cpu_pct": 6.2, "mem_pct": 0.4, "cmd": "python3 bin/sketchgen worker"},
+      {"pid": 40318, "cpu_pct": 1.9, "mem_pct": 0.1, "cmd": "sshd ubuntu@notty"}
+    ]
+  },
+  "model": {
+    "ollama_version": "0.34.0",
+    "resident": [
+      {
+        "name": "qwen3-coder:30b-a3b-q4_K_M",
+        "size_gb": 20.51,
+        "processor": "100% CPU",
+        "context": 32768,
+        "until_utc": "2026-09-14T04:58:06Z"
+      }
+    ],
+    "slot": {
+      "state": "ours",
+      "holder": "sketchgen worker job 42"
+    },
+    "instant": {
+      "prefill_tok_s": 94.8,
+      "decode_tok_s": 25.4,
+      "from_attempt_id": 87,
+      "at_utc": "2026-09-14T04:30:01Z"
+    },
+    "gate_launch_s": 0.66
+  },
+  "worker": {
+    "control": "running",
+    "reason": null,
+    "updated_utc": "2026-09-13T21:14:02Z",
+    "started_utc": "2026-09-13T21:14:02Z",
+    "job_in_flight": 42
+  },
+  "odometer": {
+    "session": {
+      "in": 41574,
+      "out": 26908,
+      "wall_s": 2986.4,
+      "since_utc": "2026-09-13T21:14:02Z",
+      "slot_ours_pct": 9.6
+    },
+    "total": {
+      "in": 118203,
+      "out": 74612,
+      "wall_s": 8431.2
+    }
+  },
+  "funnel": {
+    "generated": {"now": 1, "session": 39, "per_day": 62.0, "total": 124},
+    "revised": {"now": 0, "session": 11, "per_day": 18.5, "total": 37},
+    "passed_gate": {"now": 0, "session": 27, "per_day": 43.5, "total": 87},
+    "published": {"now": 0, "session": 12, "per_day": 19.5, "total": 39},
+    "held": {"now": 3, "session": 9, "per_day": 14.0, "total": 28},
+    "rejected": {"now": 0, "session": 2, "per_day": 3.5, "total": 7},
+    "failed_kept": {"now": 0, "session": 4, "per_day": 6.5, "total": 13},
+    "children": {"now": 1, "session": 5, "per_day": 8.5, "total": 17}
+  },
+  "per_sketch": {
+    "last": {
+      "attempts_to_pass": 1.0,
+      "wall_s": 67.9,
+      "gate_s": 4.12,
+      "tokens_in": 1066.0,
+      "tokens_out": 628.0,
+      "sketch_lines": 65.0,
+      "first_attempt_pass_rate": 1.0,
+      "cost_usd_16_96": 0.0043,
+      "cost_usd_4_24": 0.0
+    },
+    "session": {
+      "attempts_to_pass": 1.44,
+      "wall_s": 96.3,
+      "gate_s": 4.38,
+      "tokens_in": 1521.7,
+      "tokens_out": 982.4,
+      "sketch_lines": 71.2,
+      "first_attempt_pass_rate": 0.692,
+      "cost_usd_16_96": 0.0061,
+      "cost_usd_4_24": 0.0
+    },
+    "all": {
+      "attempts_to_pass": 1.51,
+      "wall_s": 101.8,
+      "gate_s": 4.41,
+      "tokens_in": 1583.2,
+      "tokens_out": 1014.9,
+      "sketch_lines": 70.6,
+      "first_attempt_pass_rate": 0.663,
+      "cost_usd_16_96": 0.0064,
+      "cost_usd_4_24": 0.0
+    }
+  }
+}
