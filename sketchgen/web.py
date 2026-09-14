@@ -40,6 +40,16 @@ plausible. Every field is read through :func:`_dig`, which returns ``None`` for
 anything missing, so a collector whose document has grown a field or lost one
 renders a dash rather than a traceback.
 
+**The transcript is a stream, and the page still reads without it** (packet
+4.3). ``GET /events/job/<id>`` is server-sent events: the last 200 lines of
+``job.log`` at once, then each line as the worker appends it, a ``state`` event
+carrying the job's state and attempt count, and ``done`` when the job reaches a
+terminal state. The server-rendered tail stays in the HTML and the script
+replaces it on the first line event, so a reader with no JS — or with the
+stream refused — sees the log as of page load rather than an empty box. One
+stream is one thread for as long as the tab is open, so :data:`MAX_STREAMS`
+caps them and the next one gets 503 rather than a thread.
+
 **Publishing is somebody else's code.** ``POST /held/<id>/publish`` imports
 ``sketchgen.publish`` lazily (packet 3.2); when it is not there the page says
 "publisher not installed" and nothing changes — the entry stays held, which is
@@ -59,8 +69,9 @@ import sqlite3
 import string
 import sys
 import threading
+import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -81,8 +92,12 @@ __all__ = [
     "DEFAULT_BIND",
     "DEFAULT_PORT",
     "GALLERY_URL",
+    "LogTailer",
+    "MAX_STREAMS",
     "Refused",
     "console_document",
+    "job_document",
+    "live_streams",
     "make_server",
     "serve",
 ]
@@ -108,6 +123,19 @@ SAMPLE_CONSOLE = REPO_ROOT / "tests" / "fixtures" / "console" / "sample.json"
 ONCE_TIMEOUT_S = 60.0
 
 LOG_TAIL_LINES = 200
+
+#: One SSE stream is one thread for as long as the browser tab is open, so the
+#: number of them is capped rather than left to the client. Nine tabs on a
+#: single-user UI is a bug somewhere; the ninth gets 503, not a thread.
+MAX_STREAMS = 8
+#: How often the stream looks at the log file and at the job row.
+STREAM_POLL_S = 0.5
+#: How often a ``state`` event is sent even when nothing has changed.
+STATE_EVERY_S = 2.0
+#: How often a ``: keepalive`` comment is sent so an idle stream stays alive.
+KEEPALIVE_EVERY_S = 15.0
+#: How many lines the page keeps in ``#log`` before dropping from the top.
+BROWSER_LOG_LINES = 1000
 
 #: What ``GET /jobs/…`` will serve out of the jobs directory, and as what.
 SERVABLE = {
@@ -1252,6 +1280,191 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The live transcript: one SSE stream per open job page (packet 4.3)
+# ---------------------------------------------------------------------------
+
+#: Streams in flight, and the lock that counts them. ThreadingHTTPServer gives
+#: each stream its own thread and a stream lives as long as its reader does, so
+#: this is the only thing standing between an open tab per job and a thread per
+#: tab. Released in the handler's ``finally``, which runs when the client goes
+#: away because the next write raises.
+_STREAM_LOCK = threading.Lock()
+_STREAMS = 0
+
+
+def live_streams() -> int:
+    """How many transcript streams are open right now."""
+    with _STREAM_LOCK:
+        return _STREAMS
+
+
+def _take_stream() -> bool:
+    global _STREAMS
+    with _STREAM_LOCK:
+        if _STREAMS >= MAX_STREAMS:
+            return False
+        _STREAMS += 1
+        return True
+
+
+def _drop_stream() -> None:
+    global _STREAMS
+    with _STREAM_LOCK:
+        _STREAMS = max(0, _STREAMS - 1)
+
+
+def sse(data: str, event: str | None = None) -> bytes:
+    """One SSE frame. A multi-line payload becomes several ``data:`` lines."""
+    head = f"event: {event}\n" if event else ""
+    body = "".join(f"data: {line}\n" for line in data.split("\n"))
+    return (head + body + "\n").encode("utf-8")
+
+
+class LogTailer:
+    """Follow a growing file by byte offset and hand back whole lines only.
+
+    ``tail -f`` in twenty lines, with the two things a naive version gets
+    wrong: a write that lands mid-line is held in ``buffer`` until its newline
+    arrives, and a file that has become *shorter* than the offset (truncated,
+    or replaced by a new job.log) restarts from zero instead of reading from
+    the middle of a line forever.
+    """
+
+    def __init__(self, path: Path | str, tail_lines: int = LOG_TAIL_LINES) -> None:
+        self.path = Path(path)
+        self.tail_lines = tail_lines
+        self.offset = 0
+        self.buffer = b""
+
+    def initial(self) -> list[str]:
+        """The last ``tail_lines`` lines on disk now; the offset lands at EOF."""
+        return self._absorb(self._read_from(0))[-self.tail_lines :]
+
+    def poll(self) -> list[str]:
+        """Whatever whole lines have been appended since the last call."""
+        try:
+            size = self.path.stat().st_size
+        except OSError:
+            return []
+        if size < self.offset:  # truncated or replaced: start again from 0
+            self.offset = 0
+            self.buffer = b""
+            return self._absorb(self._read_from(0))
+        if size == self.offset:
+            return []
+        return self._absorb(self._read_from(self.offset))
+
+    def _read_from(self, start: int) -> bytes:
+        try:
+            with open(self.path, "rb") as handle:
+                handle.seek(start)
+                data = handle.read()
+        except OSError:  # not written yet, or gone: try again next poll
+            return b""
+        self.offset = start + len(data)
+        return data
+
+    def _absorb(self, data: bytes) -> list[str]:
+        if not data:
+            return []
+        self.buffer += data
+        if b"\n" not in self.buffer:
+            return []
+        whole, _, self.buffer = self.buffer.rpartition(b"\n")
+        return whole.decode("utf-8", "replace").split("\n")
+
+
+def job_state(conn: sqlite3.Connection, job: db.Job) -> dict[str, Any]:
+    """The small document a ``state`` event carries, and the head of the JSON."""
+    attempts = db.list_attempts(conn, job.id)
+    return {
+        "id": job.id,
+        "state": job.state,
+        "attempt_n": attempts[-1].n if attempts else 0,
+        "attempts": len(attempts),
+        "max_attempts": job.max_attempts,
+        "needs": job.needs,
+        "elapsed": elapsed_for(job),
+        "terminal": job.state in TERMINAL_STATES,
+        "updated_utc": job.updated_utc,
+        "utc": db.utc_now(),
+    }
+
+
+def job_document(
+    app: App, conn: sqlite3.Connection, job: db.Job, lines: int = LOG_TAIL_LINES
+) -> dict[str, Any]:
+    """``GET /api/job/<id>.json``: the row, its attempts and the tail.
+
+    The state event's builder reads the first half of this and the operator
+    reads all of it; one shape, so the page and a shell both see the same job.
+    """
+    document = job_state(conn, job)
+    document["job"] = asdict(job) | {"assertions": job.assertions}
+    document["attempt_rows"] = [asdict(attempt) for attempt in db.list_attempts(conn, job.id)]
+    document["log_lines"] = lines
+    document["log"] = log_tail(app.jobs_root / str(job.id) / "job.log", lines)
+    return document
+
+
+JOB_SCRIPT = """<script>
+// The transcript, live. The server-rendered tail above is what a reader with
+// no JS gets; when EventSource connects, the first `line` event clears it and
+// the stream becomes the page — the same last-200 lines, then every line as
+// the worker writes it. `state` events move the pill and the attempt counter,
+// `done` means the job is finished and there is nothing left to stream.
+(function () {
+  var log = document.getElementById("log");
+  if (!log || !window.EventSource) return;
+  var id = log.getAttribute("data-job");
+  if (!id) return;
+  var MAX = %d;
+  var cleared = false;
+  var source = new EventSource("/events/job/" + encodeURIComponent(id));
+  source.onopen = function () {
+    var live = document.getElementById("log-live");
+    if (live) live.textContent = "live";
+  };
+  function at_bottom() {
+    // Within a line and a half of the end counts as "following": scrolling up
+    // to read something is a decision, and the next line should not undo it.
+    return log.scrollHeight - log.scrollTop - log.clientHeight < 40;
+  }
+  source.addEventListener("line", function (event) {
+    var follow = at_bottom();
+    if (!cleared) { log.textContent = ""; cleared = true; follow = true; }
+    log.appendChild(document.createTextNode(event.data + "\\n"));
+    while (log.childNodes.length > MAX) log.removeChild(log.firstChild);
+    if (follow) log.scrollTop = log.scrollHeight;
+  });
+  source.addEventListener("state", function (event) {
+    var d;
+    try { d = JSON.parse(event.data); } catch (err) { return; }
+    var pill = document.getElementById("job-state");
+    if (pill && d.state) { pill.textContent = d.state; pill.className = "pill " + d.state; }
+    var n = document.getElementById("job-attempt");
+    if (n && d.attempt_n !== undefined && d.attempt_n !== null) n.textContent = d.attempt_n;
+    var max = document.getElementById("job-max-attempts");
+    if (max && d.max_attempts) max.textContent = d.max_attempts;
+  });
+  source.addEventListener("done", function () {
+    // Terminal state: the server has closed its end. Do not reconnect, do not
+    // refetch — the page already shows everything there will ever be.
+    source.close();
+    var live = document.getElementById("log-live");
+    if (live) live.textContent = "finished";
+  });
+  source.onerror = function () {
+    var live = document.getElementById("log-live");
+    if (live && source.readyState === EventSource.CLOSED) live.textContent = "disconnected";
+  };
+})();
+</script>""" % (
+    BROWSER_LOG_LINES,
+)
+
+
+# ---------------------------------------------------------------------------
 # The held page
 # ---------------------------------------------------------------------------
 
@@ -1425,6 +1638,8 @@ ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     ("GET", re.compile(r"^/queue$"), "page_queue"),
     ("GET", re.compile(r"^/new$"), "page_new"),
     ("POST", re.compile(r"^/new$"), "post_new"),
+    ("GET", re.compile(r"^/api/job/(?P<job_id>\d+)\.json$"), "api_job"),
+    ("GET", re.compile(r"^/events/job/(?P<job_id>\d+)$"), "events_job"),
     ("GET", re.compile(r"^/job/(?P<job_id>\d+)$"), "page_job"),
     ("POST", re.compile(r"^/job/(?P<job_id>\d+)/cancel$"), "post_cancel"),
     ("POST", re.compile(r"^/job/(?P<job_id>\d+)/laptop$"), "post_laptop"),
@@ -1661,8 +1876,135 @@ class OpHandler(BaseHTTPRequestHandler):
                 control=control,
                 back=f"/job/{job.id}",
                 flash=self.flash(),
+                page_script=JOB_SCRIPT,
             )
         )
+
+    def api_job(self, job_id: str) -> None:
+        conn = self.app.connect()
+        try:
+            job = db.get_job(conn, int(job_id))
+            if job is None:
+                self.send_error(404, "no such job")
+                return
+            document = job_document(self.app, conn, job)
+        finally:
+            conn.close()
+        self.json_out(document)
+
+    # -- the live transcript -----------------------------------------------
+
+    def events_job(self, job_id: str) -> None:
+        """``GET /events/job/<id>`` — the job log as it is written.
+
+        404 for an id that is not a job, 503 when :data:`MAX_STREAMS` are
+        already open. Everything after the headers is best-effort: a client
+        that goes away raises on the next write and the stream ends there,
+        quietly, because a closed browser tab is not an error.
+        """
+        conn = self.app.connect()
+        try:
+            job = db.get_job(conn, int(job_id))
+        finally:
+            conn.close()
+        if job is None:
+            self.send_error(404, "no such job")
+            return
+        if self.command == "HEAD":
+            # A HEAD would otherwise open a stream nobody is reading.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            return
+        if not _take_stream():
+            # ASCII only: this goes in the status line, which is latin-1.
+            self.send_error(
+                503, f"too many live transcripts (limit {MAX_STREAMS}); close a tab"
+            )
+            return
+        try:
+            self._stream_job(job.id)
+        finally:
+            _drop_stream()
+
+    def _write_chunk(self, chunk: bytes) -> bool:
+        """Write one frame. False means the reader has gone; stop streaming."""
+        try:
+            self.wfile.write(chunk)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError):
+            return False
+        return True
+
+    def _stream_job(self, job_id: int) -> None:
+        self.close_connection = True
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        # No Content-Length: the body ends when the connection does.
+        self.end_headers()
+
+        tailer = LogTailer(self.app.jobs_root / str(job_id) / "job.log")
+        quit_event = self.app.quit_event
+        conn = self.app.connect()
+        try:
+            for line in tailer.initial():
+                if not self._write_chunk(sse(line, "line")):
+                    return
+            snapshot = self._state_snapshot(conn, job_id)
+            if snapshot is None:  # deleted between the 404 check and here
+                self._write_chunk(sse(json.dumps({"id": job_id, "state": None}), "done"))
+                return
+            if not self._write_chunk(sse(json.dumps(snapshot), "state")):
+                return
+            last_state = time.monotonic()
+            last_keepalive = last_state
+            while snapshot is None or not snapshot.get("terminal"):
+                if quit_event is not None and quit_event.is_set():
+                    return
+                time.sleep(STREAM_POLL_S)
+                for line in tailer.poll():
+                    if not self._write_chunk(sse(line, "line")):
+                        return
+                now = time.monotonic()
+                fresh = self._state_snapshot(conn, job_id)
+                if fresh is None:  # the job row went away under us
+                    break
+                changed = snapshot is None or any(
+                    fresh.get(key) != snapshot.get(key)
+                    for key in ("state", "attempt_n", "needs", "max_attempts")
+                )
+                if changed or now - last_state >= STATE_EVERY_S:
+                    snapshot = fresh
+                    last_state = now
+                    if not self._write_chunk(sse(json.dumps(fresh), "state")):
+                        return
+                else:
+                    snapshot = fresh
+                if now - last_keepalive >= KEEPALIVE_EVERY_S:
+                    last_keepalive = now
+                    if not self._write_chunk(b": keepalive\n\n"):
+                        return
+            # Terminal: one last sweep of the log, then say so and close.
+            for line in tailer.poll():
+                if not self._write_chunk(sse(line, "line")):
+                    return
+            self._write_chunk(
+                sse(json.dumps({"id": job_id, "state": (snapshot or {}).get("state")}), "done")
+            )
+        finally:
+            conn.close()
+
+    def _state_snapshot(self, conn: sqlite3.Connection, job_id: int) -> dict[str, Any] | None:
+        try:
+            job = db.get_job(conn, job_id)
+        except sqlite3.Error:  # pragma: no cover - the database went away
+            return None
+        return None if job is None else job_state(conn, job)
 
     def post_cancel(self, job_id: str) -> None:
         self.form()

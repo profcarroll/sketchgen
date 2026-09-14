@@ -11,12 +11,14 @@ database and the jobs directory and nothing else.
 """
 
 import base64
+import http.client
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
@@ -295,8 +297,12 @@ class TestPages(WebTestCase):
 
     def test_job_page_shows_the_log_the_checks_and_the_artefacts(self):
         page = self.text(f"/job/{self.held_id}")
-        self.assertIn(f'<pre id="log" data-job="{self.held_id}">', page)
+        self.assertIn(f'<pre id="log" data-job="{self.held_id}"', page)
         self.assertIn("line 39", page)  # the tail, not the head
+        # Packet 4.3: the static tail is still the page's own content, and the
+        # stream is what the script asks for on top of it.
+        self.assertIn("/events/job/", page)
+        self.assertIn("new EventSource", page)
         self.assertIn("console_clean", page)
         self.assertIn("responds(click)", page)
         self.assertIn(f"/jobs/{self.held_id}/attempt-1/.gate/strip.png", page)
@@ -538,6 +544,247 @@ class TestStaticFiles(WebTestCase):
         self.assertEqual(
             self.get(f"/jobs/{self.held_id}/attempt-1/sketch.js")[0], 404
         )
+
+
+class TestLiveTranscript(WebTestCase):
+    """Packet 4.3: ``/events/job/<id>`` and the JSON the state event is built from.
+
+    Every test here drives the stream over a raw ``http.client`` connection
+    with a socket timeout, because the point of the endpoint is what arrives
+    *while* the connection is open — urllib would sit on it until EOF.
+    """
+
+    def setUp(self):
+        self._streams = []
+
+    def tearDown(self):
+        for pair in list(self._streams):
+            self.close_stream(*pair)
+        self._streams = []
+        # A server thread only notices a closed reader on its next write, so
+        # give the slots time to come back before the next test needs them.
+        self.wait_for_streams(0, deadline_s=20)
+
+    # -- helpers -----------------------------------------------------------
+
+    def stream(self, path, timeout=3):
+        """Open one SSE connection. Returns (connection, response)."""
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=timeout)
+        conn.request("GET", path)
+        response = conn.getresponse()
+        self._streams.append((conn, response))
+        return conn, response
+
+    @staticmethod
+    def close_stream(conn, response):
+        """Hang up. The response holds the socket, so it is what must close.
+
+        ``Connection: close`` makes http.client drop its own reference the
+        moment the headers are read, so ``conn.close()`` alone leaves the
+        socket open on the response's file object and the server never sees
+        the hangup.
+        """
+        for closeable in (response, conn):
+            try:
+                closeable.close()
+            except OSError:
+                pass
+
+    def read_lines(self, response, until, deadline_s=2.0):
+        """Read SSE lines until ``until(collected)`` says stop, or time runs out.
+
+        Returns the lines collected. A read that times out is not a failure by
+        itself — the caller asserts on what did arrive, and when.
+        """
+        collected = []
+        end = time.monotonic() + deadline_s
+        while time.monotonic() < end:
+            try:
+                raw = response.readline()
+            except (TimeoutError, OSError):
+                break
+            if not raw:
+                collected.append(None)  # EOF: the server closed its end
+                break
+            collected.append(raw.decode("utf-8").rstrip("\n"))
+            if until(collected):
+                break
+        return collected
+
+    def wait_for_streams(self, n, deadline_s=10.0):
+        end = time.monotonic() + deadline_s
+        while web.live_streams() != n and time.monotonic() < end:
+            time.sleep(0.05)
+        return web.live_streams()
+
+    @staticmethod
+    def data_lines(lines):
+        return [line[6:] for line in lines if line and line.startswith("data: ")]
+
+    # -- the stream --------------------------------------------------------
+
+    def test_the_tail_arrives_at_once_then_new_lines_as_they_are_written(self):
+        log = self.jobs_dir / str(self.held_id) / "job.log"
+        conn, response = self.stream(f"/events/job/{self.held_id}")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers.get("Content-Type"), "text/event-stream")
+        self.assertEqual(response.headers.get("Cache-Control"), "no-cache")
+
+        # The 40 lines already on disk, before anything else happens.
+        seen = self.read_lines(
+            response, lambda got: "data: 2026-09-14T12:00:39Z job %d: line 39"
+            % self.held_id in got,
+            deadline_s=2.0,
+        )
+        self.assertIn(
+            "data: 2026-09-14T12:00:00Z job %d: line 0" % self.held_id, seen
+        )
+        self.assertIn(
+            "data: 2026-09-14T12:00:39Z job %d: line 39" % self.held_id, seen
+        )
+        self.assertIn("event: line", seen)
+
+        # …and a line appended after the connection is open.
+        marker = "2026-09-14T12:01:00Z job %d: appended after connect" % self.held_id
+        started = time.monotonic()
+        with open(log, "a", encoding="utf-8") as handle:
+            handle.write(marker + "\n")
+        seen = self.read_lines(
+            response, lambda got: ("data: " + marker) in got, deadline_s=2.0
+        )
+        self.assertIn("data: " + marker, seen)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_the_state_event_carries_the_state_and_the_attempt_count(self):
+        conn, response = self.stream(f"/events/job/{self.held_id}")
+        seen = self.read_lines(
+            response,
+            lambda got: "event: state" in got and got[-1].startswith("data: "),
+            deadline_s=3.0,
+        )
+        self.assertIn("event: state", seen)
+        payload = json.loads(self.data_lines(seen[seen.index("event: state") :])[0])
+        self.assertEqual(payload["state"], "held")
+        self.assertEqual(payload["id"], self.held_id)
+        self.assertEqual(payload["attempt_n"], 1)
+        self.assertEqual(payload["max_attempts"], 3)
+        self.assertFalse(payload["terminal"])
+
+    def test_a_terminal_state_sends_done_and_closes(self):
+        conn = self.db()
+        try:
+            job_id = db.enqueue(conn, "a job about to be cancelled", "student-one")
+        finally:
+            conn.close()
+        (self.jobs_dir / str(job_id)).mkdir(parents=True, exist_ok=True)
+        (self.jobs_dir / str(job_id) / "job.log").write_text(
+            "2026-09-14T12:00:00Z job %d: queued\n" % job_id, encoding="utf-8"
+        )
+        stream_conn, response = self.stream(f"/events/job/{job_id}", timeout=6)
+        self.read_lines(response, lambda got: "event: state" in got, deadline_s=3.0)
+
+        conn = self.db()
+        try:
+            db.transition(conn, job_id, "failed", last_error="cancelled by operator")
+        finally:
+            conn.close()
+
+        seen = self.read_lines(response, lambda got: None in got, deadline_s=6.0)
+        self.assertIn("event: done", seen)
+        self.assertIn(None, seen)  # the server closed the connection itself
+        self.assertLess(seen.index("event: done"), seen.index(None))
+
+    def test_an_unknown_job_is_404(self):
+        conn, response = self.stream("/events/job/9999")
+        self.assertEqual(response.status, 404)
+        response.read()
+
+    def test_the_ninth_concurrent_stream_is_503(self):
+        held = []
+        for _ in range(web.MAX_STREAMS):
+            conn, response = self.stream(f"/events/job/{self.held_id}", timeout=6)
+            self.assertEqual(response.status, 200)
+            # Read one frame so the handler is certainly inside the stream and
+            # has taken its slot before the next connection is made.
+            self.read_lines(response, lambda got: len(got) >= 1, deadline_s=3.0)
+            held.append((conn, response))
+        self.assertEqual(self.wait_for_streams(web.MAX_STREAMS), web.MAX_STREAMS)
+
+        conn, response = self.stream(f"/events/job/{self.held_id}")
+        self.assertEqual(response.status, 503)
+        response.read()
+
+        for pair in held:
+            self.close_stream(*pair)
+        self.assertEqual(self.wait_for_streams(0, deadline_s=20), 0)
+
+        # …and the slots really did come back.
+        conn, response = self.stream(f"/events/job/{self.held_id}")
+        self.assertEqual(response.status, 200)
+
+    def test_truncation_restarts_from_the_beginning(self):
+        conn = self.db()
+        try:
+            job_id = db.enqueue(conn, "a job whose log is rewritten", "student-one")
+        finally:
+            conn.close()
+        directory = self.jobs_dir / str(job_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        log = directory / "job.log"
+        log.write_text(
+            "".join(f"2026-09-14T12:00:0{n}Z before {n}\n" for n in range(3)),
+            encoding="utf-8",
+        )
+        stream_conn, response = self.stream(f"/events/job/{job_id}", timeout=5)
+        self.read_lines(
+            response, lambda got: "data: 2026-09-14T12:00:02Z before 2" in got,
+            deadline_s=3.0,
+        )
+        # Rewritten shorter: the tailer must start again from zero rather than
+        # read from the middle of a line at the old offset.
+        log.write_text("2026-09-14T12:05:00Z after the truncation\n", encoding="utf-8")
+        seen = self.read_lines(
+            response,
+            lambda got: "data: 2026-09-14T12:05:00Z after the truncation" in got,
+            deadline_s=4.0,
+        )
+        self.assertIn("data: 2026-09-14T12:05:00Z after the truncation", seen)
+
+    def test_a_partial_line_waits_for_its_newline(self):
+        tailer = web.LogTailer(self.jobs_dir / "nowhere" / "job.log")
+        self.assertEqual(tailer.initial(), [])  # no file yet is not an error
+        path = self.jobs_dir / "partial.log"
+        path.write_text("one\ntw", encoding="utf-8")
+        tailer = web.LogTailer(path)
+        self.assertEqual(tailer.initial(), ["one"])
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("o\n")
+        self.assertEqual(tailer.poll(), ["two"])
+        self.assertEqual(tailer.poll(), [])
+
+    # -- the JSON ----------------------------------------------------------
+
+    def test_api_job_json_has_the_row_the_attempts_and_the_tail(self):
+        status, content_type, body = self.get(f"/api/job/{self.held_id}.json")
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", content_type)
+        document = json.loads(body)
+        self.assertEqual(document["id"], self.held_id)
+        self.assertEqual(document["state"], "held")
+        self.assertEqual(document["attempt_n"], 1)
+        self.assertEqual(document["max_attempts"], 3)
+        self.assertFalse(document["terminal"])
+        self.assertEqual(document["job"]["prompt"], "three circles breathing")
+        self.assertEqual(document["job"]["submitted_by"], "student-two")
+        self.assertEqual(document["job"]["assertions"], [])
+        self.assertEqual(len(document["attempt_rows"]), 1)
+        self.assertEqual(document["attempt_rows"][0]["gate_exit"], 0)
+        self.assertEqual(document["log_lines"], 200)
+        self.assertIn("line 39", document["log"])
+        self.assertNotIn("@", document["job"]["submitted_by"])  # username only
+
+    def test_api_job_json_for_an_unknown_job_is_404(self):
+        self.assertEqual(self.get("/api/job/9999.json")[0], 404)
 
 
 class TestBindRefusal(unittest.TestCase):
