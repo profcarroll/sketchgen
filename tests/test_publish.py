@@ -199,17 +199,17 @@ class PublishTests(PublishTestCase):
                      "statement.md"):
             self.assertIn(f"e/{self.entry_id}/{name}", listing)
 
-        message = git(self.gallery, "log", "-1", "--pretty=%B").stdout
+        message = git(self.gallery, "log", "-1", "--pretty=%B", entry_sha).stdout
         self.assertIn(f"entry {self.entry_id}: {PROMPT[:60]}", message)
         self.assertIn(f"Co-Authored-By: {EXECUTOR} <noreply@localhost>", message)
         self.assertIn("Published-By: profcarroll", message)
 
-        author = git(self.gallery, "log", "-1", "--pretty=%an").stdout.strip()
+        author = git(self.gallery, "log", "-1", "--pretty=%an", entry_sha).stdout.strip()
         self.assertEqual(author, "sketchgen test")
 
         row = self.entry_row()
         self.assertEqual(row["state"], "published")
-        self.assertEqual(row["publish_commit"], sha)
+        self.assertEqual(row["publish_commit"], entry_sha)
         self.assertTrue(row["published_utc"].endswith("Z"), row["published_utc"])
 
     def test_publishing_twice_refuses(self):
