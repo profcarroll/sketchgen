@@ -739,3 +739,23 @@ class CommandLineTests(PairsTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WritePathContractTests(unittest.TestCase):
+    """gallery.js and writepath/worker.js must agree on every payload."""
+
+    def setUp(self):
+        import pathlib
+        root = pathlib.Path(__file__).resolve().parents[1]
+        self.js = (root / "sketchgen" / "assets" / "gallery.js").read_text()
+        self.worker = (root / "writepath" / "worker.js").read_text()
+
+    def test_counts_query_parameter(self):
+        self.assertIn('"/counts?entries="', self.js)
+        self.assertIn('searchParams.get("entries")', self.worker)
+
+    def test_like_payload(self):
+        self.assertIn("entry_id:", self.js)
+        self.assertIn("on:", self.js)
+        self.assertIn("body.entry_id", self.worker)
+        self.assertIn("body.on", self.worker)
