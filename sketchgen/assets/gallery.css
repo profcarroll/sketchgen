@@ -303,6 +303,34 @@ summary.filter-label::before { content: "\25b8\a0"; }
 .legend .mark.inline { margin-right: 0.2rem; }
 .legend .mark.inline ~ .mark.inline { margin-left: 0.5rem; }
 
+/* The entry page's compass. The same percentiles as the card's bars, but both
+ * at once on one square: across is "rather look at it", up is "closer to its
+ * brief". The faint centre lines cut it into the four readings the words
+ * beside it name — top right liked and on brief, bottom right liked but off
+ * brief, top left on brief with little to look at, bottom left neither.
+ *
+ * A population is drawn only when it has scored the entry on BOTH questions:
+ * one coordinate is not a point, and supplying the other from nothing would
+ * put the entry somewhere nobody voted for. So a square holds two marks, one,
+ * or none, and the line between two of them is the same disagreement the bars
+ * draw. Radius and opacity are the evidence and are set per mark, because only
+ * they differ from entry to entry; the rest of the look is here. */
+.compass-wrap { align-items: flex-start; display: flex; gap: 0.9rem; margin: 0 0 0.9rem; }
+.compass { flex: none; }
+.c-ground { fill: var(--chip); stroke: var(--line); }
+.c-axis { stroke: var(--line); stroke-width: 1; }
+.c-gap { opacity: 0.45; stroke: var(--ink-soft); stroke-width: 2; }
+/* Unfilled for the same reason the card's ring is: two populations that land
+ * on the same point still read as two marks, the dot inside the ring. */
+.c-mark.human { fill: var(--accent); }
+.c-mark.agent { fill: none; stroke: var(--agent); stroke-width: 2.5; }
+.c-none { fill: var(--ink-soft); font-size: 12px; }
+.quads { display: flex; flex-direction: column; font-size: 0.85rem; gap: 0.25rem; }
+.q.human { color: var(--accent); }
+.q.agent { color: var(--agent); }
+.q.none { color: var(--ink-soft); }
+.axes { color: var(--ink-soft); font-size: 0.75rem; margin-top: 0.2rem; }
+
 .pair { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); margin-bottom: 1rem; }
 .side { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1rem; }
 .side-label { font-size: 1.3rem; font-weight: 600; margin: 0 0 0.5rem; }
