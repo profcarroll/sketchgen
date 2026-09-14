@@ -1,0 +1,26 @@
+# sketchgen-web.service — the operator UI, a --user unit like the worker's.
+#
+# Binds 127.0.0.1:8081 only; reach it over an SSH tunnel:
+#   ssh -f -N -L 8081:127.0.0.1:8081 sld-cloud   ->   http://localhost:8081/
+# It has no authentication, which is why it must never bind anything else.
+# Why a user unit: a server started from an agent's tool call dies with the
+# call (dossiers/node-16x96-first-day.md §7); linger is enabled for this user.
+[Unit]
+Description=sketchgen operator UI on 127.0.0.1:8081 (console, queue, jobs, held)
+Documentation=file:%h/sketchgen/app/docs/OPERATIONS.md
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/sketchgen/app
+Environment=SKETCHGEN_DB=%h/sketchgen/sketchgen.db
+Environment=SKETCHGEN_JOBS=%h/sketchgen/jobs
+Environment=SKETCHGEN_GATE=%h/sketchgen/gate/sketch_gate.py
+Environment=SKETCHGEN_GALLERY=%h/sketchgen/gallery
+Environment=OLLAMA_HOST_URL=http://127.0.0.1:11434
+ExecStart=%h/sketchgen/.venv/bin/python3 %h/sketchgen/app/bin/sketchgen web --bind 127.0.0.1 --port 8081
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
