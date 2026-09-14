@@ -134,10 +134,26 @@
 
   /* ---- the compare page ------------------------------------------------ */
 
-  function embeddedEntries() {
-    var node = document.getElementById("sketchgen-entries");
-    if (!node) { return []; }
-    try { return JSON.parse(node.textContent) || []; } catch (err) { return []; }
+  function embedded(id, fallback) {
+    var node = document.getElementById(id);
+    if (!node) { return fallback; }
+    try { return JSON.parse(node.textContent) || fallback; } catch (err) { return fallback; }
+  }
+
+  function embeddedEntries() { return embedded("sketchgen-entries", []); }
+
+  /* The generator ran pairs.pick_pair over several seeds and baked the result
+   * into this page and into pairs.json, so a static site can still offer a
+   * *balanced* pair — fewest judgments so far, control against treatment —
+   * with no server to ask. ?a= and ?b= from an entry page still win. */
+  function offeredPairs() { return embedded("sketchgen-pairs", []); }
+
+  function agentVerdicts() { return embedded("sketchgen-agents", {}); }
+
+  function pairKey(a, b) {
+    var low = Math.min(Number(a), Number(b));
+    var high = Math.max(Number(a), Number(b));
+    return low + "-" + high;
   }
 
   function pickPair(entries) {
@@ -147,10 +163,54 @@
     var a = byId[String(params.get("a"))];
     var b = byId[String(params.get("b"))];
     if (a && b && a.id !== b.id) { return [a, b]; }
+
+    var offered = offeredPairs().filter(function (pair) {
+      var left = byId[String(pair.a)];
+      var right = byId[String(pair.b)];
+      return left && right && left.id !== right.id &&
+             (!a || left.id === a.id || right.id === a.id);
+    });
+    if (offered.length) {
+      var choice = offered[Math.floor(Math.random() * offered.length)];
+      var first = byId[String(choice.a)];
+      var second = byId[String(choice.b)];
+      // An entry page links here with ?a=<itself>; keep that entry on the left.
+      if (a && second.id === a.id) { return [second, first]; }
+      return [first, second];
+    }
+
     var rest = entries.filter(function (entry) { return !a || entry.id !== a.id; });
     if (a && rest.length) { return [a, rest[0]]; }
     if (entries.length >= 2) { return [entries[0], entries[1]]; }
     return null;
+  }
+
+  /* The agent block is in the page from the start, hidden. It is filled here
+   * and revealed only once both human answers are in (spec §5: blind the human
+   * too, until they vote). */
+  function paintAgents(host, sides) {
+    if (!host) { return; }
+    var rows = agentVerdicts()[pairKey(sides.A.id, sides.B.id)] || [];
+    host.textContent = "";
+    if (!rows.length) {
+      var none = document.createElement("p");
+      none.textContent = "No agent has judged this pair yet.";
+      host.appendChild(none);
+      return;
+    }
+    // A verdict is stored against the pair in (low, high) order; this page may
+    // be showing it the other way round, so flip it to match A and B.
+    var flipped = Number(sides.A.id) > Number(sides.B.id);
+    rows.forEach(function (row) {
+      var choice = row.choice;
+      if (flipped && choice === "A") { choice = "B"; }
+      else if (flipped && choice === "B") { choice = "A"; }
+      var line = document.createElement("p");
+      line.className = "agent-verdict";
+      line.textContent = row.judge + " · " + row.question + " · " + choice +
+        (row.prompt_version ? " · " + row.prompt_version : "");
+      host.appendChild(line);
+    });
   }
 
   function paintSide(side, entry) {
@@ -186,6 +246,7 @@
     Array.prototype.forEach.call(page.querySelectorAll(".side"), function (side) {
       paintSide(side, sides[side.getAttribute("data-side")]);
     });
+    paintAgents(page.querySelector("[data-agent-verdicts]"), sides);
     if (status && !base()) {
       status.textContent = "The gallery write path is not deployed yet, so these " +
         "buttons record nothing. Nothing is lost and nothing is counted.";
@@ -212,8 +273,12 @@
               method: "POST",
               credentials: "include",
               headers: { "Content-Type": "application/json" },
+              // Exactly the payload writepath/worker.js:routeVote destructures.
               body: JSON.stringify({
-                a: sides.A.id, b: sides.B.id, question: question, choice: choice
+                entry_a: sides.A.id,
+                entry_b: sides.B.id,
+                question: question,
+                choice: choice
               })
             }).catch(function () {
               if (note) { note.textContent = "could not record " + choice + "; try again"; }
