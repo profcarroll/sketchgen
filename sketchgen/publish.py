@@ -462,6 +462,58 @@ def publish(
             shutil.rmtree(temporary, ignore_errors=True)
 
 
+def publish_index(
+    conn: sqlite3.Connection,
+    gallery_dir: str | os.PathLike[str],
+    *,
+    key: str | None = None,
+    remote: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Re-render every published entry and the index, commit and push.
+
+    For template or asset changes: no entry's state changes. Returns
+    (sha, None) on success or (None, why); refuses on a dirty checkout.
+    """
+    checkout, branch = gallery_checkout(gallery_dir)
+    target = remote or _git_out(checkout, "remote", "get-url", "origin")
+    if not target:
+        raise PublishRefused(f"{checkout} has no 'origin' remote and no --remote was given")
+    env, _ = _push_env(key, target)
+    try:
+        from . import gallery  # noqa: PLC0415
+    except ImportError as exc:
+        raise PublishRefused("generator not present") from exc
+    before = _git_out(checkout, "rev-parse", "HEAD")
+    rows = conn.execute(
+        "SELECT id FROM entries WHERE state IN ('published', 'failed-kept') ORDER BY id"
+    ).fetchall()
+    for row in rows:
+        gallery.render_entry(conn, row["id"], checkout)
+    gallery.render_index(conn, checkout)
+    present = [p for p in INDEX_PATHS if (checkout / p).exists()]
+    added = _git(checkout, "add", "-A", "--", "e", *present)
+    if added.returncode != 0:
+        return None, f"git add failed: {added.stderr.strip()}"
+    if _git(checkout, "diff", "--cached", "--quiet").returncode == 0:
+        return None, "site unchanged"
+    committed = subprocess.run(
+        ["git", "commit", "-F", "-"],
+        cwd=str(checkout),
+        input="gallery: re-render every page\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if committed.returncode != 0:
+        return None, f"commit failed: {committed.stderr.strip()}"
+    sha = _git_out(checkout, "rev-parse", "HEAD")
+    pushed = _git(checkout, "push", target, f"HEAD:refs/heads/{branch}", env=env)
+    if pushed.returncode != 0:
+        _undo(checkout, before)
+        return None, f"push failed: {pushed.stderr.strip() or 'git push failed'}"
+    return sha, None
+
+
 INDEX_PATHS = ("index.html", "failed.html", "compare.html", "lines", "assets", "config.json")
 
 
