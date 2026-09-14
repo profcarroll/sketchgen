@@ -591,6 +591,32 @@ class IndexTests(GalleryTestCase):
         entries = json.loads(embedded.replace("<\\/", "</"))
         self.assertEqual([entry["id"] for entry in entries], list(self.ids[:2]))
 
+    def test_compare_can_run_either_sketch_in_place(self):
+        """The strip is clickable and the JSON says where the sketch lives.
+
+        gallery.js turns each thumbnail into a play button and swaps in an
+        iframe of ``<href>sketch/`` — one at a time. Two things have to hold in
+        the page the generator writes for that to be possible at all: the
+        caption the script speaks through is in the shell, and every entry in
+        the embedded JSON carries the ``href`` the iframe URL is built from.
+        """
+        compare = (self.dest / "compare.html").read_text(encoding="utf-8")
+        self.assertEqual(2, compare.count("data-run-note"))
+        # one caption per side, next to that side's thumbnail
+        for side in ("A", "B"):
+            block = compare.split(f'data-side="{side}"')[1].split("</section>")[0]
+            self.assertIn("data-thumb", block)
+            self.assertIn("data-run-note", block)
+        embedded = compare.split('type="application/json">')[1].split("</script>")[0]
+        entries = json.loads(embedded.replace("<\\/", "</"))
+        self.assertTrue(entries)
+        for entry in entries:
+            with self.subTest(entry=entry["id"]):
+                self.assertEqual(f"e/{entry['id']}/", entry["href"])
+                self.assertTrue(
+                    (self.dest / "e" / str(entry["id"]) / "sketch" / "index.html").is_file()
+                )
+
     def test_config_json_carries_the_urls(self):
         config = json.loads((self.dest / "config.json").read_text(encoding="utf-8"))
         self.assertEqual(config["write_path"], "https://write.example.invalid/api")

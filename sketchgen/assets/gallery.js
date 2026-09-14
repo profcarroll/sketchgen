@@ -484,15 +484,97 @@
     });
   }
 
+  /* ---- one running sketch at a time ------------------------------------ */
+
+  /* Four still frames are not enough to answer "which is closer to its brief?"
+   * when the brief is about motion, so a thumbnail can be clicked to run the
+   * real sketch in its place — the same page the entry embeds, at the same
+   * sandbox. Never both at once: two p5 sketches side by side fight over the
+   * frame budget and over the audio context, and the comparison stops being
+   * about the sketches.
+   *
+   * This is the whole of the toggle's state: the .side element whose sketch is
+   * playing, or null. Stopping REMOVES the iframe rather than hiding it —
+   * display:none does not unload a document, so a hidden frame keeps drawing
+   * and keeps its AudioContext open. */
+  var running = null;
+
+  function runNote(side, text) {
+    var note = side.querySelector("[data-run-note]");
+    if (note) { note.textContent = text; }
+  }
+
+  function stopSketch() {
+    if (!running) { return; }
+    var side = running;
+    running = null;
+    var frame = side.querySelector("iframe.sketch");
+    if (frame) { frame.remove(); }
+    var button = side.querySelector("[data-play]");
+    if (button) {
+      button.className = "play";
+      button.setAttribute("aria-label", "run sketch " + side.getAttribute("data-side"));
+      var label = button.querySelector("[data-play-label]");
+      if (label) { label.textContent = ""; }
+    }
+    runNote(side, "click to run");
+  }
+
+  function startSketch(side, entry) {
+    stopSketch();
+    var thumb = side.querySelector("[data-thumb]");
+    var button = side.querySelector("[data-play]");
+    if (!thumb || !button) { return; }
+    var letter = side.getAttribute("data-side");
+    var frame = document.createElement("iframe");
+    frame.className = "sketch";
+    frame.src = ROOT + entry.href + "sketch/";
+    frame.title = "sketch " + letter + " running";
+    // Exactly the entry page's sandbox, so a sketch behaves the same on both
+    // pages: scripts yes, and nothing else — no same-origin, no forms, no top
+    // navigation. p5.sound still works; the viewer's click is the gesture that
+    // lets the frame start audio.
+    frame.setAttribute("sandbox", "allow-scripts");
+    thumb.insertBefore(frame, button);
+    button.className = "play running";
+    button.setAttribute("aria-label", "stop sketch " + letter);
+    var label = button.querySelector("[data-play-label]");
+    if (label) { label.textContent = "stop"; }
+    running = side;
+    runNote(side, "running · click to stop");
+  }
+
   function paintSide(side, entry) {
     var thumb = side.querySelector("[data-thumb]");
     var brief = side.querySelector("[data-brief]");
     if (thumb) {
+      if (running === side) { stopSketch(); }
       thumb.textContent = "";
       var img = document.createElement("img");
       img.src = ROOT + entry.strip;
       img.alt = "four frames from one of the two sketches";
-      thumb.appendChild(img);
+      // No href means no published sketch page to run: leave the plain strip.
+      if (!entry.href) {
+        thumb.appendChild(img);
+        runNote(side, "");
+      } else {
+        var button = document.createElement("button");
+        button.type = "button";
+        button.className = "play";
+        button.setAttribute("data-play", "");
+        button.setAttribute("aria-label", "run sketch " + side.getAttribute("data-side"));
+        button.appendChild(img);
+        // Empty while the strip is showing; "stop" while the sketch runs, so
+        // the one control both starts and stops without the layout moving.
+        var label = document.createElement("span");
+        label.setAttribute("data-play-label", "");
+        button.appendChild(label);
+        button.addEventListener("click", function () {
+          if (running === side) { stopSketch(); } else { startSketch(side, entry); }
+        });
+        thumb.appendChild(button);
+        runNote(side, "click to run");
+      }
     }
     if (brief) { brief.textContent = entry.brief || entry.prompt || "(no brief recorded)"; }
   }
