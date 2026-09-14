@@ -1,0 +1,577 @@
+"""lineage.py — a critique of one entry becomes the prompt for the next.
+
+This is what the spec means by a gallery that generates itself (§8.1). Two
+things happen here and nothing else does:
+
+**A critique becomes a child job.** :func:`spawn` takes a parent entry and one
+sentence of critique and queues a job whose prompt is the parent's prompt with
+that sentence under a fixed heading::
+
+    <the parent's prompt>
+
+    Revise: <the critique>
+
+The child job carries ``parent_entry_id``, and it carries the critique itself in
+``jobs.critique`` / ``jobs.critique_by`` (migration 005), because the `lineage`
+table keys on the child ENTRY and that entry does not exist yet. When the worker
+finally creates the entry it calls :func:`record_child`, which is the only place
+a `lineage` row is written for a spawned job.
+
+**A line runs three generations and then waits.** DECIDE[lineage-depth] is three
+(plan §4). A child at generation ``max_depth`` or deeper is still created — the
+prompt is not thrown away — but with ``publication='hold'`` whatever was asked
+for and ``needs='review'`` on the job, so a person has to touch it before the
+line goes any further. Spec §9 is the reason: a pipeline that publishes
+unattended will eventually publish something unintended, and self-prompted lines
+make that more urgent, not less.
+
+Generations count from the root, which is generation 0. An entry with no
+`lineage` row is a root; its first child is generation 1.
+
+**The critique itself is a model call, and this module never makes one by
+accident.** :func:`critique` calls Ollama's ``/api/generate`` only when it is
+given a ``host`` and no ``stub``; ``--stub FILE`` replays a saved response and is
+how the tests run. The validator is deliberately strict — one sentence, under
+forty words, no code — because the text becomes the next brief's revision line
+and a paragraph of review would be a paragraph of prompt.
+
+Python 3.12, stdlib only. Every timestamp is UTC, ISO 8601, with a Z.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Mapping
+
+from sketchgen import db
+
+__all__ = [
+    "CRITIQUE_BY_RE",
+    "DEFAULT_HOST",
+    "DEFAULT_MAX_DEPTH",
+    "MAX_CRITIQUE_WORDS",
+    "PROMPT_PATH",
+    "REVISE_HEADING",
+    "SPAWNABLE",
+    "Critique",
+    "CritiqueFailed",
+    "CritiqueRefused",
+    "compose_prompt",
+    "critique",
+    "critique_prompt",
+    "generation_of",
+    "line",
+    "prompt_version",
+    "record_child",
+    "roots",
+    "spawn",
+]
+
+#: DECIDE[lineage-depth], plan §4: three generations unattended, then a person.
+DEFAULT_MAX_DEPTH = 3
+
+#: The states a parent may be spawned from. A held entry has not been through
+#: the publication gate and a rejected one was refused at it; neither is a thing
+#: the gallery should be building a line on top of (spec §9).
+SPAWNABLE = frozenset({"published", "failed-kept"})
+
+#: The fixed heading. Fixed so that a child's prompt can always be split back
+#: into the prompt it inherited and the critique that changed it.
+REVISE_HEADING = "Revise:"
+
+#: A model id (``gemma4:e4b``) or a GitHub username, and nothing that could be a
+#: person: no ``@``, no spaces, no punctuation an email needs. Course policy.
+CRITIQUE_BY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+
+#: GitHub usernames and nothing else go in ``jobs.submitted_by``.
+USERNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+
+#: A critique longer than this is a review, not a revision line.
+MAX_CRITIQUE_WORDS = 40
+
+DEFAULT_HOST = "http://127.0.0.1:11434"
+DEFAULT_MODEL = "gemma4:e4b"
+PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "critic.md"
+
+_PROMPT_VERSION_RE = re.compile(r"^prompt_version:\s*(\S+)\s*$", re.MULTILINE)
+#: Where one sentence ends and the next begins: a terminator, then whitespace,
+#: then something that is not the rest of an abbreviation.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+#: Things a sentence of critique has no business containing.
+_CODE_MARKS = ("```", "{", "}", ";", "()", "=>", "function ", "<script", "//", "$")
+
+
+class CritiqueRefused(Exception):
+    """The critique will not start: an unreadable prompt file, a missing stub."""
+
+
+class CritiqueFailed(Exception):
+    """The model answered and the answer is unusable. ``raw`` is kept."""
+
+    def __init__(self, message: str, raw: str = "") -> None:
+        super().__init__(message)
+        self.raw = raw
+
+
+@dataclass
+class Critique:
+    """One sentence, and the provenance a verdict needs to be readable later."""
+
+    text: str
+    model: str
+    prompt_version: str
+    tokens: dict[str, int] = field(default_factory=dict)
+    raw: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Rows, without caring whether they are sqlite3.Row or a plain dict
+# ---------------------------------------------------------------------------
+
+
+def _get(row: Any, key: str, default: Any = None) -> Any:
+    if row is None:
+        return default
+    if isinstance(row, Mapping):
+        return row.get(key, default)
+    try:
+        value = row[key]
+    except (IndexError, KeyError, TypeError):
+        return getattr(row, key, default)
+    return default if value is None else value
+
+
+def _entry(conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+
+
+def _lineage_row(conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM lineage WHERE child_entry_id = ?", (entry_id,)
+    ).fetchone()
+
+
+def _parent_of(conn: sqlite3.Connection, entry_id: int) -> int | None:
+    """The parent from the lineage table, falling back to the entry column.
+
+    gallery.py resolves it the same way and for the same reason: the entry
+    column is written by the worker from the job, the lineage row is written
+    when the link is recorded, and a database where only one of them exists
+    still has a readable line.
+    """
+    row = _lineage_row(conn, entry_id)
+    if row is not None and row["parent_entry_id"] is not None:
+        return int(row["parent_entry_id"])
+    entry = _entry(conn, entry_id)
+    if entry is None or entry["parent_entry_id"] is None:
+        return None
+    return int(entry["parent_entry_id"])
+
+
+def generation_of(conn: sqlite3.Connection, entry_id: int) -> int:
+    """How many critiques stand between this entry and its root. Roots are 0."""
+    row = _lineage_row(conn, entry_id)
+    if row is None or row["generation"] is None:
+        return 0
+    return int(row["generation"])
+
+
+# ---------------------------------------------------------------------------
+# Spawning
+# ---------------------------------------------------------------------------
+
+
+def compose_prompt(parent_prompt: str, critique_text: str) -> str:
+    """The child's prompt: the parent's, then the critique under the heading."""
+    base = (parent_prompt or "").strip()
+    revision = " ".join((critique_text or "").split())
+    return f"{base}\n\n{REVISE_HEADING} {revision}".strip()
+
+
+def spawn(
+    conn: sqlite3.Connection,
+    *,
+    parent_entry_id: int,
+    critique: str,
+    critique_by: str,
+    submitted_by: str,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+    planner: str | None = None,
+    rules_file: str | None = None,
+    publication: str = "hold",
+) -> int | None:
+    """Queue the child job one critique asks for. Returns its job id, or None.
+
+    None, and nothing written at all, when the parent is not a published or
+    failed-kept entry: an entry still waiting at the publication gate is not
+    something to build a line on.
+
+    At ``generation >= max_depth`` the job is still created — the critique is
+    not thrown away — but always with ``publication='hold'`` and with
+    ``needs='review'``, so the line stops until a person moves it
+    (DECIDE[lineage-depth]).
+
+    ``planner`` and ``rules_file`` default to the parent's, so a line stays a
+    fair comparison with itself: the rules file is a variable the gallery
+    measures (spec §9) and changing it silently mid-line would spoil it.
+    """
+    text = " ".join((critique or "").split())
+    if not text:
+        raise ValueError("a critique with no text spawns nothing")
+    by = (critique_by or "").strip()
+    if not CRITIQUE_BY_RE.match(by):
+        raise ValueError(
+            f"critique_by {by!r}: a model id or a GitHub username, nothing else"
+        )
+    who = (submitted_by or "").strip()
+    if not USERNAME_RE.match(who):
+        raise ValueError(f"submitted_by {who!r}: a GitHub username, nothing else")
+
+    parent = _entry(conn, int(parent_entry_id))
+    if parent is None or parent["state"] not in SPAWNABLE:
+        return None
+
+    generation = generation_of(conn, int(parent_entry_id)) + 1
+    at_limit = generation >= int(max_depth)
+
+    options: dict[str, Any] = {
+        "parent_entry_id": int(parent_entry_id),
+        "critique": text,
+        "critique_by": by,
+        "publication": "hold" if at_limit else publication,
+        "planner": planner if planner is not None else parent["planner"],
+        "rules_file": rules_file if rules_file is not None else parent["rules_file"],
+    }
+    if at_limit:
+        options["needs"] = "review"
+    return db.enqueue(
+        conn, compose_prompt(parent["prompt"], text), who, **options
+    )
+
+
+def record_child(conn: sqlite3.Connection, child_entry_id: int, job: Any) -> int | None:
+    """Copy a job's pending critique into `lineage`. Called by the worker.
+
+    Returns the generation recorded, or None when the job has no parent and
+    there is therefore no link to record. Idempotent: ``db.add_lineage`` is an
+    INSERT OR REPLACE keyed on the child entry.
+    """
+    parent_entry_id = _get(job, "parent_entry_id")
+    if not parent_entry_id:
+        return None
+    generation = generation_of(conn, int(parent_entry_id)) + 1
+    db.add_lineage(
+        conn,
+        int(child_entry_id),
+        int(parent_entry_id),
+        generation=generation,
+        critique_by=_get(job, "critique_by"),
+        critique=_get(job, "critique"),
+    )
+    return generation
+
+
+# ---------------------------------------------------------------------------
+# Reading a line
+# ---------------------------------------------------------------------------
+
+
+def _children(conn: sqlite3.Connection) -> dict[int, list[int]]:
+    ids = [
+        int(row["id"])
+        for row in conn.execute("SELECT id FROM entries ORDER BY id")
+    ]
+    kids: dict[int, list[int]] = {entry_id: [] for entry_id in ids}
+    for entry_id in ids:
+        mother = _parent_of(conn, entry_id)
+        if mother is not None and mother in kids and mother != entry_id:
+            kids[mother].append(entry_id)
+    return kids
+
+
+def _scores(conn: sqlite3.Connection) -> dict[int, Any]:
+    """Bradley–Terry scores from packet 5.1, if packet 5.1 is installed.
+
+    Imported lazily and defensively on purpose: `pairs.py` is another packet's
+    file and may not exist in this checkout at all. Absent, or present and
+    unhappy, means every entry's ``scores`` is None — which is the honest answer
+    and not an error, because a line is readable without scores.
+    """
+    try:
+        from sketchgen import pairs  # type: ignore
+    except Exception:
+        return {}
+    for name in ("scores", "entry_scores", "score_table", "all_scores"):
+        fn = getattr(pairs, name, None)
+        if not callable(fn):
+            continue
+        try:
+            table = fn(conn)
+        except Exception:
+            continue
+        if isinstance(table, Mapping):
+            out: dict[int, Any] = {}
+            for key, value in table.items():
+                try:
+                    out[int(key)] = value
+                except (TypeError, ValueError):
+                    continue
+            return out
+    return {}
+
+
+def line(
+    conn: sqlite3.Connection,
+    root_entry_id: int,
+    max_depth: int = DEFAULT_MAX_DEPTH,
+) -> list[dict[str, Any]]:
+    """The whole line from one root, generation order, shallowest first.
+
+    One dict per entry: ``entry_id``, ``generation``, ``state``, ``prompt``, the
+    ``critique`` that produced it and its ``critique_by`` (both None for the
+    root, which nobody critiqued into being), ``parent_entry_id``, ``children``,
+    ``submitted_by``, ``scores`` (None unless ``sketchgen.pairs`` is importable)
+    and ``at_limit`` — the generation where DECIDE[lineage-depth] says the line
+    waits for a person.
+    """
+    root = _entry(conn, int(root_entry_id))
+    if root is None:
+        return []
+    kids = _children(conn)
+    scores = _scores(conn)
+
+    out: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    queue: list[tuple[int, int]] = [(int(root_entry_id), generation_of(conn, int(root_entry_id)))]
+    while queue:
+        entry_id, walked = queue.pop(0)
+        if entry_id in seen:
+            continue
+        seen.add(entry_id)
+        row = _entry(conn, entry_id)
+        if row is None:
+            continue
+        link = _lineage_row(conn, entry_id)
+        # The recorded generation is the one record_child wrote and is what the
+        # provenance says; the walked depth is the fallback for an entry whose
+        # link predates this table having a number in it.
+        generation = (
+            int(link["generation"])
+            if link is not None and link["generation"] is not None
+            else walked
+        )
+        out.append(
+            {
+                "entry_id": entry_id,
+                "generation": generation,
+                "state": row["state"],
+                "prompt": row["prompt"],
+                "brief": row["brief"],
+                "submitted_by": row["submitted_by"],
+                "parent_entry_id": _parent_of(conn, entry_id),
+                "children": list(kids.get(entry_id, [])),
+                "critique": link["critique"] if link is not None else None,
+                "critique_by": link["critique_by"] if link is not None else None,
+                "scores": scores.get(entry_id),
+                "at_limit": generation >= int(max_depth),
+            }
+        )
+        for kid in kids.get(entry_id, []):
+            queue.append((kid, generation + 1))
+    out.sort(key=lambda item: (item["generation"], item["entry_id"]))
+    return out
+
+
+def roots(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Entries with no parent that have children — one per line, id order."""
+    kids = _children(conn)
+    found: list[dict[str, Any]] = []
+    for entry_id in sorted(kids):
+        if _parent_of(conn, entry_id) is not None or not kids[entry_id]:
+            continue
+        row = _entry(conn, entry_id)
+        if row is None:  # pragma: no cover - the id came from this table
+            continue
+        found.append(
+            {
+                "entry_id": entry_id,
+                "state": row["state"],
+                "prompt": row["prompt"],
+                "children": list(kids[entry_id]),
+                "generations": 1 + max(
+                    (item["generation"] for item in line(conn, entry_id)), default=0
+                ),
+                "created_utc": row["created_utc"],
+            }
+        )
+    return found
+
+
+# ---------------------------------------------------------------------------
+# The critique itself — one model call, and never by accident
+# ---------------------------------------------------------------------------
+
+
+def _read_prompt_file(path: str | Path | None = None) -> str:
+    target = Path(path) if path is not None else PROMPT_PATH
+    try:
+        return target.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise CritiqueRefused(f"cannot read the prompt file {target}: {exc}") from exc
+
+
+def prompt_version(path: str | Path | None = None) -> str:
+    """The ``prompt_version:`` line at the top of ``prompts/critic.md``.
+
+    Read from the file, never written in code: an edited prompt with an
+    unchanged version would make every verdict's provenance a lie (spec §5).
+    """
+    text = _read_prompt_file(path)
+    match = _PROMPT_VERSION_RE.search(text)
+    if match is None:
+        raise CritiqueRefused(f"no 'prompt_version:' line in {path or PROMPT_PATH}")
+    return match.group(1)
+
+
+def critique_prompt(
+    entry_row: Any,
+    statement: str | None,
+    brief: str | None,
+    path: str | Path | None = None,
+) -> str:
+    """Fill ``prompts/critic.md`` for one entry.
+
+    The critic sees the prompt, the brief, the executor's own statement and the
+    assertions the gate ran. It does not see who submitted it, what any human
+    thought of it, or which model made it: spec §5 blinds the agent, and a
+    critic that becomes the next prompt is an agent judge with a pen.
+    """
+    text = _read_prompt_file(path)
+    text = _PROMPT_VERSION_RE.sub("", text, count=1).lstrip("\n")
+    raw_assertions = _get(entry_row, "assertions_json")
+    try:
+        words = json.loads(raw_assertions) if raw_assertions else []
+    except (TypeError, ValueError):
+        words = []
+    return (
+        text.replace("{prompt}", str(_get(entry_row, "prompt", "") or "").strip())
+        .replace("{brief}", str(brief or "").strip() or "(no brief on record)")
+        .replace(
+            "{statement}",
+            str(statement or "").strip() or "(the model said nothing about it)",
+        )
+        .replace("{assertions}", ", ".join(str(w) for w in words) or "(none)")
+    )
+
+
+def validate(raw: str) -> str:
+    """One sentence, under forty words, no code. Returns it trimmed.
+
+    Raises :class:`CritiqueFailed` with the raw text attached otherwise, so the
+    caller can save what the model actually said before it exits 1.
+    """
+    text = " ".join((raw or "").split())
+    if not text:
+        raise CritiqueFailed("the critique is empty", raw)
+    for mark in _CODE_MARKS:
+        if mark in text:
+            raise CritiqueFailed(
+                f"the critique contains code ({mark!r}); it becomes a prompt, "
+                "not a patch",
+                raw,
+            )
+    sentences = [part for part in _SENTENCE_SPLIT_RE.split(text) if part]
+    if len(sentences) > 1:
+        raise CritiqueFailed(
+            f"the critique is {len(sentences)} sentences; one is the contract",
+            raw,
+        )
+    words = text.split()
+    if len(words) >= MAX_CRITIQUE_WORDS:
+        raise CritiqueFailed(
+            f"the critique is {len(words)} words; under {MAX_CRITIQUE_WORDS} "
+            "is the contract",
+            raw,
+        )
+    return text
+
+
+def _post(host: str, payload: dict, timeout: float) -> dict:
+    url = host.rstrip("/") + "/api/generate"
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=body, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as exc:
+        raise CritiqueFailed(
+            f"the model host {url} did not answer usably: {exc}"
+        ) from exc
+
+
+def critique(
+    conn: sqlite3.Connection,
+    entry_id: int,
+    model: str = DEFAULT_MODEL,
+    host: str = DEFAULT_HOST,
+    stub: str | Path | None = None,
+    *,
+    num_ctx: int = 8192,
+    seed: int = 1,
+    prompt_path: str | Path | None = None,
+    timeout: float = 300.0,
+) -> Critique:
+    """One sentence of critique for one entry. With ``stub``, call nothing.
+
+    ``"think": false`` goes only to the qwen tags, as in planner.py: ollama
+    refuses an option a model does not declare, and ``gemma4:e4b`` — the critic,
+    as it is the local judge in spec §5 — has no thinking mode to turn off.
+    """
+    row = _entry(conn, int(entry_id))
+    if row is None:
+        raise CritiqueRefused(f"there is no entry {entry_id}")
+    version = prompt_version(prompt_path)
+    rendered = critique_prompt(row, row["statement"], row["brief"], prompt_path)
+    tokens: dict[str, int] = {}
+
+    if stub is not None:
+        path = Path(stub)
+        try:
+            raw = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise CritiqueRefused(f"cannot read the stub {path}: {exc}") from exc
+    else:
+        payload: dict = {
+            "model": model,
+            "prompt": rendered,
+            "stream": False,
+            "options": {"num_ctx": num_ctx, "seed": seed},
+        }
+        if model.startswith("qwen"):
+            payload["think"] = False
+        body = _post(host, payload, timeout)
+        raw = body.get("response")
+        if not isinstance(raw, str):
+            raise CritiqueFailed(
+                "the model host returned no 'response' field", json.dumps(body, indent=2)
+            )
+        tokens = {
+            "prompt": int(body.get("prompt_eval_count") or 0),
+            "response": int(body.get("eval_count") or 0),
+        }
+
+    return Critique(
+        text=validate(raw),
+        model=model,
+        prompt_version=version,
+        tokens=tokens,
+        raw=raw,
+    )
