@@ -986,6 +986,7 @@ def _grid_page(
         root="./",
         page_title=_esc(heading),
         heading=_esc(heading),
+        heading_html=f"<h1>{_esc(heading)}</h1>" if heading else "",
         intro_html=f'<p class="intro">{_esc(intro)}</p>' if intro else "",
         filters=_filters(rows, page),
         cards=cards,
@@ -1079,7 +1080,7 @@ def render_index(
             _grid_page(
                 conn,
                 published,
-                heading="sketchgen",
+                heading="",   # the header bar names the site; the grid needs no title
                 intro="",
                 page="index.html",
                 failed=False,
