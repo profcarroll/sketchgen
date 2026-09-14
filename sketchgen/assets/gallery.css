@@ -1,0 +1,201 @@
+/* gallery.css — the whole look of the published gallery.
+ *
+ * No external stylesheet, no web font, no CDN: GitHub Pages serves this file
+ * and nothing else is fetched for the chrome. The only network dependency in
+ * the site is p5 inside a sketch's own page, which is the sketch's business.
+ *
+ * Both themes: the palette is defined once on :root and redefined under
+ * prefers-color-scheme: dark. Nothing else in this file names a colour.
+ */
+
+:root {
+  --ink: #16181d;
+  --ink-soft: #4a5160;
+  --ground: #f7f7f5;
+  --panel: #ffffff;
+  --line: #d9dae0;
+  --accent: #2f5bd8;
+  --chip: #eceef4;
+  --failed-ink: #8a2b18;
+  --failed-ground: #fbe9e4;
+  --shadow: 0 1px 2px rgba(20, 22, 28, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --ink: #e9eaee;
+    --ink-soft: #a3a9b8;
+    --ground: #14161a;
+    --panel: #1c1f25;
+    --line: #2e333c;
+    --accent: #8fabff;
+    --chip: #262b33;
+    --failed-ink: #ffb4a0;
+    --failed-ground: #35201a;
+    --shadow: none;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  padding: 0 1.25rem 4rem;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+a { color: var(--accent); }
+
+h1 { font-size: 1.6rem; line-height: 1.25; margin: 1.5rem 0 0.25rem; }
+h2 { font-size: 1.05rem; margin: 0 0 0.5rem; }
+
+.bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  justify-content: space-between;
+  align-items: baseline;
+  border-bottom: 1px solid var(--line);
+  margin: 0 auto;
+  max-width: 60rem;
+  padding: 0.9rem 0;
+}
+
+footer.bar { border-bottom: 0; border-top: 1px solid var(--line); margin-top: 2.5rem; }
+
+.wordmark { font-weight: 600; margin: 0; }
+.wordmark a { color: inherit; text-decoration: none; }
+.nav { margin: 0; color: var(--ink-soft); }
+
+main {
+  margin: 0 auto;
+  max-width: 60rem;
+}
+
+.byline, .intro { color: var(--ink-soft); margin: 0.25rem 0 1.25rem; }
+.note { color: var(--ink-soft); font-size: 0.85rem; margin: 0.5rem 0 0; }
+.none { color: var(--ink-soft); font-style: italic; }
+
+.panel, .stage, .engagement, .questions, .reveal, .filters {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  margin: 0 0 1rem;
+  padding: 1rem;
+}
+
+.stage { padding: 0.75rem; }
+.stage-meta { color: var(--ink-soft); font-size: 0.85rem; margin: 0.6rem 0 0; }
+
+iframe.sketch {
+  background: var(--chip);
+  border: 0;
+  border-radius: 6px;
+  display: block;
+  height: 26rem;
+  width: 100%;
+}
+
+.chip {
+  background: var(--chip);
+  border-radius: 999px;
+  display: inline-block;
+  font-size: 0.75rem;
+  letter-spacing: 0.03em;
+  padding: 0.1rem 0.55rem;
+  text-transform: uppercase;
+}
+
+.chip.failed { background: var(--failed-ground); color: var(--failed-ink); }
+p.chip.failed { text-transform: none; letter-spacing: 0; border-radius: 8px; padding: 0.5rem 0.75rem; }
+
+.two { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); }
+.score { background: var(--chip); border-radius: 8px; padding: 0.75rem; }
+.score-label { font-weight: 600; margin: 0; }
+.score-value { font-size: 1.2rem; margin: 0.2rem 0 0; }
+
+.actions { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; margin: 0.75rem 0 0; }
+.counts { font-size: 1rem; margin: 0; }
+
+button, .button {
+  background: var(--chip);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--ink);
+  cursor: pointer;
+  font: inherit;
+  padding: 0.4rem 0.9rem;
+  text-decoration: none;
+}
+
+button[disabled] { cursor: not-allowed; opacity: 0.55; }
+button[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+
+table.fields { border-collapse: collapse; width: 100%; }
+table.fields th, table.fields td {
+  border-top: 1px solid var(--line);
+  padding: 0.45rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+  word-break: break-word;
+}
+table.fields th { color: var(--ink-soft); font-weight: 500; white-space: nowrap; width: 11rem; }
+
+.filters { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: baseline; }
+.filter-label { color: var(--ink-soft); margin: 0; }
+.filter-links { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0; }
+.filter { background: var(--chip); border-radius: 999px; padding: 0.15rem 0.7rem; text-decoration: none; }
+.filter[aria-current="true"] { background: var(--accent); color: var(--panel); }
+
+.grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  padding: 0 0 0.75rem;
+}
+
+.card .thumb { margin: 0; }
+.card img { display: block; width: 100%; background: var(--chip); }
+.card-prompt {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  margin: 0.6rem 0.75rem 0.3rem;
+  max-height: 3rem;
+  overflow: hidden;
+}
+.card-prompt a { color: inherit; text-decoration: none; }
+.card-meta, .card-scores, .card-counts, .reason {
+  color: var(--ink-soft);
+  font-size: 0.85rem;
+  margin: 0.2rem 0.75rem 0;
+}
+.reason { color: var(--failed-ink); }
+.tag { background: var(--chip); border-radius: 999px; padding: 0.05rem 0.5rem; }
+
+.pair { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); margin-bottom: 1rem; }
+.side { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1rem; }
+.side-label { font-size: 1.3rem; font-weight: 600; margin: 0 0 0.5rem; }
+.side img { border-radius: 6px; display: block; width: 100%; }
+.side .thumb { margin: 0; }
+.side-brief { color: var(--ink-soft); }
+.question { border-top: 1px solid var(--line); padding: 0.75rem 0 0; }
+.question:first-child { border-top: 0; padding-top: 0; }
+.ask { font-weight: 600; margin: 0 0 0.5rem; }
+.choices { display: flex; gap: 0.5rem; margin: 0; }
+.answered { color: var(--ink-soft); font-size: 0.85rem; margin: 0.4rem 0 0; }
+
+.tree .node { border-left: 2px solid var(--line); margin: 0.5rem 0 0 0; padding: 0 0 0 0.9rem; }
+.tree .depth-0 { border-left: 0; padding-left: 0; }
+.node-head { margin: 0; }
+.node-prompt { color: var(--ink-soft); margin: 0 0 0.3rem; }
