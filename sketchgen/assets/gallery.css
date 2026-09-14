@@ -216,9 +216,11 @@ table.fields th { color: var(--ink-soft); font-weight: 500; white-space: nowrap;
   width: auto;
 }
 .side .play.running img { display: none; }
-/* A fixed 16:9 box, so swapping strip for sketch and back does not move the
- * questions underneath. The global iframe.sketch height is for the entry page. */
-.side iframe.sketch { aspect-ratio: 16 / 9; height: auto; width: 100%; }
+/* A fixed box, so swapping strip for sketch and back does not move the
+ * questions underneath. 64:45 is the gate's viewport, 1280 by 900 (sketch_gate.py
+ * VIEWPORT), which is also each frame of the strip the iframe replaces. The
+ * global iframe.sketch height is for the entry page. */
+.side iframe.sketch { aspect-ratio: 64 / 45; height: auto; width: 100%; }
 .run-note { color: var(--ink-soft); font-size: 0.85rem; margin: 0.4rem 0 0; }
 .run-note:empty { margin: 0; }
 
