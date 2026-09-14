@@ -24,7 +24,13 @@ EXPECTED_TABLES = {
     "likes",
     "lineage",
     "schema_version",
+    "sync_state",
 }
+
+#: The highest migration in migrations/, so adding one does not break these
+#: tests; the point of the assertions below is that init() applies all of them
+#: and that rerunning it applies none.
+LATEST_MIGRATION = max(version for version, _ in db._migration_files())
 
 TIMESTAMP = "1970-01-01T00:00:00Z"
 
@@ -45,24 +51,25 @@ class DbTestCase(unittest.TestCase):
 
 
 class TestInit(DbTestCase):
-    def test_init_creates_tables_and_records_version_one(self):
+    def test_init_creates_tables_and_records_every_migration(self):
         names = {name for name, _ in db.table_counts(self.conn)}
         self.assertEqual(EXPECTED_TABLES, names)
-        self.assertEqual(1, db.schema_version(self.conn))
+        self.assertEqual(LATEST_MIGRATION, db.schema_version(self.conn))
         rows = self.conn.execute(
             "SELECT version, name FROM schema_version ORDER BY version"
         ).fetchall()
-        self.assertEqual(1, len(rows))
+        self.assertEqual(LATEST_MIGRATION, len(rows))
         self.assertEqual(1, rows[0]["version"])
         self.assertEqual("001_init.sql", rows[0]["name"])
+        self.assertEqual("002_sync.sql", rows[1]["name"])
 
     def test_rerunning_init_is_a_no_op(self):
         job_id = self.enqueue()
         applied = db.init(self.path)
         self.assertEqual([], applied)
-        self.assertEqual(1, db.schema_version(self.conn))
+        self.assertEqual(LATEST_MIGRATION, db.schema_version(self.conn))
         self.assertEqual(
-            1,
+            LATEST_MIGRATION,
             self.conn.execute("SELECT COUNT(*) AS c FROM schema_version").fetchone()["c"],
         )
         # and it did not disturb what was already there
