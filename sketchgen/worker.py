@@ -57,6 +57,24 @@ An attempt that has already been recorded is never re-run: the attempt number
 resumes from the highest row in the table, and the evidence from that row is
 what the next attempt is given.
 
+**Idle work, packet 5.4.** When the queue is empty and control is ``running``,
+the worker does one bounded round of idle work before it sleeps: it judges up to
+``SKETCHGEN_IDLE_JUDGE`` pairs with the local judge (packet 5.2) and critiques up
+to ``SKETCHGEN_IDLE_CRITIQUE`` published entries, spawning the child each
+critique asks for (packet 5.3). The instructor's decision of 2026-09-14 is that
+this is scheduled *inside this loop* rather than by a second timer, and the
+reason is the one fact the whole system is built around: there is one inference
+slot. A second unit would need its own fence, and two fences racing each other
+is exactly the contention the fence exists to prevent. One process owns the slot;
+when it has nothing to make, it looks and it critiques.
+
+Two consequences, both deliberate. The idle round runs *after* the worker's own
+fence has cleared, and the judge is handed the worker's own probe, so it never
+refuses the process that already owns the slot. And an idle round cannot take the
+worker down: every step is bounded by a limit, and an exception inside one is
+logged and dropped, because a queue that stops draining because a critique failed
+would be a worse system than one that occasionally skips a critique.
+
 Python 3.12, stdlib only. Timestamps are UTC, ISO 8601 with a trailing Z.
 """
 
@@ -65,7 +83,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import random
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -78,9 +98,14 @@ from typing import Any, Callable
 from . import db, executor, lineage, planner
 
 __all__ = [
+    "DEFAULT_CRITIC_MODEL",
     "DEFAULT_GATE_PATH",
     "DEFAULT_HOST",
+    "DEFAULT_IDLE_CRITIQUE",
+    "DEFAULT_IDLE_JUDGE",
     "DEFAULT_JOBS_DIR",
+    "DEFAULT_JUDGE_MODEL",
+    "DEFAULT_LINEAGE_DEPTH",
     "DEFAULT_PLANNER_MODEL",
     "DEFAULT_RULES",
     "DEFAULT_SLEEP_S",
@@ -94,13 +119,16 @@ __all__ = [
     "StopNow",
     "Worker",
     "build_evidence",
+    "default_judge",
     "default_probe",
     "fence",
+    "idle_summary",
     "is_stop_now",
     "node_shape",
     "observing_probe",
     "resolve_rules",
     "stub_executor",
+    "stub_judge",
     "stub_planner",
 ]
 
@@ -121,6 +149,29 @@ DEFAULT_HOST = os.environ.get("OLLAMA_HOST_URL", "http://127.0.0.1:11434")
 DEFAULT_SLEEP_S = 30.0
 DEFAULT_PLANNER_MODEL = "gemma4:e4b"
 DEFAULT_GATE_TIMEOUT_S = 600.0
+
+
+def _int_env(name: str, default: int) -> int:
+    """An integer from the environment, or the default if it is not one.
+
+    Junk in an ``Environment=`` line must not stop the worker starting: a
+    misspelled limit becomes the default, and the unit file documents the names.
+    """
+    try:
+        return int(str(os.environ.get(name, default)).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+#: Idle work (packet 5.4). The two limits are also the off switches: 0 disables
+#: that half of the round. Both models default to the local judge's model —
+#: ``gemma4:e4b`` is the model on this box that can see (spec §5), and the critic
+#: is that judge with a pen.
+DEFAULT_JUDGE_MODEL = os.environ.get("SKETCHGEN_JUDGE_MODEL", "gemma4:e4b")
+DEFAULT_CRITIC_MODEL = os.environ.get("SKETCHGEN_CRITIC_MODEL", "gemma4:e4b")
+DEFAULT_IDLE_JUDGE = _int_env("SKETCHGEN_IDLE_JUDGE", 1)
+DEFAULT_IDLE_CRITIQUE = _int_env("SKETCHGEN_IDLE_CRITIQUE", 1)
+DEFAULT_LINEAGE_DEPTH = _int_env("SKETCHGEN_LINEAGE_DEPTH", lineage.DEFAULT_MAX_DEPTH)
 #: The rules file a job gets when it names none. The A/B (spec §9) is opt-in per
 #: job; a job that says nothing is executed under the rules the course teaches.
 DEFAULT_RULES = "treatment"
@@ -633,6 +684,88 @@ def stub_executor(source: str | os.PathLike[str]) -> Callable[..., Execution]:
     return run_stub
 
 
+def default_judge(conn, **kwargs: Any) -> dict[str, int]:
+    """:func:`sketchgen.judge.run_local`, imported here rather than at the top.
+
+    ``judge.py`` imports this module for the fence, so importing it at module
+    level would be a cycle. It is imported at the moment it is called instead,
+    which also means a worker that never goes idle never loads the judge.
+    """
+    from . import judge  # local import: judge.py imports worker for the fence
+
+    return judge.run_local(conn, **kwargs)
+
+
+def default_critic(conn, entry_id: int, **kwargs: Any):
+    """:func:`sketchgen.lineage.critique` — one sentence about one entry."""
+    return lineage.critique(conn, entry_id, **kwargs)
+
+
+def stub_judge(reply: str | os.PathLike[str] | None = None) -> Callable[..., dict[str, int]]:
+    """A judge that replays a saved reply, or judges nothing at all. TEST ONLY.
+
+    With no ``reply`` it calls nothing and reports no pairs, which is what
+    ``sketchgen worker --stub-judge`` gives the phase gate: an idle round whose
+    critique half can be watched without the judge touching the model.
+    """
+
+    def judge_stub(conn, **kwargs: Any) -> dict[str, int]:
+        if reply is None:
+            log = kwargs.get("log")
+            if log is not None:
+                log("the judge is stubbed and was given no reply to replay")
+            return {"judged": 0, "recorded": 0, "pairs_offered": 0}
+        from . import judge  # local import, as in default_judge
+
+        kwargs["stub"] = str(reply)
+        return judge.run_local(conn, **kwargs)
+
+    return judge_stub
+
+
+def idle_summary(conn) -> dict[str, Any]:
+    """What the idle round has done, read from the database, not from memory.
+
+    ``sketchgen db status`` prints this. A database that predates migration 006
+    (or 001's judgments table) answers zeros rather than raising: an older file
+    should still render.
+    """
+    summary: dict[str, Any] = {
+        "agent_verdicts": 0,
+        "critiques": 0,
+        "spawned": 0,
+        "rejected": 0,
+        "last_action_utc": None,
+    }
+    stamps: list[str] = []
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c, MAX(created_utc) AS last FROM judgments "
+            "WHERE judge_kind = 'agent'"
+        ).fetchone()
+        summary["agent_verdicts"] = int(row["c"] or 0)
+        if row["last"]:
+            stamps.append(str(row["last"]))
+    except sqlite3.OperationalError:
+        pass
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c, "
+            "SUM(CASE WHEN spawned_job_id IS NOT NULL THEN 1 ELSE 0 END) AS spawned, "
+            "SUM(CASE WHEN rejected_reason IS NOT NULL THEN 1 ELSE 0 END) AS rejected, "
+            "MAX(created_utc) AS last FROM critiques"
+        ).fetchone()
+        summary["critiques"] = int(row["c"] or 0)
+        summary["spawned"] = int(row["spawned"] or 0)
+        summary["rejected"] = int(row["rejected"] or 0)
+        if row["last"]:
+            stamps.append(str(row["last"]))
+    except sqlite3.OperationalError:
+        pass
+    summary["last_action_utc"] = max(stamps) if stamps else None
+    return summary
+
+
 def stub_planner(assertions: list[str]) -> Callable[..., planner.Plan]:
     """A planner that returns the job's own prompt as the brief. TEST ONLY."""
 
@@ -672,9 +805,17 @@ class Worker:
         host: str = DEFAULT_HOST,
         executor_model: str = executor.DEFAULT_MODEL,
         planner_model: str = DEFAULT_PLANNER_MODEL,
+        judge_model: str = DEFAULT_JUDGE_MODEL,
+        critic_model: str = DEFAULT_CRITIC_MODEL,
+        idle_judge: int = DEFAULT_IDLE_JUDGE,
+        idle_critique: int = DEFAULT_IDLE_CRITIQUE,
+        lineage_depth: int = DEFAULT_LINEAGE_DEPTH,
         planner_fn: Callable[..., Any] | None = None,
         executor_fn: Callable[..., Execution] | None = None,
         gate_fn: Callable[..., GateOutcome] | None = None,
+        judge_fn: Callable[..., dict[str, int]] | None = None,
+        critic_fn: Callable[..., Any] | None = None,
+        spawn_fn: Callable[..., int | None] | None = None,
         probe: Callable[[], dict[str, Any]] | None = None,
         log_stream=None,
     ) -> None:
@@ -689,6 +830,14 @@ class Worker:
         self.gate_fn = gate_fn or (
             lambda **kwargs: default_gate(gate_path=self.gate_path, **kwargs)
         )
+        self.judge_model = judge_model
+        self.critic_model = critic_model
+        self.idle_judge = int(idle_judge)
+        self.idle_critique = int(idle_critique)
+        self.lineage_depth = int(lineage_depth)
+        self.judge_fn = judge_fn or default_judge
+        self.critic_fn = critic_fn or default_critic
+        self.spawn_fn = spawn_fn or lineage.spawn
         self.probe = probe or (lambda: default_probe(self.host))
         self.log_stream = sys.stderr if log_stream is None else log_stream
         self._log_path: Path | None = None
@@ -767,6 +916,7 @@ class Worker:
         job = db.claim_next(self.conn)
         if job is None:
             self.log("queue: nothing queued")
+            self._idle_round()
             return EXIT_OK
 
         directory = self._open_job_log(job.id)
@@ -792,6 +942,189 @@ class Worker:
             if code == EXIT_REFUSED:
                 self.log(f"worker: fenced; backing off {sleep_s:.0f}s")
             time.sleep(sleep_s)
+
+    # -- idle work (packet 5.4) ------------------------------------------
+
+    def _idle_say(self, message: str) -> None:
+        """One line from inside an idle step, prefixed so a log reader can tell.
+
+        ``judge.run_local`` says ``judged 1 vs 2: brief=A look=B``; the model
+        that said it belongs in the same line, because two judges will share
+        this log before the semester is out.
+        """
+        if message.startswith("judged "):
+            head, _, tail = message.partition(":")
+            detail = f" ({tail.strip()})" if tail.strip() else ""
+            self.log(f"idle: {head.strip()} as {self.judge_model}{detail}")
+        else:
+            self.log(f"idle: {message}")
+
+    def _idle_seed(self) -> int:
+        """A seed from the UTC minute: stable within a round, different between.
+
+        The judge's pair choice is deterministic given its rng (packet 5.1), and
+        a seed that changes every minute keeps a worker that idles all night
+        from offering the same tied pair over and over.
+        """
+        return int("".join(ch for ch in db.utc_now()[:16] if ch.isdigit()))
+
+    def _idle_round(self) -> None:
+        """One bounded round of idle work: judge a pair, critique an entry.
+
+        Called only when the queue is empty and control is ``running``. Nothing
+        here may raise: a failure in idle work is logged and dropped, because a
+        worker that stopped draining the queue over a failed critique would be a
+        worse machine than one that skips a critique.
+        """
+        judged = self._idle_judge() if self.idle_judge > 0 else None
+        critiqued = self._idle_critique() if self.idle_critique > 0 else None
+        if judged or critiqued:
+            return
+        parts = [
+            "judging is switched off (SKETCHGEN_IDLE_JUDGE=0)"
+            if self.idle_judge <= 0 else "nothing to judge",
+            "critiquing is switched off (SKETCHGEN_IDLE_CRITIQUE=0)"
+            if self.idle_critique <= 0 else "nothing to critique",
+        ]
+        self.log("idle: " + "; ".join(parts))
+
+    def _idle_judge(self) -> int:
+        """Judge up to ``idle_judge`` pairs with the local judge (packet 5.2).
+
+        The judge is handed *this worker's* probe. Its own fence has already
+        cleared this pass, and the worker is the process that owns the slot: a
+        second probe could only refuse the worker its own resident model, or
+        undo the test-mode observing probe the CLI injected.
+        """
+        try:
+            counts = self.judge_fn(
+                self.conn,
+                model=self.judge_model,
+                host=self.host,
+                limit=self.idle_judge,
+                rng=random.Random(self._idle_seed()),
+                probe=self.probe,
+                log=self._idle_say,
+            )
+        except Exception as exc:  # never take the worker down over idle work
+            self.log(f"idle: the judge stopped: {type(exc).__name__}: {exc}")
+            return 0
+        return int((counts or {}).get("judged") or 0)
+
+    def _idle_critique(self) -> int:
+        """Critique up to ``idle_critique`` published entries and spawn children.
+
+        Returns how many critiques were *recorded*, rejections included: a
+        rejected critique is an action, and it is what stops that entry being
+        offered again under the same prompt version.
+        """
+        try:
+            version = lineage.prompt_version()
+        except Exception as exc:
+            self.log(f"idle: no critique prompt to work from: {exc}")
+            return 0
+        try:
+            candidates = db.entries_to_critique(
+                self.conn, version, self.idle_critique
+            )
+        except sqlite3.Error as exc:
+            self.log(f"idle: cannot look for entries to critique: {exc}")
+            return 0
+        recorded = 0
+        for entry_id in candidates:
+            try:
+                if self._critique_one(entry_id, version):
+                    recorded += 1
+            except Exception as exc:  # as above: logged, dropped
+                self.log(
+                    f"idle: critique of entry {entry_id} stopped: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        return recorded
+
+    def _parent_rules_file(self, entry_row) -> str | None:
+        """The rules file the parent's JOB named, not the one it resolved to.
+
+        ``entries.rules_file`` holds the resolved side of the A/B ('control' or
+        'treatment'); the job may have said 'random'. A line inherits the
+        *setting*, so a random line stays random and the coin is tossed again
+        per child (spec §9).
+        """
+        job_id = entry_row["job_id"] if "job_id" in entry_row.keys() else None
+        if job_id is None:
+            return None
+        row = self.conn.execute(
+            "SELECT rules_file FROM jobs WHERE id = ?", (int(job_id),)
+        ).fetchone()
+        return row["rules_file"] if row is not None else None
+
+    def _critique_one(self, entry_id: int, version: str) -> bool:
+        """One entry: critique it, spawn its child, record what happened."""
+        row = self.conn.execute(
+            "SELECT * FROM entries WHERE id = ?", (int(entry_id),)
+        ).fetchone()
+        if row is None:  # pragma: no cover - it was there a moment ago
+            return False
+
+        try:
+            critique = self.critic_fn(
+                self.conn, int(entry_id), model=self.critic_model, host=self.host
+            )
+        except lineage.CritiqueRefused as exc:
+            # It could not run at all (no prompt file, no stub). The entry is
+            # not consumed: nothing was asked of the model.
+            self.log(f"idle: critique of entry {entry_id} refused: {exc}")
+            return False
+        except lineage.CritiqueFailed as exc:
+            raw = " ".join(str(getattr(exc, "raw", "") or "").split())[:1000]
+            db.record_critique(
+                self.conn,
+                entry_id,
+                critique=raw or None,
+                critique_by=self.critic_model,
+                prompt_version=version,
+                spawned_job_id=None,
+                rejected_reason=str(exc),
+            )
+            self.log(f"idle: critiqued entry {entry_id} but it was rejected: {exc}")
+            return True
+
+        job_id: int | None = None
+        reason: str | None = None
+        try:
+            job_id = self.spawn_fn(
+                self.conn,
+                parent_entry_id=int(entry_id),
+                critique=critique.text,
+                critique_by=critique.model,
+                submitted_by=row["submitted_by"] or "",
+                max_depth=self.lineage_depth,
+                rules_file=self._parent_rules_file(row),
+                publication="hold",
+            )
+        except ValueError as exc:
+            reason = f"spawn refused: {exc}"
+        if job_id is None and reason is None:
+            reason = "the parent is not a published or failed-kept entry"
+
+        db.record_critique(
+            self.conn,
+            entry_id,
+            critique=critique.text,
+            critique_by=critique.model,
+            prompt_version=version,
+            spawned_job_id=job_id,
+            rejected_reason=reason,
+        )
+        if job_id is None:
+            self.log(f"idle: critiqued entry {entry_id}, spawned nothing: {reason}")
+        else:
+            generation = lineage.generation_of(self.conn, int(entry_id)) + 1
+            self.log(
+                f"idle: critiqued entry {entry_id} -> job {job_id} "
+                f"(generation {generation})"
+            )
+        return True
 
     # -- the job ---------------------------------------------------------
 

@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sketchgen import __version__  # noqa: E402
 from sketchgen import db  # noqa: E402
 from sketchgen import executor  # noqa: E402
+from sketchgen import lineage  # noqa: E402
 from sketchgen import planner  # noqa: E402
 from sketchgen import publish as publication  # noqa: E402
 from sketchgen import worker  # noqa: E402
@@ -131,6 +132,16 @@ def cmd_db_status(args: argparse.Namespace) -> int:
         print("jobs by state:")
         for state, count in db.job_counts(conn):
             print(f"  {state:<16} {count:>8}")
+        idle = worker.idle_summary(conn)
+        print("idle work:")
+        for label, key in (
+            ("agent verdicts", "agent_verdicts"),
+            ("critiques", "critiques"),
+            ("spawned children", "spawned"),
+            ("rejected", "rejected"),
+        ):
+            print(f"  {label:<16} {idle[key]:>8}")
+        print(f"  last action utc: {idle['last_action_utc'] or '-'}")
     except sqlite3.Error as exc:
         print(f"sketchgen: db status failed: {exc}", file=sys.stderr)
         return EXIT_FAIL
@@ -188,16 +199,39 @@ def cmd_worker(args: argparse.Namespace) -> int:
         return EXIT_FAIL
     executor_fn = None
     planner_fn = None
+    judge_fn = None
+    critic_fn = None
     probe = None
-    if args.stub_executor:
-        executor_fn = worker.stub_executor(args.stub_executor)
+    if any((args.stub_executor, args.stub_planner_assert,
+            args.stub_judge is not None, args.stub_critic)):
         # A stubbed run calls no model, so it cannot contend for the inference
         # slot: the fence observes and reports but does not refuse. A real run
         # gets the real fence.
         probe = worker.observing_probe(args.host)
+    if args.stub_executor:
+        executor_fn = worker.stub_executor(args.stub_executor)
         print(
             "sketchgen: TEST MODE — the executor is stubbed; no model is called, "
             "and the fence observes the slot without refusing on it",
+            file=sys.stderr,
+        )
+    if args.stub_judge is not None:
+        judge_fn = worker.stub_judge(args.stub_judge or None)
+        print(
+            "sketchgen: TEST MODE — the idle judge is stubbed"
+            + (f"; replaying {args.stub_judge}" if args.stub_judge
+               else "; it judges nothing"),
+            file=sys.stderr,
+        )
+    if args.stub_critic:
+        stub_path = args.stub_critic
+
+        def critic_fn(conn, entry_id, **kwargs):  # noqa: F811 — test-only stub
+            """TEST ONLY: replay a saved critique instead of calling the model."""
+            return lineage.critique(conn, entry_id, stub=stub_path, **kwargs)
+
+        print(
+            f"sketchgen: TEST MODE — the critic is stubbed; replaying {stub_path}",
             file=sys.stderr,
         )
     if args.stub_planner_assert:
@@ -213,6 +247,8 @@ def cmd_worker(args: argparse.Namespace) -> int:
         host=args.host,
         executor_fn=executor_fn,
         planner_fn=planner_fn,
+        judge_fn=judge_fn,
+        critic_fn=critic_fn,
         probe=probe,
     )
     try:
@@ -751,6 +787,14 @@ def build_parser() -> argparse.ArgumentParser:
                                action="append", default=[], metavar="WORD",
                                help="TEST ONLY: plan with the job's own prompt as the "
                                     "brief and these assertions; repeatable")
+    worker_parser.add_argument("--stub-judge", dest="stub_judge", nargs="?", const="",
+                               default=None, metavar="FILE",
+                               help="TEST ONLY: the idle judge replays FILE, or "
+                                    "judges nothing when given no FILE")
+    worker_parser.add_argument("--stub-critic", dest="stub_critic", default=None,
+                               metavar="FILE",
+                               help="TEST ONLY: the idle critic replays this saved "
+                                    "critique instead of calling the model")
     worker_parser.set_defaults(func=cmd_worker, _parser=worker_parser)
 
     control_parser = top.add_parser(

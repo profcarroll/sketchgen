@@ -38,6 +38,23 @@
 # `sketchgen worker` is packet 2.3's subcommand. The four Environment= lines below
 # are the only configuration it has; the same four names, with the same defaults,
 # are what sketchgen/worker.py reads when no unit set them.
+#
+# IDLE WORK (packet 5.4). When the queue is empty and the control row says
+# running, this same process judges one pair and critiques one published entry
+# before it sleeps — inside this loop, deliberately, and NOT as a second timer:
+# there is one inference slot, and a second unit would need a second fence
+# racing this one. Five optional Environment= lines tune it, and none of them
+# needs to be set for the default behaviour:
+#
+#   Environment=SKETCHGEN_IDLE_JUDGE=1      pairs judged per idle round; 0 = off
+#   Environment=SKETCHGEN_IDLE_CRITIQUE=1   entries critiqued per round; 0 = off
+#   Environment=SKETCHGEN_JUDGE_MODEL=gemma4:e4b
+#   Environment=SKETCHGEN_CRITIC_MODEL=gemma4:e4b
+#   Environment=SKETCHGEN_LINEAGE_DEPTH=3   DECIDE[lineage-depth]; then a person
+#
+# Set the two limits to 0 to leave the node entirely idle between jobs — the
+# quickest way to hand the slot to someone else without pausing the worker.
+# Do not change ExecStart to add them; they are environment, not arguments.
 
 [Unit]
 Description=sketchgen worker: one p5.js sketch job at a time, slot-fenced
