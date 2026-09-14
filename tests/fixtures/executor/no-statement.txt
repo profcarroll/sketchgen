@@ -1,0 +1,33 @@
+```js
+// A slow grid of squares breathing in and out of a dark ground.
+
+let t = 0;
+const STEP = 48;
+
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  rectMode(CENTER);
+  noStroke();
+}
+
+function draw() {
+  background(10);
+  t += 0.02;
+  for (let y = STEP / 2; y < height; y += STEP) {
+    for (let x = STEP / 2; x < width; x += STEP) {
+      const n = noise(x * 0.005, y * 0.005, t);
+      const s = STEP * 0.15 + n * STEP * 0.6;
+      fill(230, 120, 60, 200);
+      square(x, y, s);
+    }
+  }
+}
+
+function mousePressed() {
+  t += 3;
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+```
