@@ -1402,9 +1402,41 @@ def _count(conn: sqlite3.Connection, sql: str, args: Iterable[Any] = ()) -> int:
     return int(row[0]) if row else 0
 
 
+def _entries_by_job(conn: sqlite3.Connection) -> dict[int, tuple[int, str]]:
+    """``{job_id: (entry_id, entry_state)}`` for every job that has an entry."""
+    return {
+        int(row["job_id"]): (int(row["id"]), str(row["state"]))
+        for row in conn.execute("SELECT id, job_id, state FROM entries")
+    }
+
+
+def entry_cell(entry: tuple[int, str] | None) -> str:
+    """The queue's 'entry' cell: the entry id, linked to where it is now.
+
+    A job and its entry have different numbers (job 49 made entry 48), and
+    the queue speaks in job ids while the Held page and the gallery speak in
+    entry ids. This column is the crosswalk, so nobody has to carry one number
+    over to the other page and get it wrong.
+    """
+    if entry is None:
+        return '<td class="n dim">—</td>'
+    entry_id, state = entry
+    if state == "held":
+        href = f"/held#entry-{entry_id}"
+    elif state in ("published", "failed-kept"):
+        href = f"{GALLERY_URL}e/{entry_id}/"
+    else:
+        return f'<td class="n" title="entry {entry_id}, {esc(state)}">{entry_id}</td>'
+    return (
+        f'<td class="n"><a href="{esc(href)}" title="entry {entry_id}, {esc(state)}" '
+        f'onclick="event.stopPropagation()">{entry_id}</a></td>'
+    )
+
+
 def queue_page(conn: sqlite3.Connection, doc: dict[str, Any], control) -> str:
     jobs = list(reversed(db.list_jobs(conn)))
     counts = _attempt_counts(conn)
+    entries = _entries_by_job(conn)
     today = db.utc_now()[:10]
     pill_text, pill_class, _ = pill_for(control)
 
@@ -1469,6 +1501,7 @@ def queue_page(conn: sqlite3.Connection, doc: dict[str, Any], control) -> str:
         rows.append(
             f'<tr class="job" onclick="location=\'/job/{job.id}\'">'
             f'<td class="n"><a href="/job/{job.id}">{job.id}</a></td>'
+            f"{entry_cell(entries.get(job.id))}"
             f"<td>{esc(truncate(job.prompt))}</td>"
             f'<td><span class="pill {esc(job.state)}">{esc(state_label(job.state))}</span></td>'
             f'<td class="n">{attempts}/{esc(job.max_attempts)}</td>'
@@ -1480,7 +1513,7 @@ def queue_page(conn: sqlite3.Connection, doc: dict[str, Any], control) -> str:
         )
     if not rows:
         rows.append(
-            '<tr><td colspan="8" class="dim">nothing queued yet — '
+            '<tr><td colspan="9" class="dim">nothing queued yet — '
             '<a href="/new">write the first job</a></td></tr>'
         )
 
@@ -1829,8 +1862,12 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
             '<p class="dim">no attempt has run yet</p></section>'
         )
 
+    own = conn.execute(
+        "SELECT id, state FROM entries WHERE job_id = ?", (job.id,)
+    ).fetchone()
     rows = [
         ("state", job.state),
+        ("entry", f"entry {own['id']} ({own['state']})" if own is not None else "— (no entry yet)"),
         ("prompt", job.prompt),
         ("brief", job.brief or "— (the planner has not run)"),
         ("assertions", ", ".join(job.assertions) or "—"),
@@ -2182,13 +2219,18 @@ def _decision_card(
             '<input type="text" name="reason" placeholder="reason" '
             'style="font:inherit;padding:4px 8px;border:1px solid var(--line);'
             'border-radius:5px;background:var(--bg);color:var(--fg)">'
-            '<button type="submit" class="danger">Reject</button></form>'
+            f'<button type="submit" class="danger">Reject entry {row["id"]}</button></form>'
         )
     )
     return (
-        '<section class="panel card">'
-        f"<h2>Entry {row['id']} <span class='dim' style='text-transform:none'>"
-        f"— job <a href=\"/job/{row['job_id']}\">{row['job_id']}</a></span></h2>"
+        f'<section class="panel card" id="entry-{row["id"]}">'
+        # One number per card, and it is the entry's: every button here acts
+        # on the entry. The job that made it is provenance, said in words,
+        # because "Entry 48 — job 49" was read as two ids for one thing twice
+        # on 2026-09-14 and the wrong one was typed into the next request.
+        f"<h2>Entry {row['id']}</h2>"
+        f'<p class="dim" style="font-size:12px;margin:-6px 0 8px">made by job '
+        f'<a href="/job/{row["job_id"]}">{row["job_id"]}</a></p>'
         # The sketch running, then the strip the gate saw. Publication is a
         # person's decision (DECIDE[publication-gate]) and this is the part
         # of it a still frame cannot carry.
@@ -2200,7 +2242,7 @@ def _decision_card(
         f" · rules {esc(row['rules_file'] or '—')}</p>"
         '<div class="actions">'
         f'<form method="post" action="/held/{row["id"]}/publish">'
-        "<button type=\"submit\">Publish</button></form>"
+        f'<button type="submit">Publish entry {row["id"]}</button></form>'
         f"{reject}"
         "</div>"
         f'<div class="actions">{spawn_form(row, "/held")}</div>'
@@ -2348,7 +2390,7 @@ def spawn_form(row: sqlite3.Row, back: str) -> str:
     return (
         f'<form method="post" action="/entry/{entry_id}/spawn" class="spawn">'
         f'<input type="hidden" name="back" value="{esc(back)}">'
-        f'<label for="critique-{entry_id}">Spawn a child from a critique</label>'
+        f'<label for="critique-{entry_id}">Spawn a child of entry {entry_id} from a critique</label>'
         f'<input type="text" id="critique-{entry_id}" name="critique" required '
         'maxlength="400" placeholder="one sentence: what the child should do '
         'differently" style="font:inherit;padding:4px 8px;border:1px solid '
@@ -2358,7 +2400,7 @@ def spawn_form(row: sqlite3.Row, back: str) -> str:
         'title="model id or GitHub username — who wrote the critique" '
         'style="font:inherit;padding:4px 8px;border:1px solid var(--line);'
         'border-radius:5px;background:var(--bg);color:var(--fg);max-width:12em">'
-        '<button type="submit">Spawn a child</button>'
+        f'<button type="submit">Spawn a child of entry {entry_id}</button>'
         f'<span class="dim" style="font-size:12px">{esc(note)}</span>'
         "</form>"
     )
