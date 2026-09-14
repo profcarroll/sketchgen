@@ -1,0 +1,86 @@
+Sure! Here is the sketch. I put the statement first since you will want to read
+it before the code, and I had to touch index.html because the brief needs sound.
+
+## Statement
+
+A ring of bars listens to the room and leans toward whatever is loudest; when
+nothing is happening it settles into a slow tide instead of going flat, because
+silence should still look alive. The colour is one warm hue pushed through a
+narrow range of brightness, so the motion is the only thing that changes.
+
+Because the sketch uses the microphone I also need the p5.sound addon, which the
+default page does not load, so here is the whole index.html:
+
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>sketch</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/addons/p5.sound.min.js"></script>
+    <style>
+        body { margin: 0; overflow: hidden; background: #111; }
+        canvas { display: block; }
+    </style>
+</head>
+<body>
+    <script src="sketch.js"></script>
+</body>
+</html>
+```
+
+And the sketch itself:
+
+```js
+// A ring of bars driven by the microphone level, with a slow tide underneath
+// so the piece keeps moving in a silent room.
+
+let mic = null;
+let level = 0;
+let t = 0;
+const BARS = 72;
+
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  angleMode(RADIANS);
+  noStroke();
+}
+
+function draw() {
+  background(14, 10, 8);
+  t += 0.015;
+  if (mic) {
+    level = lerp(level, mic.getLevel(), 0.2);
+  }
+  translate(width / 2, height / 2);
+  const base = min(width, height) * 0.18;
+  for (let i = 0; i < BARS; i++) {
+    const a = (TWO_PI / BARS) * i;
+    const tide = sin(t * 2 + i * 0.2) * 12;
+    const len = base + tide + level * min(width, height) * 1.6;
+    fill(240, 150, 70, 220);
+    push();
+    rotate(a);
+    rect(base, -3, len - base, 6);
+    pop();
+  }
+}
+
+// Browsers keep audio suspended until a gesture, so the microphone is started
+// from the click and not from setup().
+function mousePressed() {
+  userStartAudio();
+  if (!mic) {
+    mic = new p5.AudioIn();
+    mic.start();
+  }
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+```
+
+That is everything — let me know if you want the bars to respond to bass only.
