@@ -114,6 +114,7 @@ Five environment variables tune it; none has to be set:
 | `SKETCHGEN_JUDGE_MODEL` | `gemma4:e4b` | the local judge |
 | `SKETCHGEN_CRITIC_MODEL` | `gemma4:e4b` | the critic whose sentence becomes the next prompt |
 | `SKETCHGEN_LINEAGE_DEPTH` | 3 | generations a line runs before a person has to touch it |
+| `SKETCHGEN_STUCK_MINUTES` | 30 | how long a job may sit in a running state with nobody attending it before the sweep re-queues it; `0` never sweeps |
 
 Set both limits to `0` to leave the node quiet between jobs — the quickest way to
 hand the inference slot to somebody else without pausing the worker at all:
@@ -128,6 +129,37 @@ An entry is critiqued **once per version of `prompts/critic.md`**, and the row i
 rejected for breaking the one-sentence rule, which is kept with its reason rather
 than retried. Editing that prompt bumps its `prompt_version`, and those entries
 may be critiqued again under the new one.
+
+## When a job goes wrong
+
+Two things the worker does for itself, both written after job 5 spent a night
+stuck in `planning` on 2026-09-14:
+
+**A step that fails is a job outcome, not a crash.** If the planner's reply
+cannot be parsed, the raw text is saved to
+`~/sketchgen/jobs/<id>/plan-response-<n>.txt` and the plan is tried once more
+**with a different seed** — the log line says which seed each try used, because
+the first version of this retry re-sampled with the same seed and the model
+reproduced its mistake word for word. If both tries fail, the last reply is read
+leniently: prose with no `Brief` heading still becomes the brief, and the entry
+records `planner-v1+lenient` so you can see the plan was recovered rather than
+parsed. Only a reply with no prose at all fails the job, with
+`last_error: planner: …`, and no entry is kept because nothing was made. The
+executor and the gate are the same: whatever goes wrong becomes an attempt row
+with evidence, and the worker carries on.
+
+**A job nobody is attending goes back on the queue.** At startup, and again on
+every idle cycle, the worker re-queues any job left in `planning`, `executing`,
+`gating` or `repairing` that has not moved for `SKETCHGEN_STUCK_MINUTES`
+(default 30) and that it is not working on itself. It says so in the log:
+
+```
+sweep: job 5 sat in planning for 47 minutes with no worker attending it; re-queued
+```
+
+The attempt rows that job already has are kept, and it resumes at the next
+attempt number. Nothing has to be recovered by hand: `db status` shows the state
+and the next pass picks it up.
 
 ## The two deploy keys
 

@@ -14,6 +14,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sketchgen import db  # noqa: E402
 from sketchgen import lineage  # noqa: E402
+from sketchgen import planner  # noqa: E402
 from sketchgen import worker  # noqa: E402
 
 
@@ -150,7 +152,7 @@ class StubGate:
 
 
 def stub_plan(assertions=("motion(idle)",), brief="a brief the stub planner wrote"):
-    def plan(*, job, host, model):
+    def plan(*, job, host, model, seed=1):
         from sketchgen import planner
 
         return planner.Plan(brief=brief, assertions=list(assertions),
@@ -788,6 +790,343 @@ class TestIdleEnv(unittest.TestCase):
             self.assertEqual(1, worker._int_env("SKETCHGEN_IDLE_JUDGE", 1))
         with mock.patch.dict(os.environ, {}, clear=False):
             self.assertEqual(3, worker._int_env("SKETCHGEN_NOT_SET_ANYWHERE", 3))
+
+
+class FlakyPlanner:
+    """A planner that fails its first ``failures`` calls, then succeeds.
+
+    The default failure is the real one from the node on 2026-09-14: the model
+    answered with no Brief heading and planner.py raised PlannerFailed with the
+    reply attached.
+    """
+
+    RAW = "Sure! Here are some ideas for the sketch:\n- drifting circles\n"
+    #: A reply with nothing a lenient parse could take a brief from.
+    UNUSABLE = "Assertions:\n- motion(idle)\n"
+
+    def __init__(self, failures=1, error=None, raw=None):
+        self.failures = failures
+        self.error = error
+        self.raw = self.RAW if raw is None else raw
+        self.calls = 0
+        self.seeds = []
+
+    def __call__(self, *, job, host, model, seed=1):
+        self.calls += 1
+        self.seeds.append(seed)
+        if self.calls <= self.failures:
+            if self.error is not None:
+                raise self.error
+            raise planner.PlannerFailed("no 'Brief' heading in the response",
+                                        self.raw)
+        return planner.Plan(
+            brief="a brief the planner wrote on the retry",
+            assertions=["motion(idle)"],
+            prompt_version="planner-v1",
+            tokens={},
+            durations={},
+            raw="",
+        )
+
+
+class ExplodingExecutor:
+    """An executor that raises on its first calls and then behaves."""
+
+    def __init__(self, raises=1, exc=None):
+        self.raises = raises
+        self.exc = exc or RuntimeError("the response was bytes, not text")
+        self.inner = StubExecutor()
+        self.calls = 0
+
+    def __call__(self, **kwargs):
+        self.calls += 1
+        if self.calls <= self.raises:
+            raise self.exc
+        return self.inner(**kwargs)
+
+
+class TestPlannerFailures(WorkerTestCase):
+    """2026-09-14: a planner failure has to be a job outcome, not a crash."""
+
+    def plan_files(self, job_id):
+        return sorted(p.name for p in
+                      (self.jobs / str(job_id)).glob("plan-response-*.txt"))
+
+    def test_one_slip_is_retried_and_the_reply_is_saved(self):
+        job_id = db.enqueue(self.conn, "sixty drifting circles", "octocat")
+        planner_fn = FlakyPlanner(failures=1)
+        self.assertEqual(0, self.make_worker(planner_fn=planner_fn).run_once())
+
+        self.assertEqual(2, planner_fn.calls)
+        self.assertEqual("held", db.get_job(self.conn, job_id).state)
+        self.assertEqual(["plan-response-1.txt"], self.plan_files(job_id))
+        self.assertEqual(
+            FlakyPlanner.RAW,
+            (self.jobs / str(job_id) / "plan-response-1.txt").read_text(),
+        )
+
+    def test_two_failures_fail_the_job_and_keep_no_entry(self):
+        job_id = db.enqueue(self.conn, "sixty drifting circles", "octocat")
+        planner_fn = FlakyPlanner(failures=2, raw=FlakyPlanner.UNUSABLE)
+        # a job outcome, not an error exit: the worker carries on
+        self.assertEqual(0, self.make_worker(planner_fn=planner_fn).run_once())
+
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual("failed", job.state)
+        self.assertTrue(job.last_error.startswith("planner:"), job.last_error)
+        self.assertIn("Brief", job.last_error)
+        self.assertEqual([], self.attempts(job_id))
+        self.assertEqual([], self.entries(job_id))  # nothing was made to keep
+        self.assertEqual(["plan-response-1.txt", "plan-response-2.txt"],
+                         self.plan_files(job_id))
+
+    def test_a_refusal_fails_the_job_the_same_way(self):
+        job_id = db.enqueue(self.conn, "sixty drifting circles", "octocat")
+        error = planner.PlannerRefused("cannot read prompts/planner.md")
+        run = self.make_worker(planner_fn=FlakyPlanner(failures=2, error=error))
+        self.assertEqual(0, run.run_once())
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual("failed", job.state)
+        self.assertTrue(job.last_error.startswith("planner:"), job.last_error)
+
+    def test_an_unexpected_exception_from_the_planner_is_caught_too(self):
+        job_id = db.enqueue(self.conn, "sixty drifting circles", "octocat")
+        run = self.make_worker(
+            planner_fn=FlakyPlanner(failures=2, error=ZeroDivisionError("division"))
+        )
+        self.assertEqual(0, run.run_once())
+        self.assertEqual("failed", db.get_job(self.conn, job_id).state)
+
+
+class SeededPlanner:
+    """Malformed on one seed, fine on any other — the 2026-09-14 failure mode.
+
+    The planner is sampled with a fixed seed, so the retry of job 5 asked the
+    same question the same way and got the same broken answer back. This stub is
+    that model: deterministic per seed.
+    """
+
+    BAD = "Sure! Some ideas:\n- circles\n"
+
+    def __init__(self, bad_seed):
+        self.bad_seed = bad_seed
+        self.seeds = []
+
+    def __call__(self, *, job, host, model, seed=1):
+        self.seeds.append(seed)
+        if seed == self.bad_seed:
+            raise planner.PlannerFailed("no 'Brief' heading in the response",
+                                        self.BAD)
+        return planner.Plan(brief="a brief from a different roll",
+                            assertions=["motion(idle)"],
+                            prompt_version="planner-v1", tokens={},
+                            durations={}, raw="")
+
+
+class ProsePlanner:
+    """Always headingless, always prose: the lenient parse is the only way out."""
+
+    RAW = ("Sure! Here is the plan:\n\n"
+           "Sixty circles drift across a dark field, each on its own slow noise "
+           "path.\n\nAssertions:\n- motion(idle)\n- responds(click)\n")
+
+    def __init__(self):
+        self.calls = 0
+
+    def __call__(self, *, job, host, model, seed=1):
+        self.calls += 1
+        raise planner.PlannerFailed("no 'Brief' heading in the response", self.RAW)
+
+
+class TestPlannerSeedAndRecovery(WorkerTestCase):
+    def test_the_retry_uses_a_different_seed(self):
+        job_id = db.enqueue(self.conn, "sixty drifting circles", "octocat")
+        first_seed = worker.plan_seed(job_id, 1)
+        planner_fn = SeededPlanner(bad_seed=first_seed)
+        log = io.StringIO()
+        run = self.make_worker(planner_fn=planner_fn, log_stream=log)
+        self.assertEqual(0, run.run_once())
+
+        self.assertEqual([first_seed, worker.plan_seed(job_id, 2)], planner_fn.seeds)
+        self.assertNotEqual(planner_fn.seeds[0], planner_fn.seeds[1])
+        self.assertEqual("held", db.get_job(self.conn, job_id).state)
+        self.assertEqual("a brief from a different roll",
+                         db.get_job(self.conn, job_id).brief)
+        for seed in planner_fn.seeds:  # every try says which seed it used
+            self.assertIn(f"seed {seed}", log.getvalue())
+
+    def test_prose_without_a_heading_is_recovered_and_marked_lenient(self):
+        job_id = db.enqueue(self.conn, "sixty drifting circles", "octocat")
+        planner_fn = ProsePlanner()
+        log = io.StringIO()
+        run = self.make_worker(planner_fn=planner_fn, log_stream=log)
+        self.assertEqual(0, run.run_once())
+
+        self.assertEqual(worker.PLAN_TRIES, planner_fn.calls)  # strict first, both times
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual("held", job.state)
+        self.assertEqual(
+            "Sixty circles drift across a dark field, each on its own slow "
+            "noise path.",
+            job.brief,
+        )
+        self.assertEqual(["motion(idle)", "responds(click)"], job.assertions)
+        self.assertIn("lenient parse", log.getvalue())
+        # the entry says the plan was recovered rather than parsed
+        self.assertEqual(
+            f"planner-v1{planner.LENIENT_MARK}",
+            self.entries(job_id)[0]["planner_prompt_version"],
+        )
+
+    def test_a_reply_with_no_prose_at_all_still_fails_the_job(self):
+        job_id = db.enqueue(self.conn, "sixty drifting circles", "octocat")
+        run = self.make_worker(
+            planner_fn=FlakyPlanner(failures=2, raw=FlakyPlanner.UNUSABLE)
+        )
+        self.assertEqual(0, run.run_once())
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual("failed", job.state)
+        self.assertTrue(job.last_error.startswith("planner:"), job.last_error)
+
+
+class TestStepExceptions(WorkerTestCase):
+    def test_an_executor_that_raises_is_a_failed_attempt_and_the_job_repairs(self):
+        job_id = self.enqueue(max_attempts=3)
+        run = self.make_worker(executor_fn=ExplodingExecutor(raises=1),
+                               gate_fn=StubGate([0]))
+        self.assertEqual(0, run.run_once())
+
+        rows = self.attempts(job_id)
+        self.assertEqual([1, 2], [row.n for row in rows])
+        self.assertTrue(rows[0].evidence.startswith("executor: RuntimeError"),
+                        rows[0].evidence)
+        self.assertIsNone(rows[0].gate_exit)
+        self.assertIn("repairing", self.states)
+        self.assertEqual("held", db.get_job(self.conn, job_id).state)
+
+    def test_a_gate_that_raises_is_a_failed_attempt_with_no_verdict(self):
+        job_id = self.enqueue(max_attempts=1)
+
+        def gate_fn(**kwargs):
+            raise OSError("chromium is not where it was")
+
+        self.assertEqual(0, self.make_worker(gate_fn=gate_fn).run_once())
+        rows = self.attempts(job_id)
+        self.assertEqual(1, len(rows))
+        self.assertIsNone(rows[0].gate_exit)
+        self.assertIn("chromium is not where it was", rows[0].evidence)
+        self.assertEqual("failed", db.get_job(self.conn, job_id).state)
+
+    def test_a_job_is_never_left_owned_after_a_pass(self):
+        """Even an exception no guard expects releases the job to the sweep."""
+        job_id = self.enqueue()
+
+        def gate_fn(**kwargs):
+            raise KeyboardInterrupt  # not an Exception: it escapes every guard
+
+        run = self.make_worker(gate_fn=gate_fn)
+        with self.assertRaises(KeyboardInterrupt):
+            run.run_once()
+        self.assertEqual("gating", db.get_job(self.conn, job_id).state)
+        self.assertEqual(set(), run._owned)  # so the next sweep can recover it
+
+
+class TestSweep(WorkerTestCase):
+    def age(self, job_id, minutes):
+        """Backdate one job's updated_utc."""
+        then = datetime.strptime(db.utc_now(), worker.UTC_FORMAT) - timedelta(
+            minutes=minutes)
+        self.conn.execute("UPDATE jobs SET updated_utc = ? WHERE id = ?",
+                          (then.strftime(worker.UTC_FORMAT), job_id))
+
+    #: How a job legally reaches each running state from `queued`.
+    PATHS = {
+        "planning": ("planning",),
+        "executing": ("executing",),
+        "gating": ("executing", "gating"),
+        "repairing": ("executing", "gating", "repairing"),
+    }
+
+    def stuck(self, state="planning", minutes=90):
+        """A job parked in one running state with an old updated_utc."""
+        job_id = self.enqueue()
+        for step in self.PATHS[state]:
+            db.transition(self.conn, job_id, step)
+        self.age(job_id, minutes)
+        self.states.clear()
+        return job_id
+
+    def test_a_job_left_in_planning_is_requeued(self):
+        job_id = self.stuck("planning", minutes=90)
+        self.assertEqual([job_id], self.make_worker().sweep_stuck())
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual("queued", job.state)
+        self.assertIn("swept", job.last_error)
+        self.assertIn("90 minutes", job.last_error)
+
+    def test_every_running_state_is_swept(self):
+        ids = [self.stuck(state) for state in
+               ("planning", "executing", "gating", "repairing")]
+        self.assertEqual(ids, self.make_worker().sweep_stuck())
+        for job_id in ids:
+            self.assertEqual("queued", db.get_job(self.conn, job_id).state)
+
+    def test_a_fresh_job_is_left_alone(self):
+        job_id = self.stuck("executing", minutes=5)
+        self.assertEqual([], self.make_worker().sweep_stuck())
+        self.assertEqual("executing", db.get_job(self.conn, job_id).state)
+
+    def test_a_queued_or_finished_job_is_never_swept(self):
+        queued = self.enqueue()
+        self.age(queued, 600)
+        done = self.enqueue()
+        for state in ("executing", "gating", "held"):
+            db.transition(self.conn, done, state)
+        self.age(done, 600)
+        self.assertEqual([], self.make_worker().sweep_stuck())
+        self.assertEqual("queued", db.get_job(self.conn, queued).state)
+        self.assertEqual("held", db.get_job(self.conn, done).state)
+
+    def test_the_job_this_worker_owns_is_never_swept(self):
+        job_id = db.enqueue(self.conn, "sixty drifting circles", "octocat")
+        seen = {}
+
+        def slow_planner(*, job, host, model, seed=1):
+            # the worker owns this job right now; pretend its plan took two hours
+            self.age(job.id, 120)
+            seen["swept"] = run.sweep_stuck()
+            return planner.Plan(brief="a brief", assertions=["motion(idle)"],
+                                prompt_version="planner-v1", tokens={},
+                                durations={}, raw="")
+
+        run = self.make_worker(planner_fn=slow_planner)
+        self.assertEqual(0, run.run_once())
+        self.assertEqual([], seen["swept"])
+        self.assertEqual("held", db.get_job(self.conn, job_id).state)
+
+    def test_the_sweep_runs_at_the_start_of_a_pass(self):
+        job_id = self.stuck("gating", minutes=45)
+        log = io.StringIO()
+        self.assertEqual(0, self.make_worker(log_stream=log).run_once())
+        self.assertIn(f"sweep: job {job_id} sat in gating", log.getvalue())
+        # swept before claim_next, so the same pass picks it back up
+        self.assertNotEqual("gating", db.get_job(self.conn, job_id).state)
+
+    def test_zero_minutes_switches_the_sweep_off(self):
+        job_id = self.stuck("planning", minutes=999)
+        run = self.make_worker()
+        run.stuck_minutes = 0
+        self.assertEqual([], run.sweep_stuck())
+        self.assertEqual("planning", db.get_job(self.conn, job_id).state)
+
+    def test_an_unreadable_timestamp_is_left_alone(self):
+        job_id = self.stuck("planning", minutes=90)
+        self.conn.execute("UPDATE jobs SET updated_utc = 'yesterday' WHERE id = ?",
+                          (job_id,))
+        self.assertEqual([], self.make_worker().sweep_stuck())
+        self.assertIsNone(worker.minutes_between("yesterday", db.utc_now()))
+        self.assertEqual(60.0, worker.minutes_between("2026-09-14T00:00:00Z",
+                                                      "2026-09-14T01:00:00Z"))
 
 
 class TestEvidence(unittest.TestCase):

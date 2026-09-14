@@ -37,9 +37,12 @@ __all__ = [
     "Plan",
     "PlannerFailed",
     "PlannerRefused",
+    "LENIENT_MARK",
     "build_prompt",
     "parse_response",
+    "parse_response_lenient",
     "plan",
+    "recover",
     "prompt_version",
     "utc_now",
     "validate",
@@ -92,6 +95,15 @@ _HEADING_RE_CACHE: dict[str, re.Pattern[str]] = {}
 #: assertions.
 _CANDIDATE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*(\([^()]*\))?$")
 _BULLET_RE = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+")
+#: A line that is only a heading — '## Sketch', '**Plan**', 'Idea:' — and so is
+#: not the prose the lenient parse is looking for.
+_HEADING_ONLY_RE = re.compile(
+    r"^(?:#{1,6}\s*\S.*|[*_`]{0,2}[A-Za-z][A-Za-z ]{0,30}:[*_`]{0,2})$"
+)
+
+#: Stamped onto ``prompt_version`` when a plan was rescued from a reply the
+#: strict parser refused (see :func:`recover`).
+LENIENT_MARK = "+lenient"
 
 
 class PlannerRefused(Exception):
@@ -208,6 +220,95 @@ def parse_response(raw: str) -> tuple[str, list[str]]:
                 break  # trailing commentary; the assertion block is over
             words.append(candidate)
     return brief, words
+
+
+def parse_response_lenient(raw: str) -> tuple[str, list[str]]:
+    """``(brief, words)`` from a reply that has prose but no ``Brief`` heading.
+
+    The strict parser refuses to guess, and it is right to: a wrong brief is
+    silently wrong for the life of the entry. But a *missing heading* over a
+    perfectly good paragraph is a format slip, not a wrong brief, and on
+    2026-09-14 it cost one job twice, because the seed was fixed and the model
+    reproduced its mistake exactly. So this is the rescue, used only after the
+    strict parse has failed on every try (worker.py, ``_plan``): the first
+    non-empty paragraph above any ``Assertions`` heading becomes the brief, the
+    assertion block is read exactly as before, and the plan is stamped
+    ``+lenient`` so the entry says how it was obtained.
+
+    Raises :class:`PlannerFailed` when there is no prose to take — an empty
+    reply, or nothing but an assertion list.
+    """
+    lines = raw.splitlines()
+    assertions_re = _heading_re("Assertions")
+    assertions_at = -1
+    for i, line in enumerate(lines):
+        if assertions_re.match(line):
+            assertions_at = i
+            break
+
+    head = lines[:assertions_at] if assertions_at >= 0 else lines
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for line in head:
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                paragraphs.append(" ".join(current))
+                current = []
+            continue
+        if _HEADING_ONLY_RE.match(stripped):
+            continue  # a heading of its own: '## Sketch', 'Plan:'
+        current.append(_BULLET_RE.sub("", stripped))
+    if current:
+        paragraphs.append(" ".join(current))
+    if not paragraphs:
+        raise PlannerFailed("no brief, and no prose to take one from", raw)
+
+    # The first paragraph, unless it ends in a colon: a paragraph that ends in a
+    # colon is announcing the next one ("Sure! Here are some ideas:"), and small
+    # models open with one constantly. Taking it would make the brief a sentence
+    # about the brief.
+    brief = next(
+        (text for text in paragraphs if not text.rstrip().endswith(":")),
+        paragraphs[0],
+    ).strip()
+    if not brief:
+        raise PlannerFailed("no brief, and no prose to take one from", raw)
+
+    words: list[str] = []
+    if assertions_at >= 0:
+        for line in lines[assertions_at + 1:]:
+            stripped = _BULLET_RE.sub("", line).strip().strip("`").rstrip(".,;")
+            if not stripped:
+                continue
+            candidate = re.sub(r"\s+", "", stripped)
+            if not _CANDIDATE_RE.match(candidate):
+                break
+            words.append(candidate)
+    return brief, words
+
+
+def recover(raw: str, prompt_path: str | Path | None = None) -> Plan:
+    """A :class:`Plan` from a reply the strict parser refused. See above.
+
+    ``prompt_version`` carries the ``+lenient`` mark, so an entry made this way
+    is visible as one: provenance that says "recovered" is worth more than
+    provenance that looks ordinary (spec §5). The assertion list goes through
+    the same validator, so a lenient plan cannot smuggle in a word the gate
+    does not implement.
+    """
+    brief, words = parse_response_lenient(raw)
+    ok, rejected, defaulted = validate_detailed(words)
+    return Plan(
+        brief=brief,
+        assertions=ok,
+        prompt_version=prompt_version(prompt_path) + LENIENT_MARK,
+        tokens={},
+        durations={},
+        raw=raw,
+        rejected=rejected,
+        defaulted=defaulted,
+    )
 
 
 # ---------------------------------------------------------------------------
