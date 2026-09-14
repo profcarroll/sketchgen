@@ -14,6 +14,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -24,6 +25,7 @@ from sketchgen import executor  # noqa: E402
 from sketchgen import planner  # noqa: E402
 from sketchgen import publish as publication  # noqa: E402
 from sketchgen import worker  # noqa: E402
+from sketchgen import sync as sync_mod  # noqa: E402
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -351,6 +353,75 @@ def cmd_plan(args: argparse.Namespace) -> int:
             print(f"defaulted: {', '.join(result.defaulted)}")
         for item in result.rejected:
             print(f"rejected: {item['word']}  ({item['reason']})")
+def _sync_report(result: dict, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(result, indent=2))
+        return
+    print(
+        f"{result['pulled_utc']}  votes {result['votes']}  likes {result['likes']}  "
+        f"unlikes {result['unlikes']}  views {result['views']}  "
+        f"skipped {result['skipped']}  watermark {result['next_since']}"
+    )
+
+
+def cmd_sync(args: argparse.Namespace) -> int:
+    """Pull the gallery write path into the app database.
+
+    The token is read first, before the database is opened or any request is
+    made: a missing or world-readable token file is a refusal, not a failure,
+    and there is nothing to clean up after one.
+    """
+    try:
+        token = sync_mod.read_token(args.token_file)
+    except sync_mod.SyncRefused as exc:
+        print(f"sketchgen: refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+
+    url = args.url or sync_mod.DEFAULT_URL
+    if not url:
+        print(
+            "sketchgen: refused: no write path URL (pass --url, or set "
+            "SKETCHGEN_WRITEPATH_URL)",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+
+    if not os.path.exists(args.db):
+        print(
+            f"sketchgen: no database at {args.db} (run: sketchgen db init)",
+            file=sys.stderr,
+        )
+        return EXIT_FAIL
+
+    conn = db.connect(args.db)
+    try:
+        if db.schema_version(conn) < 2:
+            print(
+                f"sketchgen: {args.db} is missing migration 002 "
+                "(run: sketchgen db init)",
+                file=sys.stderr,
+            )
+            return EXIT_FAIL
+        while True:
+            try:
+                result = sync_mod.run_once(conn, url, token, timeout=args.timeout)
+            except sync_mod.SyncRefused as exc:
+                print(f"sketchgen: refused: {exc}", file=sys.stderr)
+                return EXIT_REFUSED
+            except (sync_mod.SyncFailed, sqlite3.Error) as exc:
+                print(f"sketchgen: sync failed: {exc}", file=sys.stderr)
+                return EXIT_FAIL
+            _sync_report(result, args.json)
+            if args.once:
+                return EXIT_OK
+            try:
+                time.sleep(args.interval)
+            except KeyboardInterrupt:
+                return EXIT_OK
+    finally:
+        conn.close()
+
+
 def _print_enable_help(target_dir: Path) -> None:
     """Print the two modes. This command never enables or starts anything."""
     print()
@@ -754,6 +825,65 @@ def build_parser() -> argparse.ArgumentParser:
     plan_parser.add_argument("--json", action="store_true",
                              help="print plan.json to stdout as well")
     plan_parser.set_defaults(func=cmd_plan, _parser=plan_parser)
+    sync_parser = top.add_parser(
+        "sync",
+        help="pull gallery votes, likes and views into the database",
+        description=(
+            "Pull GET /pull from the gallery write path Worker and write the "
+            "result into this node's database: votes become human judgments, "
+            "likes become likes, view counts become engagement.views. The "
+            "watermark lives in sync_state, so a pull resumes where the last "
+            "one stopped. This is the only route the node calls, and the node "
+            "listens on nothing."
+        ),
+        epilog=(
+            "The bearer token is read from a file, never from the command line, "
+            "and the file must be mode 0600."
+        ),
+    )
+    sync_parser.add_argument(
+        "--db",
+        default=db.DEFAULT_DB_PATH,
+        metavar="P",
+        help="database file (default: $SKETCHGEN_DB, else ~/sketchgen/sketchgen.db)",
+    )
+    sync_parser.add_argument(
+        "--url",
+        default=sync_mod.DEFAULT_URL,
+        metavar="URL",
+        help="write path base URL (default: $SKETCHGEN_WRITEPATH_URL)",
+    )
+    sync_parser.add_argument(
+        "--token-file",
+        dest="token_file",
+        default=sync_mod.DEFAULT_TOKEN_FILE,
+        metavar="F",
+        help=f"file holding the pull token, mode 0600 (default: {sync_mod.DEFAULT_TOKEN_FILE})",
+    )
+    sync_parser.add_argument(
+        "--once",
+        action="store_true",
+        help="pull once and exit; this is what the worker loop and the timer use",
+    )
+    sync_parser.add_argument(
+        "--interval",
+        type=float,
+        default=300.0,
+        metavar="S",
+        help="seconds between pulls when --once is not given (default: 300)",
+    )
+    sync_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=sync_mod.DEFAULT_TIMEOUT,
+        metavar="S",
+        help=f"HTTP timeout in seconds (default: {sync_mod.DEFAULT_TIMEOUT:g})",
+    )
+    sync_parser.add_argument(
+        "--json", action="store_true", help="print the result as JSON"
+    )
+    sync_parser.set_defaults(func=cmd_sync, _parser=sync_parser)
+
     install_parser = top.add_parser(
         "install-unit",
         help="copy the systemd --user unit files into place (enables nothing)",
