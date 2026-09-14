@@ -3,7 +3,7 @@
  * Three jobs, all of them read-or-write against the gallery write path
  * (packet 3.3), whose base URL comes from config.json and from nowhere else:
  *
- *   1. counts   GET  <base>/counts?ids=1,2,3   views and likes per entry
+ *   1. counts   GET  <base>/counts?entries=1,2,3   views and likes per entry
  *   2. like     POST <base>/like               one like, identified by GitHub
  *   3. vote     POST <base>/vote               one answer to one question
  *
@@ -66,7 +66,7 @@
   function loadCounts() {
     var ids = entryIds();
     if (!base() || ids.length === 0) { return; }
-    fetch(base() + "/counts?ids=" + encodeURIComponent(ids.join(",")), {
+    fetch(base() + "/counts?entries=" + encodeURIComponent(ids.join(",")), {
       credentials: "include"
     })
       .then(function (response) { return response.json(); })
@@ -90,7 +90,11 @@
         method: "POST",
         credentials: "include",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ entry: Number(button.getAttribute("data-like")) })
+        // worker.js routeLike: { entry_id, on } — on is the state we are asking for
+        body: JSON.stringify({
+          entry_id: Number(button.getAttribute("data-like")),
+          on: button.getAttribute("data-liked") !== "true"
+        })
       })
         .then(function (response) {
           if (response.status === 401 && login) {
@@ -102,7 +106,8 @@
         })
         .then(function (data) {
           if (!data) { return; }
-          button.textContent = data.liked === false ? "like" : "liked";
+          button.setAttribute("data-liked", data.on ? "true" : "false");
+          button.textContent = data.on ? "liked" : "like";
           button.disabled = false;
           loadCounts();
         })
