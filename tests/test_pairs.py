@@ -759,3 +759,43 @@ class WritePathContractTests(unittest.TestCase):
         self.assertIn("on:", self.js)
         self.assertIn("body.entry_id", self.worker)
         self.assertIn("body.on", self.worker)
+
+    def test_the_session_crosses_the_origin_boundary_as_a_bearer(self):
+        """The gallery and the write path are different origins.
+
+        A SameSite=Lax cookie is never sent on a cross-site fetch, and
+        SameSite=None would be dropped as a third-party cookie by Safari and
+        increasingly by Chrome, so a cookie alone cannot sign anyone in from the
+        gallery. /callback hands the same signed token back in the redirect
+        fragment; the page stores it for its own origin and returns it as a
+        bearer. Both halves have to agree, neither file can see the other, so
+        the agreement is asserted here.
+        """
+        # The Worker's half: the fragment, the bearer, the allowed header.
+        self.assertIn("#session=", self.worker)
+        self.assertIn("encodeURIComponent(token)", self.worker)
+        self.assertIn('header.startsWith("Bearer ")', self.worker)
+        self.assertIn("Content-Type, Authorization", self.worker)
+        self.assertIn('path === "/logout"', self.worker)
+
+        # The page's half: read the fragment, keep it, send it, strip it.
+        self.assertIn('"#session="', self.js)
+        self.assertIn('"sketchgen_session"', self.js)
+        self.assertIn("localStorage", self.js)
+        self.assertIn('"Authorization"', self.js)
+        self.assertIn('"Bearer "', self.js)
+        self.assertIn("history.replaceState", self.js)
+
+        # One helper builds the headers, so the like button and the compare
+        # page's vote buttons cannot drift apart.
+        self.assertEqual(self.js.count("function authHeaders("), 1)
+        self.assertGreaterEqual(self.js.count("authHeaders("), 4)
+        for route in ("/me", "/vote", "/like", "/logout"):
+            self.assertIn('"' + route + '"', self.js)
+
+    def test_the_token_is_all_the_page_keeps(self):
+        """What reaches browser storage is the signed username and nothing else."""
+        for secret in ("client_secret", "SESSION_KEY", "access_token", "PULL_TOKEN"):
+            self.assertNotIn(secret, self.js)
+        # The Worker still sets its cookie: a same-site visit to it works.
+        self.assertIn("Set-Cookie", self.worker)

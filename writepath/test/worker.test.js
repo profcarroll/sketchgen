@@ -592,7 +592,10 @@ test("/callback keeps only the login and discards everything else GitHub sends",
       env,
     );
     assert.equal(callback.status, 302);
-    assert.equal(callback.headers.get("Location"), GALLERY_URL);
+    assert.ok(
+      callback.headers.get("Location").startsWith(`${GALLERY_URL}/#session=`),
+      callback.headers.get("Location"),
+    );
     assert.equal(store.oauthState.size, 0); // state consumed
 
     const session = /sg_session=([^;]+)/.exec(callback.headers.get("Set-Cookie"))[1];
@@ -658,4 +661,161 @@ test("/me without a session is 401", async () => {
   const { env } = makeEnv();
   const response = await worker.fetch(get("/me"), env);
   assert.equal(response.status, 401);
+});
+
+// ---------------------------------------------------------------------------
+// The session as a bearer token — the cross-site half of sign-in
+// ---------------------------------------------------------------------------
+
+test("/callback hands the gallery the same token in the fragment", async () => {
+  const { env } = makeEnv();
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) =>
+    new Response(
+      JSON.stringify(
+        String(url).includes("access_token")
+          ? { access_token: "gho_test", token_type: "bearer" }
+          : { login: "octocat" },
+      ),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  try {
+    const login = await worker.fetch(get("/login"), env);
+    const state = new URL(login.headers.get("Location")).searchParams.get("state");
+    const callback = await worker.fetch(
+      new Request(`${WORKER}/callback?code=abc123&state=${state}`, {
+        headers: { Cookie: `sg_state=${state}` },
+      }),
+      env,
+    );
+
+    const location = callback.headers.get("Location");
+    const fragment = location.slice(`${GALLERY_URL}/#session=`.length);
+    const token = decodeURIComponent(fragment);
+    assert.notEqual(fragment, ""); // the page has something to store
+    assert.equal(await readSession(token, SESSION_KEY), "octocat");
+
+    // It is the same token the cookie carries, so there is one trust path.
+    const cookie = /sg_session=([^;]+)/.exec(callback.headers.get("Set-Cookie"))[1];
+    assert.equal(token, cookie);
+
+    // And the Worker accepts it as a bearer, which is the whole point: a
+    // SameSite=Lax cookie never reaches a cross-site call from the gallery.
+    const me = await worker.fetch(get("/me", { bearer: token }), env);
+    assert.equal(me.status, 200);
+    assert.deepEqual(await me.json(), { username: "octocat" });
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("a bearer session works on every authenticated route", async () => {
+  const { env, store } = makeEnv();
+  const token = await forgeSession("octocat");
+  const auth = { Authorization: `Bearer ${token}` };
+  const body = (path, payload) =>
+    new Request(`${WORKER}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Origin: GALLERY_ORIGIN, ...auth },
+      body: JSON.stringify(payload),
+    });
+
+  assert.equal(
+    (await worker.fetch(body("/vote", { entry_a: 1, entry_b: 2, question: "brief", choice: "A" }), env)).status,
+    200,
+  );
+  assert.equal((await worker.fetch(body("/like", { entry_id: 7, on: true }), env)).status, 200);
+  assert.equal(store.votes.get("octocat|1|2|brief").choice, "A");
+  assert.equal(store.likes.get("7|octocat").active, 1);
+
+  // /view needs no session, but a bearer one de-duplicates the same way a
+  // cookie one does: the window is keyed on the token, whichever way it came.
+  assert.deepEqual(
+    await (await worker.fetch(body("/view", { entry_id: 3 }), env)).json(),
+    { ok: true, counted: true },
+  );
+  assert.deepEqual(
+    await (await worker.fetch(body("/view", { entry_id: 3 }), env)).json(),
+    { ok: true, counted: false },
+  );
+  assert.equal(store.views.get(3).count, 1);
+});
+
+test("a bearer with a bad signature is refused", async () => {
+  const { env, store } = makeEnv();
+  const token = await forgeSession("octocat");
+  const [name, expiry, signature] = token.split(".");
+
+  for (const forged of [
+    `${name}.${expiry}.${signature.slice(0, -1)}x`,
+    `mallory.${expiry}.${signature}`,
+    "not-a-token",
+    await signSession("octocat", Math.floor(Date.now() / 1000) + 3600, "the-wrong-key"),
+  ]) {
+    const response = await worker.fetch(
+      new Request(`${WORKER}/like`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${forged}` },
+        body: JSON.stringify({ entry_id: 7, on: true }),
+      }),
+      env,
+    );
+    assert.equal(response.status, 401, `accepted ${forged}`);
+    assert.equal((await worker.fetch(get("/me", { bearer: forged }), env)).status, 401);
+  }
+  assert.equal(store.likes.size, 0);
+});
+
+test("/pull takes the PULL_TOKEN and not a session, whatever the header shape", async () => {
+  const { env, store } = makeEnv();
+  seedForPull(store);
+  const token = await forgeSession("octocat");
+
+  // A perfectly valid session is still not the node's credential.
+  assert.equal(
+    (await worker.fetch(get("/pull?since=1970-01-01T00:00:00Z", { bearer: token }), env)).status,
+    401,
+  );
+  // And the node's credential is not a session: it opens no other route.
+  assert.equal(
+    (await worker.fetch(get("/me", { bearer: PULL_TOKEN }), env)).status,
+    401,
+  );
+  assert.equal(
+    (await worker.fetch(get("/pull?since=1970-01-01T00:00:00Z", { bearer: PULL_TOKEN }), env)).status,
+    200,
+  );
+});
+
+test("preflight admits the Authorization header", async () => {
+  const { env } = makeEnv();
+  const response = await worker.fetch(
+    new Request(`${WORKER}/like`, {
+      method: "OPTIONS",
+      headers: {
+        Origin: GALLERY_ORIGIN,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "authorization, content-type",
+      },
+    }),
+    env,
+  );
+  assert.equal(response.status, 204);
+  const allowed = (response.headers.get("Access-Control-Allow-Headers") || "")
+    .toLowerCase()
+    .split(",")
+    .map((piece) => piece.trim());
+  assert.ok(allowed.includes("authorization"), "the bearer would never be sent");
+  assert.ok(allowed.includes("content-type"));
+});
+
+test("/logout answers JSON and clears the cookie", async () => {
+  const { env } = makeEnv();
+  const token = await forgeSession("octocat");
+  const response = await worker.fetch(get("/logout", { cookie: token }), env);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("Content-Type"), "application/json");
+  assert.deepEqual(await response.json(), { ok: true });
+  assert.match(response.headers.get("Set-Cookie"), /^sg_session=;/);
+  assert.match(response.headers.get("Set-Cookie"), /Max-Age=0/);
 });
