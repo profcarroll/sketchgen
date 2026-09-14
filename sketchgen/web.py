@@ -150,6 +150,14 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 
 TERMINAL_STATES = frozenset({"published", "rejected", "failed"})
 
+# What a state is CALLED on screen. The database keeps its names; the UI says
+# who rejected the work. Anything not listed is shown as its state name.
+STATE_LABELS = {"failed": "rejected · gate", "rejected": "rejected · operator"}
+
+
+def state_label(state: str) -> str:
+    return STATE_LABELS.get(state, state)
+
 
 class Refused(Exception):
     """A refusal, in delegate.py's sense: exit 3, one line, nothing done."""
@@ -594,7 +602,7 @@ FUNNEL_ORDER = (
     ("published", "published"),
     ("held", "held"),
     ("rejected", "rejected"),
-    ("failed_kept", "failed, kept"),
+    ("failed_kept", "rejections (gate), kept"),
     ("children", "children"),
 )
 
@@ -930,7 +938,7 @@ def queue_page(conn: sqlite3.Connection, doc: dict[str, Any], control) -> str:
             f'<tr class="job" onclick="location=\'/job/{job.id}\'">'
             f'<td class="n"><a href="/job/{job.id}">{job.id}</a></td>'
             f"<td>{esc(truncate(job.prompt))}</td>"
-            f'<td><span class="pill {esc(job.state)}">{esc(job.state)}</span></td>'
+            f'<td><span class="pill {esc(job.state)}">{esc(state_label(job.state))}</span></td>'
             f'<td class="n">{attempts}/{esc(job.max_attempts)}</td>'
             f"<td class=\"mono\">{esc(job.executor or '—')}</td>"
             f"<td>{esc(job.rules_file or '—')}</td>"
@@ -1262,7 +1270,7 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
     return render(
         "op_job",
         id=job.id,
-        state=esc(job.state),
+        state=esc(state_label(job.state)),
         state_class=esc(job.state),
         attempt_n=attempt_n,
         max_attempts=esc(job.max_attempts),
