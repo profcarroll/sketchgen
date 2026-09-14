@@ -17,6 +17,10 @@
  * says votes are not being recorded. The generator never writes a number it
  * does not have, and neither does this file.
  *
+ * It also owns the grid's order and its filters. Those ask nothing of anyone:
+ * the cards are rendered newest first and the filters are plain links, so the
+ * page is right before this file runs and stays right if it never does.
+ *
  * Vanilla, no framework, no build step. The page sets window.SKETCHGEN_ROOT to
  * its own relative path back to the gallery root.
  */
@@ -195,7 +199,11 @@
       credentials: "include"
     })
       .then(function (response) { return response.json(); })
-      .then(function (data) { paintCounts(data && data.counts ? data.counts : data || {}); })
+      .then(function (data) {
+        paintCounts(data && data.counts ? data.counts : data || {});
+        // The numbers the "most liked" order sorts on have only just arrived.
+        if (currentSort() === "liked") { applySort("liked"); }
+      })
       .catch(function () { /* leave the em dashes where they are */ });
   }
 
@@ -241,6 +249,15 @@
 
   /* ---- the grid's filters, which are plain links ----------------------- */
 
+  /* The query a link's href carries, as parameters rather than as a string:
+   * the sort lives in the same query now, so comparing whole query strings
+   * would stop recognising the active filter the moment anything sorted. */
+  function linkParams(link) {
+    var href = link.getAttribute("href") || "";
+    var cut = href.indexOf("?");
+    return new URLSearchParams(cut === -1 ? "" : href.slice(cut + 1));
+  }
+
   function applyFilters() {
     var cards = document.querySelectorAll(".card[data-entry]");
     if (cards.length === 0) { return; }
@@ -253,11 +270,136 @@
       card.hidden = !keep;
     });
     Array.prototype.forEach.call(document.querySelectorAll("a.filter"), function (link) {
-      var href = link.getAttribute("href") || "";
-      var query = href.indexOf("?") === -1 ? "" : href.slice(href.indexOf("?"));
-      var active = (query === "" && !rules && !executor) ||
-                   (query !== "" && query === "?" + params.toString());
+      var own = linkParams(link);
+      var active = (own.get("rules") || "") === (rules || "") &&
+                   (own.get("executor") || "") === (executor || "");
       if (active) { link.setAttribute("aria-current", "true"); }
+      else { link.removeAttribute("aria-current"); }
+    });
+    /* The block is collapsed in the HTML. A filtered view has to show which
+     * filter it is showing, so the URL opens it. */
+    var block = document.querySelector("details.filters");
+    if (block && (rules || executor)) { block.open = true; }
+  }
+
+  /* ---- the grid's order ------------------------------------------------ */
+
+  /* Every page is rendered newest first, so "newest" is the default and the
+   * one order the URL never has to name. The other three are ?sort=<name>,
+   * which makes a sorted view a link someone can send. */
+  var SORTS = ["newest", "oldest", "random", "liked"];
+  var DEFAULT_SORT = "newest";
+
+  function currentSort() {
+    var want = new URLSearchParams(window.location.search).get("sort");
+    return SORTS.indexOf(want) === -1 ? DEFAULT_SORT : want;
+  }
+
+  function publishedAt(card) { return card.getAttribute("data-published") || ""; }
+
+  function entryOf(card) { return Number(card.getAttribute("data-entry")) || 0; }
+
+  /* The counts arrive from the write path long after the page does, and read
+   * "—" until they do. An em dash is not a number of likes; it is no likes
+   * yet, and sorts as zero. */
+  function likesOf(card) {
+    var slot = card.querySelector("[data-count=\"likes\"]");
+    var value = slot ? parseInt(slot.textContent, 10) : 0;
+    return isNaN(value) ? 0 : value;
+  }
+
+  /* The stamps are ISO 8601 in UTC with a trailing Z, so they compare as
+   * strings; the id breaks a tie the way the generator breaks it. */
+  function byNewest(a, b) {
+    var left = publishedAt(a);
+    var right = publishedAt(b);
+    if (left !== right) { return left < right ? 1 : -1; }
+    return entryOf(b) - entryOf(a);
+  }
+
+  function byOldest(a, b) { return -byNewest(a, b); }
+
+  function byLikes(a, b) {
+    var diff = likesOf(b) - likesOf(a);
+    return diff !== 0 ? diff : byNewest(a, b);
+  }
+
+  /* Fisher-Yates: every order equally likely, which "random" ought to mean. */
+  function shuffle(cards) {
+    var index, pick, held;
+    for (index = cards.length - 1; index > 0; index--) {
+      pick = Math.floor(Math.random() * (index + 1));
+      held = cards[index];
+      cards[index] = cards[pick];
+      cards[pick] = held;
+    }
+    return cards;
+  }
+
+  function paintSortButtons(name) {
+    Array.prototype.forEach.call(document.querySelectorAll("button.sort"), function (button) {
+      if (button.getAttribute("data-sort") === name) {
+        button.setAttribute("aria-current", "true");
+      } else {
+        button.removeAttribute("aria-current");
+      }
+    });
+  }
+
+  /* Moving the nodes rather than rewriting the grid keeps every card's image,
+   * its counts and anything already wired to it exactly as it was. */
+  function applySort(name) {
+    var grid = document.querySelector(".grid");
+    if (!grid) { return; }
+    var cards = Array.prototype.slice.call(grid.querySelectorAll(".card[data-entry]"));
+    paintSortButtons(name);
+    if (cards.length < 2) { return; }
+    if (name === "random") { shuffle(cards); }
+    else if (name === "oldest") { cards.sort(byOldest); }
+    else if (name === "liked") { cards.sort(byLikes); }
+    else { cards.sort(byNewest); }
+    var order = document.createDocumentFragment();
+    cards.forEach(function (card) { order.appendChild(card); });
+    grid.appendChild(order);
+  }
+
+  /* The chosen sort goes in the address bar without navigating: reload it,
+   * or send it to someone, and the grid comes back in the same order. */
+  function rememberSort(name) {
+    if (!window.history || !window.history.replaceState) { return; }
+    var params = new URLSearchParams(window.location.search);
+    if (name === DEFAULT_SORT) { params.delete("sort"); } else { params.set("sort", name); }
+    var query = params.toString();
+    window.history.replaceState(
+      null, "", window.location.pathname + (query ? "?" + query : "") + window.location.hash
+    );
+  }
+
+  /* The filters are still plain links, so following one is a fresh page load:
+   * the sort has to ride along in the href or it is lost at the click. */
+  function carrySort(name) {
+    Array.prototype.forEach.call(document.querySelectorAll("a.filter"), function (link) {
+      var href = link.getAttribute("href") || "";
+      var cut = href.indexOf("?");
+      var params = linkParams(link);
+      if (name === DEFAULT_SORT) { params.delete("sort"); } else { params.set("sort", name); }
+      var query = params.toString();
+      link.setAttribute("href", (cut === -1 ? href : href.slice(0, cut)) + (query ? "?" + query : ""));
+    });
+  }
+
+  function wireSort() {
+    var buttons = document.querySelectorAll("button.sort");
+    if (buttons.length === 0) { return; }
+    Array.prototype.forEach.call(buttons, function (button) {
+      button.addEventListener("click", function () {
+        var name = button.getAttribute("data-sort") || DEFAULT_SORT;
+        rememberSort(name);
+        carrySort(name);
+        // applySort shuffles every time it is asked for "random", so pressing
+        // random again is another shuffle rather than nothing at all.
+        applySort(name);
+      });
     });
   }
 
@@ -429,7 +571,11 @@
     // First, before any request: the token /callback handed back in the
     // fragment, stored for this origin and stripped from the address bar.
     claimTokenFromHash();
+    var sort = currentSort();
+    if (sort !== DEFAULT_SORT) { carrySort(sort); }
     applyFilters();
+    applySort(sort);
+    wireSort();
     loadConfig().then(function () {
       loadCounts();
       wireLike();

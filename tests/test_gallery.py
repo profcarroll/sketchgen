@@ -663,6 +663,25 @@ class GridOrderTests(GalleryTestCase):
             with self.subTest(page=name):
                 self.assertEqual(page.count('class="card"'), page.count("data-published="))
 
+    def test_the_grid_offers_the_four_sorts(self):
+        for name, page in (("index", self.index), ("rejections", self.failed)):
+            with self.subTest(page=name):
+                for sort in ("newest", "oldest", "random", "liked"):
+                    self.assertIn(
+                        f'<button type="button" class="sort" data-sort="{sort}"', page
+                    )
+                self.assertEqual(page.count('class="sort"'), 4)
+                # the order the HTML is already in is the one marked current
+                self.assertIn('data-sort="newest" aria-current="true"', page)
+
+    def test_the_filters_are_a_details_that_starts_closed(self):
+        for name, page in (("index", self.index), ("rejections", self.failed)):
+            with self.subTest(page=name):
+                self.assertIn('<details class="filters">', page)
+                self.assertIn('<summary class="filter-label">Filter</summary>', page)
+                self.assertNotIn('<div class="filters">', page)
+                self.assertNotIn("open", page.split("<details")[1].split(">")[0])
+
     def test_the_line_page_is_still_oldest_first(self):
         # the grid reversed; the line pages did not, because a critique has to
         # be read before the generation it produced
