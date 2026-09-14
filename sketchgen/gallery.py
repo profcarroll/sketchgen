@@ -785,6 +785,148 @@ def _agreement(scores: dict[str, dict[str, dict]], entry_id: int) -> str:
     return f' <span class="chip {css_class}">{word}</span>'
 
 
+# ---------------------------------------------------------------------------
+# The entry page's compass (this packet)
+#
+# The card's bars answer each question on its own track, which is all a card
+# has room for. The entry page has room for the question the bars cannot ask:
+# does a population want to look at the thing *and* think it did what it was
+# asked, or does it split the two? One square, one mark per population, right
+# for "rather look at it" and up for "closer to its brief", both as the same
+# percentile the bars use. A mark needs both questions, so it is the entry
+# page's mark and not the card's.
+# ---------------------------------------------------------------------------
+
+#: The quadrant, in words, keyed by (strong on look, strong on brief). Chosen
+#: once here so that two entries in the same quadrant read the same way in week
+#: one and in week twelve.
+_QUADRANT_WORDS = {
+    (True, True): "looks good, on brief",
+    (True, False): "looks good, misses the brief",
+    (False, True): "on brief, not much to look at",
+    (False, False): "neither",
+}
+
+#: Which way each axis runs, spelled out under the words. The square has no
+#: tick and no number on it; this line is the whole of its scale.
+_COMPASS_AXES = "→ rather look at it · ↑ closer to its brief"
+
+#: Above this percentile a population is on the strong half of an axis. The
+#: centre lines are drawn at the same 0.5, so the words and the picture cannot
+#: disagree about which quadrant a mark is in.
+_COMPASS_STRONG = 0.5
+
+
+def _compass_title(population: str, look: dict, brief: dict) -> str:
+    """The facts behind one mark, for its <title>: both ranks, both scores.
+
+    The square shows position and nothing else, the same trade the card's bars
+    make. The numbers are not gone, they are one hover away — and on this page
+    they are also spelled out in the two score boxes below.
+    """
+    return (
+        f"{population}: look {_ordinal(look['rank'])} of {look['pool']} "
+        f"({look['score']:.2f} over {_pairs_phrase(look['n'])}) · "
+        f"brief {_ordinal(brief['rank'])} of {brief['pool']} "
+        f"({brief['score']:.2f} over {_pairs_phrase(brief['n'])})"
+    )
+
+
+def _compass(
+    scores: dict[str, dict[str, dict]], entry_id: int, *, size: int = 160
+) -> str:
+    """One square: the *look* percentile across, the *brief* percentile up.
+
+    A filled dot is the humans and a ring is the agents, each placed only when
+    that population has scored this entry on **both** questions — one
+    coordinate is not a point, and inventing the other would put the entry
+    somewhere nobody voted for. The mark grows and solidifies with the evidence
+    behind it, counted as the smaller of the two questions' pairs, because the
+    thinner question is what the point actually rests on. The line between the
+    two marks is the gap, the same disagreement the card's bars draw.
+
+    Pure, and keyed off :func:`_standing`, so the pool is the population's own
+    scored entries exactly as on the card, and a second render of an unchanged
+    database emits the same bytes.
+    """
+    #: 96 was the mockup's square; every distance below is a proportion of it,
+    #: so changing `size` scales the whole drawing rather than parts of it.
+    unit = size / 96
+    pad = size / 12
+    span = size - 2 * pad
+
+    placed: dict[str, tuple[dict, dict, float, float, float]] = {}
+    for population in ("human", "agent"):
+        look = _standing(scores[population]["look"], entry_id)
+        brief = _standing(scores[population]["brief"], entry_id)
+        if look is None or brief is None:
+            continue
+        opacity = _evidence_opacity(min(look["n"], brief["n"]))
+        placed[population] = (
+            look,
+            brief,
+            pad + look["pct"] * span,
+            (size - pad) - brief["pct"] * span,
+            opacity,
+        )
+
+    svg = [
+        f'<svg class="compass" viewBox="0 0 {size} {size}" width="{size}" '
+        f'height="{size}" role="img" aria-label="how this entry stands on '
+        'looks, across, against its brief, up">',
+        f'<rect x="0.5" y="0.5" width="{size - 1}" height="{size - 1}" '
+        f'rx="{6 * unit:.1f}" class="c-ground"/>',
+        f'<line x1="{size / 2:.1f}" y1="{4 * unit:.1f}" x2="{size / 2:.1f}" '
+        f'y2="{size - 4 * unit:.1f}" class="c-axis"/>',
+        f'<line x1="{4 * unit:.1f}" y1="{size / 2:.1f}" '
+        f'x2="{size - 4 * unit:.1f}" y2="{size / 2:.1f}" class="c-axis"/>',
+    ]
+    if len(placed) == 2:
+        (_, _, hx, hy, _), (_, _, ax, ay, _) = placed["human"], placed["agent"]
+        svg.append(
+            f'<line x1="{hx:.1f}" y1="{hy:.1f}" x2="{ax:.1f}" y2="{ay:.1f}" '
+            'class="c-gap"/>'
+        )
+    for population, label in (("human", "humans"), ("agent", "agents")):
+        if population not in placed:
+            continue
+        look, brief, x, y, opacity = placed[population]
+        radius = (5 + 2 * opacity) * unit
+        svg.append(
+            f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{radius:.1f}" '
+            f'class="c-mark {population}" style="opacity:{opacity}">'
+            f"<title>{_esc(_compass_title(label, look, brief))}</title></circle>"
+        )
+    if not placed:
+        svg.append(
+            f'<text x="{size / 2:.1f}" y="{size / 2 + 4 * unit:.1f}" '
+            'text-anchor="middle" class="c-none">no pairs</text>'
+        )
+    svg.append("</svg>")
+
+    words = []
+    for population, label in (("human", "humans"), ("agent", "agents")):
+        if population not in placed:
+            continue
+        look, brief, _, _, _ = placed[population]
+        phrase = _QUADRANT_WORDS[
+            (look["pct"] >= _COMPASS_STRONG, brief["pct"] >= _COMPASS_STRONG)
+        ]
+        words.append(f'<span class="q {population}">{label}: {phrase}</span>')
+    if not words:
+        words.append(
+            '<span class="q none">neither population has scored this entry on '
+            "both questions</span>"
+        )
+    return (
+        '<div class="compass-wrap">'
+        + "".join(svg)
+        + '<div class="quads">'
+        + "".join(words)
+        + f'<span class="axes">{_esc(_COMPASS_AXES)}</span></div></div>'
+    )
+
+
 def _attribution(row: sqlite3.Row, config: Config) -> str:
     """The CC BY 4.0 attribution line, generated from the entry's provenance."""
     prompt = " ".join(str(row["prompt"] or "").split())
@@ -1166,6 +1308,9 @@ def _write_entry(
         agent_value=_esc(agent_value),
         agent_brief=_brief_line(agent_brief),
         agent_note=_esc(agent_note),
+        # Above the two boxes, not instead of them: the square says where the
+        # entry sits on both questions at once, the boxes keep the numbers.
+        compass=_compass(scores, entry_id),
         compare_href=f"../../compare.html?a={entry_id}",
         source_rows=_source_rows(meta),
         provenance_rows=_provenance_rows(meta),

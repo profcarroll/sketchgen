@@ -1092,6 +1092,166 @@ class CardMarksTests(GalleryTestCase):
         self.assertNotIn('class="standing"', entry)
 
 
+class CompassTests(unittest.TestCase):
+    """The square itself, on score tables built by hand.
+
+    _compass is pure, so the coordinates can be checked exactly — which is the
+    part a browser cannot show us. A 160 square pads by size/12, so the strong
+    end of an axis is at 146.7 and the weak end at 13.3.
+    """
+
+    STRONG, WEAK = "146.7", "13.3"
+
+    #: entry 1 above entry 2 in a pool of two, and the other way round
+    WON = {1: {"score": 2.0, "n": 4}, 2: {"score": 1.0, "n": 4}}
+    LOST = {1: {"score": 1.0, "n": 4}, 2: {"score": 2.0, "n": 4}}
+
+    @staticmethod
+    def scores(human=None, agent=None):
+        """A scores() shape with only the questions each population answered.
+
+        `human`/`agent` are {"look": table, "brief": table}; a question left out
+        is one that population has not judged at all.
+        """
+        empty = {"look": {}, "brief": {}}
+        return {
+            "human": {**empty, **(human or {})},
+            "agent": {**empty, **(agent or {})},
+        }
+
+    def test_a_population_strong_on_both_questions_sits_top_right(self):
+        square = gallery._compass(
+            self.scores(human={"look": self.WON, "brief": self.WON}), 1
+        )
+        self.assertIn(f'cx="{self.STRONG}" cy="{self.WEAK}"', square)
+        self.assertIn('class="c-mark human"', square)
+        self.assertIn(">humans: looks good, on brief<", square)
+        # one mark, so there is no gap to draw and no second phrase
+        self.assertNotIn('class="c-gap"', square)
+        self.assertNotIn('class="c-mark agent"', square)
+        self.assertNotIn("agents:", square)
+        # the facts are in the title, both questions, not on the square
+        self.assertIn(
+            "<title>humans: look 1st of 2 (2.00 over 4 pairs) · "
+            "brief 1st of 2 (2.00 over 4 pairs)</title>",
+            square,
+        )
+        self.assertIn("→ rather look at it · ↑ closer to its brief", square)
+
+    def test_a_population_weak_on_both_questions_sits_bottom_left(self):
+        square = gallery._compass(
+            self.scores(human={"look": self.LOST, "brief": self.LOST}), 1
+        )
+        self.assertIn(f'cx="{self.WEAK}" cy="{self.STRONG}"', square)
+        self.assertIn(">humans: neither<", square)
+
+    def test_two_marks_draw_the_gap_and_each_quadrant_gets_its_words(self):
+        # the humans put entry 1 top of the look pool and bottom of the brief
+        # pool; the agents read it the other way round, which is the whole
+        # point of the square: they disagree about *which* question it answers
+        square = gallery._compass(
+            self.scores(
+                human={"look": self.WON, "brief": self.LOST},
+                agent={"look": self.LOST, "brief": self.WON},
+            ),
+            1,
+        )
+        self.assertIn(
+            f'<line x1="{self.STRONG}" y1="{self.STRONG}" '
+            f'x2="{self.WEAK}" y2="{self.WEAK}" class="c-gap"/>',
+            square,
+        )
+        self.assertIn(">humans: looks good, misses the brief<", square)
+        self.assertIn(">agents: on brief, not much to look at<", square)
+        self.assertEqual(square.count('class="c-mark'), 2)
+
+    def test_the_mark_carries_the_evidence_of_the_thinner_question(self):
+        # eight pairs on looks, one on the brief: the point rests on the one
+        many = {1: {"score": 2.0, "n": 8}, 2: {"score": 1.0, "n": 8}}
+        few = {1: {"score": 2.0, "n": 1}, 2: {"score": 1.0, "n": 1}}
+        thin = gallery._compass(self.scores(human={"look": many, "brief": few}), 1)
+        solid = gallery._compass(self.scores(human={"look": many, "brief": many}), 1)
+        self.assertIn("opacity:0.4", thin)
+        self.assertIn('r="9.7"', thin)
+        self.assertIn("opacity:1.0", solid)
+        self.assertIn('r="11.7"', solid)
+
+    def test_one_question_alone_places_no_mark_and_says_nothing(self):
+        square = gallery._compass(self.scores(human={"look": self.WON}), 1)
+        self.assertNotIn('class="c-mark', square)
+        self.assertNotIn("humans:", square)
+        self.assertIn(">no pairs</text>", square)
+        self.assertIn(
+            "neither population has scored this entry on both questions", square
+        )
+
+    def test_an_entry_nobody_judged_still_draws_its_square(self):
+        square = gallery._compass(self.scores(), 1)
+        self.assertIn('class="compass"', square)
+        self.assertIn('class="c-ground"', square)
+        self.assertEqual(square.count('class="c-axis"'), 2)
+        self.assertIn('text-anchor="middle" class="c-none">no pairs</text>', square)
+        # "no pairs", not "no pairs yet": the score boxes below say that part
+        self.assertNotIn(gallery.NO_PAIRS, square)
+
+    def test_the_whole_drawing_scales_with_the_size(self):
+        square = gallery._compass(
+            self.scores(human={"look": self.WON, "brief": self.WON}), 1, size=96
+        )
+        self.assertIn('viewBox="0 0 96 96" width="96" height="96"', square)
+        self.assertIn('cx="88.0" cy="8.0"', square)
+
+
+class EntryCompassTests(GalleryTestCase):
+    """Where the compass goes: the Judgment panel of an entry page, only."""
+
+    def judge(self, question, kind, judge_id, a, b, choice):
+        db.record_judgment(self.conn, a, b, kind, judge_id, question, choice)
+
+    def panel(self, entry_id):
+        """The Judgment panel of one rendered entry page."""
+        page = (self.dest / "e" / str(entry_id) / "index.html").read_text(
+            encoding="utf-8"
+        )
+        return page.split("<h2>Judgment</h2>")[1].split("</section>")[0]
+
+    def test_the_compass_is_in_the_judgment_panel_above_the_score_boxes(self):
+        one, two, _ = self.ids
+        for question in ("look", "brief"):
+            self.judge(question, "human", "profcarroll", one, two, "A")
+            self.judge(question, "agent", "qwen3.5:4b", one, two, "B")
+        self.render()
+        panel = self.panel(one)
+        self.assertIn('<div class="compass-wrap">', panel)
+        self.assertIn('class="c-mark human"', panel)
+        self.assertIn('class="c-mark agent"', panel)
+        self.assertIn('class="c-gap"', panel)
+        self.assertIn(">humans: looks good, on brief<", panel)
+        self.assertIn(">agents: neither<", panel)
+        self.assertLess(panel.index("compass-wrap"), panel.index('<div class="two">'))
+        # the numbers stay: the square is added to the panel, not swapped in
+        self.assertIn("over 1 pair", panel)
+        self.assertIn("closer to its brief:", panel)
+
+    def test_an_unjudged_entry_keeps_the_panel_the_same_shape(self):
+        self.render()
+        panel = self.panel(self.ids[0])
+        self.assertIn('<div class="compass-wrap">', panel)
+        self.assertIn(">no pairs</text>", panel)
+        self.assertEqual(panel.count(gallery.NO_PAIRS), 2)
+
+    def test_the_grid_pages_do_not_carry_the_compass(self):
+        one, two, _ = self.ids
+        for question in ("look", "brief"):
+            self.judge(question, "human", "profcarroll", one, two, "A")
+        self.render()
+        for name in ("index.html", "rejections.html"):
+            with self.subTest(page=name):
+                page = (self.dest / name).read_text(encoding="utf-8")
+                self.assertNotIn("compass", page)
+                self.assertNotIn('class="quads"', page)
+
+
 class GuardTests(GalleryTestCase):
 
     def test_an_email_in_a_statement_is_refused_and_nothing_is_left(self):
