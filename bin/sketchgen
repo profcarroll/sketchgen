@@ -614,6 +614,10 @@ def cmd_publish(args: argparse.Namespace) -> int:
 
     print(result.commit)
     print(result.url)
+    if result.index_commit:
+        print(f"index {result.index_commit}")
+    elif result.index_note:
+        print(f"index: {result.index_note}", file=sys.stderr)
     return EXIT_OK
 
 
