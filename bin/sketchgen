@@ -903,6 +903,14 @@ def build_parser() -> argparse.ArgumentParser:
     reject_parser.set_defaults(func=cmd_reject, _parser=reject_parser)
 
     parser.set_defaults(_parser=parser)
+    # Later packets add subcommands as sketchgen/cli/<name>.py exposing
+    # register(top: argparse._SubParsersAction) -> None, so they never edit
+    # this file and cannot conflict with each other.
+    import importlib
+    import pkgutil
+    from sketchgen import cli as _cli
+    for _mod in sorted(m.name for m in pkgutil.iter_modules(_cli.__path__)):
+        importlib.import_module(f"sketchgen.cli.{_mod}").register(top)
     return parser
 
 
