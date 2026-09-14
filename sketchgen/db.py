@@ -32,12 +32,14 @@ __all__ = [
     "enqueue",
     "get_control",
     "get_job",
+    "get_meta",
     "init",
     "list_jobs",
     "record_judgment",
     "requeue",
     "schema_version",
     "set_control",
+    "set_meta",
     "transition",
     "utc_now",
 ]
@@ -552,6 +554,35 @@ def set_control(
         (state, reason, utc_now()),
     )
     return get_control(conn)
+
+
+# ---------------------------------------------------------------------------
+# Meta — migration 003's key/value scratchpad
+# ---------------------------------------------------------------------------
+
+
+def get_meta(conn: sqlite3.Connection, key: str, default: str | None = None):
+    """One meta value, or ``default``.
+
+    A database still on migration 001 has no ``meta`` table; that is not an
+    error here, it is the answer ``default``. The console reads
+    ``worker_started_utc`` through this and treats its absence as "no session
+    yet", so an older database renders rather than raising.
+    """
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    except sqlite3.OperationalError:
+        return default
+    return row["value"] if row is not None else default
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str | None) -> None:
+    """Write one meta value, replacing any previous one."""
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
 
 
 # ---------------------------------------------------------------------------
