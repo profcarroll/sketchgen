@@ -252,6 +252,71 @@ class TestJudgments(DbTestCase):
         self.assertEqual(2, row["generation"])
 
 
+class TestEntriesToCritique(DbTestCase):
+    """Who the idle critic may pick: no live child, no critique at this version."""
+
+    def parent(self, prompt="a root"):
+        job = self.enqueue(prompt)
+        self.conn.execute("UPDATE jobs SET state = 'published' WHERE id = ?", (job,))
+        entry = db.create_entry(
+            self.conn, job, "published", prompt=prompt,
+            published_utc="2026-09-14T12:00:00Z",
+        )
+        self.conn.commit()
+        return entry
+
+    def child(self, parent, job_state, entry_state=None):
+        job = self.enqueue("a child", parent_entry_id=parent)
+        self.conn.execute("UPDATE jobs SET state = ? WHERE id = ?", (job_state, job))
+        entry = None
+        if entry_state is not None:
+            entry = db.create_entry(
+                self.conn, job, entry_state, prompt="a child", parent_entry_id=parent,
+            )
+            self.conn.execute(
+                "INSERT INTO lineage (child_entry_id, parent_entry_id, generation, "
+                "critique, critique_by, created_utc) VALUES (?, ?, 1, 'x', 'octocat', ?)",
+                (entry, parent, db.utc_now()),
+            )
+        self.conn.commit()
+        return job, entry
+
+    def test_a_parent_with_no_child_is_offered_oldest_first(self):
+        one = self.parent("first")
+        two = self.parent("second")
+        self.assertEqual([one, two], db.entries_to_critique(self.conn, "critic-v2", 5))
+
+    def test_a_live_child_blocks_its_parent(self):
+        for job_state, entry_state in (
+            ("queued", None), ("executing", None), ("held", "held"), ("published", "published"),
+        ):
+            with self.subTest(job_state=job_state, entry_state=entry_state):
+                parent = self.parent()
+                self.child(parent, job_state, entry_state)
+                self.assertNotIn(parent, db.entries_to_critique(self.conn, "critic-v2", 50))
+
+    def test_a_dead_child_frees_its_parent(self):
+        # A failed gate, a person's rejection, or a kept rejection ends that
+        # line; the parent is offered again rather than blocked for good.
+        for job_state, entry_state in (
+            ("failed", None), ("failed", "failed-kept"), ("rejected", "rejected"),
+        ):
+            with self.subTest(job_state=job_state, entry_state=entry_state):
+                parent = self.parent()
+                self.child(parent, job_state, entry_state)
+                self.assertIn(parent, db.entries_to_critique(self.conn, "critic-v2", 50))
+
+    def test_a_critique_at_this_version_blocks_even_after_a_dead_child(self):
+        parent = self.parent()
+        self.child(parent, "failed", "failed-kept")
+        db.record_critique(
+            self.conn, parent, critique="x", critique_by="gemma4:e4b",
+            prompt_version="critic-v2", spawned_job_id=None, rejected_reason=None,
+        )
+        self.assertNotIn(parent, db.entries_to_critique(self.conn, "critic-v2", 50))
+        self.assertIn(parent, db.entries_to_critique(self.conn, "critic-v3", 50))
+
+
 class TestRequeue(DbTestCase):
     def test_requeue_from_gating_and_not_from_held(self):
         job_id = self.enqueue()

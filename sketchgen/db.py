@@ -599,23 +599,32 @@ def get_critique(
 def entries_to_critique(
     conn: sqlite3.Connection, prompt_version: str, limit: int = 1
 ) -> list[int]:
-    """Published entries with no child and no critique yet, oldest first.
+    """Published entries with no live child and no critique yet, oldest first.
 
-    "No child" is asked of all three places a child can show up — a job spawned
-    from this entry, an entry that came from it, and a recorded `lineage` link —
-    because the three are written at different moments in a line's life and a
-    line that is already running does not need a second critique of its parent
-    (spec §8.1). "No critique yet" is per prompt version, which is migration
-    006's UNIQUE constraint read from the other side.
+    "No live child" is asked of all three places a child can show up — a job
+    spawned from this entry, an entry that came from it, and a recorded
+    `lineage` link — because the three are written at different moments in a
+    line's life and a line that is already running does not need a second
+    critique of its parent (spec §8.1). A child that died — its job failed or
+    was rejected, its entry rejected or kept as a rejection — does not count:
+    that line is over, and without this the parent would never be offered
+    again (entries 2, 10, 14 and 35 on 2026-09-14, each blocked for good by
+    one dead child). "No critique yet" is per prompt version, which is
+    migration 006's UNIQUE constraint read from the other side, so a parent
+    gets one more chance per version, not an endless supply.
     """
     if int(limit) <= 0:
         return []
     rows = conn.execute(
         "SELECT e.id AS id FROM entries e "
         "WHERE e.state = 'published' "
-        "  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.parent_entry_id = e.id) "
-        "  AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id) "
-        "  AND NOT EXISTS (SELECT 1 FROM lineage l WHERE l.parent_entry_id = e.id) "
+        "  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.parent_entry_id = e.id "
+        "                    AND j.state NOT IN ('failed', 'rejected')) "
+        "  AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id "
+        "                    AND c.state NOT IN ('rejected', 'failed-kept')) "
+        "  AND NOT EXISTS (SELECT 1 FROM lineage l JOIN entries c ON c.id = l.child_entry_id "
+        "                    WHERE l.parent_entry_id = e.id "
+        "                    AND c.state NOT IN ('rejected', 'failed-kept')) "
         "  AND NOT EXISTS (SELECT 1 FROM critiques q WHERE q.entry_id = e.id "
         "                    AND q.prompt_version = ?) "
         "ORDER BY e.created_utc, e.id LIMIT ?",
