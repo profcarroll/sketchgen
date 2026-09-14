@@ -202,3 +202,7 @@ table.fields th { color: var(--ink-soft); font-weight: 500; white-space: nowrap;
 .tree .depth-0 { border-left: 0; padding-left: 0; }
 .node-head { margin: 0; }
 .node-prompt { color: var(--ink-soft); margin: 0 0 0.3rem; }
+
+.critique { color: var(--ink); font-style: italic; margin: 0 0 0.3rem; }
+.dim { color: var(--ink-soft); font-style: normal; font-size: 0.85rem; }
+.node.waits { border-left-style: dashed; }

@@ -56,6 +56,16 @@ caps them and the next one gets 503 rather than a thread.
 the safe direction for a gate whose whole point is that a person decides
 (spec §9). Its failures are flash messages too: a missing gallery checkout or
 deploy key is something to read on the page, not a traceback in the log.
+
+**Spawning a child belongs here and not on the public site** (packet 5.3).
+``POST /entry/<id>/spawn`` hands one critique to :func:`sketchgen.lineage.spawn`,
+which composes the parent's prompt with it and queues the child. The form sits on
+the job page and on each held card; ``critique-by`` defaults to the operator's
+username, which is ``$SKETCHGEN_OPERATOR`` when it is set and the entry's own
+submitter otherwise. The gallery is generated, static, and has no way to write to
+this database — asking it to would mean a public form on a queue, and the
+publication gate exists precisely so a person stands between the queue and the
+site.
 """
 
 from __future__ import annotations
@@ -78,6 +88,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from sketchgen import db
+from sketchgen import lineage
 from sketchgen import planner
 from sketchgen import worker
 
@@ -1192,6 +1203,9 @@ def _artefacts(app: App, job_id: int, attempt_n: int) -> str:
 def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
     attempts = db.list_attempts(conn, job.id)
     attempt_n = attempts[-1].n if attempts else 0
+    entry = conn.execute(
+        "SELECT * FROM entries WHERE job_id = ?", (job.id,)
+    ).fetchone()
 
     def tile(key: str, value: str) -> str:
         return (
@@ -1256,6 +1270,8 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
         ("executor", job.executor or "—"),
         ("rules file", job.rules_file or "—"),
         ("parent entry", job.parent_entry_id if job.parent_entry_id else "—"),
+        ("critique", job.critique or "—"),
+        ("critique by", job.critique_by or "—"),
         ("submitted by", job.submitted_by),
         ("created (UTC)", job.created_utc),
         ("updated (UTC)", job.updated_utc),
@@ -1267,9 +1283,19 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
     )
 
     terminal = job.state in TERMINAL_STATES
+    # Packet 5.3: the spawn form needs an entry to spawn from, and a job that
+    # has not produced one yet has nothing to critique.
+    spawn = (
+        '<section class="panel"><h2>Lineage</h2>'
+        f'<div class="actions">{spawn_form(entry, f"/job/{job.id}")}</div>'
+        "</section>"
+        if entry is not None
+        else ""
+    )
     return render(
         "op_job",
         id=job.id,
+        spawn=spawn,
         state=esc(state_label(job.state)),
         state_class=esc(job.state),
         attempt_n=attempt_n,
@@ -1550,7 +1576,9 @@ def held_page(app: App, conn: sqlite3.Connection) -> str:
             'style="font:inherit;padding:4px 8px;border:1px solid var(--line);'
             'border-radius:5px;background:var(--bg);color:var(--fg)">'
             '<button type="submit" class="danger">Reject</button></form>'
-            "</div></section>"
+            "</div>"
+            f'<div class="actions">{spawn_form(row, "/held")}</div>'
+            "</section>"
         )
     if not cards:
         cards.append(
@@ -1636,6 +1664,99 @@ def reject_entry(conn: sqlite3.Connection, entry_id: int, reason: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Spawning a child from a critique (packet 5.3)
+# ---------------------------------------------------------------------------
+
+
+def operator_username(row: sqlite3.Row | None = None) -> str:
+    """Who the UI signs a critique as, by default.
+
+    ``$SKETCHGEN_OPERATOR`` when it is set to something that is a GitHub
+    username, the entry's own submitter when it is not, and the literal
+    ``operator`` when there is neither. The field is editable on the form, so
+    this is a default and never a claim: ``critique_by`` is a model id when a
+    model wrote the sentence.
+    """
+    name = (os.environ.get("SKETCHGEN_OPERATOR") or "").strip()
+    if name and USERNAME_RE.match(name):
+        return name
+    if row is not None:
+        submitter = (row["submitted_by"] or "").strip()
+        if USERNAME_RE.match(submitter):
+            return submitter
+    return "operator"
+
+
+def spawn_form(row: sqlite3.Row, back: str) -> str:
+    """The 'Spawn a child' form for one entry. Posts to /entry/<id>/spawn."""
+    entry_id = int(row["id"])
+    spawnable = row["state"] in lineage.SPAWNABLE
+    note = (
+        "the critique becomes the next prompt, under 'Revise:'"
+        if spawnable
+        else f"entry {entry_id} is {row['state']}: a line grows from a published "
+        "or failed-kept entry, so this will be refused until it is one"
+    )
+    return (
+        f'<form method="post" action="/entry/{entry_id}/spawn" class="spawn">'
+        f'<input type="hidden" name="back" value="{esc(back)}">'
+        f'<label for="critique-{entry_id}">Spawn a child from a critique</label>'
+        f'<input type="text" id="critique-{entry_id}" name="critique" required '
+        'maxlength="400" placeholder="one sentence: what the child should do '
+        'differently" style="font:inherit;padding:4px 8px;border:1px solid '
+        'var(--line);border-radius:5px;background:var(--bg);color:var(--fg);'
+        'min-width:22em">'
+        f'<input type="text" name="critique_by" value="{esc(operator_username(row))}" '
+        'title="model id or GitHub username — who wrote the critique" '
+        'style="font:inherit;padding:4px 8px;border:1px solid var(--line);'
+        'border-radius:5px;background:var(--bg);color:var(--fg);max-width:12em">'
+        '<button type="submit">Spawn a child</button>'
+        f'<span class="dim" style="font-size:12px">{esc(note)}</span>'
+        "</form>"
+    )
+
+
+def spawn_child(conn: sqlite3.Connection, entry_id: int, form: dict) -> str:
+    """Hand one critique to lineage.spawn(). Returns the flash message."""
+    critique = (form.get("critique") or [""])[0].strip()
+    by = (form.get("critique_by") or [""])[0].strip()
+    row = conn.execute(
+        "SELECT * FROM entries WHERE id = ?", (entry_id,)
+    ).fetchone()
+    if row is None:
+        return f"there is no entry {entry_id}"
+    if not critique:
+        return "a critique with no text spawns nothing — nothing changed"
+    who = by or operator_username(row)
+    try:
+        job_id = lineage.spawn(
+            conn,
+            parent_entry_id=entry_id,
+            critique=critique,
+            critique_by=who,
+            submitted_by=operator_username(row),
+        )
+    except ValueError as exc:
+        return f"refused: {exc}"
+    except sqlite3.Error as exc:  # pragma: no cover - defensive
+        return f"spawn failed: {exc}"
+    if job_id is None:
+        return (
+            f"entry {entry_id} is {row['state']}, not published — nothing "
+            "spawned, and a line grows from a published or failed-kept entry only"
+        )
+    job = db.get_job(conn, job_id)
+    generation = lineage.generation_of(conn, entry_id) + 1
+    if job is not None and job.needs == "review":
+        return (
+            f"Queued as #{job_id} — generation {generation} is at the depth "
+            f"limit ({lineage.DEFAULT_MAX_DEPTH}), so it is held and needs a "
+            "person before it goes any further"
+        )
+    return f"Queued as #{job_id} — generation {generation} of entry {entry_id}"
+
+
+# ---------------------------------------------------------------------------
 # The server
 # ---------------------------------------------------------------------------
 
@@ -1654,6 +1775,7 @@ ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     ("GET", re.compile(r"^/held$"), "page_held"),
     ("POST", re.compile(r"^/held/(?P<entry_id>\d+)/publish$"), "post_publish"),
     ("POST", re.compile(r"^/held/(?P<entry_id>\d+)/reject$"), "post_reject"),
+    ("POST", re.compile(r"^/entry/(?P<entry_id>\d+)/spawn$"), "post_spawn"),
     ("POST", re.compile(r"^/control$"), "post_control"),
     ("GET", re.compile(r"^/jobs/(?P<rest>.*)$"), "serve_job_file"),
     ("POST", re.compile(r"^/_quit$"), "post_quit"),
@@ -2082,6 +2204,18 @@ class OpHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
         self.redirect("/held", message)
+
+    def post_spawn(self, entry_id: str) -> None:
+        form = self.form()
+        back = (form.get("back") or ["/held"])[0]
+        if not back.startswith("/") or back.startswith("//"):
+            back = "/held"
+        conn = self.app.connect()
+        try:
+            message = spawn_child(conn, int(entry_id), form)
+        finally:
+            conn.close()
+        self.redirect(back, message)
 
     def post_control(self) -> None:
         form = self.form()

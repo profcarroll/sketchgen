@@ -75,7 +75,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import db, executor, planner
+from . import db, executor, lineage, planner
 
 __all__ = [
     "DEFAULT_GATE_PATH",
@@ -876,6 +876,18 @@ class Worker:
             png_path=artefacts.get("png"),
         )
         self.log(f"job {job_id}: entry {entry_id} created, state {state}")
+        # Packet 5.3. A spawned job has carried its critique since
+        # lineage.spawn() queued it, because the `lineage` table keys on the
+        # child ENTRY and the entry is only now a thing that exists. This is
+        # the one place that link is recorded; a job with no parent records
+        # nothing and record_child says so by returning None.
+        if job.parent_entry_id:
+            generation = lineage.record_child(self.conn, entry_id, job)
+            self.log(
+                f"job {job_id}: entry {entry_id} is generation {generation} of "
+                f"entry {job.parent_entry_id}"
+                + (f", critiqued by {job.critique_by}" if job.critique_by else "")
+            )
         return entry_id
 
     def _plan(self, job: db.Job) -> db.Job | None:
