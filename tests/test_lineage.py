@@ -418,7 +418,7 @@ class TestTheLinePage(LineageTestCase):
 
 class TestCritique(LineageTestCase):
     def test_prompts_critic_md_is_version_1_and_leaves_no_placeholders(self):
-        self.assertEqual("critic-v1", lineage.prompt_version())
+        self.assertEqual("critic-v2", lineage.prompt_version())
         row = self.conn.execute(
             "SELECT * FROM entries WHERE id = ?", (self.root_entry,)
         ).fetchone()
@@ -452,7 +452,7 @@ class TestCritique(LineageTestCase):
             result.text,
         )
         self.assertEqual("gemma4:e4b", result.model)
-        self.assertEqual("critic-v1", result.prompt_version)
+        self.assertEqual("critic-v2", result.prompt_version)
 
     def test_a_saved_two_sentence_output_is_refused(self):
         with self.assertRaises(lineage.CritiqueFailed) as caught:
@@ -547,7 +547,7 @@ class TestCli(LineageTestCase):
         )
         self.assertEqual(0, done.returncode, done.stderr)
         document = json.loads(done.stdout)
-        self.assertEqual("critic-v1", document["prompt_version"])
+        self.assertEqual("critic-v2", document["prompt_version"])
         self.assertTrue(document["critique"].startswith("the same field"))
         self.assertTrue(
             (out / f"entry-{self.root_entry}-critique.json").is_file()
