@@ -247,7 +247,10 @@ def _render_with_generator(conn: sqlite3.Connection, entry_id: int, dest: Path) 
     render = getattr(gallery, "render_entry", None)
     if render is None:
         raise PublishRefused("generator not present; pass --from")
-    render(conn, entry_id, dest)
+    try:
+        render(conn, entry_id, dest, publishing=True)
+    except Exception as exc:  # the generator's own refusals, reported, not raised
+        raise PublishRefused(f"generator refused entry {entry_id}: {exc}") from exc
 
 
 # ---------------------------------------------------------------------------
