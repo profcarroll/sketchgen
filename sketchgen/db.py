@@ -64,7 +64,11 @@ DEFAULT_DB_PATH = os.environ.get(
 TRANSITIONS: dict[str, frozenset[str]] = {
     "queued": frozenset({"planning", "executing", "needs-laptop", "failed"}),
     "planning": frozenset({"executing", "needs-laptop", "failed"}),
-    "executing": frozenset({"gating", "failed", "queued"}),
+    # executing -> repairing is packet 2.3's malformed-response path: a response
+    # with no js block never reaches the gate, so the job repairs without
+    # passing through gating and its attempt row carries a null gate_exit with
+    # "executor: …" as its evidence.
+    "executing": frozenset({"gating", "repairing", "failed", "queued"}),
     "gating": frozenset({"held", "repairing", "failed", "queued"}),
     "repairing": frozenset({"executing", "needs-laptop", "failed", "queued"}),
     "needs-laptop": frozenset({"planning", "executing", "repairing", "failed"}),

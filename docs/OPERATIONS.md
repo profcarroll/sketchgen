@@ -49,14 +49,36 @@ The pause switch is a row in the database, not systemctl, so it survives a worke
 restart and does not fight the timer:
 
 ```
-python3 bin/sketchgen db status      # prints: control: running | pausing | paused
+python3 bin/sketchgen db status                  # control: running | pausing | paused
+python3 bin/sketchgen control pause --reason "someone else wants the slot"
+python3 bin/sketchgen control stop --reason "swapping models"
+python3 bin/sketchgen control resume
 ```
 
 `running` takes jobs; `pausing` finishes the attempt in flight, releases the
 inference slot and settles into `paused`; `paused` takes nothing. Use it to
 de-contend the node when someone else wants the one inference slot, or for
-maintenance. Packet 2.3 adds the subcommand that sets it. Stopping the unit
-instead kills the attempt in flight; pause does not.
+maintenance. Stopping the unit instead kills the attempt in flight; pause does not.
+
+`control stop` is stop-now: the worker abandons the attempt in flight, puts the job
+back on the queue and settles into `paused`. Attempt rows already written are kept
+and the job resumes at the next attempt number after `control resume` — nothing is
+re-run, nothing is lost. On the wire it is `pausing` with a reason beginning `stop`,
+so the control row still holds only the three values migration 001 allows;
+`sketchgen/worker.py`'s docstring says why. A job paused mid-repair is re-queued
+rather than stranded, so `db status` after a pause shows it back under `queued`.
+
+## Watching one job
+
+```
+python3 bin/sketchgen worker --once            # one job, then exit
+tail -f ~/sketchgen/jobs/<id>/job.log          # the same lines the unit logs
+```
+
+Each job has a directory under `$SKETCHGEN_JOBS` (default `~/sketchgen/jobs`):
+`job.log`, then `attempt-1/`, `attempt-2/` … holding the prompt, the raw response,
+the sketch, and the gate's own output under `attempt-N/.gate/`. That is the
+canonical record of what happened; the database rows point at it.
 
 ## The two deploy keys
 
