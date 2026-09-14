@@ -340,3 +340,29 @@ class RejectTests(PublishTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublishIndexTests(PublishTestCase):
+    def test_publish_index_records_the_write_path_and_pushes(self):
+        result = self.publish_cli("--by", "profcarroll")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        before = self.head(self.bare)
+        import json as _json
+        from sketchgen import publish as publication
+        sha, why = publication.publish_index(
+            self.conn, self.gallery, remote=str(self.bare),
+            write_path="https://writepath.example/",
+        )
+        self.assertIsNone(why, why)
+        self.assertEqual(sha, self.head(self.gallery))
+        self.assertEqual(self.head(self.bare), sha)
+        self.assertNotEqual(before, sha)
+        config = _json.loads((self.gallery / "config.json").read_text())
+        self.assertEqual(config["write_path"], "https://writepath.example")
+        # A second run with nothing new is a no-op, not a commit.
+        sha2, why2 = publication.publish_index(
+            self.conn, self.gallery, remote=str(self.bare),
+            write_path="https://writepath.example/",
+        )
+        self.assertIsNone(sha2)
+        self.assertEqual(why2, "site unchanged")

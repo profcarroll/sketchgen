@@ -355,3 +355,13 @@ class SyncTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UserAgentTests(unittest.TestCase):
+    def test_sync_sends_a_named_user_agent(self):
+        # Cloudflare answers 403 (error 1010) to Python-urllib's default agent.
+        from sketchgen import sync
+        self.assertTrue(sync.USER_AGENT.startswith("sketchgen-sync/"))
+        import inspect
+        self.assertIn('"User-Agent": USER_AGENT', inspect.getsource(sync))
+
