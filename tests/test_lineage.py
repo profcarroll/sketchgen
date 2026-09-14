@@ -180,14 +180,30 @@ class TestSpawn(LineageTestCase):
             0, self.conn.execute("SELECT COUNT(*) AS c FROM lineage").fetchone()["c"]
         )
 
-    def test_spawn_from_a_held_parent_returns_none_and_records_nothing(self):
+    def test_spawn_from_a_held_parent_is_allowed(self):
+        # Asking for a revision is how a person decides whether the parent is
+        # worth publishing (instructor, 2026-09-14); the child holds as usual.
         held = self.publish("a sketch that has not been through the gate",
                             state="held")
+        job_id = lineage.spawn(
+            self.conn,
+            parent_entry_id=held,
+            critique="try it with one warm hue",
+            critique_by="profcarroll",
+            submitted_by="profcarroll",
+        )
+        self.assertIsNotNone(job_id)
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual(held, job.parent_entry_id)
+        self.assertEqual("hold", job.publication)
+
+    def test_spawn_from_a_rejected_parent_returns_none_and_records_nothing(self):
+        rejected = self.publish("a sketch a person closed", state="rejected")
         jobs_before = len(db.list_jobs(self.conn))
         self.assertIsNone(
             lineage.spawn(
                 self.conn,
-                parent_entry_id=held,
+                parent_entry_id=rejected,
                 critique="try it with one warm hue",
                 critique_by="profcarroll",
                 submitted_by="profcarroll",
@@ -517,8 +533,8 @@ class TestCli(LineageTestCase):
         self.assertEqual(0, done.returncode, done.stderr)
         self.assertEqual(1, len(json.loads(done.stdout)["generations"]))
 
-    def test_spawn_from_a_held_parent_exits_1(self):
-        held = self.publish("not through the gate yet", state="held")
+    def test_spawn_from_a_rejected_parent_exits_1(self):
+        held = self.publish("closed by a person", state="rejected")
         done = self.run_cli(
             "spawn", "--parent", str(held), "--critique", "slower",
             "--by", "profcarroll", "--db", self.path,

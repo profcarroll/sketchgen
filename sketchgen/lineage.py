@@ -79,7 +79,10 @@ DEFAULT_MAX_DEPTH = 3
 #: The states a parent may be spawned from. A held entry has not been through
 #: the publication gate and a rejected one was refused at it; neither is a thing
 #: the gallery should be building a line on top of (spec §9).
-SPAWNABLE = frozenset({"published", "failed-kept"})
+#: A line grows from a held entry too (instructor, 2026-09-14): "you need to
+#: see if a revision will make it worth publishing" is a primary use of the
+#: gate, not an edge case. Only a rejected entry is closed.
+SPAWNABLE = frozenset({"held", "published", "failed-kept"})
 
 #: The fixed heading. Fixed so that a child's prompt can always be split back
 #: into the prompt it inherited and the critique that changed it.
@@ -208,9 +211,10 @@ def spawn(
 ) -> int | None:
     """Queue the child job one critique asks for. Returns its job id, or None.
 
-    None, and nothing written at all, when the parent is not a published or
-    failed-kept entry: an entry still waiting at the publication gate is not
-    something to build a line on.
+    None, and nothing written at all, when the parent is a rejected entry:
+    a person closed it. A held parent is allowed — asking for a revision is
+    how a person finds out whether the parent is worth publishing — and its
+    children wait at the gate like any other.
 
     At ``generation >= max_depth`` the job is still created — the critique is
     not thrown away — but always with ``publication='hold'`` and with

@@ -1285,7 +1285,7 @@ class Worker:
         except ValueError as exc:
             reason = f"spawn refused: {exc}"
         if job_id is None and reason is None:
-            reason = "the parent is not a published or failed-kept entry"
+            reason = "the parent is a rejected entry, and a line does not grow from one"
 
         db.record_critique(
             self.conn,
