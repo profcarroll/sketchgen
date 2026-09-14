@@ -125,6 +125,9 @@ file, executor and submitter — composes with the filters, and keeps its query 
 URL as `?q=`. With JavaScript off the grid is still newest first, the filters are
 still plain links, and the search box is a form that reloads the page it is on.
 
+A kept rejection's `compare` link judges it against a random published entry — the
+status quo — and says which side was rejected only after both answers are in.
+
 ## Tests
 
 ```
