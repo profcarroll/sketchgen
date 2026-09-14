@@ -120,7 +120,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from . import db, executor, lineage, planner
+from . import db, executor, lineage, planner, preflight
 
 __all__ = [
     "DEFAULT_CRITIC_MODEL",
@@ -142,11 +142,13 @@ __all__ = [
     "Execution",
     "FenceResult",
     "GateOutcome",
+    "PREFLIGHT_HEADING",
     "StopNow",
     "Worker",
     "build_evidence",
     "default_judge",
     "default_probe",
+    "evidence_with_preflight",
     "fence",
     "idle_summary",
     "is_stop_now",
@@ -222,6 +224,11 @@ DEFAULT_RULES = "treatment"
 #: prompt_version therefore does not change: the evidence is part of the brief,
 #: which is where a person would put it too.
 EVIDENCE_HEADING = "## What the gate found on the previous attempt"
+
+#: The heading the pre-flight scan's findings are filed under, above everything
+#: the gate itself said. The gate remains the authority on the verdict; this is
+#: the sentence that explains the console error it reported (sketchgen/preflight.py).
+PREFLIGHT_HEADING = "Names this sketch shadows (checked before the gate ran):"
 
 #: Which report notes belong to which fixed check, when the note does not name
 #: the check itself. sketch_gate.py writes prose notes; the evidence has to put
@@ -565,6 +572,19 @@ def build_evidence(report: dict[str, Any] | None, gate_exit: int | None,
             parts.append(f"- {note.strip()}")
 
     return "\n".join(parts).rstrip() + "\n"
+
+
+def evidence_with_preflight(evidence: str, lines: list[str]) -> str:
+    """The gate's evidence with the pre-flight findings above it.
+
+    Above, because the model reads the top of what it is given and the gate's
+    own first line is ``line is not a function`` — the symptom. The finding is
+    the cause, and putting the cause second is how three attempts got spent on
+    job 16. No findings changes nothing at all.
+    """
+    if not lines:
+        return evidence
+    return "\n".join([PREFLIGHT_HEADING, *lines, "", evidence.lstrip("\n")])
 
 
 def minutes_between(earlier: str | None, later: str | None) -> float | None:
@@ -1506,6 +1526,24 @@ class Worker:
             self._pause_after_attempt(job.id)
         return EXIT_OK
 
+    def _preflight_lines(self, job_id: int, attempt_dir: Path) -> list[str]:
+        """The pre-flight scan over one attempt directory, as evidence lines.
+
+        Never raises into the job: a scan that fails is logged and dropped, the
+        same bargain the idle round makes. The pre-flight is an explanation of a
+        failure that has already happened, and no explanation is worth losing
+        the evidence the gate did produce.
+        """
+        try:
+            lines = preflight.evidence_lines(preflight.scan_dir(attempt_dir))
+        except Exception as exc:  # noqa: BLE001 - deliberately everything
+            self.log(f"job {job_id}: preflight scan failed: "
+                     f"{type(exc).__name__}: {' '.join(f'{exc}'.split())}")
+            return []
+        for line in lines:
+            self.log(f"job {job_id}: {line}")
+        return lines
+
     def _attempt(
         self,
         job: db.Job,
@@ -1607,9 +1645,17 @@ class Worker:
                 stderr=f"{type(exc).__name__}: {' '.join(f'{exc}'.split())}",
             )
         passed = outcome.exit_code == 0
-        new_evidence = None if passed else build_evidence(
+        gate_evidence = None if passed else build_evidence(
             outcome.report, outcome.exit_code, outcome.stderr
         )
+        # The pre-flight runs only on a failure, and only ever adds to what the
+        # gate said. `gate_evidence` is kept separate because its first line is
+        # the gate's summary, and that line is what `jobs.last_error` shows.
+        new_evidence = gate_evidence
+        if gate_evidence is not None:
+            new_evidence = evidence_with_preflight(
+                gate_evidence, self._preflight_lines(job.id, attempt_dir)
+            )
         db.add_attempt(
             self.conn,
             job.id,
@@ -1641,7 +1687,7 @@ class Worker:
             self._create_entry(job.id, "held", rules)
             return None
 
-        first_line = (new_evidence or "gate failed").splitlines()[0]
+        first_line = (gate_evidence or "gate failed").splitlines()[0]
         if last:
             db.transition(self.conn, job.id, "failed", last_error=first_line)
             self.log(f"job {job.id}: failed after {n} attempt(s): {first_line}")

@@ -11,12 +11,13 @@ Python 3.12, standard library only. No dependencies, no framework.
 
 ```
 sketchgen/       the package: db.py (schema, helpers, state machine), planner.py,
-                 executor.py, worker.py (the loop), console.py (the vitals)
+                 executor.py, worker.py (the loop), preflight.py (the p5 names a
+                 sketch shadows), console.py (the vitals)
 sketchgen/cli/   drop-in subcommands, one file per packet, exposing register(top)
 migrations/      001_init.sql and everything after it, applied in order
 prompts/         executor.md, planner.md and the two rules files, versioned
 bin/sketchgen    the one CLI: db | enqueue | worker | control | execute | plan |
-                 install-unit | keygen | console  (later packets add publish,
+                 install-unit | keygen | console | preflight  (later packets add publish,
                  web, judge)
 systemd/         the worker's user unit and its timer
 tests/           stdlib unittest

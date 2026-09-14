@@ -64,11 +64,15 @@ def make_report(sketch_dir, *, checks=None, assertions=None, notes=None,
 class StubExecutor:
     """Writes the files a real executor would and records how it was called."""
 
-    def __init__(self, statement="a stub statement\n", ok=None, on_call=None):
+    def __init__(self, statement="a stub statement\n", ok=None, on_call=None,
+                 sketch_js="function setup(){}\n"):
         self.calls = []
         self.statement = statement
         self.ok = list(ok) if ok is not None else None
         self.on_call = on_call
+        # The sketch the stub "writes". Default: the smallest thing that is a
+        # sketch. tests/test_preflight.py hands it one that shadows a p5 name.
+        self.sketch_js = sketch_js
 
     def __call__(self, *, brief, assertions, rules_file, out_dir, model, host):
         n = len(self.calls) + 1
@@ -91,7 +95,7 @@ class StubExecutor:
                 prompt_version="executor-v1",
                 wall_s=0.5,
             )
-        (out / "sketch.js").write_text("function setup(){}\n", encoding="utf-8")
+        (out / "sketch.js").write_text(self.sketch_js, encoding="utf-8")
         (out / "index.html").write_text("<!DOCTYPE html>\n", encoding="utf-8")
         (out / "statement.md").write_text(self.statement, encoding="utf-8")
         return worker.Execution(
