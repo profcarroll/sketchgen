@@ -12,6 +12,7 @@ One entry row plus its attempt directory in, a directory of plain files out:
     <gallery>/index.html                 the grid (published entries)
     <gallery>/rejections.html            the gate's rejections, kept
     <gallery>/compare.html               the paired-judgment shell
+    <gallery>/pairs.json                 balanced pairs to offer, and agent verdicts
     <gallery>/lines/<root>.html          one page per lineage line
     <gallery>/assets/gallery.{css,js}
     <gallery>/config.json                write-path base URL, gallery URL
@@ -26,11 +27,14 @@ one land in a public repository. The spec's no-personal-data rule (§7) is a
 build-time check here, not a convention.
 
 **Nothing is invented.** The two judgment populations are kept apart and are
-rendered from the ``judgments`` table alone; Bradley–Terry is packet 5.1, so
-until it exists a population with no pairs says "no pairs yet" and one with
-pairs says how many answers are recorded, never a score. Views and likes live
-behind the write path (packet 3.3) and are rendered by ``gallery.js`` at read
-time; the generator writes an em dash and no number.
+rendered from the ``judgments`` table alone, through :mod:`sketchgen.pairs`'s
+Bradley–Terry fit (packet 5.1): one score per population per question, never
+one aggregate, the 'look' score as the headline and the 'brief' score beside
+it. A population that has judged an entry no times says "no pairs yet" and
+carries no number at all — a score nobody voted on is not a low score. Views
+and likes live behind the write path (packet 3.3) and are rendered by
+``gallery.js`` at read time; the generator writes an em dash and no number, and
+they are never folded into either score (spec §5).
 
 **The same database gives the same bytes.** No clock is read while rendering:
 every timestamp on a page comes from a row. A second ``render_all`` over an
@@ -51,6 +55,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from string import Template
 from typing import Any, Iterable
+
+from . import pairs as pairs_mod
 
 __all__ = [
     "DEFAULT_GALLERY_URL",
@@ -335,15 +341,21 @@ def _attempt_rows(conn: sqlite3.Connection, job_id: int) -> list[sqlite3.Row]:
     )
 
 
-def _judgment_counts(conn: sqlite3.Connection, entry_id: int) -> dict[str, int]:
-    counts = {"human": 0, "agent": 0}
-    for row in conn.execute(
-        "SELECT judge_kind, COUNT(*) AS c FROM judgments "
-        "WHERE entry_a = ? OR entry_b = ? GROUP BY judge_kind",
-        (entry_id, entry_id),
-    ):
-        counts[row["judge_kind"]] = int(row["c"])
-    return counts
+def _all_scores(conn: sqlite3.Connection) -> dict[str, dict[str, dict]]:
+    """Every Bradley–Terry table the pages need, fitted once per render.
+
+    ``{population: {question: {entry_id: {...}}}}``. Four fits, not four per
+    entry: the fit is over the whole pool, so doing it per card would be both
+    slower and no different. Packet 5.1; see sketchgen/pairs.py for the prior
+    and what it costs.
+    """
+    return {
+        population: {
+            question: pairs_mod.scores(conn, population=population, question=question)
+            for question in pairs_mod.QUESTIONS
+        }
+        for population in pairs_mod.POPULATIONS
+    }
 
 
 def _lineage_row(conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row | None:
@@ -512,18 +524,50 @@ def _json_block(data: Any) -> str:
     return json.dumps(data, indent=2, sort_keys=True).replace("</", "<\\/")
 
 
-def _score_slot(count: int) -> tuple[str, str]:
-    """(value, note) for one judge population. No number is ever invented."""
-    if count <= 0:
+NO_PAIRS = "no pairs yet"
+
+
+def _one_score(table: dict, entry_id: int) -> str:
+    """One population/question cell: the score to two decimals, with its n."""
+    row = table.get(entry_id)
+    if row is None:
+        return NO_PAIRS
+    n = int(row["n"])
+    return f"{float(row['score']):.2f} over {n} pair{'' if n == 1 else 's'}"
+
+
+def _score_slot(
+    scores: dict[str, dict[str, dict]], population: str, entry_id: int
+) -> tuple[str, str, str]:
+    """(headline, brief line, note) for one judge population.
+
+    The headline is the 'look' score — *which would you rather look at*, the
+    question the gallery is about — and the 'brief' score is shown beside it,
+    never folded into it. An entry this population has never judged gets
+    :data:`NO_PAIRS` and no number: a score nobody voted on is not a low score,
+    it is no score.
+    """
+    look = scores[population]["look"]
+    brief = scores[population]["brief"]
+    if entry_id not in look and entry_id not in brief:
         return (
-            "no pairs yet",
+            NO_PAIRS,
+            "",
             "A Bradley–Terry score needs pairs; none has been judged.",
         )
     return (
-        "pending",
-        f"{count} answer{'s' if count != 1 else ''} recorded; the score arrives "
-        "with the Bradley–Terry fit (packet 5.1).",
+        _one_score(look, entry_id),
+        f"closer to its brief: {_one_score(brief, entry_id)}",
+        "Bradley–Terry over this population's pairs alone. 1.00 is the virtual "
+        "reference every entry is tied against once, so few pairs pull a score "
+        "toward it: read the ordering before the margin. Views and likes are "
+        "engagement, not judgment, and are not in this number.",
     )
+
+
+def _brief_line(text: str) -> str:
+    """The second question's score, as its own element, or nothing at all."""
+    return f'<p class="score-brief">{_esc(text)}</p>' if text else ""
 
 
 def _attribution(row: sqlite3.Row, config: Config) -> str:
@@ -873,9 +917,9 @@ def _write_entry(
     )
     written.write_text(out / "meta.json", json.dumps(meta, indent=2, sort_keys=True) + "\n")
 
-    counts = _judgment_counts(conn, entry_id)
-    human_value, human_note = _score_slot(counts["human"])
-    agent_value, agent_note = _score_slot(counts["agent"])
+    scores = _all_scores(conn)
+    human_value, human_brief, human_note = _score_slot(scores, "human", entry_id)
+    agent_value, agent_brief, agent_note = _score_slot(scores, "agent", entry_id)
     root = meta["lineage"]["root_entry_id"]
     has_line = bool(_descendants(children, root))
     title = " ".join(str(row["prompt"] or f"entry {entry_id}").split())
@@ -902,8 +946,10 @@ def _write_entry(
         statement_model=_esc(row["executor"] or "an unrecorded model"),
         statement=_paragraphs(statement, "The executor wrote no statement."),
         human_value=_esc(human_value),
+        human_brief=_brief_line(human_brief),
         human_note=_esc(human_note),
         agent_value=_esc(agent_value),
+        agent_brief=_brief_line(agent_brief),
         agent_note=_esc(agent_note),
         compare_href=f"../../compare.html?a={entry_id}",
         source_rows=_source_rows(meta),
@@ -924,12 +970,21 @@ def _card(
     row: sqlite3.Row,
     failed: bool,
     template: Template,
+    scores: dict[str, dict[str, dict]],
 ) -> str:
     entry_id = int(row["id"])
-    counts = _judgment_counts(conn, entry_id)
-    human_value, _ = _score_slot(counts["human"])
-    agent_value, _ = _score_slot(counts["agent"])
+    human_value, human_brief, _ = _score_slot(scores, "human", entry_id)
+    agent_value, agent_brief, _ = _score_slot(scores, "agent", entry_id)
     prompt = " ".join(str(row["prompt"] or f"entry {entry_id}").split())
+    # The card's headline pair is the 'look' score; the 'brief' score goes on
+    # its own line beneath, and the line is absent rather than empty when
+    # neither population has judged this entry.
+    parts = [
+        f"humans {_esc(human_brief)}" if human_brief else "",
+        f"agents {_esc(agent_brief)}" if agent_brief else "",
+    ]
+    kept = [part for part in parts if part]
+    briefs = f'<p class="card-briefs">{" · ".join(kept)}</p>' if kept else ""
     reason = ""
     chip = ""
     if failed:
@@ -948,6 +1003,7 @@ def _card(
         submitted_by=_esc(row["submitted_by"] or "unknown"),
         human=_esc(human_value),
         agent=_esc(agent_value),
+        briefs=briefs,
         reason=reason,
     )
 
@@ -978,8 +1034,9 @@ def _grid_page(
     failed: bool,
 ) -> str:
     card = _template("card.html")
+    scores = _all_scores(conn)
     if rows:
-        cards = "\n      ".join(_card(conn, row, failed, card) for row in rows)
+        cards = "\n      ".join(_card(conn, row, failed, card, scores) for row in rows)
     else:
         cards = '<p class="none">Nothing here yet.</p>'
     return _template("grid.html").substitute(
@@ -1009,7 +1066,23 @@ def _compare_page(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> str:
         root="./",
         page_title="Compare two sketches",
         entries_json=_json_block(entries),
+        pairs_json=_json_block(_offered_pairs(conn)),
+        agents_json=_json_block(pairs_mod.agent_verdicts(conn)),
     )
+
+
+def _offered_pairs(conn: sqlite3.Connection) -> list[dict[str, int]]:
+    """The balanced pairs the static compare page may offer, from pick_pair.
+
+    A published gallery has no server to ask "which pair next?", so the
+    generator asks for it here — once per seed, each seed a fresh
+    :class:`random.Random`, so the list is deterministic and a second render of
+    an unchanged database writes the same bytes. The browser picks one of these
+    rather than the first two entries in the grid, which is how the balance
+    rule (fewest judgments so far, control against treatment) reaches a static
+    page at all.
+    """
+    return pairs_mod.offer(conn)
 
 
 def _line_node(
@@ -1099,6 +1172,18 @@ def render_index(
                 page="rejections.html",
                 failed=True,
             ),
+        )
+        written.write_text(
+            dest / "pairs.json",
+            json.dumps(
+                {
+                    "pairs": _offered_pairs(conn),
+                    "agents": pairs_mod.agent_verdicts(conn),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
         )
         written.write_text(dest / "compare.html", _compare_page(conn, published))
         roots = sorted(
