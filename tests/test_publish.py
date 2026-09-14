@@ -375,6 +375,33 @@ class PublishIndexTests(PublishTestCase):
         self.assertEqual(why2, "site unchanged")
 
 
+    def test_publish_index_leaves_an_unpublished_rejection_alone(self):
+        # A gate rejection the worker kept is a person's to publish (spec §9).
+        # The re-render must not put it on the site by the back door.
+        kept_job = db.enqueue(self.conn, "a kept rejection", "profcarroll")
+        self.conn.execute("UPDATE jobs SET state = 'failed' WHERE id = ?", (kept_job,))
+        self.conn.commit()
+        kept = db.create_entry(
+            self.conn, kept_job, state="failed-kept", prompt="a kept rejection",
+            executor=EXECUTOR, submitted_by="profcarroll",
+        )
+        result = self.publish_cli("--by", "profcarroll")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        from sketchgen import publish as publication
+        publication.publish_index(self.conn, self.gallery, remote=str(self.bare))
+        self.assertFalse((self.gallery / "e" / str(kept)).exists())
+        failed = (self.gallery / "rejections.html").read_text(encoding="utf-8")
+        self.assertNotIn(f'data-entry="{kept}"', failed)
+        # Once a person publishes it, it is on the rejections page and nowhere else.
+        result = self.publish_cli("--by", "profcarroll", entry_id=kept)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.gallery / "e" / str(kept) / "index.html").exists())
+        failed = (self.gallery / "rejections.html").read_text(encoding="utf-8")
+        self.assertIn(f'data-entry="{kept}"', failed)
+        index = (self.gallery / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn(f'data-entry="{kept}"', index)
+
+
 class ScanTests(unittest.TestCase):
     def test_binary_files_are_not_scanned_for_addresses(self):
         import tempfile, pathlib
