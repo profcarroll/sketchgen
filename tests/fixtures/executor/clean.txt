@@ -1,0 +1,63 @@
+```js
+// Sixty circles drifting on individual noise paths over a dark ground.
+// Each keeps its own offsets into the noise field so the flock never
+// moves as one body, which is what makes the drift read as drift.
+
+let circles = [];
+const COUNT = 60;
+
+function setup() {
+  createCanvas(windowWidth, windowHeight);
+  noStroke();
+  for (let i = 0; i < COUNT; i++) {
+    circles.push({
+      x: random(width),
+      y: random(height),
+      r: random(8, 26),
+      xoff: random(1000),
+      yoff: random(1000),
+      vx: 0,
+      vy: 0
+    });
+  }
+}
+
+function draw() {
+  background(12, 14, 20);
+  for (const c of circles) {
+    // Noise supplies the wander; velocity supplies the memory of a click.
+    c.x += (noise(c.xoff) - 0.5) * 2.4 + c.vx;
+    c.y += (noise(c.yoff) - 0.5) * 2.4 + c.vy;
+    c.xoff += 0.006;
+    c.yoff += 0.006;
+    c.vx *= 0.94;
+    c.vy *= 0.94;
+    c.x = (c.x + width) % width;
+    c.y = (c.y + height) % height;
+    fill(255, 170, 90, 190);
+    circle(c.x, c.y, c.r * 2);
+  }
+}
+
+function mousePressed() {
+  for (const c of circles) {
+    const d = max(dist(mouseX, mouseY, c.x, c.y), 1);
+    const push = 900 / d;
+    c.vx += ((c.x - mouseX) / d) * push;
+    c.vy += ((c.y - mouseY) / d) * push;
+  }
+}
+
+function windowResized() {
+  resizeCanvas(windowWidth, windowHeight);
+}
+```
+
+## Statement
+
+Sixty small suns wander a night field, each on its own private path through a
+noise landscape, so the group never quite agrees on a direction. A click is a
+shove: everything near the cursor is thrown outward at once and then, as the
+damping takes hold, forgets it and returns to drifting. I wanted the recovery to
+be the subject rather than the scatter — the piece is about how quickly a crowd
+goes back to what it was doing.
