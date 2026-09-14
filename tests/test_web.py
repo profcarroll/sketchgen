@@ -14,6 +14,7 @@ import base64
 import http.client
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -366,6 +367,171 @@ class TestPages(WebTestCase):
         self.assertEqual(self.get("/nope")[0], 404)
         self.assertEqual(self.get(f"/job/{self.held_id}/cancel")[0], 405)
         self.assertEqual(self.get("/control")[0], 405)
+
+
+class TestHeaderMarks(WebTestCase):
+    """The nav's live summaries: a meter on Console, counts on the rest.
+
+    The seeded database is one queued job, one held job with an entry, one
+    failed job and no ``worker_started_utc`` — so the header should read
+    1 queued, 0 in flight, 0 failed this session, 1 held, 0 public.
+    """
+
+    METER = re.compile(r'data-nav="cpu" title="([^"]*)"[^>]*>(.*?)</span>', re.S)
+
+    def marks(self, page):
+        """(number, title) for each nav mark that carries a number."""
+        found = {}
+        for key in ("queued", "in-flight", "failed", "held", "public"):
+            match = re.search(r'data-nav="%s" title="([^"]*)">(\d+)<' % key, page)
+            self.assertIsNotNone(match, f"no {key} mark in the header")
+            found[key] = (int(match.group(2)), match.group(1))
+        return found
+
+    def meter(self, page):
+        """(title, lit segments, total segments) for the Console meter."""
+        match = self.METER.search(page)
+        self.assertIsNotNone(match, "no Console meter in the header")
+        title, segments = match.group(1), match.group(2)
+        return title, segments.count('<i class="on">'), segments.count("<i")
+
+    def test_every_page_carries_the_five_marks(self):
+        for path in ("/", "/queue", "/new", "/held", f"/job/{self.held_id}"):
+            with self.subTest(path=path):
+                page = self.text(path)
+                title, lit, total = self.meter(page)
+                self.assertEqual(total, 5)
+                self.assertLessEqual(lit, total)
+                self.assertIn("node CPU", title)
+                self.assertIn("slot ", title)
+                marks = self.marks(page)
+                self.assertEqual(marks["queued"][0], 1)
+                self.assertEqual(marks["in-flight"][0], 0)
+                self.assertEqual(marks["failed"][0], 0)
+                self.assertEqual(marks["held"][0], 1)
+                self.assertEqual(marks["public"][0], 0)
+                # every number says what it is, on hover
+                self.assertEqual(marks["queued"][1], "jobs queued")
+                self.assertEqual(marks["in-flight"][1], "jobs in flight")
+                self.assertEqual(
+                    marks["failed"][1], "jobs failed since the worker started"
+                )
+                self.assertEqual(
+                    marks["held"][1], "1 waiting · 0 kept rejections below them"
+                )
+                self.assertEqual(marks["public"][1], "0 public · 0 published, 0 kept")
+                # the marks sit inside the anchors: the whole thing is the link
+                self.assertRegex(
+                    page, r'<a href="/queue"[^>]*>Queue <span class="counts"'
+                )
+                self.assertRegex(
+                    page, r'<a href="/held"[^>]*>Held<sup class="sup warn"'
+                )
+
+    def test_the_marks_move_with_the_database(self):
+        # A job the worker has claimed is in flight; publishing the seeded
+        # entry moves it off Held and onto Gallery.
+        conn = self.db()
+        try:
+            moving = db.enqueue(conn, "in flight now", "student-one")
+            conn.execute("UPDATE jobs SET state = 'executing' WHERE id = ?", (moving,))
+            conn.execute(
+                "UPDATE entries SET state = 'published', published_utc = ? "
+                "WHERE id = ?",
+                ("2026-09-14T13:00:00Z", self.entry_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        try:
+            marks = self.marks(self.text("/queue"))
+            self.assertEqual(marks["in-flight"][0], 1)
+            self.assertEqual(marks["held"][0], 0)
+            self.assertEqual(marks["public"][0], 1)
+            self.assertEqual(marks["public"][1], "1 public · 1 published, 0 kept")
+        finally:
+            conn = self.db()
+            try:
+                conn.execute("DELETE FROM jobs WHERE id = ?", (moving,))
+                conn.execute(
+                    "UPDATE entries SET state = 'held', published_utc = NULL "
+                    "WHERE id = ?",
+                    (self.entry_id,),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def test_the_red_number_is_failures_since_the_worker_started(self):
+        # The all-time count only ever grows, so this one is the session's:
+        # state failed, updated at or after meta.worker_started_utc.
+        conn = self.db()
+        try:
+            db.set_meta(conn, "worker_started_utc", "2026-09-14T12:00:00Z")
+            # the seeded failure happened before this worker came up
+            conn.execute(
+                "UPDATE jobs SET updated_utc = ? WHERE id = ?",
+                ("2026-09-14T11:00:00Z", self.failed_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        after = None
+        try:
+            self.assertEqual(self.marks(self.text("/"))["failed"][0], 0)
+            conn = self.db()
+            try:
+                after = db.enqueue(conn, "failed after the restart", "student-one")
+                conn.execute(
+                    "UPDATE jobs SET state = 'failed', updated_utc = ? WHERE id = ?",
+                    ("2026-09-14T12:30:00Z", after),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            self.assertEqual(self.marks(self.text("/"))["failed"][0], 1)
+        finally:
+            conn = self.db()
+            try:
+                if after is not None:
+                    conn.execute("DELETE FROM jobs WHERE id = ?", (after,))
+                conn.execute("DELETE FROM meta WHERE key = 'worker_started_utc'")
+                conn.execute(
+                    "UPDATE jobs SET updated_utc = ? WHERE id = ?",
+                    ("2026-09-14T12:00:00Z", self.failed_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def test_control_json_carries_the_same_numbers(self):
+        status, content_type, body = self.get("/api/control.json")
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", content_type)
+        nav = json.loads(body)["nav"]
+        self.assertEqual(nav["queued"], 1)
+        self.assertEqual(nav["in_flight"], 0)
+        self.assertEqual(nav["failed_session"], 0)
+        self.assertEqual(nav["held"], 1)
+        self.assertEqual(nav["kept"], 0)
+        self.assertEqual(nav["public"], 0)
+        self.assertEqual(nav["published"], 0)
+        self.assertIn(nav["slot_state"], ("ours", "busy", "free"))
+        self.assertGreaterEqual(nav["cpu_pct"], 0.0)
+        self.assertLessEqual(nav["cpu_pct"], 100.0)
+
+    def test_no_proc_is_an_unlit_meter_and_not_an_error(self):
+        # A machine without /proc — a Mac, a container — renders a dark meter
+        # rather than a traceback.
+        self.assertEqual(web.node_cpu_pct(Path(self._tmp.name) / "no-loadavg"), 0.0)
+        original = web.node_cpu_pct
+        web.node_cpu_pct = lambda *args, **kwargs: 0.0
+        try:
+            title, lit, total = self.meter(self.text("/"))
+            self.assertEqual((lit, total), (0, 5))
+            self.assertIn("node CPU 0%", title)
+        finally:
+            web.node_cpu_pct = original
 
 
 class TestForms(WebTestCase):

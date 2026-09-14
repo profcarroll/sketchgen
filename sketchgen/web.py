@@ -122,6 +122,8 @@ __all__ = [
     "job_document",
     "live_streams",
     "make_server",
+    "nav_summary",
+    "node_cpu_pct",
     "serve",
 ]
 
@@ -539,6 +541,220 @@ def pill_for(control: db.Control | None) -> tuple[str, str, str]:
     return ("PAUSING", "pausing", control.reason or "finishing the attempt in flight")
 
 
+# ---------------------------------------------------------------------------
+# The header's live marks
+#
+# Each nav item carries a small summary of its own page, so the node is never
+# out of sight while the operator is standing somewhere else: a five-segment
+# level meter on Console, a coloured triple on Queue, a superscript on Held and
+# on Gallery. Every one of them is rendered here, server-side, on every page
+# load — the header is right with JavaScript off — and repainted from
+# /api/control.json by the two-second poll at the bottom of op_layout.html.
+# ---------------------------------------------------------------------------
+
+#: Where :func:`node_cpu_pct` reads the load from. A module constant so a test
+#: on a machine with no /proc can point it at nothing and see the meter go dark.
+LOADAVG_PATH = "/proc/loadavg"
+
+#: How many segments the Console meter has. Lit segments are the CPU
+#: percentage in fifths, rounded.
+METER_SEGMENTS = 5
+
+#: What "in flight" means in the header's green number: a job the worker is
+#: carrying, planning included. ``console.IN_FLIGHT_STATES`` leaves planning
+#: out because that tuple is about who holds the inference slot at the moment
+#: of the reading; this one is about work that is moving.
+IN_FLIGHT_STATES = ("planning", "executing", "gating", "repairing")
+
+#: A summary with nothing in it: what the header draws when the database
+#: cannot be counted. Zeros and an unlit meter, never a traceback.
+EMPTY_NAV: dict[str, Any] = {
+    "cpu_pct": 0.0,
+    "slot_state": "free",
+    "slot_holder": None,
+    "queued": 0,
+    "in_flight": 0,
+    "failed_session": 0,
+    "held": 0,
+    "kept": 0,
+    "public": 0,
+    "published": 0,
+}
+
+
+def node_cpu_pct(path: str | os.PathLike[str] = LOADAVG_PATH) -> float:
+    """Node CPU for the header meter: one-minute load per core, as a percent.
+
+    This is deliberately not the console's ``node.cpu_total_pct``. That number
+    is the honest one — busy jiffies between two readings of /proc/stat — and
+    the second reading costs a sleep, which is tens of milliseconds on a header
+    that renders on every click of every page. /proc/loadavg is one line the
+    kernel has already averaged, and it answers the question a five-segment
+    meter asks: how much of this machine is spoken for right now. Divided by
+    the core count and capped at 100, so a load of 32 on 16 cores lights every
+    segment and stops there.
+
+    No /proc — a test on another OS, a container without it — is 0.0 and an
+    unlit meter. This never raises.
+    """
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            load = float(handle.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+    try:
+        cores = len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):  # pragma: no cover - non-Linux
+        cores = os.cpu_count() or 1
+    return round(min(100.0, max(0.0, 100.0 * load / max(cores, 1))), 1)
+
+
+def _nav_slot(in_flight: int) -> tuple[str, str | None]:
+    """Who holds the inference slot, cheaply: (state, holder).
+
+    :func:`sketchgen.console._slot` is the full rule and it is not free — it
+    needs Ollama's resident list over HTTP and a CPU percentage per process.
+    The header keeps the two branches that cost one walk of /proc or nothing at
+    all: a live worker with a job in flight is **ours**, an ``opencode`` session
+    is **busy** (the fence's own refusal), everything else is **free**. The
+    branch left out is Ollama's "a model is resident and something is burning
+    it", so the header can say free where the console says busy; the console is
+    the page to check when that matters, and it is one click away.
+    """
+    found = {"worker": None, "opencode": None}
+    finder = getattr(console, "_find_processes", None) if console else None
+    if finder is not None:
+        try:
+            found = finder(
+                {"worker": ("sketchgen", "worker"), "opencode": ("opencode",)}
+            )
+        except Exception:  # pragma: no cover - the header must not take the UI down
+            found = {"worker": None, "opencode": None}
+    if found.get("worker") is not None and in_flight:
+        return ("ours", "sketchgen worker")
+    if found.get("opencode") is not None:
+        return ("busy", f"opencode pid {found['opencode']}")
+    return ("free", None)
+
+
+def nav_summary(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The numbers behind the header's marks, in one pass of small counts.
+
+    The red Queue number is failures **since the worker started**, not the
+    all-time count: the worker stamps ``meta.worker_started_utc`` when it comes
+    up, and a number that only ever grows is a number nobody reads. A database
+    with no stamp has had no session, so it is zero rather than everything.
+    """
+    try:
+        marks = ",".join("?" for _ in IN_FLIGHT_STATES)
+        in_flight = _count(
+            conn,
+            f"SELECT COUNT(*) FROM jobs WHERE state IN ({marks})",
+            IN_FLIGHT_STATES,
+        )
+        since = db.get_meta(conn, "worker_started_utc")
+        summary = {
+            "cpu_pct": node_cpu_pct(),
+            "queued": _count(conn, "SELECT COUNT(*) FROM jobs WHERE state = 'queued'"),
+            "in_flight": in_flight,
+            "failed_session": (
+                _count(
+                    conn,
+                    "SELECT COUNT(*) FROM jobs WHERE state = 'failed' "
+                    "AND updated_utc >= ?",
+                    (since,),
+                )
+                if since
+                else 0
+            ),
+            "held": _count(conn, "SELECT COUNT(*) FROM entries WHERE state = 'held'"),
+            # The kept rejections still waiting below the held cards: the ones
+            # already published have left the Held page.
+            "kept": _count(
+                conn,
+                "SELECT COUNT(*) FROM entries WHERE state = 'failed-kept' "
+                "AND published_utc IS NULL",
+            ),
+            "public": _count(
+                conn, "SELECT COUNT(*) FROM entries WHERE published_utc IS NOT NULL"
+            ),
+            "published": _count(
+                conn,
+                "SELECT COUNT(*) FROM entries WHERE state = 'published' "
+                "AND published_utc IS NOT NULL",
+            ),
+        }
+    except sqlite3.Error as exc:  # the header must never take the UI down
+        sys.stderr.write(f"{db.utc_now()} nav summary failed: {exc}\n")
+        return dict(EMPTY_NAV)
+    state, holder = _nav_slot(summary["in_flight"])
+    summary["slot_state"] = state
+    summary["slot_holder"] = holder
+    return summary
+
+
+def _nav_meter(summary: dict[str, Any]) -> str:
+    """The Console meter: ``[▮▮▯▯▯]``, lit segments coloured by position."""
+    cpu = max(0.0, min(100.0, float(summary.get("cpu_pct") or 0.0)))
+    lit = round(cpu / 100.0 * METER_SEGMENTS)
+    holder = summary.get("slot_holder")
+    title = "node CPU %d%% · slot %s%s" % (
+        round(cpu),
+        summary.get("slot_state") or "free",
+        f" ({holder})" if holder else "",
+    )
+    segments = "".join(
+        '<i class="on"></i>' if index < lit else "<i></i>"
+        for index in range(METER_SEGMENTS)
+    )
+    return (
+        f'<span class="throttle" data-nav="cpu" title="{esc(title)}" '
+        f'aria-label="{esc(title)}">{segments}</span>'
+    )
+
+
+def nav_html(here: str, summary: dict[str, Any]) -> str:
+    """The whole nav, links and marks, with the current page underlined.
+
+    The marks sit inside the anchors, so the number is part of the link to the
+    page it counts; New job counts nothing and carries nothing.
+    """
+    extras = {
+        "/": " " + _nav_meter(summary),
+        "/queue": (
+            ' <span class="counts" data-nav="counts">'
+            f'<b class="n warn" data-nav="queued" title="jobs queued">'
+            f'{summary["queued"]}</b>·'
+            f'<b class="n ok" data-nav="in-flight" title="jobs in flight">'
+            f'{summary["in_flight"]}</b>·'
+            f'<b class="n bad" data-nav="failed" '
+            f'title="jobs failed since the worker started">'
+            f'{summary["failed_session"]}</b></span>'
+        ),
+        "/held": (
+            f'<sup class="sup warn" data-nav="held" title="{summary["held"]} waiting'
+            f' · {summary["kept"]} kept rejections below them">{summary["held"]}</sup>'
+        ),
+    }
+    nav = "".join(
+        '<a href="%s"%s>%s%s</a>'
+        % (
+            esc(path),
+            ' class="here"' if path == here else "",
+            esc(label),
+            extras.get(path, ""),
+        )
+        for path, label in NAV
+    )
+    kept_public = summary["public"] - summary["published"]
+    return nav + (
+        f'<a href="{esc(GALLERY_URL)}" target="_blank" rel="noopener">Gallery '
+        f'<sup class="sup" data-nav="public" title="{summary["public"]} public · '
+        f'{summary["published"]} published, {kept_public} kept">'
+        f'{summary["public"]}</sup> ↗</a>'
+    )
+
+
 def layout(
     *,
     title: str,
@@ -548,16 +764,12 @@ def layout(
     back: str,
     flash: str | None = None,
     page_script: str = "",
+    nav_marks: dict[str, Any] | None = None,
 ) -> str:
     text, css, tooltip = pill_for(control)
     state = control.state if control else "unknown"
     stop_now = worker.is_stop_now(control)
-    nav = "".join(
-        '<a href="%s"%s>%s</a>'
-        % (esc(path), ' class="here"' if path == here else "", esc(label))
-        for path, label in NAV
-    )
-    nav += f'<a href="{esc(GALLERY_URL)}" target="_blank" rel="noopener">Gallery ↗</a>'
+    nav = nav_html(here, nav_marks or EMPTY_NAV)
     # A refusal is not a success in the same quiet box: the operator has
     # already clicked, and "nothing changed" has to be the first thing seen.
     flash_html = (
@@ -2086,6 +2298,7 @@ class OpHandler(BaseHTTPRequestHandler):
         conn = self.app.connect()
         try:
             control = db.get_control(conn)
+            marks = nav_summary(conn)
         finally:
             conn.close()
         doc = console_document(self.app)
@@ -2098,6 +2311,7 @@ class OpHandler(BaseHTTPRequestHandler):
                 back="/",
                 flash=self.flash(),
                 page_script=CONSOLE_SCRIPT,
+                nav_marks=marks,
             )
         )
 
@@ -2108,6 +2322,7 @@ class OpHandler(BaseHTTPRequestHandler):
         conn = self.app.connect()
         try:
             control = db.get_control(conn)
+            marks = nav_summary(conn)
         finally:
             conn.close()
         text, css, tooltip = pill_for(control)
@@ -2120,6 +2335,9 @@ class OpHandler(BaseHTTPRequestHandler):
                 "pill": text,
                 "pill_class": css,
                 "title": tooltip,
+                # The header's marks ride along with the pill: one poll keeps
+                # the whole header honest, and nothing else has to be fetched.
+                "nav": marks,
             }
         )
 
@@ -2128,6 +2346,7 @@ class OpHandler(BaseHTTPRequestHandler):
         try:
             control = db.get_control(conn)
             body = queue_page(conn, console_document(self.app), control)
+            marks = nav_summary(conn)
         finally:
             conn.close()
         self.html(
@@ -2138,6 +2357,7 @@ class OpHandler(BaseHTTPRequestHandler):
                 control=control,
                 back="/queue",
                 flash=self.flash(),
+                nav_marks=marks,
             )
         )
 
@@ -2145,6 +2365,7 @@ class OpHandler(BaseHTTPRequestHandler):
         conn = self.app.connect()
         try:
             control = db.get_control(conn)
+            marks = nav_summary(conn)
         finally:
             conn.close()
         self.html(
@@ -2155,6 +2376,7 @@ class OpHandler(BaseHTTPRequestHandler):
                 control=control,
                 back="/new",
                 flash=self.flash(),
+                nav_marks=marks,
             )
         )
 
@@ -2173,6 +2395,7 @@ class OpHandler(BaseHTTPRequestHandler):
                         body=new_page(form, str(exc)),
                         control=control,
                         back="/new",
+                        nav_marks=nav_summary(conn),
                     ),
                     status=400,
                 )
@@ -2190,6 +2413,7 @@ class OpHandler(BaseHTTPRequestHandler):
                 return
             control = db.get_control(conn)
             body = job_page(self.app, conn, job)
+            marks = nav_summary(conn)
         finally:
             conn.close()
         self.html(
@@ -2201,6 +2425,7 @@ class OpHandler(BaseHTTPRequestHandler):
                 back=f"/job/{job.id}",
                 flash=self.flash(),
                 page_script=JOB_SCRIPT,
+                nav_marks=marks,
             )
         )
 
@@ -2367,6 +2592,7 @@ class OpHandler(BaseHTTPRequestHandler):
         try:
             control = db.get_control(conn)
             body = held_page(self.app, conn)
+            marks = nav_summary(conn)
         finally:
             conn.close()
         self.html(
@@ -2377,6 +2603,7 @@ class OpHandler(BaseHTTPRequestHandler):
                 control=control,
                 back="/held",
                 flash=self.flash(),
+                nav_marks=marks,
             )
         )
 

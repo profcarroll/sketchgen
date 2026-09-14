@@ -253,6 +253,21 @@ Then open http://localhost:8081/ — the Console; Queue, New job, Job detail (li
 transcript) and Held are in its top bar, with the worker's Pause / Stop now / Resume
 control upper right. Logs: `journalctl --user -u sketchgen-web -n 50`.
 
+Each item in that top bar carries a small live summary of its own page, so the node is
+never out of sight while you are standing somewhere else. **Console** has a
+five-segment meter: lit segments are the node's one-minute load per core as a
+percentage, in fifths — the first two green, the third amber, the last two red — and
+hovering it names the CPU figure and who holds the inference slot. **Queue** has three
+counts, `queued · in flight · failed`: amber is waiting, green is moving, and the red
+one is failures **since the worker last started** (the worker stamps
+`meta.worker_started_utc` when it comes up), not the all-time total, which would only
+ever grow — so a red zero means this session has been clean, and restarting the worker
+clears it. **Held** has an amber superscript, the number waiting for you to publish or
+reject, with the kept rejections below them named on hover. **Gallery** has a dim
+superscript: everything that is public, published entries and kept rejections
+together. All five are rendered by the server on every page load and repainted by the
+same two-second poll that keeps the worker pill honest.
+
 ## The write-path sync as a timer
 
 `install-unit` also copies `systemd/sketchgen-sync.{service,timer}`. The service is a
