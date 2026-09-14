@@ -7,6 +7,11 @@
  *   2. like     POST <base>/like               one like, identified by GitHub
  *   3. vote     POST <base>/vote               one answer to one question
  *
+ * Both writes need a session, and the gallery is a different origin from the
+ * write path, so the session arrives as a token in the /callback redirect's
+ * fragment, lives in this origin's localStorage, and rides back as a bearer
+ * header. See "the session" below for why a cookie cannot do this job.
+ *
  * Until that service exists, config.json carries an empty write_path: every
  * count stays an em dash, the like button stays disabled, and the compare page
  * says votes are not being recorded. The generator never writes a number it
@@ -32,6 +37,126 @@
 
   function base() {
     return config && config.write_path ? String(config.write_path).replace(/\/+$/, "") : "";
+  }
+
+  /* ---- the session ----------------------------------------------------- */
+
+  var STORAGE_KEY = "sketchgen_session";
+
+  /* Why the session is kept here and not left to a cookie: this page is on
+   * github.io and the write path is on workers.dev, so every call it makes is
+   * cross-site. The Worker's SameSite=Lax cookie is not sent on those, and
+   * SameSite=None would be dropped anyway as a third-party cookie by Safari and
+   * increasingly by Chrome. So <write_path>/callback redirects back here with
+   * the same signed token in the fragment, this origin keeps it, and it goes
+   * back as an Authorization: Bearer header.
+   *
+   * The token is username.expiry.HMAC(username.expiry). It names the viewer to
+   * the Worker and carries no secret of the service: the signing key never
+   * leaves the Worker, and this token cannot be used to mint another. */
+  function readToken() {
+    try { return window.localStorage.getItem(STORAGE_KEY) || ""; } catch (err) { return ""; }
+  }
+
+  function writeToken(token) {
+    try { window.localStorage.setItem(STORAGE_KEY, token); } catch (err) { /* private mode */ }
+  }
+
+  function dropToken() {
+    try { window.localStorage.removeItem(STORAGE_KEY); } catch (err) { /* ditto */ }
+  }
+
+  /* Runs before anything else: take the token out of the fragment and out of
+   * the address bar, so copying the URL does not hand it to someone else. A
+   * fragment rather than a query string because a fragment is never sent to a
+   * server, so it cannot land in a log or a Referer header. */
+  function claimTokenFromHash() {
+    var hash = window.location.hash || "";
+    if (hash.indexOf("#session=") !== 0) { return; }
+    var token = decodeURIComponent(hash.slice("#session=".length));
+    if (token) { writeToken(token); }
+    if (window.history && window.history.replaceState) {
+      window.history.replaceState(null, "", window.location.pathname + window.location.search);
+    } else {
+      window.location.hash = "";
+    }
+  }
+
+  /* The one place a request's headers are built. The like button and the
+   * compare page's vote buttons both call it, so the two cannot drift apart.
+   * credentials: "include" stays on every call too: it costs nothing, and it is
+   * what works for someone browsing the Worker's own domain. */
+  function authHeaders(extra) {
+    var headers = {};
+    var key;
+    if (extra) {
+      for (key in extra) {
+        if (Object.prototype.hasOwnProperty.call(extra, key)) { headers[key] = extra[key]; }
+      }
+    }
+    var token = readToken();
+    if (token) { headers["Authorization"] = "Bearer " + token; }
+    return headers;
+  }
+
+  /* A 401 means the token expired, or the signing key was rotated. Drop it
+   * rather than go on presenting it. */
+  function refused(response) {
+    if (response && response.status === 401) {
+      dropToken();
+      paintSession(null);
+      return true;
+    }
+    return false;
+  }
+
+  function paintSession(username) {
+    var login = document.querySelector("[data-login]");
+    if (login) {
+      if (base()) { login.setAttribute("href", base() + "/login"); }
+      login.hidden = !!username;
+    }
+    var button = document.querySelector("[data-like]");
+    if (button && base()) {
+      button.disabled = !username;
+      if (!username) { button.textContent = "sign in to like"; }
+      else if (button.textContent === "sign in to like") { button.textContent = "like"; }
+    }
+    var slot = document.querySelector("[data-session]");
+    if (!slot) { return; }
+    slot.textContent = "";
+    if (!username) { slot.hidden = true; return; }
+    slot.hidden = false;
+    slot.appendChild(document.createTextNode("signed in: " + username + " · "));
+    var out = document.createElement("a");
+    out.setAttribute("href", "#");
+    out.textContent = "sign out";
+    out.addEventListener("click", function (event) {
+      event.preventDefault();
+      var headers = authHeaders();
+      dropToken();
+      paintSession(null);
+      if (base()) {
+        fetch(base() + "/logout", { credentials: "include", headers: headers })
+          .catch(function () { /* the copy that mattered is already gone */ });
+      }
+    });
+    slot.appendChild(out);
+  }
+
+  function loadMe() {
+    if (!base()) { paintSession(null); return Promise.resolve(null); }
+    return fetch(base() + "/me", { credentials: "include", headers: authHeaders() })
+      .then(function (response) {
+        if (refused(response)) { return null; }
+        return response.ok ? response.json() : null;
+      })
+      .then(function (data) {
+        var username = data && data.username ? data.username : null;
+        paintSession(username);
+        return username;
+      })
+      .catch(function () { paintSession(null); return null; });
   }
 
   function loadConfig() {
@@ -83,13 +208,13 @@
       button.title = "the gallery write path is not deployed yet";
       return;
     }
-    button.disabled = false;
+    // loadMe() decides whether this is usable; until it answers, leave it alone.
     button.addEventListener("click", function () {
       button.disabled = true;
       fetch(base() + "/like", {
         method: "POST",
         credentials: "include",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         // worker.js routeLike: { entry_id, on } — on is the state we are asking for
         body: JSON.stringify({
           entry_id: Number(button.getAttribute("data-like")),
@@ -97,9 +222,8 @@
         })
       })
         .then(function (response) {
-          if (response.status === 401 && login) {
+          if (refused(response)) {
             button.textContent = "sign in to like";
-            button.disabled = false;
             return null;
           }
           return response.json();
@@ -277,7 +401,8 @@
             fetch(base() + "/vote", {
               method: "POST",
               credentials: "include",
-              headers: { "Content-Type": "application/json" },
+              // The same header helper the like button uses; see authHeaders.
+              headers: authHeaders({ "Content-Type": "application/json" }),
               // Exactly the payload writepath/worker.js:routeVote destructures.
               body: JSON.stringify({
                 entry_a: sides.A.id,
@@ -285,6 +410,11 @@
                 question: question,
                 choice: choice
               })
+            }).then(function (response) {
+              if (refused(response) && note) {
+                note.textContent = "noted here only: " + choice +
+                  " — sign in with GitHub to record it";
+              }
             }).catch(function () {
               if (note) { note.textContent = "could not record " + choice + "; try again"; }
             });
@@ -296,11 +426,15 @@
   }
 
   ready(function () {
+    // First, before any request: the token /callback handed back in the
+    // fragment, stored for this origin and stripped from the address bar.
+    claimTokenFromHash();
     applyFilters();
     loadConfig().then(function () {
       loadCounts();
       wireLike();
       wireCompare();
+      loadMe();
     });
   });
 })();
