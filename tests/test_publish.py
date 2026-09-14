@@ -183,10 +183,15 @@ class PublishTests(PublishTestCase):
         result = self.publish_cli("--by", "profcarroll")
         self.assertEqual(result.returncode, 0, result.stderr)
 
-        sha = self.head(self.gallery)
         self.assertNotEqual(self.head(self.bare), before)
-        self.assertEqual(self.head(self.bare), sha)
-        self.assertIn(sha, result.stdout)
+        self.assertEqual(self.head(self.bare), self.head(self.gallery))
+        # First stdout line is the entry commit; when the generator is present a
+        # second "gallery index" commit follows it, so the entry commit is an
+        # ancestor of HEAD rather than HEAD itself.
+        entry_sha = result.stdout.splitlines()[0]
+        self.assertEqual(
+            0, git(self.gallery, "merge-base", "--is-ancestor", entry_sha, "HEAD").returncode
+        )
         self.assertIn(f"/e/{self.entry_id}/", result.stdout)
 
         listing = git(self.bare, "ls-tree", "-r", "--name-only", "HEAD").stdout

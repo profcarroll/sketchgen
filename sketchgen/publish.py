@@ -112,6 +112,8 @@ class Published:
     url: str
     published_utc: str
     files: list[str] = field(default_factory=list)
+    index_commit: str | None = None   # the gallery index re-rendered after this entry
+    index_note: str | None = None     # why there is no index commit, when there is none
 
 
 # ---------------------------------------------------------------------------
@@ -440,6 +442,11 @@ def publish(
             "publish_commit = ? WHERE id = ?",
             (now, sha, entry_id),
         )
+        conn.commit()
+        # The entry is public. Now the grid, the failures page, compare and the
+        # line pages must know about it: re-render the index and push it as a
+        # second commit. This never fails the publish; the entry is already up.
+        index_sha, index_note = _publish_index(conn, checkout, branch, target, env, entry_id)
         return Published(
             entry_id=entry_id,
             commit=sha,
@@ -447,10 +454,66 @@ def publish(
             url=entry_url(entry_id, url_base),
             published_utc=now,
             files=files,
+            index_commit=index_sha,
+            index_note=index_note,
         )
     finally:
         if temporary:
             shutil.rmtree(temporary, ignore_errors=True)
+
+
+INDEX_PATHS = ("index.html", "failed.html", "compare.html", "lines", "assets", "config.json")
+
+
+def _publish_index(
+    conn: sqlite3.Connection,
+    checkout: Path,
+    branch: str,
+    target: str,
+    env: dict[str, str] | None,
+    entry_id: int,
+) -> tuple[str | None, str | None]:
+    """Re-render the gallery index into the checkout, commit and push it.
+
+    Returns (sha, None) on success, (None, why) otherwise. A failure here is
+    reported, never raised: the entry itself is already published.
+    """
+    try:
+        from . import gallery  # noqa: PLC0415
+    except ImportError:
+        return None, "generator not present; index not re-rendered"
+    render_index = getattr(gallery, "render_index", None)
+    if render_index is None:
+        return None, "generator has no render_index; index not re-rendered"
+    before = _git_out(checkout, "rev-parse", "HEAD")
+    try:
+        render_index(conn, checkout)
+    except Exception as exc:  # the generator's own refusal, reported
+        return None, f"index render failed: {exc}"
+    present = [p for p in INDEX_PATHS if (checkout / p).exists()]
+    if not present:
+        return None, "index render wrote nothing"
+    added = _git(checkout, "add", "--", *present)
+    if added.returncode != 0:
+        return None, f"git add of the index failed: {added.stderr.strip()}"
+    if _git(checkout, "diff", "--cached", "--quiet").returncode == 0:
+        return None, "index unchanged"
+    committed = subprocess.run(
+        ["git", "commit", "-F", "-"],
+        cwd=str(checkout),
+        input=f"gallery index after entry {entry_id}\n",
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if committed.returncode != 0:
+        return None, f"index commit failed: {committed.stderr.strip()}"
+    sha = _git_out(checkout, "rev-parse", "HEAD")
+    pushed = _git(checkout, "push", target, f"HEAD:refs/heads/{branch}", env=env)
+    if pushed.returncode != 0:
+        _undo(checkout, before)
+        return None, f"index push failed: {pushed.stderr.strip() or 'git push failed'}"
+    return sha, None
 
 
 def _undo(checkout: Path, before: str | None) -> None:
