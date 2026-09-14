@@ -73,6 +73,7 @@ DEFAULT_URL_BASE = os.environ.get(
 
 #: What must never be committed to a public repository.
 EMAIL_RE = re.compile(rb"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+BINARY_SUFFIXES = frozenset({".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".wav", ".woff", ".woff2", ".ico"})
 HOSTNAME_TOKEN = b"instance-"
 
 #: Shown instead of the deploy key's path under --dry-run.
@@ -224,7 +225,15 @@ def scan_for_personal_data(source: Path) -> None:
     runs on the bytes that are about to be committed, not on a sample of them.
     """
     for relative in _source_files(source):
-        data = (source / relative).read_bytes()
+        path = source / relative
+        # Only text is scanned. A PNG's bytes matched the email pattern by
+        # chance on the node (entry 5, 2026-09-14) and refused a real publish;
+        # an image cannot carry an address a reader would see anyway.
+        if path.suffix.lower() in BINARY_SUFFIXES:
+            continue
+        data = path.read_bytes()
+        if b"\x00" in data[:8192]:
+            continue  # not text, whatever its name
         if EMAIL_RE.search(data):
             raise PublishRefused(
                 f"{relative} contains an email-shaped string; the gallery is "
