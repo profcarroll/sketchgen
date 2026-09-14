@@ -1,0 +1,660 @@
+<title>Sketchgen Project Summary</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,500;0,600;1,400&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,400&display=swap');
+
+  :root {
+    --bg: #0c0e12;
+    --bg-raised: #13161c;
+    --bg-inset: #0a0b0f;
+    --border: #1e222a;
+    --border-subtle: #161a21;
+    --text: #d4d7de;
+    --text-muted: #7c8291;
+    --text-dim: #4a5060;
+    --accent: #6ea8fe;
+    --accent-muted: #3a6fb5;
+    --green: #5cb870;
+    --amber: #d4a347;
+    --red: #c75d5d;
+    --mono: 'IBM Plex Mono', 'SF Mono', 'Menlo', monospace;
+    --serif: 'Source Serif 4', 'Georgia', serif;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f4f5f7;
+      --bg-raised: #ffffff;
+      --bg-inset: #eceef1;
+      --border: #d4d7de;
+      --border-subtle: #e4e7ec;
+      --text: #1a1d24;
+      --text-muted: #5a6070;
+      --text-dim: #8a8f9c;
+      --accent: #2d6cc0;
+      --accent-muted: #7aabde;
+      --green: #3a8a4e;
+      --amber: #a07c2e;
+      --red: #b04040;
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #f4f5f7;
+    --bg-raised: #ffffff;
+    --bg-inset: #eceef1;
+    --border: #d4d7de;
+    --border-subtle: #e4e7ec;
+    --text: #1a1d24;
+    --text-muted: #5a6070;
+    --text-dim: #8a8f9c;
+    --accent: #2d6cc0;
+    --accent-muted: #7aabde;
+    --green: #3a8a4e;
+    --amber: #a07c2e;
+    --red: #b04040;
+  }
+  :root[data-theme="dark"] {
+    --bg: #0c0e12;
+    --bg-raised: #13161c;
+    --bg-inset: #0a0b0f;
+    --border: #1e222a;
+    --border-subtle: #161a21;
+    --text: #d4d7de;
+    --text-muted: #7c8291;
+    --text-dim: #4a5060;
+    --accent: #6ea8fe;
+    --accent-muted: #3a6fb5;
+    --green: #5cb870;
+    --amber: #d4a347;
+    --red: #c75d5d;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1.65;
+    max-width: 860px;
+    margin: 0 auto;
+    padding: 40px 24px 80px;
+  }
+
+  h1, h2, h3 {
+    font-family: var(--serif);
+    font-weight: 700;
+    text-wrap: balance;
+    letter-spacing: -0.01em;
+  }
+
+  h1 {
+    font-size: 28px;
+    line-height: 1.2;
+    margin: 0 0 6px;
+    color: var(--text);
+  }
+
+  .subtitle {
+    font-family: var(--serif);
+    font-size: 16px;
+    font-style: italic;
+    color: var(--text-muted);
+    margin: 0 0 32px;
+    line-height: 1.4;
+  }
+
+  h2 {
+    font-size: 18px;
+    margin: 40px 0 12px;
+    color: var(--text);
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  h3 {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 24px 0 8px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-family: var(--mono);
+  }
+
+  p, li {
+    max-width: 62ch;
+    color: var(--text);
+  }
+
+  p {
+    margin: 0 0 12px;
+  }
+
+  ul {
+    padding-left: 1.5em;
+    margin: 0 0 12px;
+  }
+
+  li {
+    margin-bottom: 4px;
+  }
+
+  a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  a:hover {
+    text-decoration: underline;
+  }
+
+  code {
+    font-family: var(--mono);
+    font-size: 12px;
+    background: var(--bg-inset);
+    padding: 1px 5px;
+    border-radius: 3px;
+    border: 1px solid var(--border-subtle);
+  }
+
+  .meta-bar {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin-bottom: 32px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .meta-bar span {
+    white-space: nowrap;
+  }
+
+  .stat-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 1px;
+    background: var(--border-subtle);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+    margin: 16px 0 24px;
+  }
+  .stat-cell {
+    background: var(--bg-raised);
+    padding: 14px 16px;
+  }
+  .stat-cell .num {
+    font-size: 22px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    color: var(--text);
+    line-height: 1.1;
+  }
+  .stat-cell .label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+
+  .pipeline {
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.8;
+    color: var(--text-muted);
+    padding: 16px 20px;
+    background: var(--bg-inset);
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    overflow-x: auto;
+    margin: 12px 0 20px;
+  }
+  .pipeline .stage {
+    color: var(--accent);
+    font-weight: 500;
+  }
+  .pipeline .arrow {
+    color: var(--text-dim);
+  }
+  .pipeline .note {
+    color: var(--text-dim);
+    font-size: 11px;
+    font-style: italic;
+  }
+
+  .two-col {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin: 12px 0 20px;
+  }
+  @media (max-width: 580px) {
+    .two-col { grid-template-columns: 1fr; }
+  }
+  .col-box {
+    background: var(--bg-raised);
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    padding: 14px 16px;
+  }
+  .col-box h4 {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    margin: 0 0 8px;
+  }
+  .col-box p {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.6;
+  }
+
+  .em-accent {
+    color: var(--accent);
+    font-style: normal;
+    font-weight: 500;
+  }
+
+  .tag {
+    display: inline-block;
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 2px 7px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+  }
+  .tag.green { border-color: var(--green); color: var(--green); }
+  .tag.amber { border-color: var(--amber); color: var(--amber); }
+
+  .divider {
+    height: 1px;
+    background: var(--border);
+    margin: 36px 0;
+  }
+
+  .footer-note {
+    font-size: 11px;
+    color: var(--text-dim);
+    font-style: italic;
+    margin-top: 36px;
+    padding-top: 16px;
+    border-top: 1px solid var(--border-subtle);
+    max-width: 62ch;
+  }
+</style>
+
+<h1>sketchgen</h1>
+<p class="subtitle">A self-hosted, self-generating, self-judging p5.js gallery — built in one session, running on one node</p>
+
+<div class="meta-bar">
+  <span>Parsons PSAM 5600 B · Fall 2026</span>
+  <span>Built 2026-09-13/14</span>
+  <span>Python 3.12, stdlib only</span>
+  <span><a href="https://profcarroll.github.io/sketchgen-gallery/">Gallery ↗</a></span>
+</div>
+
+<div class="stat-grid">
+  <div class="stat-cell">
+    <div class="num">114+</div>
+    <div class="label">Gallery entries</div>
+  </div>
+  <div class="stat-cell">
+    <div class="num">66.3%</div>
+    <div class="label">First-attempt pass rate</div>
+  </div>
+  <div class="stat-cell">
+    <div class="num">$0.006</div>
+    <div class="label">Per sketch (compute)</div>
+  </div>
+  <div class="stat-cell">
+    <div class="num">~102 s</div>
+    <div class="label">Avg wall time</div>
+  </div>
+  <div class="stat-cell">
+    <div class="num">0</div>
+    <div class="label">API calls (all local)</div>
+  </div>
+  <div class="stat-cell">
+    <div class="num">~25k</div>
+    <div class="label">Lines of code + test</div>
+  </div>
+</div>
+
+
+<h2>What it is</h2>
+
+<p>
+  sketchgen is a pipeline that takes a one-line creative prompt, expands it into a brief
+  with testable assertions, generates a complete p5.js sketch in a single model call,
+  gates the result in a headless browser, and publishes the survivors to a static gallery
+  on GitHub Pages — with full provenance, paired human/agent judgments, and a self-prompting
+  lineage that lets the gallery grow without human input.
+</p>
+
+<p>
+  It runs on one Oracle ARM node (16 OCPUs, 96 GB RAM), uses <em class="em-accent">zero
+  external dependencies</em> beyond Python's standard library, and holds its entire state
+  in a single SQLite file. The models — <code>qwen3-coder:30b</code> for execution and
+  <code>gemma4:e4b</code> for vision judging and critique — are self-hosted via Ollama.
+  No paid API key ever reaches the node.
+</p>
+
+
+<h2>The pipeline</h2>
+
+<div class="pipeline">
+  <span class="stage">PROMPT</span>
+  <span class="arrow"> → </span>
+  <span class="stage">PLAN</span>
+  <span class="note">(brief + assertions)</span>
+  <span class="arrow"> → </span>
+  <span class="stage">EXECUTE</span>
+  <span class="note">(single-shot sketch.js)</span>
+  <span class="arrow"> → </span>
+  <span class="stage">GATE</span>
+  <span class="note">(headless browser, assertions)</span>
+  <span class="arrow"> → </span>
+  <span class="stage">REPAIR</span>
+  <span class="note">(evidence-fed retries)</span>
+  <span class="arrow"> → </span>
+  <span class="stage">HOLD</span>
+  <span class="arrow"> → </span>
+  <span class="stage">PUBLISH</span>
+  <br>
+  <span class="arrow" style="margin-left: 4px">↑ idle: </span>
+  <span class="stage">JUDGE</span>
+  <span class="note">(paired, blind)</span>
+  <span class="arrow"> + </span>
+  <span class="stage">CRITIQUE</span>
+  <span class="note">(→ child prompt)</span>
+  <span class="arrow"> + </span>
+  <span class="stage">SLEEP</span>
+</div>
+
+<p>
+  <strong>One inference slot, one worker, one process.</strong> The worker fences the
+  slot against interactive sessions (a second client causes 9× decode collapse), claims
+  jobs from the queue, and when the queue is empty, does idle work — judging unpaired
+  entries and critiquing published ones — before sleeping. Pause, stop, and resume are
+  database rows, not signals.
+</p>
+
+<h3>The planner</h3>
+<p>
+  Expands a short prompt into a prose brief (under 120 words) and a list of assertions
+  drawn from a closed vocabulary: <code>motion(idle)</code>, <code>responds(click)</code>,
+  <code>responds(drag)</code>, <code>responds(audio)</code>, <code>uses(webgl)</code>,
+  <code>size(w,h)</code>, <code>no_motion</code>. The vocabulary is small by design — the
+  planner cannot write an assertion the gate cannot execute.
+</p>
+
+<h3>The executor</h3>
+<p>
+  <code>qwen3-coder:30b-a3b-q4_K_M</code>, single-shot. One prompt in (~2k tokens),
+  one <code>sketch.js</code> out (~3k tokens), plus a statement the model writes about
+  what it built. Not an agent loop — the first-day measurements showed an agent loop
+  spends an hour on what single-shot does in a minute.
+</p>
+
+<h3>The gate</h3>
+<p>
+  Playwright + headless Chromium, deterministic (seeded random, frozen clock). Fixed checks
+  on every job: console errors, frame advancing, sound library state. Then the planner's
+  per-job assertions. A preflight scan catches the most common crash class — a variable
+  that shadows a p5 global (<code>let line</code> hiding <code>line()</code>) — and puts
+  the explanation above the evidence before the executor sees it. On failure, the gate's
+  evidence (not a verdict) goes back for bounded repair. On success, the entry is held for
+  human review.
+</p>
+
+<h3>Publication</h3>
+<p>
+  Held entries are published or rejected by a human. Publication pushes to GitHub Pages
+  with a write-only deploy key — the entry directory, the commit with the executor's
+  model as <code>Co-Authored-By</code>, and the index re-rendered behind it. Files are
+  scanned for email addresses before anything touches the public repo.
+</p>
+
+
+<h2>The hypothesis</h2>
+
+<p>
+  The research idea is not "can AI make art." It is: <em class="em-accent">when humans and
+  agents judge the same artefacts on the same questions under blind conditions, how much do
+  they disagree?</em>
+</p>
+
+<div class="two-col">
+  <div class="col-box">
+    <h4>The two questions</h4>
+    <p>
+      <strong>1. Which is closer to its brief?</strong><br>
+      Fidelity — how much of the brief is on the canvas.<br><br>
+      <strong>2. Which would you rather look at?</strong><br>
+      Taste — there is no correct answer.
+    </p>
+  </div>
+  <div class="col-box">
+    <h4>Two populations, never one aggregate</h4>
+    <p>
+      Humans and agents get identical frame strips, identical briefs, identical questions.
+      A Bradley–Terry fit gives every entry a score <em>per population</em>. The
+      <strong>divergence</strong> between the two is the measurement. Nothing in the
+      system ever collapses them into one number.
+    </p>
+  </div>
+</div>
+
+<h3>Blinding</h3>
+<p>
+  The agent judge never sees: a human vote, a Bradley–Terry score, an engagement tally,
+  the producing model, the submitter, or the rules file. <code>judge.py:assert_blind()</code>
+  enforces a banned-field list against the rendered prompt before anything is sent. The
+  human sees the agent's verdict only <em>after</em> their own choice — compatible with
+  "never hidden," incompatible with anchoring.
+</p>
+
+<h3>The A/B experiment</h3>
+<p>
+  Every job records its <strong>rules file</strong> — <span class="tag green">treatment</span>
+  carries structured p5.js conventions (the library trap, global mode, canvas sizing,
+  verification norms) while <span class="tag amber">control</span> carries the class
+  repo's generic context. The gallery's own paired comparisons score the difference,
+  making sketchgen an A/B rig measuring whether structured context improves creative output
+  from the same model on the same prompts.
+</p>
+
+
+<h2>The self-generating loop</h2>
+
+<p>
+  When the queue empties, the worker critiques published entries using the local vision
+  model. The critic writes one sentence — under forty words, no code — describing a
+  visible change for the same sketch made again. That sentence becomes the child's prompt:
+</p>
+
+<div class="pipeline">
+  <span class="note">entry 2: "a breathing grid of squares"</span><br>
+  <span class="arrow">  └─ </span><span class="stage">CRITIQUE</span>
+  <span class="note"> → "the same grid, and this time the pulse colors are randomized upon impact"</span><br>
+  <span class="arrow">     └─ </span><span class="stage">entry 9</span>
+  <span class="note"> (generation 1)</span><br>
+  <span class="arrow">        └─ </span><span class="stage">CRITIQUE</span>
+  <span class="note"> → …</span><br>
+  <span class="arrow">           └─ </span><span class="stage">entry N</span>
+  <span class="note"> (generation 2) — line continues to depth 3, then waits for a human</span>
+</div>
+
+<p>
+  Lineage runs three generations unattended; at depth 3 the child is created but held for
+  human review before the line can extend further. Every entry stores its parent, its
+  generation, the critique, and the critic's model id. The provenance graph — which prompt
+  begat which, through which model, past which gate — is what "generates itself" means.
+</p>
+
+
+<h2>The emerging data</h2>
+
+<p>
+  From the console's production telemetry (a live snapshot of the running system):
+</p>
+
+<div class="stat-grid" style="grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));">
+  <div class="stat-cell">
+    <div class="num">124</div>
+    <div class="label">Generation attempts</div>
+  </div>
+  <div class="stat-cell">
+    <div class="num">87</div>
+    <div class="label">Passed gate (70%)</div>
+  </div>
+  <div class="stat-cell">
+    <div class="num">37</div>
+    <div class="label">Required repair</div>
+  </div>
+  <div class="stat-cell">
+    <div class="num">17</div>
+    <div class="label">Lineage children</div>
+  </div>
+  <div class="stat-cell">
+    <div class="num">1.51</div>
+    <div class="label">Avg attempts to pass</div>
+  </div>
+  <div class="stat-cell">
+    <div class="num">71</div>
+    <div class="label">Avg sketch lines</div>
+  </div>
+</div>
+
+<h3>Per-sketch economics</h3>
+<div class="two-col">
+  <div class="col-box">
+    <h4>Tokens</h4>
+    <p>
+      <strong>1,583</strong> prompt tokens in, <strong>1,015</strong> completion tokens out (average).<br>
+      Prefill <strong>94.8</strong> tok/s, decode <strong>25.4</strong> tok/s.<br>
+      Total odometer: 118k in, 75k out across all jobs.
+    </p>
+  </div>
+  <div class="col-box">
+    <h4>Cost</h4>
+    <p>
+      <strong>$0.0064</strong> per sketch at the 16/96 node shape.<br>
+      Gate latency <strong>4.4 s</strong> per attempt.<br>
+      All inference local — zero API spend, zero tokens billed.
+    </p>
+  </div>
+</div>
+
+<h3>What the gallery shows</h3>
+<ul>
+  <li>Bradley–Terry scores per population per question, rendered as percentile bars on each card</li>
+  <li>An entry-page compass: <em>rather look at it</em> across, <em>closer to its brief</em> up,
+    a dot for humans and a ring for agents, the line between them the gap</li>
+  <li>Human and agent populations that sometimes agree and sometimes diverge — the first
+    real points toward <code>MEASURE[agent-human-correlation]</code></li>
+  <li>Multi-generation lineage trees: prompts evolving through self-critique</li>
+  <li>A rejection record with kept failures — "a gallery that only shows
+    successes is not a record of anything"</li>
+  <li>Full provenance on every entry: tokens, wall time, attempts, seed, model ids,
+    prompt versions, node shape, <code>Co-Authored-By</code> the executor model</li>
+</ul>
+
+
+<h2>Architecture</h2>
+
+<div class="two-col">
+  <div class="col-box">
+    <h4>On the node</h4>
+    <p>
+      <strong>Worker</strong> — systemd user service, one job at a time, slot-fenced<br>
+      <strong>Ollama</strong> — qwen3-coder:30b (executor), gemma4:e4b (judge/critic)<br>
+      <strong>Gate</strong> — Playwright + headless Chromium<br>
+      <strong>Web UI</strong> — stdlib http.server on 127.0.0.1:8081, SSH tunnel only<br>
+      <strong>Sync</strong> — 5-min timer pulling from the write path<br>
+      <strong>Database</strong> — one SQLite file, 9 tables + critiques
+    </p>
+  </div>
+  <div class="col-box">
+    <h4>Off the node</h4>
+    <p>
+      <strong>Gallery</strong> — GitHub Pages, static HTML, pushed by deploy key<br>
+      <strong>Write path</strong> — Cloudflare Worker + KV, GitHub OAuth (username only)<br>
+      <strong>Compare</strong> — paired judgment UI, humans vote before seeing agent scores<br>
+      <strong>Engagement</strong> — views and likes, kept apart from judgment by design
+    </p>
+  </div>
+</div>
+
+<h3>The database</h3>
+<p>
+  12 tables across 5 migrations, all in WAL mode. <code>jobs</code> and their
+  <code>attempts</code>, the <code>entries</code> the gallery shows, paired
+  <code>judgments</code>, <code>lineage</code>, <code>critiques</code>,
+  <code>engagement</code> and <code>likes</code>, <code>sync_state</code> for the
+  write-path watermark, <code>meta</code> for the worker's own timestamps, and a
+  singleton <code>control</code> row. A job's legal moves are enforced in
+  <code>db.py</code> (<code>TRANSITIONS</code>), not in SQL.
+</p>
+
+<h3>The operator UI</h3>
+<p>
+  Five screens over SSH tunnel (stdlib <code>http.server</code>, 3,100 lines): Console
+  (node vitals, five-segment load meter, tokens-per-5-minute sparkline, production
+  funnel), Queue, New Job, Job Detail (live SSE transcript), and Held (publish/reject).
+  Every screen carries the worker-state pill and pause/stop/resume controls. No
+  framework, no JS build — server-rendered HTML with a two-second poll. Navigation items
+  carry live summaries: an amber superscript for held entries, a green/red count for
+  queue state, a decode rate on the tokens gauge.
+</p>
+
+<h3>The codebase</h3>
+<p>
+  ~14,600 lines of application Python, ~8,600 lines of test (14 files, stdlib
+  <code>unittest</code>), ~1,200 lines of gallery CSS/JS, ~560 lines of Cloudflare
+  Worker. 108 commits, 49 PRs, built between 2026-09-13 22:07 and 2026-09-14 14:35 EDT.
+  Every commit carries <code>Co-Authored-By</code> attribution naming the specific model.
+</p>
+
+
+<h2>What it demonstrates</h2>
+
+<p>
+  <strong>Self-hosted AI can produce at scale.</strong> Close to 100 high-quality creative
+  sketches in under 24 hours, on commodity hardware, with open-weights models, zero paid
+  API calls, and full provenance — every token counted, every decision recorded, every
+  model named.
+</p>
+
+<p>
+  <strong>The tooling is the multiplier.</strong> The gate, the preflight, the evidence-fed
+  repair loop, the single-shot execution model, the closed assertion vocabulary — each is
+  a design decision that compounds: the gate catches what the model can't see, the
+  preflight explains what the gate caught, and the repair loop gives the model another
+  chance with that explanation. Without them the same model produces the same code and
+  gets stuck on the same bugs.
+</p>
+
+<p>
+  <strong>The interesting question is the disagreement.</strong> Not whether agents or
+  humans are right, but where they diverge on taste and fidelity — and whether that
+  divergence is a function of the artefact, the context the model was given, or the
+  population doing the judging. That question can only be asked with blind conditions,
+  paired comparisons, and separate scores.
+</p>
+
+
+<div class="footer-note">
+  Working document for the README.md revision. Data reflects the gallery as of 2026-09-14.
+  The database runs on the cloud node; entry count from the published gallery.
+  Course: PSAM 5600 B, Small Linux Devices, Large Language Models, Parsons School of Design.
+</div>
