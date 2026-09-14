@@ -15,9 +15,12 @@
   --panel: #ffffff;
   --line: #d9dae0;
   --accent: #2f5bd8;
+  --agent: #b8741a;
   --chip: #eceef4;
   --failed-ink: #8a2b18;
   --failed-ground: #fbe9e4;
+  --ok-ink: #1f6b3f;
+  --ok-ground: #e4f2e8;
   --shadow: 0 1px 2px rgba(20, 22, 28, 0.08);
 }
 
@@ -29,9 +32,12 @@
     --panel: #1c1f25;
     --line: #2e333c;
     --accent: #8fabff;
+    --agent: #e0a85a;
     --chip: #262b33;
     --failed-ink: #ffb4a0;
     --failed-ground: #35201a;
+    --ok-ink: #7fd6a2;
+    --ok-ground: #1a3023;
     --shadow: none;
   }
 }
@@ -116,6 +122,11 @@ iframe.sketch {
 }
 
 .chip.failed { background: var(--failed-ground); color: var(--failed-ink); }
+.chip.agree { background: var(--ok-ground); color: var(--ok-ink); }
+.chip.disagree { background: var(--failed-ground); color: var(--failed-ink); }
+/* The agreement chips sit in the card's meta line among lowercase tags, and
+ * read as a sentence about the entry rather than as a stamp on it. */
+.chip.agree, .chip.disagree, .chip.only { letter-spacing: 0; text-transform: none; }
 p.chip.failed { text-transform: none; letter-spacing: 0; border-radius: 8px; padding: 0.5rem 0.75rem; }
 
 .two { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); }
@@ -224,13 +235,73 @@ summary.filter-label::before { content: "\25b8\a0"; }
   overflow: hidden;
 }
 .card-prompt a { color: inherit; text-decoration: none; }
-.card-meta, .card-scores, .card-briefs, .card-counts, .reason {
+.card-meta, .card-counts, .reason {
   color: var(--ink-soft);
   font-size: 0.85rem;
   margin: 0.2rem 0.75rem 0;
 }
 .reason { color: var(--failed-ink); }
 .tag { background: var(--chip); border-radius: 999px; padding: 0.05rem 0.5rem; }
+
+/* The standing bars. A track is the pool of entries one population has scored
+ * on one question, weakest at the left and strongest at the right; a mark is
+ * this entry's place in it. The filled dot is the humans, the ring is the
+ * agents, and the bar between them is how far apart the two readings are.
+ *
+ * Opacity is evidence, not decoration: a mark drawn on a single pair is nearly
+ * a guess and is drawn faint, one drawn on eight pairs or more is solid. Only
+ * `left` and `opacity` are set per mark, on the mark itself, because only they
+ * differ from card to card; everything else about the look is here. */
+.standing { display: flex; flex-direction: column; gap: 0.35rem; margin: 0.45rem 0.75rem 0; }
+.bar-row {
+  align-items: center;
+  color: var(--ink-soft);
+  display: grid;
+  font-size: 0.8rem;
+  gap: 0.6rem;
+  grid-template-columns: 8.4rem 1fr;
+}
+.track {
+  background: linear-gradient(90deg, var(--chip), var(--line));
+  border-radius: 999px;
+  height: 10px;
+  position: relative;
+}
+.mark {
+  border-radius: 50%;
+  box-sizing: border-box;
+  height: 12px;
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 12px;
+}
+/* The ring is hollow rather than filled with the panel colour so that the two
+ * populations landing on the same percentile still read as two marks: the
+ * humans' dot shows through the agents' ring instead of disappearing under it. */
+.mark.human { background: var(--accent); }
+.mark.agent { background: none; border: 2.5px solid var(--agent); }
+.legend .mark.agent { background: var(--panel); }
+.mark.inline {
+  display: inline-block;
+  height: 10px;
+  position: static;
+  transform: none;
+  vertical-align: middle;
+  width: 10px;
+}
+.gap {
+  background: var(--ink-soft);
+  height: 3px;
+  opacity: 0.45;
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+}
+.none-note { color: var(--ink-soft); font-size: 0.75rem; left: 0; position: absolute; top: -4px; }
+.legend { color: var(--ink-soft); font-size: 0.72rem; margin: 0.15rem 0 0; }
+.legend .mark.inline { margin-right: 0.2rem; }
+.legend .mark.inline ~ .mark.inline { margin-left: 0.5rem; }
 
 .pair { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(18rem, 1fr)); margin-bottom: 1rem; }
 .side { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 1rem; }
