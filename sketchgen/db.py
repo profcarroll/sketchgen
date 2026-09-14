@@ -118,6 +118,11 @@ class Job:
     updated_utc: str = ""
     needs: str | None = None
     last_error: str | None = None
+    # Migration 005: the pending half of a lineage link. A spawned job carries
+    # the critique that asked for it until the worker has an entry to hang it
+    # on; see sketchgen/lineage.py.
+    critique: str | None = None
+    critique_by: str | None = None
 
     @property
     def assertions(self) -> list[str]:
@@ -281,6 +286,8 @@ _JOB_FIELDS = (
     "max_attempts",
     "needs",
     "last_error",
+    "critique",
+    "critique_by",
 )
 
 
