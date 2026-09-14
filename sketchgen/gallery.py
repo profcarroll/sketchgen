@@ -10,7 +10,7 @@ One entry row plus its attempt directory in, a directory of plain files out:
     <gallery>/e/<id>/statement.md        the executor's own words, verbatim
     <gallery>/e/<id>/meta.json           every spec §7 field
     <gallery>/index.html                 the grid (published entries)
-    <gallery>/failed.html                the kept failures
+    <gallery>/rejections.html            the gate's rejections, kept
     <gallery>/compare.html               the paired-judgment shell
     <gallery>/lines/<root>.html          one page per lineage line
     <gallery>/assets/gallery.{css,js}
@@ -884,7 +884,7 @@ def _write_entry(
         job = _job(conn, int(row["job_id"]))
         reason = (job["last_error"] if job is not None else None) or "reason not recorded"
         failed_note = (
-            '<p class="chip failed">FAILED — kept, because a gallery that only '
+            '<p class="chip failed">REJECTED BY THE GATE — kept, because a gallery that only '
             f"shows successes is not a record of anything: {_esc(reason)}</p>"
         )
 
@@ -936,7 +936,7 @@ def _card(
         job = _job(conn, int(row["job_id"]))
         text = (job["last_error"] if job is not None else None) or "reason not recorded"
         reason = f'<p class="reason">{_esc(text)}</p>'
-        chip = '<span class="chip failed">FAILED</span> '
+        chip = '<span class="chip failed">REJECTED</span> '
     return template.substitute(
         entry_id=entry_id,
         href=f"e/{entry_id}/",
@@ -1083,23 +1083,23 @@ def render_index(
                 intro=(
                     "A gallery that generates itself: every entry is one prompt, "
                     "one brief, one gate and the model's own account of what it "
-                    "built. Failures are kept too."
+                    "built. Rejections are kept too."
                 ),
                 page="index.html",
                 failed=False,
             ),
         )
         written.write_text(
-            dest / "failed.html",
+            dest / "rejections.html",
             _grid_page(
                 conn,
                 failed,
-                heading="Kept failures",
+                heading="Rejections",
                 intro=(
-                    "Entries that never passed their gate, kept on purpose: a "
+                    "Entries the gate rejected after every attempt, kept on purpose: a "
                     "gallery that only shows successes is not a record of anything."
                 ),
-                page="failed.html",
+                page="rejections.html",
                 failed=True,
             ),
         )
