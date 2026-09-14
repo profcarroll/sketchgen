@@ -8,6 +8,7 @@ sketch_gate.py's real schema, so the evidence builder is tested against the shap
 the gate actually produces rather than against a convenient fiction.
 """
 
+import io
 import json
 import os
 import sys
@@ -19,6 +20,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sketchgen import db  # noqa: E402
+from sketchgen import lineage  # noqa: E402
 from sketchgen import worker  # noqa: E402
 
 
@@ -158,6 +160,46 @@ def stub_plan(assertions=("motion(idle)",), brief="a brief the stub planner wrot
     return plan
 
 
+class StubJudge:
+    """Stands in for judge.run_local: records the call, records no verdict."""
+
+    def __init__(self, judged=1):
+        self.judged = judged
+        self.calls = []
+
+    def __call__(self, conn, *, model, host, limit, rng, probe=None, log=None,
+                 **kwargs):
+        self.calls.append({"model": model, "host": host, "limit": limit,
+                           "probe": probe, "rng": rng})
+        for index in range(self.judged):
+            if log is not None:
+                log(f"judged {index + 1} vs {index + 2}: brief=A look=B")
+        return {"judged": self.judged, "recorded": 2 * self.judged,
+                "pairs_offered": self.judged}
+
+
+class StubCritic:
+    """Stands in for lineage.critique: one sentence, or a validation failure."""
+
+    def __init__(self, text="the same field, and this time let one circle fall "
+                            "out of phase with the rest.", fails=None):
+        self.text = text
+        self.fails = fails
+        self.calls = []
+
+    def __call__(self, conn, entry_id, *, model, host, **kwargs):
+        self.calls.append(entry_id)
+        if self.fails:
+            raise lineage.CritiqueFailed(self.fails, "Sure! Here is my review. "
+                                                     "It has two sentences.")
+        return lineage.Critique(
+            text=self.text,
+            model=model,
+            prompt_version=lineage.prompt_version(),
+            raw=self.text,
+        )
+
+
 FREE_SLOT = {"processes": [], "models": [], "ollama_error": None}
 BUSY_SLOT = {"processes": ["4242 node /home/ubuntu/.local/bin/opencode"],
              "models": ["qwen3-coder:30b-a3b-q4_K_M"], "ollama_error": None}
@@ -197,7 +239,14 @@ class WorkerTestCase(unittest.TestCase):
         return db.enqueue(self.conn, prompt, by, **opts)
 
     def make_worker(self, *, executor_fn=None, gate_fn=None, planner_fn=None,
-                    probe=None):
+                    probe=None, judge_fn=None, critic_fn=None, spawn_fn=None,
+                    idle_judge=0, idle_critique=0, lineage_depth=3,
+                    log_stream=None):
+        """A worker with everything external stubbed.
+
+        Idle work is off by default, so a test that does not ask for it cannot
+        reach the judge or the critic; the idle tests below turn the limits up.
+        """
         return worker.Worker(
             self.conn,
             jobs_dir=self.jobs,
@@ -205,8 +254,14 @@ class WorkerTestCase(unittest.TestCase):
             executor_fn=executor_fn or StubExecutor(),
             gate_fn=gate_fn or StubGate([0]),
             planner_fn=planner_fn or stub_plan(),
+            judge_fn=judge_fn or StubJudge(judged=0),
+            critic_fn=critic_fn or StubCritic(),
+            spawn_fn=spawn_fn,
+            idle_judge=idle_judge,
+            idle_critique=idle_critique,
+            lineage_depth=lineage_depth,
             probe=probe or (lambda: dict(FREE_SLOT)),
-            log_stream=self.log,
+            log_stream=log_stream or self.log,
         )
 
     def attempts(self, job_id):
@@ -528,6 +583,211 @@ class TestEntries(WorkerTestCase):
         job_id = db.enqueue(self.conn, "sixty drifting circles", "octocat")
         self.make_worker().run_once()
         self.assertEqual("planner-v1", self.entries(job_id)[0]["planner_prompt_version"])
+
+
+class IdleTestCase(WorkerTestCase):
+    """Packet 5.4: what the worker does with an empty queue."""
+
+    def publish(self, prompt="a field of dots", by="octocat", rules="random"):
+        """One published entry, its job walked out of the queue first.
+
+        A job left in `queued` would mean the queue is not empty and there
+        would be no idle round to test.
+        """
+        job_id = db.enqueue(self.conn, prompt, by, rules_file=rules,
+                            brief="a brief", assertions=["motion(idle)"])
+        for state in ("executing", "gating", "held", "published"):
+            db.transition(self.conn, job_id, state)
+        entry_id = db.create_entry(
+            self.conn, job_id, state="published", prompt=prompt, brief="a brief",
+            statement="the model's own words", submitted_by=by,
+            rules_file="treatment", assertions_json=json.dumps(["motion(idle)"]),
+        )
+        self.states.clear()
+        return job_id, entry_id
+
+    def critiques(self):
+        return self.conn.execute(
+            "SELECT * FROM critiques ORDER BY id"
+        ).fetchall()
+
+    def child_jobs(self):
+        return self.conn.execute(
+            "SELECT * FROM jobs WHERE parent_entry_id IS NOT NULL ORDER BY id"
+        ).fetchall()
+
+
+class TestIdleRound(IdleTestCase):
+    def test_an_empty_queue_judges_a_pair_and_critiques_an_entry(self):
+        _, first = self.publish(prompt="a field of dots")
+        self.publish(prompt="a second field")
+        judge_fn = StubJudge(judged=1)
+        critic_fn = StubCritic()
+        run = self.make_worker(judge_fn=judge_fn, critic_fn=critic_fn,
+                               idle_judge=1, idle_critique=1)
+        self.assertEqual(0, run.run_once())
+
+        self.assertEqual(1, len(judge_fn.calls))
+        self.assertEqual(1, judge_fn.calls[0]["limit"])
+        self.assertEqual(worker.DEFAULT_JUDGE_MODEL, judge_fn.calls[0]["model"])
+        # the judge is handed the worker's own probe: it must not refuse the
+        # process that already owns the slot
+        self.assertIs(run.probe, judge_fn.calls[0]["probe"])
+
+        self.assertEqual([first], critic_fn.calls)  # the oldest one lacking a critique
+        rows = self.critiques()
+        self.assertEqual(1, len(rows))
+        self.assertEqual(first, rows[0]["entry_id"])
+        self.assertEqual(critic_fn.text, rows[0]["critique"])
+        self.assertEqual(worker.DEFAULT_CRITIC_MODEL, rows[0]["critique_by"])
+        self.assertEqual(lineage.prompt_version(), rows[0]["prompt_version"])
+        self.assertIsNone(rows[0]["rejected_reason"])
+        self.assertTrue(rows[0]["created_utc"].endswith("Z"))
+
+        children = self.child_jobs()
+        self.assertEqual(1, len(children))
+        child = children[0]
+        self.assertEqual(rows[0]["spawned_job_id"], child["id"])
+        self.assertEqual(first, child["parent_entry_id"])
+        self.assertEqual("queued", child["state"])
+        self.assertEqual("octocat", child["submitted_by"])  # the parent's, not a model
+        self.assertEqual("gemma4:e4b", child["critique_by"])
+        self.assertEqual("hold", child["publication"])
+        # the line inherits the SETTING, so a random line stays random
+        self.assertEqual("random", child["rules_file"])
+        self.assertIn(lineage.REVISE_HEADING, child["prompt"])
+
+    def test_a_second_round_judges_nothing_and_critiques_nothing(self):
+        self.publish()  # one entry, so the first round leaves nothing to do
+        critic_fn = StubCritic()
+        self.make_worker(judge_fn=StubJudge(judged=1), critic_fn=critic_fn,
+                         idle_judge=1, idle_critique=1).run_once()
+        # the child the first round spawned would otherwise be claimed
+        db.transition(self.conn, self.child_jobs()[0]["id"], "failed")
+
+        log = io.StringIO()
+        judge_fn = StubJudge(judged=0)
+        run = self.make_worker(judge_fn=judge_fn, critic_fn=critic_fn,
+                               idle_judge=1, idle_critique=1, log_stream=log)
+        self.assertEqual(0, run.run_once())
+
+        self.assertEqual(1, len(judge_fn.calls))  # asked, and told there were none
+        self.assertEqual(1, len(critic_fn.calls))  # not asked a second time
+        self.assertEqual(1, len(self.critiques()))
+        self.assertIn("idle: nothing to judge; nothing to critique", log.getvalue())
+
+    def test_both_switches_off_call_nothing(self):
+        self.publish()
+        self.publish(prompt="a second field")
+        judge_fn, critic_fn = StubJudge(), StubCritic()
+        log = io.StringIO()
+        run = self.make_worker(judge_fn=judge_fn, critic_fn=critic_fn,
+                               idle_judge=0, idle_critique=0, log_stream=log)
+        self.assertEqual(0, run.run_once())
+
+        self.assertEqual([], judge_fn.calls)
+        self.assertEqual([], critic_fn.calls)
+        self.assertEqual([], self.critiques())
+        self.assertIn("SKETCHGEN_IDLE_JUDGE=0", log.getvalue())
+        self.assertIn("SKETCHGEN_IDLE_CRITIQUE=0", log.getvalue())
+
+    def test_paused_does_no_idle_work(self):
+        self.publish()
+        db.set_control(self.conn, "paused", "maintenance")
+        judge_fn, critic_fn = StubJudge(), StubCritic()
+        run = self.make_worker(judge_fn=judge_fn, critic_fn=critic_fn,
+                               idle_judge=1, idle_critique=1)
+        self.assertEqual(0, run.run_once())
+        self.assertEqual([], judge_fn.calls)
+        self.assertEqual([], critic_fn.calls)
+
+    def test_a_queued_job_takes_precedence_over_idle_work(self):
+        self.publish()
+        job_id = self.enqueue()
+        judge_fn, critic_fn = StubJudge(), StubCritic()
+        run = self.make_worker(judge_fn=judge_fn, critic_fn=critic_fn,
+                               idle_judge=1, idle_critique=1)
+        self.assertEqual(0, run.run_once())
+
+        self.assertEqual("held", db.get_job(self.conn, job_id).state)
+        self.assertEqual([], judge_fn.calls)
+        self.assertEqual([], critic_fn.calls)
+
+
+class TestIdleCritiqueRejected(IdleTestCase):
+    def test_an_invalid_critique_is_kept_and_spawns_nothing(self):
+        _, entry_id = self.publish()
+        critic_fn = StubCritic(fails="the critique is 2 sentences; one is the contract")
+        run = self.make_worker(critic_fn=critic_fn, idle_critique=1)
+        self.assertEqual(0, run.run_once())
+
+        rows = self.critiques()
+        self.assertEqual(1, len(rows))
+        self.assertEqual(entry_id, rows[0]["entry_id"])
+        self.assertIsNone(rows[0]["spawned_job_id"])
+        self.assertIn("one is the contract", rows[0]["rejected_reason"])
+        self.assertIn("two sentences", rows[0]["critique"])  # what it actually said
+        self.assertEqual([], self.child_jobs())
+
+    def test_the_rejected_entry_is_not_offered_again(self):
+        self.publish()
+        critic_fn = StubCritic(fails="the critique contains code")
+        self.make_worker(critic_fn=critic_fn, idle_critique=1).run_once()
+        self.make_worker(critic_fn=critic_fn, idle_critique=1).run_once()
+        self.assertEqual(1, len(critic_fn.calls))
+        self.assertEqual(1, len(self.critiques()))
+
+
+class TestIdleLineageDepth(IdleTestCase):
+    def test_a_child_at_the_depth_limit_waits_for_a_person(self):
+        _, root = self.publish(prompt="generation zero")
+        _, second = self.publish(prompt="generation one")
+        _, third = self.publish(prompt="generation two")
+        db.add_lineage(self.conn, second, root, generation=1)
+        db.add_lineage(self.conn, third, second, generation=2)
+        # root and second already have children, so `third` is the candidate
+        run = self.make_worker(critic_fn=StubCritic(), idle_critique=1,
+                               lineage_depth=3)
+        self.assertEqual(0, run.run_once())
+
+        children = self.child_jobs()
+        self.assertEqual(1, len(children))
+        self.assertEqual(third, children[0]["parent_entry_id"])
+        # generation 3 == DECIDE[lineage-depth]: created, held, and waiting
+        self.assertEqual("review", children[0]["needs"])
+        self.assertEqual("hold", children[0]["publication"])
+
+
+class TestIdleSummary(IdleTestCase):
+    def test_the_summary_is_read_from_the_database(self):
+        _, entry_id = self.publish()
+        self.make_worker(critic_fn=StubCritic(), idle_critique=1).run_once()
+        summary = worker.idle_summary(self.conn)
+        self.assertEqual(1, summary["critiques"])
+        self.assertEqual(1, summary["spawned"])
+        self.assertEqual(0, summary["rejected"])
+        self.assertEqual(0, summary["agent_verdicts"])
+        self.assertEqual(
+            self.critiques()[0]["created_utc"], summary["last_action_utc"]
+        )
+
+    def test_an_untouched_database_summarises_as_zeros(self):
+        summary = worker.idle_summary(self.conn)
+        self.assertEqual(
+            {"agent_verdicts": 0, "critiques": 0, "spawned": 0, "rejected": 0,
+             "last_action_utc": None},
+            summary,
+        )
+
+
+class TestIdleEnv(unittest.TestCase):
+    def test_the_limits_come_from_the_environment_and_tolerate_junk(self):
+        with mock.patch.dict(os.environ, {"SKETCHGEN_IDLE_JUDGE": "4"}):
+            self.assertEqual(4, worker._int_env("SKETCHGEN_IDLE_JUDGE", 1))
+        with mock.patch.dict(os.environ, {"SKETCHGEN_IDLE_JUDGE": "many"}):
+            self.assertEqual(1, worker._int_env("SKETCHGEN_IDLE_JUDGE", 1))
+        with mock.patch.dict(os.environ, {}, clear=False):
+            self.assertEqual(3, worker._int_env("SKETCHGEN_NOT_SET_ANYWHERE", 3))
 
 
 class TestEvidence(unittest.TestCase):
