@@ -17,10 +17,19 @@
 <main class="grid-page">
   $heading_html
   $intro_html
-  <div class="filters">
-    <p class="filter-label">Filter</p>
+  <details class="filters">
+    <summary class="filter-label">Filter</summary>
     <p class="filter-links">
       $filters
+    </p>
+  </details>
+  <div class="sorts">
+    <p class="sort-label">Sort</p>
+    <p class="sort-buttons">
+      <button type="button" class="sort" data-sort="newest" aria-current="true">newest</button>
+      <button type="button" class="sort" data-sort="oldest">oldest</button>
+      <button type="button" class="sort" data-sort="random">random</button>
+      <button type="button" class="sort" data-sort="liked">most liked</button>
     </p>
   </div>
   <div class="grid">

@@ -109,6 +109,19 @@ fails if the two ever disagree. "Session" means since the resident worker's last
 start, which it stamps into `meta.worker_started_utc`; with no stamp, session and
 total are the same numbers.
 
+## The gallery
+
+```
+python3 bin/sketchgen render-all --gallery-dir ~/sketchgen-gallery
+python3 bin/sketchgen publish-index             # re-render, commit and push
+```
+
+`index.html` and `rejections.html` are one grid of cards each, newest first in the
+HTML itself; above the grid, `Sort` reorders it (newest, oldest, random, most liked)
+and keeps the choice in the URL as `?sort=`, and `Filter` folds away until you open
+it or arrive with `?rules=` or `?executor=` in the URL. With JavaScript off the grid
+is still newest first and the filters are still plain links.
+
 ## Tests
 
 ```
