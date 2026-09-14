@@ -85,6 +85,7 @@ from __future__ import annotations
 import html
 import inspect
 import json
+import math
 import os
 import re
 import sqlite3
@@ -94,7 +95,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -125,6 +126,7 @@ __all__ = [
     "nav_summary",
     "node_cpu_pct",
     "serve",
+    "token_bins",
 ]
 
 EXIT_OK = 0
@@ -560,11 +562,33 @@ LOADAVG_PATH = "/proc/loadavg"
 #: percentage in fifths, rounded.
 METER_SEGMENTS = 5
 
+#: The tokens gauge: twenty-four five-minute bins, so the sparkline beside
+#: the meter is the last two hours of finished work. Long enough to show the
+#: shape of a session, short enough that one job is still a visible spike.
+TOKEN_BINS = 24
+TOKEN_BIN_MINUTES = 5
+
+#: The gauge at its two sizes, (width, height) in SVG units: inline in the
+#: header, and again in the Console's model panel with room to read it.
+NAV_SPARK_SIZE = (72, 14)
+CONSOLE_SPARK_SIZE = (240, 40)
+
 #: What "in flight" means in the header's green number: a job the worker is
 #: carrying, planning included. ``console.IN_FLIGHT_STATES`` leaves planning
 #: out because that tuple is about who holds the inference slot at the moment
 #: of the reading; this one is about work that is moving.
 IN_FLIGHT_STATES = ("planning", "executing", "gating", "repairing")
+
+#: The gauge with nothing in it: a flat line on the baseline and a dash
+#: where the rate goes. Read, never written — nothing mutates it in place.
+EMPTY_TOKENS: dict[str, Any] = {
+    "bins": [0] * TOKEN_BINS,
+    "bin_minutes": TOKEN_BIN_MINUTES,
+    "decode_tok_s": None,
+    "prefill_tok_s": None,
+    "session_in": 0,
+    "session_out": 0,
+}
 
 #: A summary with nothing in it: what the header draws when the database
 #: cannot be counted. Zeros and an unlit meter, never a traceback.
@@ -579,6 +603,7 @@ EMPTY_NAV: dict[str, Any] = {
     "kept": 0,
     "public": 0,
     "published": 0,
+    "tokens": EMPTY_TOKENS,
 }
 
 
@@ -637,6 +662,116 @@ def _nav_slot(in_flight: int) -> tuple[str, str | None]:
     return ("free", None)
 
 
+def token_bins(
+    conn: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+    bins: int = TOKEN_BINS,
+    minutes: int = TOKEN_BIN_MINUTES,
+) -> list[int]:
+    """Tokens completed per bin over the last ``bins * minutes`` minutes.
+
+    One number per bin, oldest first, the partial bin the clock is standing in
+    rightmost: every attempt whose ``finished_utc`` falls in the window adds
+    its ``prompt_tokens + completion_tokens`` to the bin it finished in. An
+    attempt still running has no ``finished_utc`` and counts nowhere until it
+    does — this is completed work, not work in progress, and an attempt lands
+    in one bin rather than being spread over the minutes it actually ran.
+
+    The bins roll back from ``now`` instead of being aligned to the clock, so
+    each one is exactly ``minutes`` older than the one on its right and a test
+    can inject ``now`` and know where a stamp belongs. Idle minutes are zeros,
+    which is the point: the line lies on the floor while the node is quiet and
+    spikes when it works. A database that cannot be read is all zeros — the
+    header must never take the UI down.
+    """
+    width = max(1, int(minutes)) * 60
+    count = max(1, int(bins))
+    end = now or datetime.now(timezone.utc)
+    start = end - timedelta(seconds=width * count)
+    out = [0] * count
+    try:
+        rows = conn.execute(
+            "SELECT finished_utc, COALESCE(prompt_tokens, 0) "
+            "+ COALESCE(completion_tokens, 0) AS tokens FROM attempts "
+            "WHERE finished_utc IS NOT NULL AND finished_utc >= ?",
+            (start.strftime("%Y-%m-%dT%H:%M:%SZ"),),
+        ).fetchall()
+    except sqlite3.Error as exc:
+        sys.stderr.write(f"{db.utc_now()} token bins failed: {exc}\n")
+        return out
+    for row in rows:
+        stamp = _parse_utc(row["finished_utc"])
+        if stamp is None:  # a stamp nobody here wrote: skipped, not guessed
+            continue
+        age = (end - stamp).total_seconds()
+        index = count - 1 - int(age // width)
+        if index >= count:  # a clock that has stepped: the bin we are in
+            index = count - 1
+        if 0 <= index < count:
+            out[index] += int(row["tokens"] or 0)
+    return out
+
+
+def _session_tokens(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Tokens in and out this session: the Console odometer's own numbers.
+
+    :func:`sketchgen.console._odometer` is the source — it sums the attempts
+    table since ``meta.worker_started_utc``, and sums everything on a database
+    the worker never stamped. Reused rather than re-derived so the header and
+    the odometer cannot disagree; when packet 4.1 is not installed the same
+    query stands in, mirroring its WHERE clause.
+    """
+    odometer = getattr(console, "_odometer", None) if console else None
+    session_start = getattr(console, "_session_start", None) if console else None
+    if callable(odometer) and callable(session_start):
+        try:
+            session = odometer(conn, session_start(conn))["session"]
+            return int(session.get("in") or 0), int(session.get("out") or 0)
+        except (sqlite3.Error, KeyError, TypeError, ValueError):
+            return (0, 0)
+    since = db.get_meta(conn, "worker_started_utc")
+    sql = (
+        "SELECT COALESCE(SUM(prompt_tokens), 0) AS tin, "
+        "COALESCE(SUM(completion_tokens), 0) AS tout FROM attempts"
+    )
+    args: tuple = ()
+    if since:
+        sql += " WHERE COALESCE(started_utc, finished_utc) >= ?"
+        args = (since,)
+    try:
+        row = conn.execute(sql, args).fetchone()
+    except sqlite3.Error:
+        return (0, 0)
+    return int(row["tin"] or 0), int(row["tout"] or 0)
+
+
+def _nav_tokens(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The gauge's numbers: the line, and the rates that label it.
+
+    The line is throughput — tokens a bin — because that is what changes from
+    minute to minute on this node. The decode rate is not: it sits at about 25
+    tok/s for every attempt the model runs, so a sparkline of it would be a
+    straight line pretending to be news. It is the label instead.
+    """
+    instant = {}
+    rates = getattr(console, "_instant", None) if console else None
+    if rates is not None:
+        try:
+            instant = rates(conn) or {}
+        except Exception:  # pragma: no cover - the header must not fall over
+            instant = {}
+    session_in, session_out = _session_tokens(conn)
+    return {
+        "bins": token_bins(conn),
+        "bin_minutes": TOKEN_BIN_MINUTES,
+        "decode_tok_s": instant.get("decode_tok_s"),
+        "prefill_tok_s": instant.get("prefill_tok_s"),
+        "session_in": session_in,
+        "session_out": session_out,
+    }
+
+
 def nav_summary(conn: sqlite3.Connection) -> dict[str, Any]:
     """The numbers behind the header's marks, in one pass of small counts.
 
@@ -683,6 +818,7 @@ def nav_summary(conn: sqlite3.Connection) -> dict[str, Any]:
                 "SELECT COUNT(*) FROM entries WHERE state = 'published' "
                 "AND published_utc IS NOT NULL",
             ),
+            "tokens": _nav_tokens(conn),
         }
     except sqlite3.Error as exc:  # the header must never take the UI down
         sys.stderr.write(f"{db.utc_now()} nav summary failed: {exc}\n")
@@ -713,6 +849,120 @@ def _nav_meter(summary: dict[str, Any]) -> str:
     )
 
 
+def _spark_points(bins: list[int], width: int, height: int) -> list[str]:
+    """The sparkline's points, ``x,y`` strings, oldest first.
+
+    THE SHARED FORMULA. ``sparkPoints()`` in op_layout.html is this function
+    line for line, so the poll repaints a bin exactly where the server drew
+    it:
+
+        x(i) = 1 + i * (w - 2) / (n - 1)
+        y(i) = (h - 1) - v(i) / peak * (h - 4)     — peak 0 gives y = h - 1
+
+    One unit of padding either side, the tallest bin four units below the top
+    edge, and a window with nothing in it flat on the baseline rather than
+    divided by zero. Both sides round with ``floor(v * 10 + 0.5) / 10`` and
+    print one decimal — JavaScript's ``toFixed`` and Python's ``%.1f`` break
+    ties in opposite directions, so the tie is rounded away before either of
+    them sees it and the two sides agree as strings, not merely as geometry.
+    """
+    count = max(1, len(bins))
+    peak = max(bins) if bins else 0
+    step = (width - 2) / (count - 1) if count > 1 else 0.0
+    points = []
+    for index in range(count):
+        value = bins[index] if index < len(bins) else 0
+        x = 1 + index * step
+        y = (height - 1) - (value / peak * (height - 4) if peak > 0 else 0.0)
+        points.append(
+            f"{math.floor(x * 10 + 0.5) / 10:.1f},"
+            f"{math.floor(y * 10 + 0.5) / 10:.1f}"
+        )
+    return points
+
+
+def _spark_window(tokens: dict[str, Any]) -> tuple[str, int]:
+    """How much time the gauge covers, as text, and the width of one bin."""
+    minutes = int(tokens.get("bin_minutes") or TOKEN_BIN_MINUTES)
+    count = len(tokens.get("bins") or []) or TOKEN_BINS
+    total = minutes * count
+    return (f"{total / 60:g} h" if total >= 60 else f"{total:g} min"), minutes
+
+
+def _spark_title(tokens: dict[str, Any]) -> str:
+    """What the gauge says on hover: the window, the peak, the rate."""
+    bins = list(tokens.get("bins") or [])
+    span, minutes = _spark_window(tokens)
+    return (
+        f"tokens completed, last {span} in {minutes}-min bins · "
+        f"peak {max(bins) if bins else 0:,} · "
+        f"decode {_fmt(tokens.get('decode_tok_s'), 'f1')} tok/s"
+    )
+
+
+def _spark_svg(
+    tokens: dict[str, Any], width: int, height: int, css_class: str = "spark"
+) -> str:
+    """One sparkline: a filled area under a line, scaled to the window's peak.
+
+    ``data-nav="tokens"`` is the hook the poll repaints by, and it repaints
+    every match — the header's gauge and the Console's wider one are the same
+    line at two sizes, and one poll keeps both of them honest.
+    """
+    bins = list(tokens.get("bins") or []) or [0] * TOKEN_BINS
+    points = _spark_points(bins, width, height)
+    line = "M" + " L".join(points)
+    area = f"M1,{height - 1} L" + " L".join(points) + f" L{width - 1},{height - 1} Z"
+    now_x, now_y = points[-1].split(",")
+    title = _spark_title(tokens)
+    return (
+        f'<svg class="{esc(css_class)}" data-nav="tokens" width="{width}" '
+        f'height="{height}" viewBox="0 0 {width} {height}" role="img" '
+        f'aria-label="{esc(title)}"><title>{esc(title)}</title>'
+        f'<path class="spark-area" d="{esc(area)}"/>'
+        f'<path class="spark-line" d="{esc(line)}"/>'
+        f'<circle class="spark-now" cx="{esc(now_x)}" cy="{esc(now_y)}" r="1.4"/>'
+        "</svg>"
+    )
+
+
+def _nav_spark(summary: dict[str, Any]) -> str:
+    """The header's gauge: two hours of throughput, then the decode rate.
+
+    The meter beside it is now — how much of the node is spoken for at this
+    instant. This is the two hours behind it, so the shape of the session is
+    readable from any page: flat while the worker idles, a spike per job.
+    """
+    tokens = summary.get("tokens") or EMPTY_TOKENS
+    width, height = NAV_SPARK_SIZE
+    return (
+        _spark_svg(tokens, width, height)
+        + ' <span class="tok"><b class="n" data-nav="decode">'
+        + esc(_fmt(tokens.get("decode_tok_s"), "f1"))
+        + "</b> tok/s</span>"
+    )
+
+
+def console_spark(tokens: dict[str, Any] | None) -> str:
+    """The Console's copy of the gauge, wide enough to read bin by bin."""
+    tokens = tokens or EMPTY_TOKENS
+    width, height = CONSOLE_SPARK_SIZE
+    span, minutes = _spark_window(tokens)
+    bins = list(tokens.get("bins") or [])
+    return (
+        '<div class="meter spark-wide"><div class="lab">'
+        f"<span>tokens completed</span><span>last {esc(span)}, "
+        f"{minutes}-min bins</span></div>"
+        + _spark_svg(tokens, width, height)
+        + '<div class="lab dim"><span>peak <b data-nav="peak">'
+        f'{max(bins) if bins else 0:,}</b> a bin</span>'
+        '<span><b data-nav="session-in">'
+        f'{tokens.get("session_in") or 0:,}</b> in · <b data-nav="session-out">'
+        f'{tokens.get("session_out") or 0:,}</b> out this session</span>'
+        "</div></div>"
+    )
+
+
 def nav_html(here: str, summary: dict[str, Any]) -> str:
     """The whole nav, links and marks, with the current page underlined.
 
@@ -720,7 +970,7 @@ def nav_html(here: str, summary: dict[str, Any]) -> str:
     page it counts; New job counts nothing and carries nothing.
     """
     extras = {
-        "/": " " + _nav_meter(summary),
+        "/": " " + _nav_meter(summary) + " " + _nav_spark(summary),
         "/queue": (
             ' <span class="counts" data-nav="counts">'
             f'<b class="n warn" data-nav="queued" title="jobs queued">'
@@ -897,13 +1147,18 @@ PER_SKETCH_COLUMNS = (
 )
 
 
-def console_page(doc: dict[str, Any]) -> str:
+def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None) -> str:
     """The wireframe's Console, rendered from packet 4.1's document.
 
     Every value is read by its path through :func:`_dig`, and every path is
     written into the element as ``data-k`` / ``data-bar`` / ``data-bar-num`` so
     the two-second refresh patches the same places without re-rendering. A key
     the collector does not have renders as a dash and patches to a dash.
+
+    ``tokens`` is the header's gauge, from :func:`nav_summary` — the console
+    document does not carry the bins, and neither does /api/console.json, so
+    the wider copy of the sparkline in the model panel is drawn from the same
+    dict the header uses and repainted by the layout's poll, not this page's.
     """
     per_core = _dig(doc, "node.cpu_pct", []) or []
     cores: list[str] = []
@@ -1105,6 +1360,7 @@ def console_page(doc: dict[str, Any]) -> str:
 
     return render(
         "op_console",
+        token_spark=console_spark(tokens),
         shape=esc(_dig(doc, "node.shape", "shape unknown")),
         cores_n=field(doc, "node.cores", "int"),
         source=esc(doc.get("source", "sample")),
@@ -2306,7 +2562,7 @@ class OpHandler(BaseHTTPRequestHandler):
             layout(
                 title="Console",
                 here="/",
-                body=console_page(doc),
+                body=console_page(doc, marks.get("tokens")),
                 control=control,
                 back="/",
                 flash=self.flash(),

@@ -24,6 +24,7 @@ import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -532,6 +533,173 @@ class TestHeaderMarks(WebTestCase):
             self.assertIn("node CPU 0%", title)
         finally:
             web.node_cpu_pct = original
+
+
+class TestTokensGauge(WebTestCase):
+    """The Console link's sparkline: two hours of completed tokens.
+
+    The meter beside it is the node now; this is the session behind it. The
+    seeded database has one attempt, with tokens but no rates — so the line
+    has bins to draw and the decode number is a dash until an attempt with
+    ``prefill_s`` and ``decode_s`` turns up.
+    """
+
+    SPARK = re.compile(
+        r'<svg class="spark" data-nav="tokens" width="(\d+)" height="(\d+)"'
+        r'[^>]*aria-label="([^"]*)"[^>]*>(.*?)</svg>',
+        re.S,
+    )
+
+    def sparks(self, page):
+        """(width, height, label, points) for every gauge on the page."""
+        found = []
+        for match in self.SPARK.finditer(page):
+            line = re.search(r'<path class="spark-line" d="M([^"]*)"', match.group(4))
+            self.assertIsNotNone(line, "a gauge with no line")
+            found.append(
+                (
+                    int(match.group(1)),
+                    int(match.group(2)),
+                    match.group(3),
+                    line.group(1).split(" L"),
+                )
+            )
+        self.assertTrue(found, "no tokens gauge in the page")
+        return found
+
+    def decode(self, page):
+        match = re.search(r'data-nav="decode">([^<]*)</b>', page)
+        self.assertIsNotNone(match, "no decode number in the header")
+        return match.group(1)
+
+    def test_token_bins_are_five_minutes_each_oldest_first(self):
+        now = datetime(2027, 3, 2, 9, 0, tzinfo=timezone.utc)
+
+        def stamp(minutes_ago):
+            return (now - timedelta(minutes=minutes_ago)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+
+        conn = self.db()
+        job = None
+        try:
+            job = db.enqueue(conn, "tokens for the gauge", "student-one")
+            # two inside the window, one older than it, one still running
+            db.add_attempt(
+                conn, job, 1, finished_utc=stamp(3),
+                prompt_tokens=800, completion_tokens=1200,
+            )
+            db.add_attempt(
+                conn, job, 2, finished_utc=stamp(3),
+                prompt_tokens=16, completion_tokens=0,
+            )
+            db.add_attempt(
+                conn, job, 3, finished_utc=stamp(7),
+                prompt_tokens=100, completion_tokens=20,
+            )
+            db.add_attempt(
+                conn, job, 4, finished_utc=stamp(130),
+                prompt_tokens=9999, completion_tokens=9999,
+            )
+            db.add_attempt(
+                conn, job, 5, started_utc=stamp(1),
+                prompt_tokens=7, completion_tokens=7,
+            )
+            conn.commit()
+            bins = web.token_bins(conn, now=now)
+            self.assertEqual(len(bins), 24)
+            # the partial bin the clock is standing in is the last one, and
+            # two attempts that finished in the same five minutes are one bar
+            self.assertEqual(bins[-1], 800 + 1200 + 16)
+            self.assertEqual(bins[-2], 120)
+            # everything else in the window is idle, and so is zero: the 130
+            # minute attempt is off the left edge, the running one is nowhere
+            self.assertEqual(sum(bins), 800 + 1200 + 16 + 120)
+            self.assertEqual(bins[:22], [0] * 22)
+            # a window with nothing in it is a flat line on the baseline, not
+            # a division by zero
+            flat = web._spark_points([0] * 24, 72, 14)
+            self.assertEqual(len(flat), 24)
+            self.assertEqual({point.split(",")[1] for point in flat}, {"13.0"})
+        finally:
+            if job is not None:
+                conn.execute("DELETE FROM attempts WHERE job_id = ?", (job,))
+                conn.execute("DELETE FROM jobs WHERE id = ?", (job,))
+                conn.commit()
+            conn.close()
+
+    def test_every_page_carries_the_gauge_and_the_rate(self):
+        for path in ("/queue", "/new", "/held", f"/job/{self.held_id}"):
+            with self.subTest(path=path):
+                page = self.text(path)
+                gauges = self.sparks(page)
+                self.assertEqual(len(gauges), 1)
+                width, height, label, points = gauges[0]
+                self.assertEqual((width, height), (72, 14))
+                # one point per bin, and the window says what it is
+                self.assertEqual(len(points), 24)
+                self.assertIn("tokens completed, last 2 h in 5-min bins", label)
+                self.assertIn("peak ", label)
+                # the seeded attempt has tokens but no seconds, so there is no
+                # rate to divide out and the number is a dash
+                self.assertEqual(self.decode(page), "\u2014")
+
+    def test_an_attempt_with_rates_gives_the_header_its_number(self):
+        conn = self.db()
+        attempt = None
+        try:
+            attempt = db.add_attempt(
+                conn,
+                self.held_id,
+                99,
+                started_utc="2026-09-14T14:00:00Z",
+                finished_utc="2026-09-14T14:05:00Z",
+                prompt_tokens=812,
+                completion_tokens=2530,
+                prefill_s=2.0,
+                decode_s=100.0,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        try:
+            page = self.text("/queue")
+            self.assertEqual(self.decode(page), "25.3")
+            self.assertIn("decode 25.3 tok/s", self.sparks(page)[0][2])
+        finally:
+            conn = self.db()
+            try:
+                conn.execute("DELETE FROM attempts WHERE id = ?", (attempt,))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def test_control_json_carries_the_bins(self):
+        status, content_type, body = self.get("/api/control.json")
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", content_type)
+        tokens = json.loads(body)["nav"]["tokens"]
+        self.assertEqual(len(tokens["bins"]), 24)
+        self.assertTrue(all(isinstance(n, int) for n in tokens["bins"]))
+        self.assertEqual(tokens["bin_minutes"], 5)
+        # no attempt has rates in the seeded database, and the odometer's
+        # session is the whole table while the worker has never stamped it
+        self.assertIsNone(tokens["decode_tok_s"])
+        self.assertIsNone(tokens["prefill_tok_s"])
+        self.assertEqual(tokens["session_in"], 812)
+        self.assertEqual(tokens["session_out"], 1204)
+
+    def test_the_console_page_carries_the_wider_gauge_too(self):
+        page = self.text("/")
+        gauges = self.sparks(page)
+        # the header's, and the model panel's — one hook, so the poll repaints
+        # both of them from the same bins
+        self.assertEqual(len(gauges), 2)
+        self.assertEqual([(g[0], g[1]) for g in gauges], [(72, 14), (240, 40)])
+        for gauge in gauges:
+            self.assertEqual(len(gauge[3]), 24)
+        self.assertIn("last 2 h, 5-min bins", page)
+        self.assertIn('data-nav="peak"', page)
 
 
 class TestForms(WebTestCase):
