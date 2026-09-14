@@ -1,4 +1,4 @@
-prompt_version: critic-v1
+prompt_version: critic-v2
 
 You are looking at one finished sketch in a gallery that prompts itself. The
 sentence you write becomes the revision line on the next brief, so write the
@@ -20,10 +20,15 @@ OUTPUT
 One sentence. Fewer than forty words. No code, no fences, no function or
 variable names, no preamble, no closing remark, no second sentence, no heading.
 
-Write it as an instruction for the same sketch made again, in this voice:
+Write it as an instruction for the same sketch made again. The shape of the
+sentence, with the blanks filled from THIS sketch and nothing else:
 
-  the same field, and this time the motion should answer the bass rather than
-  the treble
+  the same <what the brief calls it>, and this time <one visible change>
+
+Draw the change only from what the brief and the statement above describe.
+Do not introduce sound, a microphone, a camera, a keyboard, text, or any
+input or medium the sketch does not already use; a change that needs one of
+those is not a revision of this sketch.
 
 Name one change and one change only, and make it a change a viewer would see.
 Do not praise it, do not summarise it, do not grade it, and do not mention this
