@@ -534,12 +534,30 @@
     return low + "-" + high;
   }
 
+  function isRejection(entry) {
+    // An older page may predate the state key; absent means published, which is
+    // what every entry on the compare page was before rejections arrived here.
+    return !!entry && entry.state === "failed-kept";
+  }
+
+  function oneOf(list) { return list[Math.floor(Math.random() * list.length)]; }
+
+  /* The status quo a rejection is judged against: the published entries, minus
+   * whichever one is already on the other side. */
+  function publishedPool(entries, not) {
+    return entries.filter(function (entry) {
+      return !isRejection(entry) && (!not || entry.id !== not.id);
+    });
+  }
+
   function pickPair(entries) {
     var params = new URLSearchParams(window.location.search);
     var byId = {};
     entries.forEach(function (entry) { byId[String(entry.id)] = entry; });
     var a = byId[String(params.get("a"))];
     var b = byId[String(params.get("b"))];
+    // Both named: honoured whatever their states. A link that says exactly
+    // which two to compare is a person's request, not the balanced offer.
     if (a && b && a.id !== b.id) { return [a, b]; }
 
     var offered = offeredPairs().filter(function (pair) {
@@ -549,7 +567,7 @@
              (!a || left.id === a.id || right.id === a.id);
     });
     if (offered.length) {
-      var choice = offered[Math.floor(Math.random() * offered.length)];
+      var choice = oneOf(offered);
       var first = byId[String(choice.a)];
       var second = byId[String(choice.b)];
       // An entry page links here with ?a=<itself>; keep that entry on the left.
@@ -557,10 +575,34 @@
       return [first, second];
     }
 
-    var rest = entries.filter(function (entry) { return !a || entry.id !== a.id; });
-    if (a && rest.length) { return [a, rest[0]]; }
-    if (entries.length >= 2) { return [entries[0], entries[1]]; }
+    /* No offered pair contains `a` — which is every kept rejection, because the
+     * balanced offer is published-only (spec §9). Judge it against the status
+     * quo: a published entry drawn at random, never `a` itself and never
+     * another rejection. Random, not the first entry in the list: taking
+     * rest[0] sent every visitor who followed a rejection's link to the same
+     * partner, so the rejection's score was a verdict on one comparison. */
+    var pool = publishedPool(entries, a);
+    if (a) { return pool.length ? [a, oneOf(pool)] : null; }
+    if (pool.length >= 2) { return [pool[0], pool[1]]; }
     return null;
+  }
+
+  /* A rejection is named in the reveal and nowhere else. Spec §5 blinds the
+   * human until both answers are in, and "the gate threw this one out" is the
+   * loudest anchor the page could hand them, so neither side carries a REJECTED
+   * chip while they are looking: a rejection is just a sketch until they vote.
+   * This block sits inside [data-reveal], so it is written at load and stays
+   * hidden with the rest of it. Nothing at all when neither side is one. */
+  function paintRejected(host, sides) {
+    if (!host) { return; }
+    host.textContent = "";
+    ["A", "B"].forEach(function (letter) {
+      if (!isRejection(sides[letter])) { return; }
+      var line = document.createElement("p");
+      line.className = "rejected-note";
+      line.textContent = letter + " was rejected by the gate and kept";
+      host.appendChild(line);
+    });
   }
 
   /* The agent block is in the page from the start, hidden. It is filled here
@@ -706,6 +748,7 @@
     Array.prototype.forEach.call(page.querySelectorAll(".side"), function (side) {
       paintSide(side, sides[side.getAttribute("data-side")]);
     });
+    paintRejected(page.querySelector("[data-rejected-note]"), sides);
     paintAgents(page.querySelector("[data-agent-verdicts]"), sides);
     if (status && !base()) {
       status.textContent = "The gallery write path is not deployed yet, so these " +

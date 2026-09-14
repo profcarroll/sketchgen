@@ -624,6 +624,36 @@ class RenderedPageTests(unittest.TestCase):
         worker = (REPO_ROOT / "writepath" / "worker.js").read_text(encoding="utf-8")
         self.assertIn("entry_a: a, entry_b: b, question, choice", worker)
 
+    def test_a_vote_on_a_kept_rejection_scores_like_any_other(self):
+        """The fit never asked what state an entry is in, and still does not.
+
+        A rejection reaches a comparison only because a person followed its
+        compare link, but once the vote is cast it is an ordinary judgment row:
+        no branch in :func:`pairs.scores`, and the score prints in the same slot
+        on the rejection's own page. Asserted rather than coded, so that a later
+        change that starts filtering by state fails here.
+        """
+        rejection, published = self.ids[2], self.ids[0]
+        for judge, choice in (("dana", "A"), ("erin", "A"), ("fran", "B")):
+            for question in ("brief", "look"):
+                pairs.record(
+                    self.conn, entry_a=rejection, entry_b=published,
+                    judge_kind="human", judge_id=judge, question=question,
+                    choice=choice, prompt_version="gallery-v1",
+                )
+        table = pairs.scores(self.conn, population="human", question="look")
+        self.assertIn(rejection, table)
+        self.assertEqual(table[rejection]["n"], 3)
+        self.assertEqual(table[rejection]["wins"], 2)
+        self.assertEqual(table[rejection]["losses"], 1)
+        # and the rejection's own page prints it, where it used to say nothing
+        dest = self.tmp / "after-the-vote"
+        dest.mkdir()
+        gallery.render_all(self.conn, dest, self.config)
+        page = (dest / "e" / str(rejection) / "index.html").read_text(encoding="utf-8")
+        self.assertIn(f"{float(table[rejection]['score']):.2f} over 3 pairs", page)
+        self.assertNotIn("no pairs yet", page.split("closer to its brief")[0])
+
     def test_a_second_render_is_byte_identical(self):
         first = self.read("compare.html"), self.read("pairs.json")
         gallery.render_all(self.conn, self.dest, self.config)
