@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """sketchgen — the one CLI.
 
-Today: `db init`, `db status`, `execute`, `plan`, `install-unit` and `keygen`. Later packets add subcommands
-(worker, publish, web, judge) by adding a parser and one function each, below.
+Today: `db init`, `db status`, `execute`, `plan`, `install-unit`, `keygen`,
+`publish` and `reject`. Later packets add subcommands (worker, web, judge) by
+adding a parser and one function each, below.
 
 Exit codes: 0 success, 1 failure, 3 refused.
 """
@@ -22,6 +23,7 @@ from sketchgen import __version__  # noqa: E402
 from sketchgen import db  # noqa: E402
 from sketchgen import executor  # noqa: E402
 from sketchgen import planner  # noqa: E402
+from sketchgen import publish as publication  # noqa: E402
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -355,6 +357,88 @@ def cmd_keygen(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _open_db(path: str):
+    """Open an existing database, or refuse. Never creates one by accident."""
+    if not os.path.exists(path):
+        raise publication.PublishRefused(
+            f"no database at {path} (run: sketchgen db init)"
+        )
+    return db.connect(path)
+
+
+def cmd_publish(args: argparse.Namespace) -> int:
+    """Commit and push one held entry into the gallery repository."""
+    try:
+        conn = _open_db(args.db)
+    except publication.PublishRefused as exc:
+        print(f"sketchgen: refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    try:
+        result = publication.publish(
+            conn,
+            args.entry_id,
+            gallery_dir=args.gallery_dir,
+            from_dir=getattr(args, "from_dir"),
+            key=args.key,
+            remote=args.remote,
+            by=args.by,
+            model=args.model,
+            url_base=args.url,
+            dry_run=args.dry_run,
+        )
+    except publication.PublishRefused as exc:
+        print(f"sketchgen: refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    except publication.PublishFailed as exc:
+        print(f"sketchgen: publish failed: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+    except OSError as exc:
+        print(f"sketchgen: publish failed: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+    finally:
+        conn.close()
+
+    if isinstance(result, publication.Plan):
+        print("dry run: nothing copied, nothing committed, nothing pushed")
+        print(f"entry {result.entry_id} ({result.state}) from {result.source_dir}")
+        for name in result.files:
+            print(f"would copy {name} -> {result.dest}/{name}")
+        print("would commit with this message:")
+        for line in result.message.rstrip("\n").splitlines():
+            print(f"  {line}")
+        print(f"would run: {result.push_command}")
+        print(f"would appear at: {result.url}")
+        return EXIT_OK
+
+    print(result.commit)
+    print(result.url)
+    return EXIT_OK
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    """Mark a held entry rejected. No git, no files, no push."""
+    try:
+        conn = _open_db(args.db)
+    except publication.PublishRefused as exc:
+        print(f"sketchgen: refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    try:
+        publication.reject(conn, args.entry_id, args.reason)
+    except publication.PublishRefused as exc:
+        print(f"sketchgen: refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    except sqlite3.Error as exc:
+        print(f"sketchgen: reject failed: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+    finally:
+        conn.close()
+    if args.reason:
+        print(f"entry {args.entry_id}: rejected ({args.reason})")
+    else:
+        print(f"entry {args.entry_id}: rejected")
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sketchgen",
@@ -494,6 +578,108 @@ def build_parser() -> argparse.ArgumentParser:
         help="print what would be generated and where, then exit without writing",
     )
     keygen_parser.set_defaults(func=cmd_keygen, _parser=keygen_parser)
+
+    publish_parser = top.add_parser(
+        "publish",
+        help="commit and push one held entry into the public gallery",
+        description=(
+            "Copy an entry's files into e/<id>/ inside the gallery checkout, "
+            "commit them with the executor model and the publishing username "
+            "in the trailers, and push over the write-only deploy key. The "
+            "database row becomes 'published' only after the push succeeds; a "
+            "failed push undoes the local commit and changes nothing. Refuses "
+            "(exit 3) unless the entry is held or failed-kept, the checkout is "
+            "clean and on its default branch, and no file carries an email "
+            "address or the node's hostname."
+        ),
+    )
+    publish_parser.add_argument(
+        "entry_id", type=int, metavar="ENTRY_ID", help="the entry to publish"
+    )
+    publish_parser.add_argument(
+        "--db",
+        default=db.DEFAULT_DB_PATH,
+        metavar="P",
+        help="database file (default: $SKETCHGEN_DB, else ~/sketchgen/sketchgen.db)",
+    )
+    publish_parser.add_argument(
+        "--gallery-dir",
+        default=publication.DEFAULT_GALLERY_DIR,
+        metavar="D",
+        help=(
+            "checkout of the gallery repo (default: $SKETCHGEN_GALLERY, else "
+            "~/sketchgen/gallery)"
+        ),
+    )
+    publish_parser.add_argument(
+        "--from",
+        dest="from_dir",
+        default=None,
+        metavar="DIR",
+        help="directory whose contents become e/<id>/ (default: ask the generator)",
+    )
+    publish_parser.add_argument(
+        "--key",
+        default=publication.DEFAULT_KEY_PATH,
+        metavar="F",
+        help=(
+            "deploy key for an ssh remote (default: $SKETCHGEN_GALLERY_KEY, else "
+            "~/.ssh/sketchgen-gallery); unused for a local remote"
+        ),
+    )
+    publish_parser.add_argument(
+        "--remote",
+        default=None,
+        metavar="URL",
+        help="push here instead of the checkout's 'origin'",
+    )
+    publish_parser.add_argument(
+        "--by",
+        default=None,
+        metavar="USERNAME",
+        help="GitHub username of the person publishing (default: the OS user)",
+    )
+    publish_parser.add_argument(
+        "--model",
+        default=None,
+        metavar="M",
+        help="executor model id for the commit trailer (default: the entry's own)",
+    )
+    publish_parser.add_argument(
+        "--url",
+        default=publication.DEFAULT_URL_BASE,
+        metavar="BASE",
+        help=f"public site base (default: {publication.DEFAULT_URL_BASE})",
+    )
+    publish_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the files, the commit message and the push command; change nothing",
+    )
+    publish_parser.set_defaults(func=cmd_publish, _parser=publish_parser)
+
+    reject_parser = top.add_parser(
+        "reject",
+        help="mark a held entry rejected (no git, nothing published)",
+        description=(
+            "Move a held entry to 'rejected'. Nothing is committed, pushed or "
+            "deleted; the entry simply stops being a candidate for the gallery. "
+            "A --reason is recorded on the originating job."
+        ),
+    )
+    reject_parser.add_argument(
+        "entry_id", type=int, metavar="ENTRY_ID", help="the entry to reject"
+    )
+    reject_parser.add_argument(
+        "--db",
+        default=db.DEFAULT_DB_PATH,
+        metavar="P",
+        help="database file (default: $SKETCHGEN_DB, else ~/sketchgen/sketchgen.db)",
+    )
+    reject_parser.add_argument(
+        "--reason", default=None, metavar="TEXT", help="why, for the record"
+    )
+    reject_parser.set_defaults(func=cmd_reject, _parser=reject_parser)
 
     parser.set_defaults(_parser=parser)
     return parser
