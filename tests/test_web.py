@@ -39,6 +39,26 @@ PNG_BYTES = base64.b64decode(
     "z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
 )
 
+#: What the executor writes into an attempt directory: p5 from cdnjs, which
+#: the browser fetches for itself, and a sketch.js beside it referenced by a
+#: relative path — which is the whole reason /preview/<job>/<n>/ has to be a
+#: directory URL and not a single file.
+SKETCH_INDEX = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>sketch</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js"></script>
+</head>
+<body>
+    <script src="sketch.js"></script>
+</body>
+</html>
+"""
+SKETCH_JS = """function setup() { createCanvas(windowWidth, windowHeight); }
+function draw() { background(17); ellipse(width / 2, height / 2, 60 + sin(frameCount / 30) * 20); }
+"""
+
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     """Redirects are the assertion here, not a step on the way somewhere."""
@@ -112,6 +132,10 @@ class WebTestCase(unittest.TestCase):
             )
             (gate_dir / "strip.png").write_bytes(PNG_BYTES)
             (gate_dir / "gate.png").write_bytes(PNG_BYTES)
+            # what the executor writes beside .gate/, and what the preview runs
+            (attempt_dir / "index.html").write_text(SKETCH_INDEX, encoding="utf-8")
+            (attempt_dir / "sketch.js").write_text(SKETCH_JS, encoding="utf-8")
+            (attempt_dir / "prompt.txt").write_text("the brief\n", encoding="utf-8")
             (cls.jobs_dir / str(cls.held_id) / "job.log").write_text(
                 "".join(
                     f"2026-09-14T12:00:{n:02d}Z job {cls.held_id}: line {n}\n"
@@ -653,6 +677,93 @@ class TestStaticFiles(WebTestCase):
         self.assertEqual(
             self.get(f"/jobs/{self.held_id}/attempt-1/sketch.js")[0], 404
         )
+
+
+class TestPreview(WebTestCase):
+    """The attempt directory served as the running sketch it is.
+
+    The instructor's finding: a person cannot decide to publish from a frame
+    strip. These tests are about the route that fixes that — that it serves the
+    sketch, that it serves only the sketch's own directory, and that the two
+    screens where the decision is made actually frame it.
+    """
+
+    def raw(self, path):
+        """(status, headers, body) with the path sent exactly as written."""
+        import http.client
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("GET", path)
+            response = conn.getresponse()
+            return response.status, response.headers, response.read()
+        finally:
+            conn.close()
+
+    def test_the_directory_url_serves_index_html(self):
+        status, headers, body = self.raw(f"/preview/{self.held_id}/1/")
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers.get("Content-Type", ""))
+        self.assertIn(b'<script src="sketch.js">', body)
+        self.assertIn(b"cdnjs.cloudflare.com", body)
+
+    def test_the_preview_may_be_framed_by_this_ui_and_no_other(self):
+        _, headers, _ = self.raw(f"/preview/{self.held_id}/1/")
+        self.assertEqual(
+            headers.get("Content-Security-Policy"), "frame-ancestors 'self'"
+        )
+
+    def test_sketch_js_is_served_as_javascript(self):
+        status, headers, body = self.raw(f"/preview/{self.held_id}/1/sketch.js")
+        self.assertEqual(status, 200)
+        self.assertIn("application/javascript", headers.get("Content-Type", ""))
+        self.assertIn(b"createCanvas", body)
+        self.assertEqual(
+            headers.get("Content-Security-Policy"), "frame-ancestors 'self'"
+        )
+
+    def test_the_directory_url_without_its_slash_redirects(self):
+        status, headers, _ = self.raw(f"/preview/{self.held_id}/1")
+        self.assertEqual(status, 301)
+        self.assertEqual(headers.get("Location"), f"/preview/{self.held_id}/1/")
+
+    def test_nothing_outside_the_attempt_directory_is_reachable(self):
+        for path in (
+            f"/preview/{self.held_id}/1/../../etc",
+            f"/preview/{self.held_id}/1/../../../etc/passwd",
+            f"/preview/{self.held_id}/1/%2e%2e/%2e%2e/etc/passwd",
+            # the sibling attempt's files are somebody else's attempt
+            f"/preview/{self.held_id}/1/../attempt-2/sketch.js",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(self.raw(path)[0], 404)
+
+    def test_a_missing_attempt_is_404(self):
+        self.assertEqual(self.raw(f"/preview/{self.held_id}/9/")[0], 404)
+        self.assertEqual(self.raw("/preview/9999/1/")[0], 404)
+
+    def test_only_the_sketchs_own_file_types_are_served(self):
+        # prompt.txt sits in the same directory and is not part of the sketch
+        self.assertEqual(self.raw(f"/preview/{self.held_id}/1/prompt.txt")[0], 404)
+
+    def test_the_job_page_frames_the_running_sketch(self):
+        page = self.text(f"/job/{self.held_id}")
+        self.assertIn(f'src="/preview/{self.held_id}/1/"', page)
+        self.assertIn("<iframe", page)
+        # and says why it will not look like gate.png
+        self.assertIn("unseeded", page)
+        # every attempt is reachable, folded away
+        self.assertIn("<details", page)
+
+    def test_the_held_card_frames_the_running_sketch(self):
+        page = self.text("/held")
+        self.assertIn(f'src="/preview/{self.held_id}/1/"', page)
+        # the strip the gate saw is still there, below it
+        self.assertIn("strip.png", page)
+
+    def test_a_job_with_no_index_html_frames_nothing(self):
+        page = self.text(f"/job/{self.queued_id}")
+        self.assertNotIn("<iframe", page)
 
 
 class TestLiveTranscript(WebTestCase):

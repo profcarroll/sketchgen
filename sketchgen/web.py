@@ -66,6 +66,18 @@ submitter otherwise. The gallery is generated, static, and has no way to write t
 this database — asking it to would mean a public form on a queue, and the
 publication gate exists precisely so a person stands between the queue and the
 site.
+
+**The sketch runs on the screens where it is judged.** The first use of this UI
+in anger found the hole: gate.png and strip.png are what the gate saw, and a
+person deciding whether to publish is being asked to judge a moving sketch from
+four still frames. ``GET /preview/<job>/<n>/`` serves the attempt directory as
+the small static site it already is — ``index.html`` at the directory URL,
+``sketch.js`` and any sibling the page asks for by a relative path, fenced to
+that one directory the way ``/jobs/`` is fenced to the jobs directory. The job
+page frames the latest attempt and folds the earlier ones away; each held card
+frames the attempt its entry came from, above the strip. p5 comes from cdnjs,
+which the browser fetches for itself: nothing here proxies the internet. See
+:data:`PREVIEW_HEADERS` for what the frame is and is not allowed to do.
 """
 
 from __future__ import annotations
@@ -155,6 +167,35 @@ SERVABLE = {
     ".log": "text/plain; charset=utf-8",
     ".txt": "text/plain; charset=utf-8",
 }
+
+#: What ``GET /preview/<job>/<n>/…`` will serve out of one attempt directory.
+#: An attempt holds index.html and sketch.js (executor.py), and a sketch may
+#: reference a stylesheet or an image beside them. p5 itself comes from cdnjs,
+#: which the browser fetches for itself — nothing here is a proxy.
+PREVIEW_SERVABLE = {
+    ".html": "text/html; charset=utf-8",
+    ".js": "application/javascript; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".png": "image/png",
+    ".json": "application/json; charset=utf-8",
+}
+
+#: The header on every preview response.
+#:
+#: This is model-written code running in the operator's browser. That is the
+#: same trust anyone viewing the gallery extends to the same sketch, and seeing
+#: it run is the whole point of the screen — so it runs, scripts and all. The
+#: header keeps it *here*: ``frame-ancestors 'self'`` lets the operator UI
+#: frame the preview and nothing else, which is what X-Frame-Options was
+#: reaching for and cannot say as precisely. There is deliberately no
+#: ``sandbox``: an opaque origin is refused the microphone, and
+#: ``responds(audio)`` is in the gate's own vocabulary — a sketch the gate
+#: passed would be one the preview could not show.
+PREVIEW_HEADERS = {"Content-Security-Policy": "frame-ancestors 'self'"}
+
+#: The preview frame, in CSS pixels. The sketches size themselves to the
+#: window, so this is a window rather than a crop.
+PREVIEW_W, PREVIEW_H = 640, 400
 
 #: GitHub usernames and nothing else ever goes in ``submitted_by`` (course policy).
 USERNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
@@ -1183,6 +1224,50 @@ def _check_list(report: dict[str, Any] | None) -> str:
     return '<ul class="checks">' + "".join(items) + "</ul>"
 
 
+def attempt_dir(app: App, job_id: int, attempt_n: int) -> Path:
+    """Where the executor wrote one attempt. The preview's root, and its fence."""
+    return app.jobs_root / str(job_id) / f"attempt-{attempt_n}"
+
+
+def has_preview(app: App, job_id: int, attempt_n: int) -> bool:
+    """True when this attempt has an index.html to run."""
+    return (attempt_dir(app, job_id, attempt_n) / "index.html").is_file()
+
+
+PREVIEW_NOTE = (
+    "The preview runs unseeded, on the real clock, in your browser — the gate "
+    "ran it seeded and frozen, so this will not match gate.png frame for frame."
+)
+
+
+def preview_frame(
+    app: App, job_id: int, attempt_n: int, *, summary: str | None = None
+) -> str:
+    """The attempt, running. Empty string when there is nothing to run.
+
+    ``summary`` wraps the frame in a collapsed ``<details>`` — the job page
+    shows the latest attempt open and every earlier attempt folded away, so a
+    five-attempt job is not five sketches running at once.
+    """
+    if not has_preview(app, job_id, attempt_n):
+        return ""
+    url = f"/preview/{job_id}/{attempt_n}/"
+    frame = (
+        f'<iframe class="preview" src="{esc(url)}" '
+        f'width="{PREVIEW_W}" height="{PREVIEW_H}" loading="lazy" '
+        f'title="job {job_id}, attempt {attempt_n}, running"></iframe>'
+        f'<p class="dim" style="font-size:12px">'
+        f'<a href="{esc(url)}" target="_blank" rel="noopener">open in a tab ↗</a>'
+        f" — {esc(PREVIEW_NOTE)}</p>"
+    )
+    if summary is None:
+        return frame
+    return (
+        f'<details class="preview-fold"><summary>{esc(summary)}</summary>'
+        f"{frame}</details>"
+    )
+
+
 def _artefacts(app: App, job_id: int, attempt_n: int) -> str:
     shots = []
     gate_dir = app.jobs_root / str(job_id) / f"attempt-{attempt_n}" / ".gate"
@@ -1247,7 +1332,10 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
             + "</span></h2>"
             f'<div class="grid"><div>{_check_list(report)}</div>'
             f"<div>{_artefacts(app, job.id, attempt.n)}</div></div>"
-            f"{evidence}"
+            + preview_frame(
+                app, job.id, attempt.n, summary=f"Run attempt {attempt.n}"
+            )
+            + f"{evidence}"
             '<p class="dim" style="font-size:12px">'
             f"model {esc(attempt.model or '—')} · rules {esc(attempt.rules_file or '—')} · "
             f"prompt {esc(attempt.prompt_version or '—')} · "
@@ -1292,9 +1380,21 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
         if entry is not None
         else ""
     )
+    # The latest attempt, running, above the fold: the instructor's reason for
+    # this screen is to look at the sketch before publishing it, and a frame
+    # strip is not a sketch.
+    latest = preview_frame(app, job.id, attempt_n) if attempt_n else ""
+    preview = (
+        '<section class="panel"><h2>Running sketch — '
+        f"<span style='text-transform:none'>attempt {attempt_n}</span></h2>"
+        f"{latest}</section>"
+        if latest
+        else ""
+    )
     return render(
         "op_job",
         id=job.id,
+        preview=preview,
         spawn=spawn,
         state=esc(state_label(job.state)),
         state_class=esc(job.state),
@@ -1540,6 +1640,33 @@ def _gate_summary(conn: sqlite3.Connection, job_id: int) -> str:
     return f"attempt {row['n']}: " + (first[0] if first else f"gate exit {row['gate_exit']}")
 
 
+def _held_preview(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    """The running sketch for a held entry: its last attempt with an index.html.
+
+    The entry's own ``source_dir`` is the attempt the gate passed, so that is
+    the one to run; when it is missing or outside the jobs directory the
+    attempts table is walked backwards instead.
+    """
+    job_id = int(row["job_id"])
+    numbers = [
+        int(item["n"])
+        for item in conn.execute(
+            "SELECT n FROM attempts WHERE job_id = ? ORDER BY n DESC", (job_id,)
+        )
+    ]
+    source = row["source_dir"]
+    if source:
+        name = Path(str(source)).name
+        if name.startswith("attempt-") and name[8:].isdigit():
+            wanted = int(name[8:])
+            numbers = [wanted] + [n for n in numbers if n != wanted]
+    for n in numbers:
+        frame = preview_frame(app, job_id, n)
+        if frame:
+            return frame
+    return ""
+
+
 def held_page(app: App, conn: sqlite3.Connection) -> str:
     rows = _entry_rows(conn)
     cards = []
@@ -1563,6 +1690,10 @@ def held_page(app: App, conn: sqlite3.Connection) -> str:
             '<section class="panel card">'
             f"<h2>Entry {row['id']} <span class='dim' style='text-transform:none'>"
             f"— job <a href=\"/job/{row['job_id']}\">{row['job_id']}</a></span></h2>"
+            # The sketch running, then the strip the gate saw. Publication is a
+            # person's decision (DECIDE[publication-gate]) and this is the part
+            # of it a still frame cannot carry.
+            f"{_held_preview(app, conn, row)}"
             f"{_entry_image(app, row)}"
             f"<p>{esc(truncate(row['prompt'], 200))}</p>"
             f"<p class=\"dim\" style=\"font-size:12px\">{esc(_gate_summary(conn, row['job_id']))}"
@@ -1777,6 +1908,12 @@ ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     ("POST", re.compile(r"^/held/(?P<entry_id>\d+)/reject$"), "post_reject"),
     ("POST", re.compile(r"^/entry/(?P<entry_id>\d+)/spawn$"), "post_spawn"),
     ("POST", re.compile(r"^/control$"), "post_control"),
+    ("GET", re.compile(r"^/preview/(?P<job_id>\d+)/(?P<n>\d+)$"), "preview_slash"),
+    (
+        "GET",
+        re.compile(r"^/preview/(?P<job_id>\d+)/(?P<n>\d+)/(?P<rest>.*)$"),
+        "serve_preview",
+    ),
     ("GET", re.compile(r"^/jobs/(?P<rest>.*)$"), "serve_job_file"),
     ("POST", re.compile(r"^/_quit$"), "post_quit"),
 ]
@@ -1840,11 +1977,19 @@ class OpHandler(BaseHTTPRequestHandler):
 
     # -- replies -----------------------------------------------------------
 
-    def _send(self, body: bytes, content_type: str, status: int = 200) -> None:
+    def _send(
+        self,
+        body: bytes,
+        content_type: str,
+        status: int = 200,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -2270,6 +2415,55 @@ class OpHandler(BaseHTTPRequestHandler):
             self.send_error(404, "no such file")
             return
         self._send(body, content_type)
+
+    def preview_slash(self, job_id: str, n: str) -> None:
+        """``/preview/4/1`` → ``/preview/4/1/``, or the sketch's own
+        ``<script src="sketch.js">`` would resolve one directory too high."""
+        self.send_response(301)
+        self.send_header("Location", f"/preview/{int(job_id)}/{int(n)}/")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def serve_preview(self, job_id: str, n: str, rest: str) -> None:
+        """One attempt directory, served as the small static site it is.
+
+        The fence is the attempt directory itself, resolved before the prefix
+        check exactly as ``/jobs/…`` does it: a sketch can only reach files its
+        own attempt wrote. p5 comes from cdnjs, fetched by the browser.
+        """
+        root = attempt_dir(self.app, int(job_id), int(n))
+        try:
+            root = root.resolve(strict=True)
+        except (OSError, RuntimeError):
+            self.send_error(404, "no such attempt")
+            return
+        if not root.is_dir():
+            self.send_error(404, "no such attempt")
+            return
+        raw = urllib.parse.unquote(rest)
+        if "\x00" in raw:
+            self.send_error(404, "no such file")
+            return
+        if raw in ("", "/"):
+            raw = "index.html"
+        try:
+            target = (root / raw).resolve()
+        except (OSError, ValueError):
+            self.send_error(404, "no such file")
+            return
+        if not target.is_relative_to(root):
+            self.send_error(404, "no such file")
+            return
+        content_type = PREVIEW_SERVABLE.get(target.suffix.lower())
+        if content_type is None or not target.is_file():
+            self.send_error(404, "no such file")
+            return
+        try:
+            body = target.read_bytes()
+        except OSError:
+            self.send_error(404, "no such file")
+            return
+        self._send(body, content_type, headers=PREVIEW_HEADERS)
 
     def post_quit(self) -> None:
         self.form()
