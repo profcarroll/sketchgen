@@ -344,6 +344,26 @@ class TestPages(WebTestCase):
         self.assertEqual(page.count("data-core="), cores)
         self.assertEqual(page.count('data-bar="node.cpu_pct.'), cores)
 
+    def test_every_number_says_which_kind_it_is(self):
+        # "Entry 48 — job 49" was read as one thing with two ids, twice, on
+        # 2026-09-14. Now the card carries the entry number alone, the job is
+        # named in words, every button says which entry it acts on, the queue
+        # has an entry column, and the job page names its entry.
+        held = self.text("/held")
+        self.assertIn(f'<h2>Entry {self.entry_id}</h2>', held)
+        self.assertIn(f'made by job <a href="/job/{self.held_id}">{self.held_id}</a>', held)
+        self.assertIn(f"Publish entry {self.entry_id}</button>", held)
+        self.assertIn(f"Reject entry {self.entry_id}</button>", held)
+        self.assertIn(f"Spawn a child of entry {self.entry_id}</button>", held)
+        self.assertNotIn("— job", held)
+        queue = self.text("/queue")
+        self.assertIn('<th class="n">job</th><th class="n">entry</th>', queue)
+        self.assertIn(f'href="/held#entry-{self.entry_id}"', queue)
+        job = self.text(f"/job/{self.held_id}")
+        self.assertIn(f"entry {self.entry_id} (held)", job)
+        no_entry = self.text(f"/job/{self.queued_id}")
+        self.assertIn("(no entry yet)", no_entry)
+
     def test_queue_lists_the_jobs_newest_first(self):
         page = self.text("/queue")
         self.assertLess(
