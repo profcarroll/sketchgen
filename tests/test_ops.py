@@ -20,8 +20,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI = REPO_ROOT / "bin" / "sketchgen"
 UNIT_DIR = REPO_ROOT / "systemd"
-UNIT_FILES = ("sketchgen-worker.service", "sketchgen-worker.timer", "sketchgen-web.service",
-              "sketchgen-sync.service", "sketchgen-sync.timer")
+UNIT_FILES = ("sketchgen-worker.service", "sketchgen-worker.timer", "sketchgen-web.service")
 
 SECTION_RE = re.compile(r"^\[[A-Za-z][A-Za-z0-9]*\]$")
 KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*=")
@@ -183,19 +182,3 @@ class WebUnitTests(unittest.TestCase):
         for secret in ("KEY=", "TOKEN=", "SECRET=", "PASSWORD="):
             self.assertNotIn(secret, text.upper().replace("SKETCHGEN_GATE=", ""))
         self.assertIn("WantedBy=default.target", text)
-
-
-class SyncUnitTests(unittest.TestCase):
-    """The sync oneshot takes its token from a file, never argv, and the timer drives it."""
-
-    def test_sync_units(self):
-        service = (UNIT_DIR / "sketchgen-sync.service").read_text(encoding="utf-8")
-        timer = (UNIT_DIR / "sketchgen-sync.timer").read_text(encoding="utf-8")
-        self.assertIn("Type=oneshot", service)
-        self.assertIn("--token-file", service)
-        self.assertNotIn("Bearer", service)
-        self.assertIn("SKETCHGEN_WRITEPATH_URL=https://sketchgen-writepath.sketchgen.workers.dev", service)
-        self.assertIn("Unit=sketchgen-sync.service", timer)
-        self.assertIn("Persistent=true", timer)
-        self.assertIn("WantedBy=timers.target", timer)
-

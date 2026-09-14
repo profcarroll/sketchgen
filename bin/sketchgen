@@ -33,8 +33,7 @@ EXIT_REFUSED = 3
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 UNIT_SOURCE_DIR = REPO_ROOT / "systemd"
-UNIT_FILES = ("sketchgen-worker.service", "sketchgen-worker.timer", "sketchgen-web.service",
-              "sketchgen-sync.service", "sketchgen-sync.timer")
+UNIT_FILES = ("sketchgen-worker.service", "sketchgen-worker.timer", "sketchgen-web.service")
 
 # Per key: which repo it is registered on, which permission, what it is used for.
 KEY_ROLES = {
@@ -448,9 +447,6 @@ def _print_enable_help(target_dir: Path) -> None:
     print("  the operator UI (127.0.0.1:8081, over an SSH tunnel), independent of the mode above:")
     print("    systemctl --user enable --now sketchgen-web.service")
     print("    ssh -f -N -L 8081:127.0.0.1:8081 sld-cloud   # from the laptop, then http://localhost:8081/")
-    print()
-    print("  the write-path sync (votes, likes, views), a five-minute drip; needs ~/sketchgen/writepath.token:")
-    print("    systemctl --user enable --now sketchgen-sync.timer")
     print()
     print(f"  units installed under: {target_dir}")
 
