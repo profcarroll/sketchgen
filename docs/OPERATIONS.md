@@ -72,6 +72,35 @@ names. Never commit a private half, and never put one in a unit file or a DB row
 a scoped, write-only, one-click-revocable key is the only credential this system
 keeps on the node (`dossiers/sketchgen-gallery.md` §6).
 
+## Publish a held entry
+
+Publication holds for a person by default (`dossiers/sketchgen-gallery.md` §9), so
+this is a command someone runs, or a button someone clicks — never a step the worker
+takes on its own.
+
+```
+python3 bin/sketchgen publish 12 --from /path/to/e12 --dry-run   # prints the plan
+python3 bin/sketchgen publish 12 --from /path/to/e12 --by <github-username>
+python3 bin/sketchgen reject  12 --reason "off brief"            # no git at all
+```
+
+The entry must be `held` or `failed-kept`, and the gallery checkout (`--gallery-dir`,
+default `$SKETCHGEN_GALLERY` or `~/sketchgen/gallery`) must be a clean git work tree
+on its default branch. The files land in `e/<id>/`; the commit names the executor
+model as `Co-Authored-By:` (ATTRIBUTION.md, carried into the gallery) and the person
+as `Published-By:`; the push uses the gallery deploy key above. The database row
+becomes `published` **only after the push succeeds** — a failed push undoes the local
+commit and leaves the row `held`. Every file is scanned first for an email address
+and for `instance-`, and one hit refuses the whole publish: the gallery repo is
+public by construction.
+
+Before the first real publish, in this order: create the `sketchgen-gallery` repo;
+run `keygen gallery`; register the printed public half on that repo as a **write**
+deploy key; clone the repo to `~/sketchgen/gallery` with that key in
+`GIT_SSH_COMMAND`; set that checkout's own `user.name` and `user.email` — the commit
+is made with the checkout's identity, not one this tool invents; then publish one
+entry with `--dry-run` before publishing it for real.
+
 ## The 10/1 shrink
 
 Nothing to do. The unit encodes no core count, no memory figure and no
