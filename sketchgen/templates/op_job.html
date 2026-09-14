@@ -1,5 +1,6 @@
-<h1>Job $id <span class="pill $state_class">$state</span>
-  <span class="dim" style="font-size:13px">— attempt $attempt_n of $max_attempts</span></h1>
+<h1>Job $id <span class="pill $state_class" id="job-state">$state</span>
+  <span class="dim" style="font-size:13px">— attempt <span id="job-attempt">$attempt_n</span>
+    of <span id="job-max-attempts">$max_attempts</span></span></h1>
 
 <section class="panel">
   <p class="mono">$prompt</p>
@@ -19,8 +20,9 @@ $tiles
 </section>
 
 <section class="panel">
-  <h2>Transcript — <span class="dim" style="text-transform:none">last $log_lines lines of job.log</span></h2>
-  <pre id="log" data-job="$id">$log</pre>
+  <h2>Transcript — <span class="dim" style="text-transform:none">last $log_lines lines of job.log,
+    <span id="log-live">as of this page load</span></span></h2>
+  <pre id="log" data-job="$id" style="max-height:28em;overflow:auto">$log</pre>
 </section>
 
 $attempts
