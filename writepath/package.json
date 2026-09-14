@@ -1,0 +1,9 @@
+{
+  "name": "sketchgen-writepath",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker for the sketchgen gallery write path. No dependencies: Web APIs and node --test only.",
+  "scripts": {
+    "test": "node --test test/"
+  }
+}
