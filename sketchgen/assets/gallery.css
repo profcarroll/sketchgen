@@ -152,11 +152,26 @@ table.fields th, table.fields td {
 }
 table.fields th { color: var(--ink-soft); font-weight: 500; white-space: nowrap; width: 11rem; }
 
-.filters { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: baseline; }
-.filter-label { color: var(--ink-soft); margin: 0; }
-.filter-links { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0; }
-.filter { background: var(--chip); border-radius: 999px; padding: 0.15rem 0.7rem; text-decoration: none; }
-.filter[aria-current="true"] { background: var(--accent); color: var(--panel); }
+/* The filters fold away: <details> collapsed until someone opens it, or until
+ * gallery.js sees a filter in the URL. A block, not a flex row, because a
+ * summary is only reliably a disclosure while it is its parent's first flow
+ * child. */
+.filters { display: block; }
+.filter-label, .sort-label { color: var(--ink-soft); margin: 0; }
+summary.filter-label { cursor: pointer; list-style: none; }
+summary.filter-label::-webkit-details-marker { display: none; }
+summary.filter-label::before { content: "\25b8\a0"; }
+.filters[open] > summary.filter-label::before { content: "\25be\a0"; }
+.filters[open] .filter-links { margin-top: 0.7rem; }
+.filter-links, .sort-buttons { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0; }
+
+/* The sort buttons carry the same weight as a filter chip; they are buttons
+ * and not links because they reorder the page in place. With no JavaScript
+ * they sit there inert and the grid is newest first, which is what they say. */
+.sorts { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; align-items: baseline; margin: 0 0 1rem; }
+.filter, .sort { background: var(--chip); border-radius: 999px; padding: 0.15rem 0.7rem; text-decoration: none; }
+.sort { border: 1px solid transparent; color: var(--ink); font: inherit; line-height: inherit; }
+.filter[aria-current="true"], .sort[aria-current="true"] { background: var(--accent); color: var(--panel); }
 
 .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); }
 

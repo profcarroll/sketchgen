@@ -1025,6 +1025,9 @@ def _card(
         chip=chip,
         rules=_esc(row["rules_file"] or "unrecorded"),
         executor=_esc(row["executor"] or "unrecorded"),
+        # The sort control reads this attribute, so the order JavaScript puts
+        # the cards in is the order the generator already put them in.
+        published=_esc(row["published_utc"] or ""),
         submitted_by=_esc(row["submitted_by"] or "unknown"),
         human=_esc(human_value),
         agent=_esc(agent_value),
@@ -1049,6 +1052,22 @@ def _filters(rows: list[sqlite3.Row], page: str) -> str:
     return "\n      ".join(links)
 
 
+def _newest_first(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+    """The grid's own order: the most recently published entry first.
+
+    Only the two grid pages are reversed, and only here. ``_entries`` stays
+    ascending because the forest, the line pages, compare and the balanced
+    pairs all read an entry's ancestors before the entry itself, and because a
+    second render of an unchanged database must still be byte-identical: this
+    is a total order (the stamp, then the id), so it is.
+    """
+    return sorted(
+        rows,
+        key=lambda row: (str(row["published_utc"] or ""), int(row["id"])),
+        reverse=True,
+    )
+
+
 def _grid_page(
     conn: sqlite3.Connection,
     rows: list[sqlite3.Row],
@@ -1060,6 +1079,7 @@ def _grid_page(
 ) -> str:
     card = _template("card.html")
     scores = _all_scores(conn)
+    rows = _newest_first(rows)
     if rows:
         cards = "\n      ".join(_card(conn, row, failed, card, scores) for row in rows)
     else:
