@@ -17,6 +17,7 @@ from sketchgen import db  # noqa: E402
 EXPECTED_TABLES = {
     "attempts",
     "control",
+    "critiques",
     "engagement",
     "entries",
     "jobs",
