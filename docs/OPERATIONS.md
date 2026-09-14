@@ -143,3 +143,16 @@ ssh -f -N -L 8081:127.0.0.1:8081 sld-cloud                # on the laptop
 Then open http://localhost:8081/ — the Console; Queue, New job, Job detail (live
 transcript) and Held are in its top bar, with the worker's Pause / Stop now / Resume
 control upper right. Logs: `journalctl --user -u sketchgen-web -n 50`.
+
+## The write-path sync as a timer
+
+`install-unit` also copies `systemd/sketchgen-sync.{service,timer}`. The service is a
+oneshot `sketchgen sync --once` reading the bearer from `~/sketchgen/writepath.token`;
+the timer runs it three minutes after boot and every five minutes after that.
+
+```bash
+systemctl --user enable --now sketchgen-sync.timer
+systemctl --user list-timers --all | grep sketchgen-sync
+journalctl --user -u sketchgen-sync -n 20
+```
+

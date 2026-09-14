@@ -1,0 +1,16 @@
+# sketchgen-sync.service — one pull from the gallery write path into the app DB.
+#
+# Started by sketchgen-sync.timer; runs once and exits (Type=oneshot). Reads the
+# bearer from ~/sketchgen/writepath.token (mode 0600, never on the command line)
+# and pulls votes, likes and views changed since the recorded watermark.
+[Unit]
+Description=sketchgen sync: pull votes, likes and views from the write path
+Documentation=file:%h/sketchgen/app/docs/OPERATIONS.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/sketchgen/app
+Environment=SKETCHGEN_DB=%h/sketchgen/sketchgen.db
+Environment=SKETCHGEN_WRITEPATH_URL=https://sketchgen-writepath.sketchgen.workers.dev
+ExecStart=%h/sketchgen/.venv/bin/python3 %h/sketchgen/app/bin/sketchgen sync --once --token-file %h/sketchgen/writepath.token
