@@ -618,6 +618,16 @@ class IndexTests(GalleryTestCase):
             with self.subTest(href=href):
                 self.assertIn(href, self.index)
 
+    def test_compare_carries_no_pre_deployment_notes(self):
+        # Two sentences written before the write path and the agent judge
+        # existed survived on the live page until 2026-09-14. The script
+        # only rewrites the status note when no write path is configured, so
+        # the template's default has to be true on its own.
+        compare = (self.dest / "compare.html").read_text(encoding="utf-8")
+        self.assertNotIn("Until it is deployed", compare)
+        self.assertNotIn("packet 5.2", compare)
+        self.assertIn("Signed in with GitHub, your answers are recorded", compare)
+
     def test_compare_is_a_shell_with_both_questions(self):
         compare = (self.dest / "compare.html").read_text(encoding="utf-8")
         self.assertIn("Which is closer to its brief?", compare)
