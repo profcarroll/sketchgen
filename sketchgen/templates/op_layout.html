@@ -97,6 +97,15 @@ pre {
 .checks .na { color: var(--dim); }
 .cards { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
 .card img, .shot img { max-width: 100%; border: 1px solid var(--line); border-radius: 5px; }
+iframe.preview {
+  display: block; max-width: 100%; border: 1px solid var(--line);
+  border-radius: 5px; background: #000;
+}
+details.preview-fold { margin: 10px 0 0; }
+details.preview-fold > summary {
+  cursor: pointer; font-size: 12px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--dim); margin-bottom: 8px;
+}
 form.stack label { display: block; margin: 10px 0 3px; font-size: 12px;
                    text-transform: uppercase; letter-spacing: .05em; color: var(--dim); }
 form.stack input[type=text], form.stack input[type=number], form.stack textarea,
