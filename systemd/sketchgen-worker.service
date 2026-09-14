@@ -51,6 +51,10 @@
 #   Environment=SKETCHGEN_JUDGE_MODEL=gemma4:e4b
 #   Environment=SKETCHGEN_CRITIC_MODEL=gemma4:e4b
 #   Environment=SKETCHGEN_LINEAGE_DEPTH=3   DECIDE[lineage-depth]; then a person
+#   Environment=SKETCHGEN_STUCK_MINUTES=30  a job left in planning/executing/
+#                                           gating/repairing for this long with
+#                                           no worker attending it is re-queued;
+#                                           0 = never sweep
 #
 # Set the two limits to 0 to leave the node entirely idle between jobs — the
 # quickest way to hand the slot to someone else without pausing the worker.
