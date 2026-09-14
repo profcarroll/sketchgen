@@ -30,11 +30,14 @@ __all__ = [
     "connect",
     "create_entry",
     "enqueue",
+    "entries_to_critique",
     "get_control",
+    "get_critique",
     "get_job",
     "get_meta",
     "init",
     "list_jobs",
+    "record_critique",
     "record_judgment",
     "requeue",
     "schema_version",
@@ -536,6 +539,81 @@ def add_lineage(
         "critique_by, critique, created_utc) VALUES (?,?,?,?,?,?)",
         (child_entry_id, parent_entry_id, generation, critique_by, critique, utc_now()),
     )
+
+
+# ---------------------------------------------------------------------------
+# Critiques — migration 006, the worker's idle work
+# ---------------------------------------------------------------------------
+
+
+def record_critique(
+    conn: sqlite3.Connection,
+    entry_id: int,
+    *,
+    critique: str | None,
+    critique_by: str | None,
+    prompt_version: str,
+    spawned_job_id: int | None = None,
+    rejected_reason: str | None = None,
+) -> int:
+    """Record one critique of one entry, whether or not it spawned anything.
+
+    One row per (entry, prompt_version): the UNIQUE constraint in migration 006
+    is what stops the worker critiquing the same entry on every idle round, so a
+    second call for the same pair raises ``sqlite3.IntegrityError`` by design.
+    """
+    cur = conn.execute(
+        "INSERT INTO critiques (entry_id, critique, critique_by, prompt_version, "
+        "spawned_job_id, rejected_reason, created_utc) VALUES (?,?,?,?,?,?,?)",
+        (
+            int(entry_id),
+            critique,
+            critique_by,
+            prompt_version,
+            spawned_job_id,
+            rejected_reason,
+            utc_now(),
+        ),
+    )
+    return int(cur.lastrowid)
+
+
+def get_critique(
+    conn: sqlite3.Connection, entry_id: int, prompt_version: str
+) -> sqlite3.Row | None:
+    """This entry's critique under this prompt version, if it has one."""
+    return conn.execute(
+        "SELECT * FROM critiques WHERE entry_id = ? AND prompt_version = ?",
+        (int(entry_id), prompt_version),
+    ).fetchone()
+
+
+def entries_to_critique(
+    conn: sqlite3.Connection, prompt_version: str, limit: int = 1
+) -> list[int]:
+    """Published entries with no child and no critique yet, oldest first.
+
+    "No child" is asked of all three places a child can show up — a job spawned
+    from this entry, an entry that came from it, and a recorded `lineage` link —
+    because the three are written at different moments in a line's life and a
+    line that is already running does not need a second critique of its parent
+    (spec §8.1). "No critique yet" is per prompt version, which is migration
+    006's UNIQUE constraint read from the other side.
+    """
+    if int(limit) <= 0:
+        return []
+    rows = conn.execute(
+        "SELECT e.id AS id FROM entries e "
+        "WHERE e.state = 'published' "
+        "  AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.parent_entry_id = e.id) "
+        "  AND NOT EXISTS (SELECT 1 FROM entries c WHERE c.parent_entry_id = e.id) "
+        "  AND NOT EXISTS (SELECT 1 FROM lineage l WHERE l.parent_entry_id = e.id) "
+        "  AND NOT EXISTS (SELECT 1 FROM critiques q WHERE q.entry_id = e.id "
+        "                    AND q.prompt_version = ?) "
+        "ORDER BY e.created_utc, e.id LIMIT ?",
+        (prompt_version, int(limit)),
+    ).fetchall()
+    return [int(row["id"]) for row in rows]
 
 
 # ---------------------------------------------------------------------------

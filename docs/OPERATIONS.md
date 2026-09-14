@@ -80,6 +80,55 @@ Each job has a directory under `$SKETCHGEN_JOBS` (default `~/sketchgen/jobs`):
 the sketch, and the gate's own output under `attempt-N/.gate/`. That is the
 canonical record of what happened; the database rows point at it.
 
+## What the worker does when the queue is empty
+
+Nothing stays idle for long. With an empty queue and `control: running`, the
+worker does one bounded round of idle work before it sleeps:
+
+1. **judges** up to `SKETCHGEN_IDLE_JUDGE` pairs with the local judge
+   (`gemma4:e4b`, the model on this box that can see);
+2. **critiques** up to `SKETCHGEN_IDLE_CRITIQUE` published entries that have no
+   child yet, and queues the child each critique asks for;
+3. then sleeps.
+
+This runs **inside the worker's own loop, not on a second timer**, and that is the
+whole of the design: there is one inference slot, so one process is allowed to use
+it. A second unit would need a second fence, and two fences racing each other is
+the contention the fence exists to prevent. `worker --once` does a round too, so
+you can watch one from the shell.
+
+```
+python3 bin/sketchgen db status | sed -n '/idle work/,$p'
+```
+
+prints how many agent verdicts and critiques exist, how many children were
+spawned, how many critiques were rejected, and when the last of any of it
+happened — read from the database, so it survives a restart.
+
+Five environment variables tune it; none has to be set:
+
+| variable | default | what it does |
+|---|---|---|
+| `SKETCHGEN_IDLE_JUDGE` | 1 | pairs judged per round. **0 turns judging off.** |
+| `SKETCHGEN_IDLE_CRITIQUE` | 1 | entries critiqued per round. **0 turns critiquing off.** |
+| `SKETCHGEN_JUDGE_MODEL` | `gemma4:e4b` | the local judge |
+| `SKETCHGEN_CRITIC_MODEL` | `gemma4:e4b` | the critic whose sentence becomes the next prompt |
+| `SKETCHGEN_LINEAGE_DEPTH` | 3 | generations a line runs before a person has to touch it |
+
+Set both limits to `0` to leave the node quiet between jobs — the quickest way to
+hand the inference slot to somebody else without pausing the worker at all:
+
+```
+systemctl --user edit sketchgen-worker.service   # add the two Environment= lines
+systemctl --user restart sketchgen-worker.service
+```
+
+An entry is critiqued **once per version of `prompts/critic.md`**, and the row in
+`critiques` is what remembers that — including when the critic's sentence was
+rejected for breaking the one-sentence rule, which is kept with its reason rather
+than retried. Editing that prompt bumps its `prompt_version`, and those entries
+may be critiqued again under the new one.
+
 ## The two deploy keys
 
 ```
