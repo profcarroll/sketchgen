@@ -131,6 +131,43 @@ def balance_errors(path: Path) -> list[str]:
     return parser.finish()
 
 
+class Elements(HTMLParser):
+    """Every start tag in a page as (name, attributes)."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tags: list[tuple[str, dict[str, str]]] = []
+
+    def handle_starttag(self, tag, attrs):
+        self.tags.append((tag, {name: (value or "") for name, value in attrs}))
+
+
+def elements(text: str) -> list[tuple[str, dict[str, str]]]:
+    """The page's tags, with attribute values unescaped the way a browser
+    unescapes them before any script ever sees them."""
+    parser = Elements()
+    parser.feed(text)
+    parser.close()
+    return parser.tags
+
+
+def search_boxes(text: str) -> list[dict[str, str]]:
+    return [
+        attrs
+        for tag, attrs in elements(text)
+        if tag == "input" and attrs.get("type") == "search" and "data-search" in attrs
+    ]
+
+
+def card_search(text: str) -> dict[str, str]:
+    """Each card's data-search attribute, by entry id."""
+    return {
+        attrs["data-entry"]: attrs.get("data-search", "")
+        for tag, attrs in elements(text)
+        if tag == "div" and "card" in attrs.get("class", "").split()
+    }
+
+
 # ---------------------------------------------------------------------------
 # The fixture database
 # ---------------------------------------------------------------------------
@@ -720,6 +757,92 @@ class GridOrderTests(GalleryTestCase):
         embedded = compare.split('type="application/json">')[1].split("</script>")[0]
         entries = json.loads(embedded.replace("<\\/", "</"))
         self.assertEqual([entry["id"] for entry in entries], list(self.ids[:2]))
+
+
+class GridSearchTests(GalleryTestCase):
+    """The grid's search box, and the one attribute it matches cards on.
+
+    The box is gallery.js's; what the generator owes it is data-search on
+    every card — and that attribute is the only place a brief reaches a grid
+    page, which is the point of having one.
+    """
+
+    #: a word from each fixture entry's brief that its own prompt does not use
+    BRIEF_ONLY = ("warm", "noloop", "treble")
+
+    def setUp(self):
+        super().setUp()
+        self.render()
+        self.index = (self.dest / "index.html").read_text(encoding="utf-8")
+        self.failed = (self.dest / "rejections.html").read_text(encoding="utf-8")
+
+    def test_both_grid_pages_offer_one_search_box(self):
+        for name, page in (("index.html", self.index), ("rejections.html", self.failed)):
+            with self.subTest(page=name):
+                boxes = search_boxes(page)
+                self.assertEqual(len(boxes), 1)
+                self.assertEqual(boxes[0]["name"], "q")
+                self.assertEqual(boxes[0].get("placeholder"), "search prompts")
+                counts = [
+                    attrs for _, attrs in elements(page) if "data-search-count" in attrs
+                ]
+                self.assertEqual(len(counts), 1)
+                self.assertIn("hidden", counts[0])
+                # with no script, Enter reloads the page it is already on and
+                # that page shows everything: harmless, which is the whole ask
+                forms = [
+                    attrs for tag, attrs in elements(page)
+                    if tag == "form" and attrs.get("role") == "search"
+                ]
+                self.assertEqual(len(forms), 1)
+                self.assertEqual(forms[0]["action"], name)
+
+    def test_every_card_carries_what_the_search_reads(self):
+        pages = {self.ids[0]: self.index, self.ids[1]: self.index, self.ids[2]: self.failed}
+        executors = {
+            self.ids[0]: "qwen3-coder:30b-a3b-q4_K_M",
+            self.ids[1]: "qwen3.5:4b",
+            self.ids[2]: "qwen3-coder:30b-a3b-q4_K_M",
+        }
+        for entry_id, word in zip(self.ids, self.BRIEF_ONLY):
+            with self.subTest(entry=entry_id):
+                value = card_search(pages[entry_id])[str(entry_id)]
+                # lowercased once by the generator, so the script only has to
+                # lowercase the query
+                self.assertEqual(value, value.lower())
+                self.assertEqual(value, " ".join(value.split()))
+                # the brief is in there and the card does not otherwise show it
+                self.assertIn(word, value)
+                prompt = str(
+                    self.conn.execute(
+                        "SELECT prompt FROM entries WHERE id = ?", (entry_id,)
+                    ).fetchone()[0]
+                ).lower()
+                self.assertNotIn(word, prompt)
+                self.assertIn(executors[entry_id].lower(), value)
+                self.assertIn(f"entry {entry_id}", value)
+                self.assertIn(f"#{entry_id}", value)
+        # the statement is not in it: it is paragraphs, and every card would
+        # have to carry them
+        self.assertNotIn("fills the window", card_search(self.index)[str(self.ids[0])])
+
+    def test_a_quote_in_a_prompt_does_not_break_the_attribute(self):
+        rough = 'a "quoted" prompt with <canvas> & one ampersand'
+        self.conn.execute(
+            "UPDATE entries SET prompt = ? WHERE id = ?", (rough, self.ids[0])
+        )
+        self.conn.commit()
+        dest = self.tmp / "escaped"
+        dest.mkdir()
+        gallery.render_index(self.conn, dest, self.config)
+        page = (dest / "index.html").read_text(encoding="utf-8")
+        # in the file the dangerous characters are entities, so the tag still
+        # ends where it says it ends
+        self.assertIn("&quot;quoted&quot;", page)
+        self.assertIn("&lt;canvas&gt;", page)
+        self.assertEqual(balance_errors(dest / "index.html"), [])
+        # and what a browser hands the script is the text itself
+        self.assertIn(rough.lower(), card_search(page)[str(self.ids[0])])
 
 
 class GuardTests(GalleryTestCase):

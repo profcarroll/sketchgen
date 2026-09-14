@@ -119,8 +119,11 @@ python3 bin/sketchgen publish-index             # re-render, commit and push
 `index.html` and `rejections.html` are one grid of cards each, newest first in the
 HTML itself; above the grid, `Sort` reorders it (newest, oldest, random, most liked)
 and keeps the choice in the URL as `?sort=`, and `Filter` folds away until you open
-it or arrive with `?rules=` or `?executor=` in the URL. With JavaScript off the grid
-is still newest first and the filters are still plain links.
+it or arrive with `?rules=` or `?executor=` in the URL. The search box in the same
+row narrows the grid as you type — over each entry's number, prompt, brief, rules
+file, executor and submitter — composes with the filters, and keeps its query in the
+URL as `?q=`. With JavaScript off the grid is still newest first, the filters are
+still plain links, and the search box is a form that reloads the page it is on.
 
 ## Tests
 
