@@ -75,6 +75,30 @@ worker down: every step is bounded by a limit, and an exception inside one is
 logged and dropped, because a queue that stops draining because a critique failed
 would be a worse system than one that occasionally skips a critique.
 
+**A step that fails is a job outcome, never an escaped exception.** Written after
+the first unattended night: on 2026-09-14 job 5 was claimed into ``planning``,
+``gemma4:e4b`` answered with no ``Brief`` heading, ``PlannerFailed`` came out
+through the job loop — ``job.log`` ends at "worker: unhandled PlannerFailed" —
+and the job sat in ``planning`` for good while the same process went on to serve
+job 6. Two rules came out of it:
+
+  * PLAN saves the raw reply to ``<jobs>/<id>/plan-response-<n>.txt`` and
+    retries once **with a different seed** (:func:`plan_seed`) — the requeued
+    job 5 failed identically on its second run because the seed was fixed, so a
+    retry that samples the same way is not a retry. If both tries fail, the last
+    reply is read leniently (:func:`sketchgen.planner.recover`): prose with no
+    ``Brief`` heading becomes the brief, and the plan is stamped
+    ``planner-v1+lenient`` so the entry says so. Only a reply with no prose at
+    all fails the job, with ``last_error`` beginning ``planner:``. EXECUTE and
+    GATE turn any exception into a recorded attempt with evidence and a
+    transition. A last-resort guard around the whole job fails it rather than
+    leaving it in a running state.
+  * :meth:`Worker.sweep_stuck` re-queues any job in ``planning``, ``executing``,
+    ``gating`` or ``repairing`` that has not moved for ``SKETCHGEN_STUCK_MINUTES``
+    and that this process does not own — at startup and once per idle cycle. A
+    worker that is killed mid-job, or a bug nobody predicted, costs a delay now
+    instead of a job.
+
 Python 3.12, stdlib only. Timestamps are UTC, ISO 8601 with a trailing Z.
 """
 
@@ -92,6 +116,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -109,6 +134,7 @@ __all__ = [
     "DEFAULT_PLANNER_MODEL",
     "DEFAULT_RULES",
     "DEFAULT_SLEEP_S",
+    "DEFAULT_STUCK_MINUTES",
     "EVIDENCE_HEADING",
     "EXIT_FAIL",
     "EXIT_OK",
@@ -124,8 +150,10 @@ __all__ = [
     "fence",
     "idle_summary",
     "is_stop_now",
+    "minutes_between",
     "node_shape",
     "observing_probe",
+    "plan_seed",
     "resolve_rules",
     "stub_executor",
     "stub_judge",
@@ -172,6 +200,19 @@ DEFAULT_CRITIC_MODEL = os.environ.get("SKETCHGEN_CRITIC_MODEL", "gemma4:e4b")
 DEFAULT_IDLE_JUDGE = _int_env("SKETCHGEN_IDLE_JUDGE", 1)
 DEFAULT_IDLE_CRITIQUE = _int_env("SKETCHGEN_IDLE_CRITIQUE", 1)
 DEFAULT_LINEAGE_DEPTH = _int_env("SKETCHGEN_LINEAGE_DEPTH", lineage.DEFAULT_MAX_DEPTH)
+
+#: How long a job may sit in a running state with nobody attending it before the
+#: sweep puts it back on the queue. 0 switches the sweep off. Thirty minutes is
+#: comfortably longer than any real step: the slowest measured job is minutes,
+#: and the gate's slowest assertion is about five seconds.
+DEFAULT_STUCK_MINUTES = _int_env("SKETCHGEN_STUCK_MINUTES", 30)
+
+#: One plan, then one retry. A small model that drops a heading usually does not
+#: drop it twice, and a second failure is a job outcome rather than a third try.
+PLAN_TRIES = 2
+
+#: The shape of every timestamp this system writes (db.utc_now).
+UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 #: The rules file a job gets when it names none. The A/B (spec §9) is opt-in per
 #: job; a job that says nothing is executed under the rules the course teaches.
 DEFAULT_RULES = "treatment"
@@ -452,9 +493,12 @@ def build_evidence(report: dict[str, Any] | None, gate_exit: int | None,
     ``jobs.last_error`` when the last attempt fails.
     """
     if not report:
-        head = f"gate refused (exit {gate_exit})" if gate_exit == 3 else (
-            f"gate exit {gate_exit}: no report.json was written"
-        )
+        if gate_exit == 3:
+            head = "gate refused (exit 3)"
+        elif gate_exit is None:
+            head = "gate did not finish and wrote no report.json"
+        else:
+            head = f"gate exit {gate_exit}: no report.json was written"
         first_error = (stderr or "").strip().splitlines()
         if first_error:
             return f"{head}: {first_error[0]}"
@@ -523,6 +567,20 @@ def build_evidence(report: dict[str, Any] | None, gate_exit: int | None,
     return "\n".join(parts).rstrip() + "\n"
 
 
+def minutes_between(earlier: str | None, later: str | None) -> float | None:
+    """Minutes between two of this system's UTC stamps, or None if unreadable.
+
+    Unreadable is not an error and not zero: a row whose timestamp cannot be
+    parsed is one the sweep leaves alone rather than re-queues on a guess.
+    """
+    try:
+        start = datetime.strptime(str(earlier), UTC_FORMAT).replace(tzinfo=timezone.utc)
+        end = datetime.strptime(str(later), UTC_FORMAT).replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+    return (end - start).total_seconds() / 60.0
+
+
 def node_shape() -> str:
     """The machine this entry was made on, as one string for the gallery.
 
@@ -562,9 +620,24 @@ def brief_with_evidence(brief: str, evidence: str | None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def default_planner(*, job: db.Job, host: str, model: str) -> planner.Plan:
+def plan_seed(job_id: int, n: int) -> int:
+    """The sampling seed for plan try ``n`` of a job.
+
+    Not a constant, and that is the point: planner.plan defaults to seed 1, so
+    the retry of job 5 on 2026-09-14 asked the same model the same question with
+    the same seed and got back the same malformed reply, exactly. A seed that
+    moves with the try number makes the retry a different roll; keying it to the
+    job id keeps it reproducible for anyone re-running that job.
+    """
+    return int(job_id) + int(n)
+
+
+def default_planner(*, job: db.Job, host: str, model: str,
+                    seed: int = 1) -> planner.Plan:
     """The local planner (packet 2.5). Calls the model; never used in tests."""
-    return planner.plan(job.prompt, model, host=host, by=job.submitted_by)
+    return planner.plan(
+        job.prompt, model, host=host, by=job.submitted_by, seed=seed
+    )
 
 
 def default_executor(
@@ -769,7 +842,7 @@ def idle_summary(conn) -> dict[str, Any]:
 def stub_planner(assertions: list[str]) -> Callable[..., planner.Plan]:
     """A planner that returns the job's own prompt as the brief. TEST ONLY."""
 
-    def plan_stub(*, job, host, model) -> planner.Plan:
+    def plan_stub(*, job, host, model, seed: int = 1) -> planner.Plan:
         return planner.Plan(
             brief=job.prompt,
             assertions=list(assertions),
@@ -810,6 +883,7 @@ class Worker:
         idle_judge: int = DEFAULT_IDLE_JUDGE,
         idle_critique: int = DEFAULT_IDLE_CRITIQUE,
         lineage_depth: int = DEFAULT_LINEAGE_DEPTH,
+        stuck_minutes: int = DEFAULT_STUCK_MINUTES,
         planner_fn: Callable[..., Any] | None = None,
         executor_fn: Callable[..., Execution] | None = None,
         gate_fn: Callable[..., GateOutcome] | None = None,
@@ -835,6 +909,7 @@ class Worker:
         self.idle_judge = int(idle_judge)
         self.idle_critique = int(idle_critique)
         self.lineage_depth = int(lineage_depth)
+        self.stuck_minutes = int(stuck_minutes)
         self.judge_fn = judge_fn or default_judge
         self.critic_fn = critic_fn or default_critic
         self.spawn_fn = spawn_fn or lineage.spawn
@@ -842,6 +917,9 @@ class Worker:
         self.log_stream = sys.stderr if log_stream is None else log_stream
         self._log_path: Path | None = None
         self._planner_prompt_version: str | None = None
+        #: Jobs this process has in flight. The sweep never touches these.
+        self._owned: set[int] = set()
+        self._swept = False
 
     # -- logging ---------------------------------------------------------
 
@@ -897,6 +975,14 @@ class Worker:
             self.log(f"control: {reason} and no attempt is in flight; now paused")
             return EXIT_OK
 
+        # Before anything else this process does with the queue: put back the
+        # jobs a dead worker left in flight. It is pure database work, no model
+        # and no browser, so it runs ahead of the fence — a worker that is about
+        # to refuse can still clean up after the one that came before it.
+        if not self._swept:
+            self._swept = True
+            self.sweep_stuck()
+
         result = fence(self.probe)
         for name in result.models:
             self.log(f"fence: ollama has {name} resident (not a refusal)")
@@ -922,11 +1008,30 @@ class Worker:
         directory = self._open_job_log(job.id)
         self.log(f"job {job.id}: claimed, state {job.state}, by {job.submitted_by}, "
                  f"work directory {directory}")
+        self._owned.add(job.id)
         try:
             return self._run_job(job)
         except StopNow:
             self._stop_now(job.id)
             return EXIT_OK
+        except Exception as exc:
+            # Last resort. Every step above already turns its own failures into
+            # a transition; this is here so that a bug nobody predicted still
+            # cannot leave a job in a running state with no worker attending it,
+            # which is exactly what happened to job 5 on 2026-09-14.
+            reason = f"worker: {type(exc).__name__}: {' '.join(f'{exc}'.split())}"
+            self.log(f"job {job.id}: unhandled {reason}")
+            try:
+                current = db.get_job(self.conn, job.id)
+                if current is not None and current.state in db.REQUEUABLE:
+                    db.transition(self.conn, job.id, "failed", last_error=reason)
+                    self.log(f"job {job.id}: failed rather than left in "
+                             f"{current.state}")
+            except Exception as inner:  # pragma: no cover - the DB is the problem
+                self.log(f"job {job.id}: could not record the failure: {inner}")
+            return EXIT_FAIL
+        finally:
+            self._owned.discard(job.id)
 
     def run_forever(self, sleep_s: float = DEFAULT_SLEEP_S) -> int:
         """The resident mode systemd runs. Never start this from a tool call."""
@@ -942,6 +1047,58 @@ class Worker:
             if code == EXIT_REFUSED:
                 self.log(f"worker: fenced; backing off {sleep_s:.0f}s")
             time.sleep(sleep_s)
+
+    # -- the sweep -------------------------------------------------------
+
+    def sweep_stuck(self, now: str | None = None) -> list[int]:
+        """Re-queue jobs left in a running state by a worker that is not coming
+        back. Returns the job ids re-queued.
+
+        A job in ``planning``, ``executing``, ``gating`` or ``repairing`` is a
+        job somebody is supposed to be attending. If its ``updated_utc`` is
+        older than ``stuck_minutes`` and this process is not the one attending
+        it, nobody is: the worker was killed, the node rebooted, or an
+        exception escaped before this packet existed. It goes back on the queue,
+        with the attempts it already has, and the next pass picks it up.
+
+        Owned means in flight *here*: a job this process claimed in this pass is
+        never swept, however long its own plan or gate takes.
+        """
+        if self.stuck_minutes <= 0:
+            return []
+        stamp = now or db.utc_now()
+        try:
+            rows = self.conn.execute(
+                "SELECT id, state, updated_utc FROM jobs WHERE state IN "
+                "('planning','executing','gating','repairing') ORDER BY id"
+            ).fetchall()
+        except sqlite3.Error as exc:  # pragma: no cover - the DB is the problem
+            self.log(f"sweep: cannot read the queue: {exc}")
+            return []
+
+        swept: list[int] = []
+        for row in rows:
+            job_id = int(row["id"])
+            if job_id in self._owned:
+                continue
+            age = minutes_between(row["updated_utc"], stamp)
+            if age is None or age < self.stuck_minutes:
+                continue
+            try:
+                db.requeue(
+                    self.conn,
+                    job_id,
+                    reason=f"swept: left in {row['state']} for {age:.0f} minutes",
+                )
+            except (db.IllegalTransition, db.UnknownJob, sqlite3.Error) as exc:
+                self.log(f"sweep: job {job_id} could not be re-queued: {exc}")
+                continue
+            swept.append(job_id)
+            self.log(
+                f"sweep: job {job_id} sat in {row['state']} for {age:.0f} minutes "
+                f"with no worker attending it; re-queued"
+            )
+        return swept
 
     # -- idle work (packet 5.4) ------------------------------------------
 
@@ -976,6 +1133,9 @@ class Worker:
         worker that stopped draining the queue over a failed critique would be a
         worse machine than one that skips a critique.
         """
+        # Once per idle cycle, because this is the moment the worker has time:
+        # a job stuck in a running state is a job nobody is coming back for.
+        self.sweep_stuck()
         judged = self._idle_judge() if self.idle_judge > 0 else None
         critiqued = self._idle_critique() if self.idle_critique > 0 else None
         if judged or critiqued:
@@ -1223,8 +1383,37 @@ class Worker:
             )
         return entry_id
 
+    def _save_plan_response(self, job_id: int, n: int, raw: str) -> str | None:
+        """Keep what the planner actually said, beside the job it was about.
+
+        The raw text is the only evidence of a format slip, and it is what a
+        person reads when a job fails at PLAN. Named by try number, so the retry
+        does not overwrite the answer that caused it.
+        """
+        if not raw:
+            return None
+        directory = self.jobs_dir / str(job_id)
+        path = directory / f"plan-response-{n}.txt"
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            path.write_text(raw, encoding="utf-8")
+        except OSError as exc:  # pragma: no cover - disk failure
+            self.log(f"job {job_id}: could not save the planner's reply: {exc}")
+            return None
+        return str(path)
+
     def _plan(self, job: db.Job) -> db.Job | None:
-        """Step 4. Returns the updated job, or None when it stops here."""
+        """Step 4. Returns the updated job, or None when it stops here.
+
+        A planner failure is a job outcome, not a crash. On the first unattended
+        night ``gemma4:e4b`` answered job 5 with no ``Brief`` heading, the
+        ``PlannerFailed`` came out through the job loop, and the job sat in
+        ``planning`` for good while the process went on to the next job. So the
+        raw reply is saved, the plan is retried **once** — a format slip from a
+        small model is usually transient — and a second failure fails the job
+        with ``last_error`` beginning ``planner:``. No entry is created: nothing
+        was made, so there is nothing to keep.
+        """
         if job.brief and job.assertions:
             return job
         if (job.planner or "").strip() == "paid":
@@ -1232,8 +1421,46 @@ class Worker:
             self.log(f"job {job.id}: planner is 'paid' — needs-laptop, needs=plan "
                      "(DECIDE[credential-model] B: no paid key on the node)")
             return None
-        self.log(f"job {job.id}: planning with {self.planner_model}")
-        plan = self.planner_fn(job=job, host=self.host, model=self.planner_model)
+
+        plan = None
+        reason = "the planner said nothing"
+        last_raw = ""
+        for n in range(1, PLAN_TRIES + 1):
+            seed = plan_seed(job.id, n)
+            self.log(f"job {job.id}: planning with {self.planner_model}, seed "
+                     f"{seed} (try {n}/{PLAN_TRIES})")
+            try:
+                plan = self.planner_fn(
+                    job=job, host=self.host, model=self.planner_model, seed=seed
+                )
+                break
+            except StopNow:
+                raise
+            except Exception as exc:
+                reason = " ".join(f"{exc}".split()) or type(exc).__name__
+                raw = str(getattr(exc, "raw", "") or "")
+                last_raw = raw or last_raw
+                saved = self._save_plan_response(job.id, n, raw)
+                where = f"; reply saved to {saved}" if saved else ""
+                self.log(f"job {job.id}: plan try {n} (seed {seed}) failed "
+                         f"({type(exc).__name__}: {reason}){where}")
+
+        if plan is None:
+            # Every strict try failed. Before giving up, read the last reply
+            # leniently: on 2026-09-14 the same seed gave the same headingless
+            # answer twice, and a missing heading over a good paragraph is a
+            # format slip, not a job that cannot be planned.
+            try:
+                plan = planner.recover(last_raw)
+            except Exception as exc:
+                db.transition(self.conn, job.id, "failed",
+                              last_error=f"planner: {reason}")
+                self.log(f"job {job.id}: failed at PLAN after {PLAN_TRIES} tries — "
+                         f"planner: {reason} (lenient parse: {exc})")
+                return None
+            self.log(f"job {job.id}: recovered the plan from the last reply with a "
+                     f"lenient parse ({plan.prompt_version})")
+
         assertions = list(plan.assertions)
         self._planner_prompt_version = plan.prompt_version
         job = db.transition(
@@ -1298,14 +1525,28 @@ class Worker:
         self.log(f"job {job.id}: attempt {n}/{job.max_attempts} executing into "
                  f"{attempt_dir}"
                  + (" with the previous attempt's evidence" if evidence else ""))
-        execution = self.executor_fn(
-            brief=brief,
-            assertions=assertions,
-            rules_file=rules,
-            out_dir=str(attempt_dir),
-            model=self.executor_model,
-            host=self.host,
-        )
+        try:
+            execution = self.executor_fn(
+                brief=brief,
+                assertions=assertions,
+                rules_file=rules,
+                out_dir=str(attempt_dir),
+                model=self.executor_model,
+                host=self.host,
+            )
+        except StopNow:
+            raise
+        except Exception as exc:
+            # executor.run() answers a bad response with ok=False rather than by
+            # raising, but an injected executor, a disk failure or a bug can
+            # still raise. It becomes the same thing: a recorded attempt with
+            # evidence, and a repair — never an exception out of the job loop.
+            execution = Execution(
+                ok=False,
+                error=f"{type(exc).__name__}: {' '.join(f'{exc}'.split())}",
+                source_dir=str(attempt_dir),
+                model=self.executor_model,
+            )
         self._check_stop()
 
         if not execution.ok:
@@ -1348,11 +1589,23 @@ class Worker:
         gate_out = attempt_dir / ".gate"
         asked = " ".join(f"--assert {word}" for word in assertions) or "(no assertions)"
         self.log(f"job {job.id}: attempt {n} gating {attempt_dir} {asked}")
-        outcome = self.gate_fn(
-            source_dir=str(attempt_dir),
-            assertions=assertions,
-            out_dir=str(gate_out),
-        )
+        try:
+            outcome = self.gate_fn(
+                source_dir=str(attempt_dir),
+                assertions=assertions,
+                out_dir=str(gate_out),
+            )
+        except StopNow:
+            raise
+        except Exception as exc:
+            # As with the executor: a gate that blows up is an attempt that
+            # failed with no verdict, not a dead worker.
+            outcome = GateOutcome(
+                exit_code=None,
+                report=None,
+                report_path=None,
+                stderr=f"{type(exc).__name__}: {' '.join(f'{exc}'.split())}",
+            )
         passed = outcome.exit_code == 0
         new_evidence = None if passed else build_evidence(
             outcome.report, outcome.exit_code, outcome.stderr

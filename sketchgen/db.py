@@ -68,7 +68,13 @@ DEFAULT_DB_PATH = os.environ.get(
 #: stamped, instead of being a quiet UPDATE somewhere in the worker.
 TRANSITIONS: dict[str, frozenset[str]] = {
     "queued": frozenset({"planning", "executing", "needs-laptop", "failed"}),
-    "planning": frozenset({"executing", "needs-laptop", "failed"}),
+    # planning -> queued was added after the first unattended night: job 5 was
+    # claimed into planning, the planner's reply had no Brief heading, and the
+    # job sat in planning for good because nothing could move it back. The
+    # worker's sweep now re-queues a job left in any running state by a worker
+    # that died (worker.py, sweep_stuck), and planning is a running state like
+    # the other three.
+    "planning": frozenset({"executing", "needs-laptop", "failed", "queued"}),
     # executing -> repairing is packet 2.3's malformed-response path: a response
     # with no js block never reaches the gate, so the job repairs without
     # passing through gating and its attempt row carries a null gate_exit with
@@ -84,8 +90,10 @@ TRANSITIONS: dict[str, frozenset[str]] = {
     "failed": frozenset(),
 }
 
-#: States a job may be requeued from (the stop-now path).
-REQUEUABLE = frozenset({"executing", "gating", "repairing"})
+#: States a job may be requeued from: the stop-now path, and the worker's sweep
+#: of jobs a dead worker left mid-flight. These are exactly the states in which
+#: a job is supposed to have a worker attending it.
+REQUEUABLE = frozenset({"planning", "executing", "gating", "repairing"})
 
 CONTROL_STATES = frozenset({"running", "pausing", "paused"})
 

@@ -213,5 +213,39 @@ class CliTests(unittest.TestCase):
         self.assertIn("--stub", result.stdout)
 
 
+class TestLenientParse(unittest.TestCase):
+    """The rescue the worker reaches for after every strict try has failed."""
+
+    def test_prose_without_a_heading_becomes_the_brief(self):
+        raw = ("Sure! Here is the plan:\n\n"
+               "Sixty circles drift across a dark field.\n\n"
+               "Assertions:\n- motion(idle)\n- responds(click)\n")
+        brief, words = planner.parse_response_lenient(raw)
+        self.assertEqual("Sixty circles drift across a dark field.", brief)
+        self.assertEqual(["motion(idle)", "responds(click)"], words)
+
+    def test_recover_marks_the_version_and_still_validates_the_words(self):
+        plan = planner.recover("A still grid of grey rectangles.\n\n"
+                               "Assertions:\n- motion(idle)\n- glows(softly)\n")
+        self.assertTrue(plan.prompt_version.endswith(planner.LENIENT_MARK))
+        self.assertEqual(["motion(idle)"], plan.assertions)  # the invention is dropped
+        self.assertEqual(["glows(softly)"], [r["word"] for r in plan.rejected])
+
+    def test_a_reply_with_no_prose_is_still_a_failure(self):
+        with self.assertRaises(planner.PlannerFailed):
+            planner.parse_response_lenient("Assertions:\n- motion(idle)\n")
+        with self.assertRaises(planner.PlannerFailed):
+            planner.parse_response_lenient("")
+
+    def test_the_strict_parser_is_unchanged_by_any_of_this(self):
+        brief, words = planner.parse_response(
+            "Brief\nA field of dots.\n\nAssertions\nmotion(idle)\n"
+        )
+        self.assertEqual("A field of dots.", brief)
+        self.assertEqual(["motion(idle)"], words)
+        with self.assertRaises(planner.PlannerFailed):
+            planner.parse_response("A field of dots, with no heading at all.\n")
+
+
 if __name__ == "__main__":
     unittest.main()
