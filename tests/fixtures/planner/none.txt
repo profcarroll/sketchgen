@@ -1,0 +1,4 @@
+Brief
+A single grey square sits at the centre of a white canvas. Its edges are very slightly uneven, as though drawn by hand, and nothing else is on the screen. There is no interaction of any kind.
+
+Assertions

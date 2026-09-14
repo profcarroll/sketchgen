@@ -1,0 +1,7 @@
+Brief
+Concentric rings of dots ripple outward from the centre of a black canvas, brightening as they reach the edge and fading as new rings form behind them. The rings never stop. Clicking changes the centre they radiate from, and the rings already in flight keep their old centre until they leave the canvas.
+
+Assertions
+motion(idle)
+responds(click)
+no_motion

@@ -1,0 +1,8 @@
+Brief
+Thin vertical lines stand across a pale canvas like reeds. They lean continuously, each at its own rate, so the whole row is never still. Dragging the mouse across them bends the lines nearest the cursor away from it, and they straighten again once the cursor has passed.
+
+Assertions
+motion(idle)
+responds(drag)
+responds(keyboard)
+looks_nice

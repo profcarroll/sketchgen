@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """sketchgen — the one CLI.
 
-Today: `db init`, `db status` and `execute`. Later packets add subcommands
+Today: `db init`, `db status`, `execute` and `plan`. Later packets add subcommands
 (worker, publish, web, judge) by adding a parser and one function each, below.
 
 Exit codes: 0 success, 1 failure, 3 refused.
 """
 
 import argparse
+import json
 import os
 import sqlite3
 import sys
@@ -18,6 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sketchgen import __version__  # noqa: E402
 from sketchgen import db  # noqa: E402
 from sketchgen import executor  # noqa: E402
+from sketchgen import planner  # noqa: E402
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -125,6 +127,78 @@ def cmd_execute(args: argparse.Namespace) -> int:
         print(f"sketchgen: {result.error}", file=sys.stderr)
         print(f"raw response kept at {result.out_dir}/response.txt", file=sys.stderr)
     return EXIT_OK if result.ok else EXIT_FAIL
+def cmd_plan(args: argparse.Namespace) -> int:
+    """Turn one prompt into a brief and a validated assertion list.
+
+    Writes ``plan.json`` and ``response.txt`` into --out. ``response.txt`` is
+    written even when the response is unusable: the raw text is the only
+    evidence of what the model actually said, and it is the thing a person
+    reads when a job fails.
+    """
+    started = planner.utc_now()
+    out_dir = Path(args.out)
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        print(f"sketchgen: cannot write to {out_dir}: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+
+    try:
+        result = planner.plan(
+            args.prompt,
+            args.model,
+            host=args.host,
+            num_ctx=args.num_ctx,
+            seed=args.seed,
+            stub=args.stub,
+            by=args.by,
+        )
+    except planner.PlannerRefused as exc:
+        print(f"sketchgen: plan refused: {exc}", file=sys.stderr)
+        return EXIT_REFUSED
+    except planner.PlannerFailed as exc:
+        raw_path = out_dir / "response.txt"
+        try:
+            raw_path.write_text(exc.raw, encoding="utf-8")
+        except OSError as write_exc:  # pragma: no cover - disk failure
+            print(f"sketchgen: could not save the raw response: {write_exc}",
+                  file=sys.stderr)
+        else:
+            print(f"sketchgen: plan failed: {exc}; raw response saved to {raw_path}",
+                  file=sys.stderr)
+        return EXIT_FAIL
+
+    document = {
+        "brief": result.brief,
+        "assertions": result.assertions,
+        "rejected": result.rejected,
+        "defaulted": result.defaulted,
+        "prompt_version": result.prompt_version,
+        "model": args.model,
+        "tokens": result.tokens,
+        "durations": result.durations,
+        "started_utc": started,
+    }
+    try:
+        (out_dir / "response.txt").write_text(result.raw, encoding="utf-8")
+        (out_dir / "plan.json").write_text(
+            json.dumps(document, indent=2) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        print(f"sketchgen: cannot write the plan to {out_dir}: {exc}", file=sys.stderr)
+        return EXIT_FAIL
+
+    if args.json:
+        print(json.dumps(document, indent=2))
+    else:
+        print(f"plan: {out_dir / 'plan.json'}")
+        print(f"prompt_version: {result.prompt_version}")
+        print(f"assertions: {', '.join(result.assertions) or '-'}")
+        if result.defaulted:
+            print(f"defaulted: {', '.join(result.defaulted)}")
+        for item in result.rejected:
+            print(f"rejected: {item['word']}  ({item['reason']})")
+    return EXIT_OK
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -197,6 +271,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ex.add_argument("--json", action="store_true", help="print result.json to stdout")
     ex.set_defaults(func=cmd_execute, _parser=ex)
+    plan_parser = top.add_parser(
+        "plan",
+        help="expand a prompt into a brief and a validated assertion list",
+        description="Expand one prompt into a brief and a list of gate assertions "
+                    "drawn only from the runner's closed vocabulary.",
+    )
+    plan_parser.add_argument("--prompt", required=True, help="the submitted prompt")
+    plan_parser.add_argument("--by", default="", metavar="USERNAME",
+                             help="GitHub username of the submitter, for the record")
+    plan_parser.add_argument("--model", required=True, metavar="M",
+                             help="model tag, e.g. gemma4:e4b")
+    plan_parser.add_argument("--out", required=True, metavar="DIR",
+                             help="directory for plan.json and response.txt")
+    plan_parser.add_argument("--stub", default=None, metavar="FILE",
+                             help="replay this saved response; calls no model")
+    plan_parser.add_argument("--host", default=planner.DEFAULT_HOST,
+                             help=f"Ollama host (default: {planner.DEFAULT_HOST})")
+    plan_parser.add_argument("--num-ctx", type=int, default=8192, metavar="N",
+                             help="context window for the call (default 8192)")
+    plan_parser.add_argument("--seed", type=int, default=1, metavar="N",
+                             help="sampling seed (default 1)")
+    plan_parser.add_argument("--json", action="store_true",
+                             help="print plan.json to stdout as well")
+    plan_parser.set_defaults(func=cmd_plan, _parser=plan_parser)
 
     parser.set_defaults(_parser=parser)
     return parser
