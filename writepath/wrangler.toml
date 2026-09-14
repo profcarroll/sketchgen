@@ -1,0 +1,27 @@
+# wrangler.toml — names and placeholders only. No secret is ever written here.
+#
+# Nothing in this directory has been created on Cloudflare. Creating the Worker,
+# the D1 database and the GitHub OAuth App is the instructor's, by hand, in the
+# order README.md gives.
+#
+# Secrets, set once each with `wrangler secret put NAME` and read from `env`:
+#
+#   wrangler secret put GITHUB_CLIENT_ID       # the OAuth App's client id
+#   wrangler secret put GITHUB_CLIENT_SECRET   # the OAuth App's client secret
+#   wrangler secret put SESSION_KEY            # 32+ random bytes; signs session cookies
+#   wrangler secret put PULL_TOKEN             # the bearer the node sends to /pull
+#
+# The client id is not strictly a secret, but it is kept with the other three so
+# that the repository holds no account-specific value at all.
+
+name = "sketchgen-writepath"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "sketchgen-writepath"
+database_id = "<set after: wrangler d1 create sketchgen-writepath>"
+
+[vars]
+GALLERY_URL = "https://profcarroll.github.io/sketchgen-gallery"
