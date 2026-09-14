@@ -297,10 +297,18 @@ def _resolve_config(dest_dir: Path, config: Config | None) -> Config:
 # ---------------------------------------------------------------------------
 
 
-def _entry(conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row:
+def _entry(conn: sqlite3.Connection, entry_id: int, *, publishing: bool = False) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
     if row is None:
         raise UnknownEntry(f"no entry {entry_id}")
+    if publishing and row["state"] == "held":
+        # The publisher renders BEFORE the push that makes the entry public
+        # (the row flips to published only on a successful push), so a held
+        # entry is admitted here and rendered as the published entry it is
+        # about to become. publish_commit stays null until the push lands.
+        d = dict(row)
+        d["state"] = "published"
+        return d
     if row["state"] not in PUBLIC_STATES:
         raise UnknownEntry(
             f"entry {entry_id} is {row['state']}: only "
@@ -801,8 +809,14 @@ def render_entry(
     entry_id: int,
     dest_dir: str | Path,
     config: Config | None = None,
+    *,
+    publishing: bool = False,
 ) -> Path:
     """Write ``dest_dir/e/<entry_id>/`` — the entry page and its artefacts.
+
+    ``publishing=True`` is what the publisher passes: it admits a ``held``
+    entry and renders it as published, because the row only becomes
+    published after the push of these very files succeeds.
 
     ``dest_dir`` is the gallery checkout root, not the entry directory: this is
     the call packet 3.2's publisher makes, and the directory it commits is the
@@ -810,7 +824,7 @@ def render_entry(
     """
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
-    row = _entry(conn, int(entry_id))
+    row = _entry(conn, int(entry_id), publishing=publishing)
     attempts = _attempt_rows(conn, int(row["job_id"]))
     parent, children = _forest(conn)
     written = _Written(dest)

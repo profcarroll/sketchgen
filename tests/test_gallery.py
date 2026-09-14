@@ -401,6 +401,22 @@ class TreeTests(GalleryTestCase):
             gallery.render_entry(self.conn, held, self.dest, self.config)
         self.assertFalse((self.dest / "e" / str(held)).exists())
 
+    def test_publisher_may_render_a_held_entry_as_published(self):
+        # The publisher renders BEFORE the push that flips the row, so with
+        # publishing=True a held entry is admitted and written as published.
+        one = self.ids[0] if hasattr(self, "ids") else 1
+        self.conn.execute(
+            "UPDATE entries SET state='held', published_utc=NULL, publish_commit=NULL "
+            "WHERE id=?", (one,))
+        self.conn.commit()
+        with self.assertRaises(gallery.UnknownEntry):
+            gallery.render_entry(self.conn, one, self.dest, self.config)
+        out = gallery.render_entry(self.conn, one, self.dest, self.config, publishing=True)
+        meta = json.loads((out / "meta.json").read_text())
+        self.assertEqual(meta["state"], "published")
+        self.assertIsNone(meta["publish_commit"])
+        self.assertTrue((out / "index.html").exists())
+
 
 class ParseTests(GalleryTestCase):
 
