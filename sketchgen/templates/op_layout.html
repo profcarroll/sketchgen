@@ -34,6 +34,25 @@ header.top nav { display: flex; gap: 14px; flex-wrap: wrap; align-items: baselin
 header.top nav a { text-decoration: none; padding: 2px 0; }
 header.top nav a.here { font-weight: 600; border-bottom: 2px solid var(--accent); }
 .brand { font-weight: 700; letter-spacing: .02em; margin-right: 6px; }
+/* The nav's live marks. A five-segment level meter after Console: lit
+   segments are node CPU in fifths, coloured by how far up the meter they
+   are — the first two green, the third amber, the last two red. The counts
+   after Queue and the superscripts after Held and Gallery use the pill's own
+   vocabulary: amber waits, green moves, red failed. */
+.throttle { display: inline-flex; gap: 2px; vertical-align: -1px; margin-left: 2px; }
+.throttle i { display: inline-block; width: 7px; height: 10px;
+              border-radius: 2px; background: var(--bar-bg); }
+.throttle i.on { background: var(--warn); }
+.throttle i.on:nth-child(n+4) { background: var(--bad); }
+.throttle i.on:nth-child(-n+2) { background: var(--ok); }
+.counts { font-size: 12px; letter-spacing: .02em; margin-left: 2px; }
+.counts .n { font-variant-numeric: tabular-nums; font-weight: 600; }
+.counts .n.ok { color: var(--ok); }
+.counts .n.warn { color: var(--warn); }
+.counts .n.bad { color: var(--bad); }
+.sup { font-size: 10px; font-weight: 700; vertical-align: super;
+       line-height: 0; color: var(--dim); font-variant-numeric: tabular-nums; }
+.sup.warn { color: var(--warn); }
 .control { display: flex; gap: 8px; align-items: center; }
 .control form { display: flex; gap: 6px; margin: 0; }
 button {
@@ -152,10 +171,30 @@ $flash
 $body
 </main>
 <script>
-// The header pill, kept honest without a reload. Two seconds, one small GET.
+// The header pill and the nav's marks, kept honest without a reload. Two
+// seconds, one small GET: the same response carries both, and the server has
+// already rendered all of it once, so a reader with no JS sees it too.
 (function () {
   var pill = document.getElementById("worker-pill");
   if (!pill) return;
+  function at(key) { return document.querySelector('[data-nav="' + key + '"]'); }
+  function mark(key, value, title) {
+    var el = at(key);
+    if (!el) return;
+    el.textContent = value;
+    if (title) el.title = title;
+  }
+  function meter(nav) {
+    var el = at("cpu");
+    if (!el) return;
+    var cpu = Math.max(0, Math.min(100, Number(nav.cpu_pct) || 0));
+    var lit = Math.round(cpu / 20);
+    for (var i = 0; i < el.children.length; i++) {
+      el.children[i].className = i < lit ? "on" : "";
+    }
+    el.title = "node CPU " + Math.round(cpu) + "% · slot " + nav.slot_state +
+               (nav.slot_holder ? " (" + nav.slot_holder + ")" : "");
+  }
   function tick() {
     fetch("/api/control.json", {cache: "no-store"}).then(function (r) {
       return r.json();
@@ -163,6 +202,16 @@ $body
       pill.textContent = d.pill;
       pill.className = "pill " + d.pill_class;
       pill.title = d.title || "";
+      var nav = d.nav;
+      if (!nav) return;
+      meter(nav);
+      mark("queued", nav.queued);
+      mark("in-flight", nav.in_flight);
+      mark("failed", nav.failed_session);
+      mark("held", nav.held,
+           nav.held + " waiting · " + nav.kept + " kept rejections below them");
+      mark("public", nav.public, nav.public + " public · " + nav.published +
+           " published, " + (nav.public - nav.published) + " kept");
     }).catch(function () {});
   }
   setInterval(tick, 2000);
