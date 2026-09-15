@@ -197,7 +197,8 @@
     var ids = entryIds();
     if (!base() || ids.length === 0) { return; }
     fetch(base() + "/counts?entries=" + encodeURIComponent(ids.join(",")), {
-      credentials: "include"
+      credentials: "include",
+      headers: authHeaders()
     })
       .then(function (response) { return response.json(); })
       .then(function (data) {
@@ -408,7 +409,7 @@
   /* Every page is rendered newest first, so "newest" is the default and the
    * one order the URL never has to name. The other three are ?sort=<name>,
    * which makes a sorted view a link someone can send. */
-  var SORTS = ["newest", "oldest", "random", "liked"];
+  var SORTS = ["newest", "oldest", "random", "liked", "reviewed", "controversial", "consensus"];
   var DEFAULT_SORT = "newest";
 
   function currentSort() {
@@ -429,6 +430,38 @@
     return isNaN(value) ? 0 : value;
   }
 
+  /* The total number of paired comparisons this entry has been in, summed
+   * across all populations and questions. Read from the standing marks' title
+   * attributes, which carry e.g. "agents: 48th of 63 · 0.52 over 1 pair". */
+  function pairsOf(card) {
+    var total = 0;
+    Array.prototype.forEach.call(
+      card.querySelectorAll(".standing .mark:not(.inline)"),
+      function (mark) {
+        var title = mark.getAttribute("title") || "";
+        var match = title.match(/over (\d+) pairs?/);
+        if (match) { total += parseInt(match[1], 10); }
+      }
+    );
+    return total;
+  }
+
+  /* The percentile gap between the human and agent marks on the "rather look
+   * at it" track (the first bar-row). Returns -1 when either population is
+   * missing, so entries with no comparison data sort to the end. */
+  function gapOf(card) {
+    var rows = card.querySelectorAll(".bar-row");
+    if (rows.length === 0) { return -1; }
+    var lookRow = rows[0];
+    var human = lookRow.querySelector(".mark.human");
+    var agent = lookRow.querySelector(".mark.agent");
+    if (!human || !agent) { return -1; }
+    var humanPct = parseFloat(human.style.left) / 100;
+    var agentPct = parseFloat(agent.style.left) / 100;
+    if (isNaN(humanPct) || isNaN(agentPct)) { return -1; }
+    return Math.abs(humanPct - agentPct);
+  }
+
   /* The stamps are ISO 8601 in UTC with a trailing Z, so they compare as
    * strings; the id breaks a tie the way the generator breaks it. */
   function byNewest(a, b) {
@@ -442,6 +475,38 @@
 
   function byLikes(a, b) {
     var diff = likesOf(b) - likesOf(a);
+    return diff !== 0 ? diff : byNewest(a, b);
+  }
+
+  /* Most reviewed: entries with the most paired comparisons first. Entries
+   * with no pairs sort to the end and are ordered newest first among themselves. */
+  function byReviewed(a, b) {
+    var diff = pairsOf(b) - pairsOf(a);
+    return diff !== 0 ? diff : byNewest(a, b);
+  }
+
+  /* Most controversial: the biggest gap between humans and agents first.
+   * Entries without both populations' marks sort to the end. */
+  function byControversial(a, b) {
+    var ga = gapOf(a);
+    var gb = gapOf(b);
+    // Entries without gap data sort last.
+    if (ga < 0 && gb < 0) { return byNewest(a, b); }
+    if (ga < 0) { return 1; }
+    if (gb < 0) { return -1; }
+    var diff = gb - ga;
+    return diff !== 0 ? diff : byNewest(a, b);
+  }
+
+  /* Most consensus: the smallest gap between humans and agents first.
+   * Entries without both populations' marks sort to the end. */
+  function byConsensus(a, b) {
+    var ga = gapOf(a);
+    var gb = gapOf(b);
+    if (ga < 0 && gb < 0) { return byNewest(a, b); }
+    if (ga < 0) { return 1; }
+    if (gb < 0) { return -1; }
+    var diff = ga - gb;
     return diff !== 0 ? diff : byNewest(a, b);
   }
 
@@ -478,6 +543,9 @@
     if (name === "random") { shuffle(cards); }
     else if (name === "oldest") { cards.sort(byOldest); }
     else if (name === "liked") { cards.sort(byLikes); }
+    else if (name === "reviewed") { cards.sort(byReviewed); }
+    else if (name === "controversial") { cards.sort(byControversial); }
+    else if (name === "consensus") { cards.sort(byConsensus); }
     else { cards.sort(byNewest); }
     var order = document.createDocumentFragment();
     cards.forEach(function (card) { order.appendChild(card); });
