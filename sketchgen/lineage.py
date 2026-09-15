@@ -71,6 +71,7 @@ __all__ = [
     "record_child",
     "roots",
     "spawn",
+    "split_prompt",
 ]
 
 #: DECIDE[lineage-depth], plan §4: three generations unattended, then a person.
@@ -101,6 +102,11 @@ MAX_CRITIQUE_WORDS = 40
 DEFAULT_HOST = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "gemma4:e4b"
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "critic.md"
+
+#: The heading as :func:`compose_prompt` writes it and only as it writes it: at
+#: the start of a line, with the revision after it. A prompt that happens to say
+#: "Revise: " in the middle of a sentence is a sentence, not a generation.
+_REVISE_SPLIT_RE = re.compile(rf"^{re.escape(REVISE_HEADING)}[ \t]*", re.MULTILINE)
 
 _PROMPT_VERSION_RE = re.compile(r"^prompt_version:\s*(\S+)\s*$", re.MULTILINE)
 #: Where one sentence ends and the next begins: a terminator, then whitespace,
@@ -195,6 +201,31 @@ def compose_prompt(parent_prompt: str, critique_text: str) -> str:
     base = (parent_prompt or "").strip()
     revision = " ".join((critique_text or "").split())
     return f"{base}\n\n{REVISE_HEADING} {revision}".strip()
+
+
+def split_prompt(prompt: str) -> tuple[str, list[str]]:
+    """Undo :func:`compose_prompt`: the root sentence, then the revisions.
+
+    The accumulated prompt of a generation-10 entry is 1,700 characters and
+    reads as one sentence with nine amendments stapled to it. Everything that
+    wants to show a line — the entry title, the ledger panel, ``lineage.json``
+    — wants the two halves apart, and the prompt has always been splittable:
+    :data:`REVISE_HEADING` is fixed, :func:`compose_prompt` is the only writer,
+    and it writes one heading per ancestor at the start of its own line.
+
+    Round-trips: ``split_prompt(compose_prompt(root, critique))`` is
+    ``(root.strip(), [collapsed critique])``, and composing those again gives
+    the same prompt back. A root with no revisions returns an empty list.
+    """
+    text = (prompt or "").strip()
+    if not text:
+        return "", []
+    parts = _REVISE_SPLIT_RE.split(text)
+    root = parts[0].strip()
+    # Each revision was written as one collapsed line, so collapsing here is
+    # what makes the round trip exact rather than merely close.
+    revisions = [" ".join(part.split()) for part in parts[1:]]
+    return root, revisions
 
 
 def spawn(
