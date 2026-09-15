@@ -1950,6 +1950,241 @@ class CommandLineTests(GalleryTestCase):
         self.assertIn("refused", result.stderr)
 
 
+class LedgerPanelTests(GalleryTestCase):
+    """The lineage panel is a ledger: one row per generation (plan §6).
+
+    The fixture is a line of eleven generations with a fork at the parent, the
+    shape the mockup was drawn against and the shape entry 82 has on the live
+    site: root, three folded middle generations, grandparent, parent, this
+    entry, a sibling, and descendants.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # ids[0] is the root and ids[1] its child; nine more take the line to
+        # eleven. A model asks for the middle of the line, which is what makes
+        # the fold read "all by gemma4".
+        self.line = [self.ids[0], self.ids[1]]
+        for generation in range(3, 12):
+            self.line.append(add_child(
+                self.conn, self.tmp, self.line[-1], state="published",
+                prompt=f"the same field, generation {generation}",
+                critique=f"generation {generation}: take one more colour out of it",
+                critique_by="gemma4:e4b", generation=generation,
+            ))
+        # The chain is then seven long — root, three that fold, grandparent,
+        # parent, this entry — exactly the shape entry 82 has on the site.
+        self.here = self.line[6]
+        self.parent = self.line[5]
+        self.sibling = add_child(
+            self.conn, self.tmp, self.parent, state="published",
+            prompt="the same field, but the other way",
+            critique="try the other way instead", critique_by="profcarroll",
+            generation=7,
+        )
+        self.render()
+        self.page = (self.dest / "e" / str(self.here) / "index.html").read_text(
+            encoding="utf-8"
+        )
+
+    def panel(self, page=None):
+        text = page if page is not None else self.page
+        return text.split('<h2>Lineage')[1].split("</section>")[0]
+
+    def test_the_heading_counts_this_generation_in_its_line(self):
+        self.assertIn("generation 7 of <span data-ledger-deepest>11</span>", self.page)
+        self.assertIn(f"in the line from <a href=\"../../lines/{self.ids[0]}.html\">"
+                      f"entry {self.ids[0]}</a>", self.page)
+
+    def test_the_root_row_is_the_prompt_and_says_root_not_a_generation(self):
+        panel = self.panel()
+        root = panel.split("</li>")[0]
+        self.assertIn('class="ledger-prompt"', root)
+        self.assertIn("a field of sixty circles", root)
+        # THE NUMBERING: the root and its first child both record generation 1,
+        # so the root prints the word and no number (gallery._generation_label).
+        self.assertIn(f'<a href="../{self.ids[0]}/">entry {self.ids[0]}</a> · root ·', root)
+        self.assertNotIn("generation 1", root)
+        self.assertIn('<span class="chip person">profcarroll</span>', root)
+
+    def test_the_middle_of_the_line_folds_into_one_disclosure(self):
+        panel = self.panel()
+        folded = self.line[1:4]
+        summary = (
+            f"3 generations folded · {folded[0]}, {folded[1]}, {folded[2]}"
+        )
+        self.assertIn(summary, html.unescape(panel))
+        self.assertIn("all by gemma4", panel)
+        # A details element, so it opens with no script at all.
+        self.assertIn('<details class="fold">', panel)
+        for one in folded:
+            self.assertIn(f'href="../{one}/"', panel)
+
+    def test_the_root_grandparent_parent_and_this_entry_are_never_folded(self):
+        panel = self.panel()
+        rows = panel.split('<li class="ledger-row')
+        # the four unfolded rows plus the three inside the disclosure
+        outside = self.panel().split("</details>")[1]
+        for one in (self.line[4], self.parent, self.here):
+            self.assertIn(f"entry {one}", outside)
+        self.assertGreaterEqual(len(rows), 7)
+
+    def test_this_entry_is_highlighted_and_is_not_a_link(self):
+        panel = self.panel()
+        self.assertIn('<li class="ledger-row here" aria-current="true">', panel)
+        here = panel.split('<li class="ledger-row here"')[1].split("</li>")[0]
+        self.assertIn(f"entry {self.here}", here)
+        # Every other row's name is a link; this one is where the reader is.
+        self.assertNotIn(f'<a href="../{self.here}/">entry {self.here}</a>', here)
+        self.assertIn("generation 7", here)
+
+    def test_every_public_row_carries_a_playable_first_frame(self):
+        panel = self.panel()
+        for one in (self.ids[0], self.parent, self.here):
+            self.assertIn(f'data-run-href="../{one}/sketch/"', panel)
+            self.assertIn(f'<img src="../{one}/strip.png"', panel)
+
+    def test_the_critique_is_the_row_and_is_never_clamped(self):
+        panel = self.panel()
+        parent = panel.split(f'data-run-href="../{self.parent}/sketch/"')[1].split("</li>")[0]
+        self.assertIn('<span class="revise">Revise:</span>', parent)
+        self.assertIn("generation 6: take one more colour out of it", parent)
+        self.assertIn('<span class="chip model">gemma4</span>', parent)
+        self.assertNotIn("clamp", parent)
+
+    def test_the_fork_and_descendant_containers_are_the_scripts_to_fill(self):
+        panel = self.panel()
+        self.assertIn(f'data-ledger="{self.here}"', panel)
+        self.assertIn(f'data-ledger-parent="{self.parent}"', panel)
+        self.assertIn("data-ledger-forks", panel)
+        self.assertIn("data-ledger-tiles", panel)
+        # The sibling itself is painted by gallery.js from lineage.json, which
+        # is why it must be in that file for this entry's parent.
+        index = json.loads((self.dest / "lineage.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [self.here, self.sibling],
+            sorted(index["entries"][str(self.parent)]["children"]),
+        )
+
+    def test_with_no_script_the_children_are_still_named(self):
+        panel = self.panel()
+        child = self.line[7]
+        self.assertIn(f'<a href="../{child}/">entry {child}</a>', panel)
+        self.assertIn("Children:", panel)
+        self.assertIn("After this entry: 1 child", panel)
+
+    def test_a_root_with_no_line_says_so_and_links_nowhere(self):
+        job = db.enqueue(self.conn, "a root nobody has revised", "profcarroll")
+        alone = db.create_entry(
+            self.conn, job, state="published", prompt="a root nobody has revised",
+            submitted_by="profcarroll", published_utc="2026-09-14T06:00:00Z",
+        )
+        db.transition(self.conn, job, "executing")
+        db.transition(self.conn, job, "gating")
+        db.transition(self.conn, job, "held")
+        db.transition(self.conn, job, "published")
+        out = gallery.render_entry(self.conn, alone, self.dest, self.config)
+        page = (out / "index.html").read_text(encoding="utf-8")
+        self.assertIn("a root prompt, no children yet", page)
+        self.assertIn("No children yet.", page)
+        self.assertNotIn(f"lines/{alone}.html", page)
+
+    def test_a_generation_that_is_not_published_is_a_blank_tile_that_counts(self):
+        """Spec §1.6: a line whose middle is missing still counts right."""
+        missing = self.line[4]          # the grandparent, in the unfolded rows
+        self.conn.execute(
+            "UPDATE entries SET state='held', published_utc=NULL WHERE id=?",
+            (missing,),
+        )
+        self.conn.commit()
+        out = gallery.render_entry(self.conn, self.here, self.dest, self.config)
+        panel = self.panel((out / "index.html").read_text(encoding="utf-8"))
+        row = panel.split(f"entry {missing}")[0].rsplit('<li class="ledger-row', 1)[1]
+        self.assertIn('class="ledger-tile narrow blank"', row)
+        self.assertNotIn(f'<img src="../{missing}/strip.png"', panel)
+        self.assertNotIn(f'<a href="../{missing}/">', panel)
+        self.assertIn('<span class="chip unpublished">not published</span>', panel)
+        # and the generations after it keep their numbers
+        self.assertIn("generation 7", panel)
+        self.assertIn("generation 6", panel)
+
+    def test_an_ancestor_that_forked_says_so_and_sends_you_to_the_line(self):
+        # A second child of the root: the ledger does not draw the other
+        # branch, it says the branch is there and where to see it.
+        add_child(
+            self.conn, self.tmp, self.ids[0], state="published",
+            prompt="the same field, a different road", generation=2,
+        )
+        out = gallery.render_entry(self.conn, self.here, self.dest, self.config)
+        panel = self.panel((out / "index.html").read_text(encoding="utf-8"))
+        root = panel.split("</li>")[0]
+        self.assertIn(f'<a href="../../lines/{self.ids[0]}.html">forked</a>', root)
+
+    def test_the_panel_says_what_clicking_a_frame_does(self):
+        self.assertIn("Click a frame to run that sketch in place", self.page)
+        self.assertIn("one at a time", self.page)
+
+
+class HeavyStageTests(GalleryTestCase):
+    """An entry the gate had to grind through does not autoplay (plan §6, the
+    addition): 29 published entries cost more than 100 ms a virtual frame."""
+
+    def reported(self, entry_id, **timings):
+        """Rewrite that entry's gate report with the timings it really had."""
+        row = self.conn.execute(
+            "SELECT source_dir FROM entries WHERE id=?", (entry_id,)
+        ).fetchone()
+        report = Path(row["source_dir"]) / ".gate" / "report.json"
+        data = json.loads(report.read_text(encoding="utf-8"))
+        data["timings"].update(timings)
+        report.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    def page_of(self, entry_id):
+        out = gallery.render_entry(self.conn, entry_id, self.dest, self.config)
+        return (out / "index.html").read_text(encoding="utf-8")
+
+    def test_the_timings_reach_meta_json_inside_gate(self):
+        self.reported(self.ids[0], total_s=208.8, ms_per_frame=1093.0)
+        out = gallery.render_entry(self.conn, self.ids[0], self.dest, self.config)
+        meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(208.8, meta["gate"][0]["total_s"])
+        self.assertEqual(1093.0, meta["gate"][0]["ms_per_frame"])
+        # inside gate, so the key list the spec fixes does not move
+        self.assertEqual(set(gallery.META_KEYS), set(meta))
+
+    def test_a_report_with_no_frame_rate_records_null_rather_than_a_guess(self):
+        out = gallery.render_entry(self.conn, self.ids[0], self.dest, self.config)
+        meta = json.loads((out / "meta.json").read_text(encoding="utf-8"))
+        self.assertIsNone(meta["gate"][0]["ms_per_frame"])
+        self.assertEqual(1.42, meta["gate"][0]["total_s"])
+
+    def test_an_ordinary_entry_still_autoplays(self):
+        page = self.page_of(self.ids[0])
+        self.assertIn('<iframe class="sketch" src="sketch/"', page)
+        self.assertNotIn("data-stage-run", page)
+        self.assertNotIn("chip heavy", page)
+
+    def test_over_the_frame_budget_the_stage_waits_for_a_click(self):
+        self.reported(self.ids[0], total_s=208.8, ms_per_frame=1093.0)
+        page = self.page_of(self.ids[0])
+        self.assertNotIn('<iframe class="sketch" src="sketch/"', page)
+        self.assertIn("data-stage-run", page)
+        self.assertIn('data-run-href="sketch/"', page)
+        self.assertIn('<img src="strip.png"', page)
+        self.assertIn('<span class="chip heavy">heavy · 1093 ms per frame</span>',
+                      html.unescape(page))
+
+    def test_a_slow_run_with_no_frame_rate_is_heavy_too(self):
+        self.reported(self.ids[0], total_s=42.0)
+        page = self.page_of(self.ids[0])
+        self.assertIn("data-stage-run", page)
+        self.assertIn("heavy · 42 s in the gate", html.unescape(page))
+
+    def test_the_budget_is_a_ceiling_not_a_target(self):
+        # Exactly at the budget is not over it.
+        self.reported(self.ids[0], total_s=12.0, ms_per_frame=100.0)
+        page = self.page_of(self.ids[0])
+        self.assertIn('<iframe class="sketch" src="sketch/"', page)
 class PublishRejectedTests(GalleryTestCase):
     """§5.4: the one-time backfill of the rejections that were only a state flip."""
 
