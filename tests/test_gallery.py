@@ -371,6 +371,57 @@ def build_db(tmp: Path):
     return conn, (entry1, entry2, entry3)
 
 
+def add_child(conn, tmp: Path, parent_entry: int, *, state: str = "held",
+              prompt: str = "the same field, slower, in one colour",
+              critique: str = "let the whole thing slow down and lose a colour",
+              generation: int = 3) -> int:
+    """One more entry in the line, with a real attempt directory behind it.
+
+    ``held`` by default, because a held child of a published parent is exactly
+    what the publisher renders and exactly what used to lose its parent link.
+    """
+    jobs = tmp / "jobs"
+    job = db.enqueue(
+        conn, prompt, "profcarroll",
+        brief="One hue, half the speed.", assertions=["motion(idle)"],
+        planner="gemma4:e4b", executor="qwen3.5:4b", rules_file="treatment",
+        parent_entry_id=parent_entry, critique=critique, critique_by="profcarroll",
+    )
+    attempt = write_attempt(jobs, job, 1, "good-motion", STATEMENT_ONE,
+                            exit_code=0, assertions=["motion(idle)"])
+    db.add_attempt(
+        conn, job, 1, model="qwen3.5:4b", rules_file="treatment",
+        prompt_version="executor.md v1", prompt_tokens=1100, completion_tokens=640,
+        wall_s=70.1, source_dir=str(attempt), gate_exit=0,
+        gate_report_path=str(attempt / ".gate" / "report.json"),
+        statement=STATEMENT_ONE,
+    )
+    db.transition(conn, job, "executing")
+    db.transition(conn, job, "gating")
+    db.transition(conn, job, "held")
+    if state == "published":
+        db.transition(conn, job, "published")
+    entry = db.create_entry(
+        conn, job, state=state, prompt=prompt,
+        brief="One hue, half the speed.", statement=STATEMENT_ONE,
+        planner="gemma4:e4b", planner_prompt_version="planner.md v1",
+        executor="qwen3.5:4b", executor_prompt_version="executor.md v1",
+        rules_file="treatment", assertions_json=json.dumps(["motion(idle)"]),
+        attempts=1, prompt_tokens=1100, completion_tokens=640, wall_s=70.1,
+        shape="VM.Standard.A1.Flex 16/96", seed=1, submitted_by="profcarroll",
+        parent_entry_id=parent_entry, source_dir=str(attempt),
+        strip_path=str(attempt / ".gate" / "strip.png"),
+        png_path=str(attempt / ".gate" / "gate.png"),
+        published_utc="2026-09-14T05:00:00Z" if state == "published" else None,
+        publish_commit=None,
+    )
+    db.add_lineage(
+        conn, entry, parent_entry, generation=generation,
+        critique_by="profcarroll", critique=critique,
+    )
+    return entry
+
+
 class GalleryTestCase(unittest.TestCase):
     """One temp database, one temp gallery checkout, per test."""
 
@@ -581,6 +632,52 @@ class MetaTests(GalleryTestCase):
         self.assertEqual(meta["attempts"], 2)
         self.assertIn("AudioContext is suspended", meta["last_error"])
         self.assertEqual(len(meta["gate"]), 2)
+
+
+class PublishTimeLineageTests(GalleryTestCase):
+    """The entry being published is in its own forest (packet 1, spec §4.1).
+
+    Before this, ``_forest`` was built over the public entries only and the
+    publisher renders while the row is still held, so the entry looked up its
+    own parent, missed, and froze ``null`` into meta.json. The parent's own
+    meta lost the child for the same reason.
+    """
+
+    def test_publishing_a_held_child_records_its_parent(self):
+        parent = self.ids[1]
+        child = add_child(self.conn, self.tmp, parent)
+        gallery.render_entry(self.conn, child, self.dest, self.config, publishing=True)
+        meta = json.loads(
+            (self.dest / "e" / str(child) / "meta.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(parent, meta["lineage"]["parent_entry_id"])
+        self.assertEqual(3, meta["lineage"]["generation"])
+        self.assertEqual(self.ids[0], meta["lineage"]["root_entry_id"])
+
+    def test_the_admitted_entry_is_a_child_in_the_forest(self):
+        parent = self.ids[1]
+        child = add_child(self.conn, self.tmp, parent)
+        forest_parent, children = gallery._forest(self.conn, admit=child)
+        self.assertEqual(parent, forest_parent[child])
+        self.assertIn(child, children[parent])
+
+    def test_without_admit_the_forest_is_the_public_entries_alone(self):
+        # The site's tree pages render entries that are already public and must
+        # not start showing held ones; only the publisher admits its own entry.
+        parent = self.ids[1]
+        child = add_child(self.conn, self.tmp, parent)
+        _, children = gallery._forest(self.conn)
+        self.assertNotIn(child, children)
+        self.assertNotIn(child, children[parent])
+
+    def test_the_parent_gains_the_child_once_the_child_is_published(self):
+        parent = self.ids[1]
+        child = add_child(self.conn, self.tmp, parent, state="published")
+        self.render()
+        meta = json.loads(
+            (self.dest / "e" / str(parent) / "meta.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual([child], meta["lineage"]["children"])
 
 
 class IndexTests(GalleryTestCase):
