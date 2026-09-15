@@ -89,6 +89,11 @@ FUNNEL_NAMES = (
     "held",
     "rejected",
     "failed_kept",
+    # Entries the operator took off their lists without deleting anything
+    # (lineage ledger §5.1). There is no archived JOB state — the job reuses
+    # 'rejected' — so this row's "now" is always zero: nothing is ever in
+    # flight towards being archived, a person just does it.
+    "archived",
     "children",
 )
 
@@ -857,9 +862,10 @@ def _funnel(conn: sqlite3.Connection, since: str | None) -> dict[str, Any]:
         ("held", "held", "held"),
         ("rejected", "rejected", "rejected"),
         ("failed_kept", "failed-kept", "failed"),
+        ("archived", "archived", None),
     ):
         total, session = entries(state)
-        funnel[name] = row(jobs_in(job_state), total, session)
+        funnel[name] = row(jobs_in(job_state) if job_state else 0, total, session)
     funnel["children"] = row(in_flight_children, children_total, children_session)
     assert set(funnel) == set(FUNNEL_NAMES)  # the contract, checked in place
     return funnel
