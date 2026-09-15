@@ -220,7 +220,7 @@ summary.filter-label::before { content: "\25b8\a0"; }
   border-radius: 10px;
   box-shadow: var(--shadow);
   overflow: hidden;
-  padding: 0 0 0.75rem;
+  padding: 0 0 0.55rem;
 }
 
 .card .thumb { margin: 0; }
@@ -230,16 +230,18 @@ summary.filter-label::before { content: "\25b8\a0"; }
   -webkit-box-orient: vertical;
   -webkit-line-clamp: 2;
   line-clamp: 2;
-  margin: 0.6rem 0.75rem 0.3rem;
-  max-height: 3rem;
+  font-size: 0.85rem;
+  margin: 0.45rem 0.6rem 0.2rem;
+  max-height: 2.6rem;
   overflow: hidden;
 }
 .card-prompt a { color: inherit; text-decoration: none; }
 .card-meta, .card-counts, .reason {
   color: var(--ink-soft);
-  font-size: 0.85rem;
-  margin: 0.2rem 0.75rem 0;
+  font-size: 0.8rem;
+  margin: 0.15rem 0.6rem 0;
 }
+.card-meta:empty { display: none; }
 .reason { color: var(--failed-ink); }
 .tag { background: var(--chip); border-radius: 999px; padding: 0.05rem 0.5rem; }
 
@@ -252,7 +254,7 @@ summary.filter-label::before { content: "\25b8\a0"; }
  * a guess and is drawn faint, one drawn on eight pairs or more is solid. Only
  * `left` and `opacity` are set per mark, on the mark itself, because only they
  * differ from card to card; everything else about the look is here. */
-.standing { display: flex; flex-direction: column; gap: 0.35rem; margin: 0.45rem 0.75rem 0; }
+.standing { display: flex; flex-direction: column; gap: 0.3rem; margin: 0.35rem 0.6rem 0; }
 .bar-row {
   align-items: center;
   color: var(--ink-soft);
