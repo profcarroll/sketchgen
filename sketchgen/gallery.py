@@ -13,6 +13,7 @@ One entry row plus its attempt directory in, a directory of plain files out:
     <gallery>/rejections.html            the gate's rejections, kept
     <gallery>/compare.html               the paired-judgment shell
     <gallery>/pairs.json                 balanced pairs to offer, and agent verdicts
+    <gallery>/lineage.json               every entry's place in its line
     <gallery>/lines/<root>.html          one page per lineage line
     <gallery>/assets/gallery.{css,js}
     <gallery>/config.json                write-path base URL, gallery URL
@@ -56,6 +57,7 @@ from pathlib import Path
 from string import Template
 from typing import Any, Iterable
 
+from . import db as db_mod
 from . import pairs as pairs_mod
 from . import lineage
 
@@ -430,9 +432,23 @@ def _public_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return rows
 
 
-def _forest(conn: sqlite3.Connection) -> tuple[dict[int, int | None], dict[int, list[int]]]:
-    """(parent by id, children by id) over the public entries, id order."""
+def _forest(
+    conn: sqlite3.Connection, *, admit: int | None = None
+) -> tuple[dict[int, int | None], dict[int, list[int]]]:
+    """(parent by id, children by id) over the public entries, id order.
+
+    ``admit`` is the entry being published: the publisher renders it while the
+    row is still ``held``, because the row only flips once the push of these
+    files lands. Without it the entry is absent from the forest, its own parent
+    lookup misses, and ``null`` is frozen into its meta.json forever — which is
+    how 74 of 101 public non-root entries came to claim they have no parent.
+    Admitting the one entry we are in the middle of publishing is the fix; the
+    site's tree pages, which render entries that are already public, pass
+    nothing and are unchanged.
+    """
     ids = [int(row["id"]) for row in _public_rows(conn)]
+    if admit is not None and int(admit) not in ids:
+        ids.append(int(admit))
     parent: dict[int, int | None] = {}
     children: dict[int, list[int]] = {i: [] for i in ids}
     for entry_id in ids:
@@ -454,6 +470,114 @@ def _root_of(parent: dict[int, int | None], entry_id: int) -> int:
             return walk
         seen.add(walk)
         walk = mother
+
+
+#: A ``lineage.json`` larger than this is a page weight problem, not a ledger.
+#: The whole file is fetched by every entry page.
+LINEAGE_JSON_LIMIT = 100 * 1024
+#: What a root prompt shrinks to if the file ever crosses that line.
+LINEAGE_ROOT_PROMPT_CAP = 200
+
+
+def _is_public(row: Any) -> bool:
+    """On the site: a public state AND the stamp a successful push leaves."""
+    return row["state"] in PUBLIC_STATES and bool(row["published_utc"])
+
+
+def _every_entry(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return list(conn.execute("SELECT * FROM entries ORDER BY id"))
+
+
+def _whole_forest(
+    conn: sqlite3.Connection, ids: list[int]
+) -> tuple[dict[int, int | None], dict[int, list[int]]]:
+    """Like :func:`_forest`, but over every entry whatever its state.
+
+    The site's tree pages must not link to a held or rejected entry, which is
+    why ``_forest`` stops at the public ones. The ledger has the opposite job:
+    a generation that is not published is still a generation, and a line whose
+    middle is missing counts wrong (spec §1.6).
+    """
+    parent: dict[int, int | None] = {}
+    children: dict[int, list[int]] = {i: [] for i in ids}
+    for entry_id in ids:
+        mother = _parent_of(conn, entry_id)
+        parent[entry_id] = mother if mother in children and mother != entry_id else None
+    for entry_id in sorted(ids):
+        mother = parent[entry_id]
+        if mother is not None:
+            children[mother].append(entry_id)
+    return parent, children
+
+
+def _lineage_index(
+    conn: sqlite3.Connection, generated_utc: str
+) -> dict[str, Any]:
+    """The ledger's data file: every entry, its place in its line, one shape.
+
+    The entry page carries its own ancestry as static HTML — it was true when
+    the entry was published and it stays true — but siblings, children and the
+    state of a not-yet-published relative all change afterwards, and a page
+    that was rendered last month cannot know them. ``gallery.js`` paints those
+    from this file, so it holds every entry in the table whatever its state
+    and resolves parents through ``_parent_of`` regardless of the parent's
+    state, which is where it deliberately differs from ``_forest``.
+
+    Nothing private leaves: a non-public entry carries its shape in the line
+    and nothing of its own — no strip, no prompt, not even who submitted it.
+    """
+    rows = _every_entry(conn)
+    ids = [int(row["id"]) for row in rows]
+    parent, children = _whole_forest(conn, ids)
+
+    def payload(cap: int | None) -> dict[str, Any]:
+        entries: dict[str, Any] = {}
+        for row in rows:
+            entry_id = int(row["id"])
+            link = _lineage_row(conn, entry_id)
+            public = _is_public(row)
+            item: dict[str, Any] = {
+                "state": row["state"],
+                "public": public,
+                "parent": parent[entry_id],
+                "children": list(children[entry_id]),
+                # The same number meta.json carries, computed the same way, so
+                # a page and this file never disagree about a generation.
+                "generation": int(link["generation"]) if link is not None else 1,
+                "root": _root_of(parent, entry_id),
+                "critique": link["critique"] if link is not None else None,
+                "critique_by": link["critique_by"] if link is not None else None,
+            }
+            if public:
+                root_prompt, _ = lineage.split_prompt(str(row["prompt"] or ""))
+                if cap is not None:
+                    root_prompt = root_prompt[:cap]
+                item["submitted_by"] = row["submitted_by"]
+                item["strip"] = f"e/{entry_id}/strip.png"
+                item["root_prompt"] = root_prompt
+            entries[str(entry_id)] = item
+        return {"generated_utc": generated_utc, "entries": entries}
+
+    data = payload(None)
+    if len(_lineage_bytes(data)) > LINEAGE_JSON_LIMIT:
+        # The critiques are the point of the file, so the prompts are what
+        # gives. It buys about two kilobytes in two hundred and sixty-eight
+        # entries: if this file ever needs real slimming it is the critiques
+        # that have to move, not the prompts.
+        data = payload(LINEAGE_ROOT_PROMPT_CAP)
+    return data
+
+
+def _lineage_bytes(data: dict[str, Any]) -> bytes:
+    """``lineage.json`` as it is written: no indent, because nothing reads it.
+
+    ``pairs.json`` is indented because a person opens it; this one is fetched
+    by every entry page on the site and the indentation costs 28 KB of the
+    100 KB budget for whitespace nobody sees.
+    """
+    return (
+        json.dumps(data, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
 
 
 def _descendants(children: dict[int, list[int]], root: int) -> list[int]:
@@ -1227,7 +1351,7 @@ def render_entry(
     config = _resolve_config(dest, config)
     row = _entry(conn, int(entry_id), publishing=publishing)
     attempts = _attempt_rows(conn, int(row["job_id"]))
-    parent, children = _forest(conn)
+    parent, children = _forest(conn, admit=int(entry_id))
     written = _Written(dest)
     try:
         out = _write_entry(conn, row, attempts, dest, config, parent, children, written)
@@ -1590,8 +1714,16 @@ def render_index(
     conn: sqlite3.Connection,
     dest_dir: str | Path,
     config: Config | None = None,
+    *,
+    generated_utc: str | None = None,
 ) -> list[Path]:
-    """Write the grid, the failures, compare, the line pages, assets and config."""
+    """Write the grid, the failures, compare, the line pages, assets and config.
+
+    ``generated_utc`` is the one clock this module reads, and it reaches only
+    ``lineage.json``, whose shape the spec fixes with that field in it. Pass a
+    stamp to keep a render byte-identical to another one; every page is
+    unaffected either way.
+    """
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
     published = _entries(conn, "published")
@@ -1643,6 +1775,12 @@ def render_index(
             )
             + "\n",
         )
+        written.write_text(
+            dest / "lineage.json",
+            _lineage_bytes(
+                _lineage_index(conn, generated_utc or db_mod.utc_now())
+            ).decode("utf-8"),
+        )
         # Every public entry, not just the published ones: a kept rejection's
         # entry page links here with ?a=<itself> and the page has to know that
         # id to honour it.
@@ -1673,11 +1811,13 @@ def render_all(
     conn: sqlite3.Connection,
     dest_dir: str | Path,
     config: Config | None = None,
+    *,
+    generated_utc: str | None = None,
 ) -> list[Path]:
     """Every public entry, then the pages that index them."""
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
-    written = render_index(conn, dest, config)
+    written = render_index(conn, dest, config, generated_utc=generated_utc)
     for row in _public_rows(conn):
         written.append(render_entry(conn, int(row["id"]), dest, config))
     return written

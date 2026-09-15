@@ -371,6 +371,57 @@ def build_db(tmp: Path):
     return conn, (entry1, entry2, entry3)
 
 
+def add_child(conn, tmp: Path, parent_entry: int, *, state: str = "held",
+              prompt: str = "the same field, slower, in one colour",
+              critique: str = "let the whole thing slow down and lose a colour",
+              generation: int = 3) -> int:
+    """One more entry in the line, with a real attempt directory behind it.
+
+    ``held`` by default, because a held child of a published parent is exactly
+    what the publisher renders and exactly what used to lose its parent link.
+    """
+    jobs = tmp / "jobs"
+    job = db.enqueue(
+        conn, prompt, "profcarroll",
+        brief="One hue, half the speed.", assertions=["motion(idle)"],
+        planner="gemma4:e4b", executor="qwen3.5:4b", rules_file="treatment",
+        parent_entry_id=parent_entry, critique=critique, critique_by="profcarroll",
+    )
+    attempt = write_attempt(jobs, job, 1, "good-motion", STATEMENT_ONE,
+                            exit_code=0, assertions=["motion(idle)"])
+    db.add_attempt(
+        conn, job, 1, model="qwen3.5:4b", rules_file="treatment",
+        prompt_version="executor.md v1", prompt_tokens=1100, completion_tokens=640,
+        wall_s=70.1, source_dir=str(attempt), gate_exit=0,
+        gate_report_path=str(attempt / ".gate" / "report.json"),
+        statement=STATEMENT_ONE,
+    )
+    db.transition(conn, job, "executing")
+    db.transition(conn, job, "gating")
+    db.transition(conn, job, "held")
+    if state == "published":
+        db.transition(conn, job, "published")
+    entry = db.create_entry(
+        conn, job, state=state, prompt=prompt,
+        brief="One hue, half the speed.", statement=STATEMENT_ONE,
+        planner="gemma4:e4b", planner_prompt_version="planner.md v1",
+        executor="qwen3.5:4b", executor_prompt_version="executor.md v1",
+        rules_file="treatment", assertions_json=json.dumps(["motion(idle)"]),
+        attempts=1, prompt_tokens=1100, completion_tokens=640, wall_s=70.1,
+        shape="VM.Standard.A1.Flex 16/96", seed=1, submitted_by="profcarroll",
+        parent_entry_id=parent_entry, source_dir=str(attempt),
+        strip_path=str(attempt / ".gate" / "strip.png"),
+        png_path=str(attempt / ".gate" / "gate.png"),
+        published_utc="2026-09-14T05:00:00Z" if state == "published" else None,
+        publish_commit=None,
+    )
+    db.add_lineage(
+        conn, entry, parent_entry, generation=generation,
+        critique_by="profcarroll", critique=critique,
+    )
+    return entry
+
+
 class GalleryTestCase(unittest.TestCase):
     """One temp database, one temp gallery checkout, per test."""
 
@@ -419,6 +470,7 @@ class TreeTests(GalleryTestCase):
             f"e/{three}/index.html",
             "rejections.html",
             "index.html",
+            "lineage.json",
             f"lines/{one}.html",
         ]
         for relative in expected:
@@ -581,6 +633,171 @@ class MetaTests(GalleryTestCase):
         self.assertEqual(meta["attempts"], 2)
         self.assertIn("AudioContext is suspended", meta["last_error"])
         self.assertEqual(len(meta["gate"]), 2)
+
+
+class PublishTimeLineageTests(GalleryTestCase):
+    """The entry being published is in its own forest (packet 1, spec §4.1).
+
+    Before this, ``_forest`` was built over the public entries only and the
+    publisher renders while the row is still held, so the entry looked up its
+    own parent, missed, and froze ``null`` into meta.json. The parent's own
+    meta lost the child for the same reason.
+    """
+
+    def test_publishing_a_held_child_records_its_parent(self):
+        parent = self.ids[1]
+        child = add_child(self.conn, self.tmp, parent)
+        gallery.render_entry(self.conn, child, self.dest, self.config, publishing=True)
+        meta = json.loads(
+            (self.dest / "e" / str(child) / "meta.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(parent, meta["lineage"]["parent_entry_id"])
+        self.assertEqual(3, meta["lineage"]["generation"])
+        self.assertEqual(self.ids[0], meta["lineage"]["root_entry_id"])
+
+    def test_the_admitted_entry_is_a_child_in_the_forest(self):
+        parent = self.ids[1]
+        child = add_child(self.conn, self.tmp, parent)
+        forest_parent, children = gallery._forest(self.conn, admit=child)
+        self.assertEqual(parent, forest_parent[child])
+        self.assertIn(child, children[parent])
+
+    def test_without_admit_the_forest_is_the_public_entries_alone(self):
+        # The site's tree pages render entries that are already public and must
+        # not start showing held ones; only the publisher admits its own entry.
+        parent = self.ids[1]
+        child = add_child(self.conn, self.tmp, parent)
+        _, children = gallery._forest(self.conn)
+        self.assertNotIn(child, children)
+        self.assertNotIn(child, children[parent])
+
+    def test_the_parent_gains_the_child_once_the_child_is_published(self):
+        parent = self.ids[1]
+        child = add_child(self.conn, self.tmp, parent, state="published")
+        self.render()
+        meta = json.loads(
+            (self.dest / "e" / str(parent) / "meta.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual([child], meta["lineage"]["children"])
+
+
+class LineageJsonTests(GalleryTestCase):
+    """<gallery>/lineage.json, the shape packet 3's panel reads (spec §4.2)."""
+
+    def setUp(self):
+        super().setUp()
+        # A line of four: 1 -> 2 (both published from build_db), then a third
+        # published generation, then a held child nobody has published.
+        self.third = add_child(
+            self.conn, self.tmp, self.ids[1], state="published",
+            prompt="the same field, slower, in one colour", generation=3,
+        )
+        self.held = add_child(
+            self.conn, self.tmp, self.third, state="held",
+            prompt="slower still, and let the ground breathe",
+            critique="slow it further and let the ground breathe",
+            generation=4,
+        )
+        self.render()
+        self.data = json.loads(
+            (self.dest / "lineage.json").read_text(encoding="utf-8")
+        )
+        self.entries = self.data["entries"]
+
+    def test_the_file_is_stamped_and_keyed_by_entry_id_as_a_string(self):
+        self.assertRegex(
+            self.data["generated_utc"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
+        )
+        self.assertEqual({"generated_utc", "entries"}, set(self.data))
+        self.assertEqual(
+            sorted(str(i) for i in (*self.ids, self.third, self.held)),
+            sorted(self.entries),
+        )
+
+    def test_every_entry_is_here_whatever_its_state(self):
+        # including the held child, which is on no page of the site at all
+        self.assertIn(str(self.held), self.entries)
+        self.assertEqual("held", self.entries[str(self.held)]["state"])
+        self.assertFalse(self.entries[str(self.held)]["public"])
+
+    def test_a_public_entry_carries_its_strip_prompt_and_submitter(self):
+        item = self.entries[str(self.ids[1])]
+        self.assertTrue(item["public"])
+        self.assertEqual("published", item["state"])
+        self.assertEqual(self.ids[0], item["parent"])
+        self.assertEqual([self.third], item["children"])
+        self.assertEqual(2, item["generation"])
+        self.assertEqual(self.ids[0], item["root"])
+        self.assertEqual("astudent", item["submitted_by"])
+        self.assertEqual(f"e/{self.ids[1]}/strip.png", item["strip"])
+        self.assertEqual(
+            "the same field, but it holds still and earns it", item["root_prompt"]
+        )
+        self.assertIn("The motion is doing the work", item["critique"])
+        self.assertEqual("gemma4:e4b", item["critique_by"])
+
+    def test_a_non_public_entry_carries_nothing_of_its_own(self):
+        item = self.entries[str(self.held)]
+        self.assertEqual(
+            {"state", "public", "parent", "children", "generation", "root",
+             "critique", "critique_by"},
+            set(item),
+        )
+        # its place in the line, and its critique, which came from its parent
+        self.assertEqual(self.third, item["parent"])
+        self.assertEqual([], item["children"])
+        self.assertEqual(4, item["generation"])
+        self.assertEqual(self.ids[0], item["root"])
+        self.assertEqual("slow it further and let the ground breathe", item["critique"])
+
+    def test_a_held_child_counts_as_a_child_of_its_public_parent(self):
+        # _forest stops at the public entries; this file does not, which is the
+        # whole reason the panel can say a generation exists but is not shown.
+        self.assertEqual([self.held], self.entries[str(self.third)]["children"])
+
+    def test_a_root_has_no_parent_and_is_its_own_root(self):
+        item = self.entries[str(self.ids[0])]
+        self.assertIsNone(item["parent"])
+        self.assertEqual(self.ids[0], item["root"])
+        self.assertIsNone(item["critique"])
+        self.assertIsNone(item["critique_by"])
+        self.assertEqual([self.ids[1]], item["children"])
+
+    def test_the_root_prompt_is_the_prompt_without_its_revisions(self):
+        composed = gallery.lineage.compose_prompt(
+            "a cityscape from sunrise to sunset", "try a colder palette"
+        )
+        self.conn.execute(
+            "UPDATE entries SET prompt = ? WHERE id = ?", (composed, self.ids[1])
+        )
+        data = gallery._lineage_index(self.conn, "2026-09-14T04:02:11Z")
+        self.assertEqual(
+            "a cityscape from sunrise to sunset",
+            data["entries"][str(self.ids[1])]["root_prompt"],
+        )
+
+    def test_the_file_stays_under_a_hundred_kilobytes(self):
+        self.assertLess(
+            (self.dest / "lineage.json").stat().st_size, gallery.LINEAGE_JSON_LIMIT
+        )
+
+    def test_over_the_limit_the_root_prompts_are_capped(self):
+        long_prompt = "x" * 4_000
+        for entry_id in (*self.ids, self.third):
+            self.conn.execute(
+                "UPDATE entries SET prompt = ? WHERE id = ?", (long_prompt, entry_id)
+            )
+        # The real limit at three hundred entries; here, a limit these four
+        # entries can cross, which is the same arithmetic.
+        limit = gallery.LINEAGE_JSON_LIMIT
+        gallery.LINEAGE_JSON_LIMIT = 4_000
+        self.addCleanup(setattr, gallery, "LINEAGE_JSON_LIMIT", limit)
+        data = gallery._lineage_index(self.conn, "2026-09-14T04:02:11Z")
+        for entry_id in (*self.ids, self.third):
+            self.assertEqual(
+                gallery.LINEAGE_ROOT_PROMPT_CAP,
+                len(data["entries"][str(entry_id)]["root_prompt"]),
+            )
 
 
 class IndexTests(GalleryTestCase):
@@ -1321,6 +1538,15 @@ class GuardTests(GalleryTestCase):
 
 class DeterminismTests(GalleryTestCase):
 
+    def render(self):
+        # lineage.json carries a generated_utc, the one clock a render reads.
+        # Pinning it here is what lets this test ask the question it means to
+        # ask — does the same database give the same bytes — rather than
+        # whether the two renders fell in the same second.
+        return gallery.render_all(
+            self.conn, self.dest, self.config, generated_utc="2026-09-14T04:02:11Z"
+        )
+
     def test_a_second_render_all_is_byte_identical(self):
         self.render()
         first = {
@@ -1338,6 +1564,60 @@ class DeterminismTests(GalleryTestCase):
         for name, data in first.items():
             with self.subTest(path=str(name)):
                 self.assertEqual(data, second[name])
+
+
+class RenderAllRereadsTests(GalleryTestCase):
+    """render-all rebuilds the record and touches no row (spec §4.4).
+
+    It is run once on the node after the forest fix, over entries published
+    months ago, so the question it has to answer is whether re-rendering an
+    entry rewrites anything about when or how it was published. It does not:
+    every stamp on the page comes from the row, and the generator only writes
+    files.
+    """
+
+    def stamps(self):
+        return {
+            int(row["id"]): (row["state"], row["published_utc"], row["publish_commit"])
+            for row in self.conn.execute(
+                "SELECT id, state, published_utc, publish_commit FROM entries"
+            )
+        }
+
+    def test_re_rendering_rewrites_the_files_and_no_row(self):
+        self.conn.execute(
+            "UPDATE entries SET publish_commit = ? WHERE id = ?",
+            ("0123456789abcdef0123456789abcdef01234567", self.ids[0]),
+        )
+        self.render()
+        before = self.stamps()
+        entry_dir = self.dest / "e" / str(self.ids[0])
+        meta_before = (entry_dir / "meta.json").read_text(encoding="utf-8")
+        shutil.rmtree(entry_dir)
+
+        self.render()
+
+        self.assertEqual(before, self.stamps())
+        self.assertTrue((entry_dir / "index.html").is_file())
+        self.assertEqual(meta_before, (entry_dir / "meta.json").read_text(encoding="utf-8"))
+        meta = json.loads(meta_before)
+        self.assertEqual("2026-09-14T04:02:11Z", meta["published_utc"])
+        self.assertEqual(
+            "0123456789abcdef0123456789abcdef01234567", meta["publish_commit"]
+        )
+
+    def test_the_cli_render_all_leaves_the_stamps_alone(self):
+        before = self.stamps()
+        result = subprocess.run(
+            [sys.executable, str(CLI), "render-all",
+             "--gallery-dir", str(self.dest),
+             "--db", str(self.tmp / "sketchgen.db"),
+             "--write-path", "https://write.example.invalid/api"],
+            capture_output=True, text=True, check=False, env=dict(os.environ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(before, self.stamps())
+        self.assertIn(str(self.dest / "lineage.json"), result.stdout)
 
 
 class CommandLineTests(GalleryTestCase):
