@@ -1,0 +1,25 @@
+# The node's virtualenv (~/sketchgen/.venv), pinned.
+#
+# The pipeline itself is stdlib-only and this file is not needed to run the
+# tests, the CLI, the operator UI or the renderer. It exists for one dependency:
+# the gate drives headless Chromium through Playwright, and the gate is the
+# referee, so a rebuilt node that silently gets a different Playwright is a node
+# whose verdicts are not comparable with the ones already in the database.
+#
+# 1.62.0 is what the node has been running since 2026-09-14; it was read off the
+# instance, not chosen. The other three lines are Playwright's own dependencies,
+# pinned to what it resolved to there, so that recovery reproduces the venv
+# rather than re-resolves it.
+#
+#   python3 -m venv ~/sketchgen/.venv
+#   ~/sketchgen/.venv/bin/pip install -r ~/sketchgen/app/requirements.txt
+#   ~/sketchgen/.venv/bin/playwright install chromium
+#
+# The browser is NOT pip-installable and is not in this file: `playwright
+# install chromium` downloads it into ~/.cache/ms-playwright. Recovery has to
+# run that line too — docs/OPERATIONS.md, Recovery.
+
+playwright==1.62.0
+greenlet==3.5.5
+pyee==13.0.1
+typing_extensions==4.16.0
