@@ -83,11 +83,11 @@ Venue: **etk-cloud**, the operator's second Oracle node (4 CPU, 23 GB, aarch64, 
 
 Owner: one agent. No UI. Everything else depends on the JSON shape here, so it is fixed in this document and other packets can build against it in parallel.
 
-### 5.1 Fix the forest at publish time
+### 4.1 Fix the forest at publish time
 
 In `sketchgen/gallery.py`, `_forest(conn, *, admit: int | None = None)` includes `admit` in `ids` when given. `render_entry(..., publishing=True)` passes the entry being published. `_meta` then records the real parent. Add a test in `tests/test_gallery.py`: publish a held child of a published parent, assert `meta["lineage"]["parent_entry_id"]` is the parent and the parent appears in `_forest` children.
 
-### 5.2 Generate `lineage.json`
+### 4.2 Generate `lineage.json`
 
 `render_index` writes `<gallery>/lineage.json` next to `pairs.json`. Client code paints the parts of the panel that change after an entry is published (siblings, children, state chips). Shape:
 
@@ -124,15 +124,15 @@ In `sketchgen/gallery.py`, `_forest(conn, *, admit: int | None = None)` includes
 
 Rules: every entry in the `entries` table appears, whatever its state, so generation counts add up. Non-public entries carry no `strip`, no `root_prompt`, no `submitted_by`. `public` is true for states in `PUBLIC_STATES` with `published_utc` set. `parent` comes from `_parent_of` regardless of the parent's state (this is the difference from `_forest`, which is for the site's tree pages and stays as it is). `root_prompt` is the prompt split at the first `REVISE_HEADING`. Keep it under 100 KB at 300 entries; if `critique` pushes it over, truncate `root_prompt` to 200 characters.
 
-### 5.3 Split the prompt
+### 4.3 Split the prompt
 
 Add `lineage.split_prompt(prompt) -> tuple[str, list[str]]` returning the root sentence and the revisions in order, splitting on `REVISE_HEADING`. Round-trips with `compose_prompt`. Tests in `tests/test_lineage.py` including a root with no revisions and a prompt containing the heading text mid-sentence (split only on the heading as `compose_prompt` writes it, at a line start).
 
-### 5.4 Re-render every entry once
+### 4.4 Re-render every entry once
 
 `sketchgen gallery render-all` (the existing render-every-public-entry command in `sketchgen/cli/gallery.py`) is run once on the node after 4.1 lands, then the gallery is pushed. Confirm the command regenerates `meta.json` and the entry page, and does not change `published_utc` or `publish_commit`. Document the operator step in `docs/OPERATIONS.md`. Expect one large gallery commit touching every `e/*/meta.json`; that is intended.
 
-### 5.5 Acceptance
+### 4.5 Acceptance
 
 - `_forest` test above passes; existing `test_gallery.py` and `test_publish.py` unchanged.
 - `lineage.json` validates against the shape above in a test that builds a four-entry line with one held child.
@@ -142,7 +142,7 @@ Add `lineage.split_prompt(prompt) -> tuple[str, list[str]]` returning the root s
 
 Owner: one agent. Touches `db.py`, `web.py`, `gallery.py`, operator templates, `cli/gallery.py`.
 
-### 6.1 State machine
+### 5.1 State machine
 
 In `db.py` transitions:
 
@@ -152,7 +152,7 @@ In `db.py` transitions:
 
 `archived` is not in `PUBLIC_STATES`. The job row moves to a matching terminal state; reuse `rejected` on the job with `last_error = "archived by operator"` rather than adding a job state.
 
-### 6.2 Rejected is public
+### 5.2 Rejected is public
 
 - `PUBLIC_STATES = ("published", "failed-kept", "rejected")`.
 - `_state_chip`: `failed-kept` reads `rejected · gate`, `rejected` reads `rejected · operator`. Use the labels `web.py` already has in `STATE_LABELS`.
@@ -161,18 +161,18 @@ In `db.py` transitions:
 - The entry page for a rejected entry carries the chip in `stage-meta` and a one-line note under the stage: "Rejected by the operator: <reason>." Everything else renders as it does for a kept failure.
 - Compare: `pairs.offer` already excludes `rejected` and `failed-kept`; leave that alone.
 
-### 6.3 Archive from the operator UI
+### 5.3 Archive from the operator UI
 
 - `/held/<id>/archive` (POST, form with a `back` field like reject) for held entries.
 - The kept-failures list on the console gets the same button for entries with `published_utc` null.
 - Archived entries disappear from `/held` and the kept list. The console summary gets an `archived` count. No page lists archived entries; they are findable by id through `/entry/<id>` in the operator UI, which should render them read-only with the state.
 - Files are untouched. Add a comment in `reject_entry` and the archive handler saying so, because the question "does rejecting delete the sketch" has already been asked once.
 
-### 6.4 Backfill the 32 existing rejections
+### 5.4 Backfill the 32 existing rejections
 
 `sketchgen gallery publish-rejected [--all | <id>...] [--dry-run]` renders and pushes existing `rejected` entries whose `published_utc` is null, in id order, one commit per entry like the publisher. `reject_reason` for these is the job's `last_error` if it looks like an operator reason, otherwise "rejected by operator (reason not recorded)". Dry run prints the list. This is operator-run once; document in `OPERATIONS.md`.
 
-### 6.5 Acceptance
+### 5.5 Acceptance
 
 - `test_db.py`: the new transitions, and that `published -> archived` is refused.
 - `test_web.py`: reject stores the reason and calls the publish path; archive hides the entry from `/held`; archive on a published entry is refused with a flash, not a 500.
@@ -183,13 +183,13 @@ In `db.py` transitions:
 
 Owner: one agent, after packet 1 merges (or against the JSON shape in 4.2, with a fixture). Touches `templates/entry.html`, `gallery.py` (`_lineage_panel`), `assets/gallery.css`, `assets/gallery.js`. Build to the mockup's option B exactly; the mockup's CSS class names are suggestions, its layout is the spec.
 
-### 7.1 What the server renders
+### 6.1 What the server renders
 
 At publish time the server knows the whole ancestry and it never changes, so the ancestors, the fold, and this entry's row are static HTML in the page. Siblings and descendants change later, so the server renders their container empty with the ids it knows, and `gallery.js` paints them from `lineage.json`. With JavaScript off the page still shows the ancestry and a text line "children: 124" as today.
 
 Panel heading: `Lineage · generation 6 of 10 in the line from entry 11`. The "of 10" is the deepest generation in the line at render time; JS updates it from `lineage.json`.
 
-### 7.2 Rows
+### 6.2 Rows
 
 Each row is a tile and a text block:
 
@@ -198,33 +198,33 @@ Each row is a tile and a text block:
 - Critic chip: `critique_by` containing `:` is a model, chip shows the name before the colon (`gemma4`) in the agent colour; otherwise a human, chip shows the username in the ok colour. The root's chip is `submitted_by`. Non-public rows get the `not published` chip.
 - This entry's row has the highlighted background and ring from the mockup and is not a link.
 
-### 7.3 Folding
+### 6.3 Folding
 
 Always show the root, the grandparent, the parent, and this entry. Ancestors strictly between root and grandparent are folded into one row when there are two or more of them: `▸ 3 generations folded · 21, 27, 42 · all by gemma4` (or `by gemma4 and profcarroll`). The fold is a `details` element whose body holds the folded rows, so it opens without JS. One ancestor between root and grandparent renders inline, no fold.
 
-### 7.4 Forks
+### 6.4 Forks
 
 A sibling (another child of this entry's parent) renders as a nested block under this entry's row: label `also from entry 78`, then sibling rows in the same tile-and-text form at 6.5rem width, sorted by id. Siblings with children add `· N children` after the generation. If this entry has more than four siblings, show four and a link to the line page for the rest.
 
 Ancestor forks (an ancestor with another child) are not drawn in the ledger; the line page shows them. Add `· forked` after that ancestor's generation with a link to the line page.
 
-### 7.5 Descendants
+### 6.5 Descendants
 
 Below a rule: `After this entry: 1 child, 4 generations so far`, then a grid (`minmax(9.5rem, 1fr)`) of direct children first, then further descendants in generation order, up to eight tiles, then `…and N more in the line` linking to the line page. Each tile shows its critique clamped to three lines. No children: `No children yet.` as today.
 
-### 7.6 Non-public generations
+### 6.6 Non-public generations
 
 Where a parent or ancestor is not public, render the row with a blank tile (chip background, no image, no button), `entry N` unlinked, `not published` chip, and the critique that produced it if known, since the critique came from its public parent. Counting continues so generation numbers match `meta.json`.
 
-### 7.7 Run in place
+### 6.7 Run in place
 
 Lift `startSketch`, `stopSketch`, and `runNote` out of `wireCompare` into a shared `runInPlace(container, href)` in `gallery.js` with the same rules: one iframe at a time on the page, `sandbox="allow-scripts"`, the iframe is removed on stop so the sketch unloads, the button reads `stop` while running. The compare page keeps using it; the ledger binds it to every public tile. The frame replaces the image inside the tile at the tile's size, so nothing below it moves. The entry's own stage iframe is not part of this: running a ledger tile does not stop the stage, and a note under the panel says only one ledger tile runs at a time.
 
-### 7.8 Mobile
+### 6.8 Mobile
 
 The ledger is a two-column grid at every width; at 40rem and below the tile is 5.5rem and the text keeps the rest. The descendants grid falls to two columns. Nothing scrolls sideways.
 
-### 7.9 Acceptance
+### 6.9 Acceptance
 
 - `test_gallery.py`: a fixture line of eleven generations with one fork renders the fold, the sibling block, the highlighted row, and the descendants grid; a line with a rejected ancestor renders the blank tile.
 - The rendered panel for entry 82 on a local render matches the mockup's option B in structure.
@@ -246,7 +246,7 @@ Acceptance: `test_gallery.py` covers a root, a generation 1, and a generation 10
 
 Owner: one agent, after packet 2 (it extends the same operator handlers and migration style). Touches `db.py`, `worker.py`, `web.py`, `gallery.py`, `lineage.py`, `cli/lineage.py`, a migration `007_attempts.sql`.
 
-### 9.1 What is there
+### 8.1 What is there
 
 - Every attempt survives on disk: `jobs/<job>/attempt-<n>/` holds `sketch.js`, `index.html`, `statement.md`, `result.json`, and `.gate/` with `report.json`, `gate.png`, `console.log`, and on all but the earliest jobs `strip.png`. Nothing purges them. Counted on 2026-09-15: 67 attempts under the 21 kept failures, 40 failed attempts under published entries, 5 under rejections.
 - An entry is its job's last attempt. `gallery._source_dir` takes `attempts[-1]`; `worker._create_entry` copies the last attempt's statement and gate report into the entry row. `meta.json["gate"]` already logs every attempt's exit and assertions, so provenance for the other attempts exists; the code and frames do not reach the gallery.
@@ -254,7 +254,7 @@ Owner: one agent, after packet 2 (it extends the same operator handlers and migr
 - `lineage.spawn` is by entry and inherits the prompt only. A child never inherits code, so "spawn from attempt 2" changes only which sketch the critic looked at. That is worth recording, not worth a different job.
 - `max_attempts` is per job, default 3. `failed` is terminal in `db.TRANSITIONS`; a job that exhausts its attempts cannot get more.
 
-### 9.2 Publish an attempt over the gate
+### 8.2 Publish an attempt over the gate
 
 `POST /job/<job>/attempt/<n>/publish` with `reason` (required, one line) and `back`. Allowed when the job's entry is `held` or an unpublished `failed-kept`; refused with a flash otherwise. Effect, in one transaction then the ordinary publish path:
 
@@ -267,24 +267,24 @@ Honesty on the page. Everywhere the state chip appears, an override reads `publi
 
 Measurement. Overrides enter the compare pool like any published entry; agents judge blind from the strip and never see the chip. They stay in the Bradley-Terry scores, flagged in `pairs.json` by `gate_override: true` so the divergence analysis can drop them. This is a default, not a finding; the operator can ask for them to be excluded from the scores later without touching the pages.
 
-### 9.3 Spawn from any attempt
+### 8.3 Spawn from any attempt
 
 - `lineage` table gains `parent_attempt INTEGER` (same migration). `lineage.spawn` takes `parent_attempt: int | None = None` and stores it; `record_child` carries it through. `sketchgen lineage critique` and `spawn` take `--attempt N`; the critic reads that attempt's `statement.md` and strip instead of the entry's.
 - The job page gets a spawn form under each attempt's preview, posting to `/entry/<id>/spawn` with a hidden `attempt` field. The held page keeps one form, for the counting attempt.
 - `meta.json["lineage"]["parent_attempt"]` and the ledger row show `critiqued attempt 2` after the generation whenever `parent_attempt` differs from the parent's `published_attempt` or last attempt. `lineage.json` carries `parent_attempt`.
 
-### 9.4 More attempts, and the gate again
+### 8.4 More attempts, and the gate again
 
 Two operator actions for a job whose entry is an unpublished `failed-kept`:
 
 - `POST /job/<job>/continue` with `more` (1 to 5): `max_attempts += more`, job `failed -> queued`, `resume_from` set to the last attempt's number so the worker starts the next attempt as a repair of it rather than from the plan. Add `failed -> queued` to the job transitions for this route only. When the job later reaches `held`, `worker._create_entry` must update the existing entry row (the `job_id` is unique) instead of inserting: add `failed-kept -> held` to entry transitions, and re-derive the row from the new last attempt.
 - `POST /job/<job>/attempt/<n>/regate`: enqueue a gate-only run of that attempt. The worker performs it under the same slot fence (the gate is Chromium, not inference, but two gates at once skew timings). A new report replaces `.gate/report.json` with the old one kept as `report.<utc>.json`; the attempt row's `gate_exit` and `evidence` update. Exit 0 moves the entry to `held` pointing at that attempt, no override recorded, because the gate passed. Use this when the failure was a timeout or a flaky check; use 8.2 when the gate's verdict stands and the operator disagrees with it.
 
-### 9.5 Every attempt reaches the gallery
+### 8.5 Every attempt reaches the gallery
 
 For kept failures, overrides, and operator rejections, `_write_entry` copies each attempt's `sketch.js`, `index.html`, `statement.md`, and `.gate/strip.png` (or `gate.png`) into `e/<id>/attempts/attempt-<n>/`. Published passes copy only the attempt that passed, as now. The entry page gets an `Attempts` panel between Source and Lineage: one tile per attempt with its gate line from `meta["gate"]`, run in place through the packet 3 helper. `meta["source"]["attempts"]` becomes a list of objects `{name, gate_exit, sketch, strip}`. Sizes are small (a sketch is a few KB, a strip about 15 KB), so `render-all` after this lands is the right way to backfill the 21 kept failures.
 
-### 9.6 Acceptance
+### 8.6 Acceptance
 
 - `test_db.py`: the three new transitions and their guards.
 - `test_web.py`: override publish requires a reason and records the operator; refused on a published entry; continue increments `max_attempts` and requeues; regate enqueues without inference.
