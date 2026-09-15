@@ -1192,6 +1192,59 @@ def _byline(row: sqlite3.Row, meta: dict[str, Any]) -> str:
     )
 
 
+def _critic_chip(who: Any) -> str:
+    """Who asked for this revision, as a chip: a model, or a person.
+
+    ``critique_by`` carries a model tag (``gemma4:e4b``) when a critic model
+    wrote the critique and a plain username when a person did. The colon is the
+    whole of the test, and the chip drops the size suffix: the line is about
+    which critic, not which quantisation.
+    """
+    name = " ".join(str(who or "").split())
+    if not name:
+        return '<span class="chip">unknown</span>'
+    if ":" in name:
+        return f'<span class="chip model">{_esc(name.split(":", 1)[0])}</span>'
+    return f'<span class="chip person">{_esc(name)}</span>'
+
+
+def _title_parts(prompt: Any) -> tuple[str, list[str]]:
+    """The prompt as a title wants it: the root sentence, then the revisions.
+
+    The split comes first and the whitespace collapse second. ``Revise:`` only
+    counts at the start of a line, which is the whole reason a prompt with the
+    word in the middle of a sentence stays in one piece — collapse the newlines
+    first and there are no line starts left to split on.
+    """
+    root, revisions = lineage.split_prompt(str(prompt or ""))
+    return " ".join(root.split()), revisions
+
+
+def _subtitle(revisions: list[str], meta: dict[str, Any]) -> str:
+    """The ``p.sub`` under the title: the latest revision, and who asked for it.
+
+    A generation-10 prompt is ten sentences stapled together and reads as none
+    of them. The heading takes the root; this line takes the newest amendment —
+    the one that made *this* entry rather than its parent — and leaves the rest
+    counted, for the lineage panel below to show in full.
+    """
+    if not revisions:
+        return ""
+    link = meta["lineage"]
+    earlier = len(revisions) - 1
+    tail = f" · generation {_esc(link['generation'])}"
+    if earlier:
+        tail += (
+            f" · {earlier} earlier revision{'s' if earlier != 1 else ''} "
+            "in the lineage below"
+        )
+    return (
+        '<p class="sub"><span class="label">Revise:</span> '
+        f"<em>{_esc(revisions[-1])}</em> {_critic_chip(link['critique_by'])}"
+        f'<span class="dim">{tail}</span></p>'
+    )
+
+
 def _frame(has_sketch: bool, title: str) -> str:
     if not has_sketch:
         return (
@@ -1403,7 +1456,11 @@ def _write_entry(
     agent_value, agent_brief, agent_note = _score_slot(scores, "agent", entry_id)
     root = meta["lineage"]["root_entry_id"]
     has_line = bool(_descendants(children, root))
-    title = " ".join(str(row["prompt"] or f"entry {entry_id}").split())
+    # The heading is the root prompt and the subtitle is the newest revision;
+    # the accumulated prompt is untouched in meta.json and in Provenance.
+    title, revisions = _title_parts(row["prompt"] or f"entry {entry_id}")
+    if not title:
+        title = f"entry {entry_id}"
     failed_note = ""
     if row["state"] == "failed-kept":
         job = _job(conn, int(row["job_id"]))
@@ -1418,6 +1475,7 @@ def _write_entry(
         page_title=_esc(title[:80]),
         entry_id=entry_id,
         title=_esc(title),
+        subtitle=_subtitle(revisions, meta),
         byline=_byline(row, meta),
         failed_note=failed_note,
         frame=_frame(has_sketch, title),
@@ -1482,7 +1540,27 @@ def _card(
     scores: dict[str, dict[str, dict]],
 ) -> str:
     entry_id = int(row["id"])
-    prompt = " ".join(str(row["prompt"] or f"entry {entry_id}").split())
+    # The card shows the root prompt and, under it, the revision that made this
+    # entry. data-search below still carries the whole accumulated prompt, so a
+    # word from a fourth-generation critique still finds the card.
+    prompt, revisions = _title_parts(row["prompt"] or f"entry {entry_id}")
+    if not prompt:
+        prompt = f"entry {entry_id}"
+    revision = ""
+    if revisions:
+        # The generation comes from the lineage row, which is what the entry
+        # page and meta.json say, rather than from counting the headings: the
+        # two agree on every entry in the database and the record is the record.
+        link = _lineage_row(conn, entry_id)
+        generation = (
+            int(link["generation"])
+            if link is not None and link["generation"] is not None
+            else len(revisions)
+        )
+        revision = (
+            f'<p class="card-revision">g{_esc(generation)} · '
+            f"{_esc(revisions[-1])}</p>"
+        )
     reason = ""
     chip = ""
     if failed:
@@ -1495,6 +1573,7 @@ def _card(
         href=f"e/{entry_id}/",
         strip=f"e/{entry_id}/strip.png",
         prompt=_esc(prompt),
+        revision=revision,
         chip=chip,
         rules=_esc(row["rules_file"] or "unrecorded"),
         executor=_esc(row["executor"] or "unrecorded"),
@@ -1631,6 +1710,7 @@ def _offered_pairs(conn: sqlite3.Connection) -> list[dict[str, int]]:
 def _line_node(
     item: dict[str, Any],
     by_id: dict[int, sqlite3.Row],
+    root: int | None = None,
 ) -> str:
     """One generation's card: the critique that asked for it, then the entry.
 
@@ -1638,6 +1718,11 @@ def _line_node(
     gets the card and nothing of its own: the generation, and that it is
     waiting. The critique above it came from the public parent and is the reason
     the child exists, so it stays (packet 5.3, spec §8.1).
+
+    Only the root card carries the prompt. Every generation's prompt is its
+    parent's with one critique appended, so a line of eleven cards used to print
+    the root sentence eleven times and the critique twice — once as this card's
+    ``Revise:`` line and again at the tail of the next card's prompt.
     """
     entry_id = int(item["entry_id"])
     depth = min(int(item["generation"]), 6)
@@ -1655,13 +1740,17 @@ def _line_node(
             f'<span class="dim">— critique by '
             f'{_esc(item["critique_by"] or "unknown")}</span></p>'
         )
-    body = (
-        f'<p class="node-prompt">{_esc(" ".join(str(item["prompt"] or "").split()))}</p>'
-        if public
-        else '<p class="node-prompt">This generation has not been through the '
-        "publication gate, so the gallery shows the critique and nothing "
-        "else.</p>"
-    )
+    is_root = root is not None and entry_id == int(root)
+    if is_root:
+        body = f'<p class="node-prompt">{_esc(_title_parts(item["prompt"])[0])}</p>'
+    elif public:
+        body = ""
+    else:
+        body = (
+            '<p class="node-prompt">This generation has not been through the '
+            "publication gate, so the gallery shows the critique and nothing "
+            "else.</p>"
+        )
     return (
         f'<div class="node depth-{depth}">'
         f"{critique}"
@@ -1690,7 +1779,7 @@ def _line_page(
     by_id: dict[int, sqlite3.Row],
 ) -> str:
     generations = lineage.line(conn, root)
-    cards = [_line_node(item, by_id) for item in generations]
+    cards = [_line_node(item, by_id, root) for item in generations]
     deepest = max((int(item["generation"]) for item in generations), default=0)
     if any(item["at_limit"] for item in generations):
         cards.append(

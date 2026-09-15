@@ -87,6 +87,20 @@ main {
 }
 
 .byline, .intro { color: var(--ink-soft); margin: 0.25rem 0 1.25rem; }
+
+/* The title is the root prompt; this is the revision that made this entry
+ * rather than its parent. The label is mono because it is the heading the
+ * prompt itself carries, and the revision is italic because it is quoted. */
+.sub { margin: 0.35rem 0 0.6rem; }
+.sub .label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  letter-spacing: 0.02em;
+}
+.sub em { font-style: italic; }
+.sub .dim { margin-left: 0.15rem; }
+.sub .chip { margin: 0 0.15rem; vertical-align: 0.05em; }
+h1 + .sub + .byline { margin-top: 0; }
 .note { color: var(--ink-soft); font-size: 0.85rem; margin: 0.5rem 0 0; }
 .none { color: var(--ink-soft); font-style: italic; }
 
@@ -123,6 +137,10 @@ iframe.sketch {
 
 .chip.failed { background: var(--failed-ground); color: var(--failed-ink); }
 .chip.agree { background: var(--ok-ground); color: var(--ok-ink); }
+/* A critic chip names who asked for the revision: a model in the agent
+ * colour, a person in the ok colour, the same two colours the scores use. */
+.chip.model { color: var(--agent); letter-spacing: 0; text-transform: none; }
+.chip.person { background: var(--ok-ground); color: var(--ok-ink); letter-spacing: 0; text-transform: none; }
 .chip.disagree { background: var(--failed-ground); color: var(--failed-ink); }
 /* The agreement chips sit in the card's meta line among lowercase tags, and
  * read as a sentence about the entry rather than as a stamp on it. */
@@ -236,6 +254,19 @@ summary.filter-label::before { content: "\25b8\a0"; }
   overflow: hidden;
 }
 .card-prompt a { color: inherit; text-decoration: none; }
+/* The card's second line: the generation and the revision behind it, so the
+ * grid shows what changed and not the root prompt over and over. */
+.card-revision {
+  color: var(--ink-soft);
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  font-size: 0.78rem;
+  margin: 0 0.6rem 0.2rem;
+  max-height: 2.4rem;
+  overflow: hidden;
+}
 .card-meta, .card-counts, .reason {
   color: var(--ink-soft);
   font-size: 0.8rem;
