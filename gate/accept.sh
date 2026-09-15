@@ -2,12 +2,16 @@
 # accept.sh -- the ACCEPT harness for the sketch gate (packet 1.2).
 #
 # For every fixtures/<name>/ directory it runs sketch_gate.py --json, compares
-# the exit code and the five fixed checks against fixtures/expected.json, then
+# the exit code and the six fixed checks against fixtures/expected.json, then
 # runs the assertions listed in expected.json["assertions_expected"] for that
 # fixture and compares their pass/fail.  One line per fixture, PASS or
 # MISMATCH with what differed, a summary, and a non-zero exit on any mismatch.
 #
 #   ./accept.sh [fixtures_dir] [artefact_dir]
+#
+# A fixture's expected "checks" object need not name every check: only the keys
+# it lists are compared.  bad-frame-budget uses that, because the budget stops
+# its run before the two checks read at the end of the idle window are read.
 #
 # fixtures_dir defaults to ./fixtures next to this script; artefact_dir
 # defaults to a fresh directory under $TMPDIR so the fixtures are not written
@@ -52,7 +56,7 @@ expected = json.loads((fixtures / "expected.json").read_text())
 asserts_expected = expected.get("assertions_expected", {})
 
 CHECKS = ["console_clean", "is_looping", "frame_advancing",
-          "sound_lib_ok", "audio_context_running"]
+          "sound_lib_ok", "audio_context_running", "frame_budget"]
 
 names = sorted(p.name for p in fixtures.iterdir()
                if p.is_dir() and (p / "index.html").is_file())
@@ -125,8 +129,10 @@ for name in names:
         bad += 1
         print("MISMATCH  %-24s %.1fs  %s" % (name, took, "; ".join(problems)))
     else:
-        print("PASS      %-24s %.1fs  exit %d%s"
+        rate = (report.get("timings") or {}).get("ms_per_frame")
+        print("PASS      %-24s %.1fs  exit %d%s%s"
               % (name, took, p.returncode,
+                 "" if rate is None else ", %g ms/frame" % rate,
                  ", %d assertion(s)" % len(want_asserts) if want_asserts else ""))
 
 print()
