@@ -186,16 +186,32 @@ PREVIEW_SERVABLE = {
 
 #: The header on every preview response.
 #:
-#: This is model-written code running in the operator's browser. That is the
-#: same trust anyone viewing the gallery extends to the same sketch, and seeing
-#: it run is the whole point of the screen — so it runs, scripts and all. The
-#: header keeps it *here*: ``frame-ancestors 'self'`` lets the operator UI
-#: frame the preview and nothing else, which is what X-Frame-Options was
-#: reaching for and cannot say as precisely. There is deliberately no
-#: ``sandbox``: an opaque origin is refused the microphone, and
-#: ``responds(audio)`` is in the gate's own vocabulary — a sketch the gate
-#: passed would be one the preview could not show.
+#: This is model-written code running in the operator's browser. Seeing it run
+#: is the whole point of the screen — so it runs, scripts and all. The header
+#: keeps it *here*: ``frame-ancestors 'self'`` lets the operator UI frame the
+#: preview and nothing else, which is what X-Frame-Options was reaching for and
+#: cannot say as precisely.
+#:
+#: Until 2026-09-15 there was deliberately no ``sandbox`` either, on the grounds
+#: that an opaque origin is refused the microphone and ``responds(audio)`` is in
+#: the gate's own vocabulary. Entry 165 and entry 269 changed the price of that
+#: reasoning: a sketch the gate passed took the operator's laptop down. The
+#: frames this page builds now carry ``sandbox="allow-scripts"``, which is
+#: exactly what the gallery's own entry and compare pages have always used, and
+#: an audio sketch is previewed in its own tab — the "open in a tab" link beside
+#: every poster — where the origin is real and the microphone works.
 PREVIEW_HEADERS = {"Content-Security-Policy": "frame-ancestors 'self'"}
+
+#: What a frame in this UI is allowed to do: run its own scripts, and nothing
+#: else. No same-origin, no forms, no top-level navigation. The same string the
+#: gallery uses (sketchgen/assets/gallery.js, startSketch).
+PREVIEW_SANDBOX = "allow-scripts"
+
+#: A gate run longer than this many seconds is worth a mark on the card even
+#: when the report says every check passed — every one of the reports over it on
+#: the node is a sketch that costs hundreds of milliseconds a frame. The gate's
+#: own median run is 2.4 s.
+SLOW_GATE_S = 30.0
 
 #: The preview frame, in CSS pixels. The sketches size themselves to the
 #: window, so this is a window rather than a crop.
@@ -1747,23 +1763,94 @@ def has_preview(app: App, job_id: int, attempt_n: int) -> bool:
     return (attempt_dir(app, job_id, attempt_n) / "index.html").is_file()
 
 
-def preview_frame(
-    app: App, job_id: int, attempt_n: int, *, summary: str | None = None
-) -> str:
-    """The attempt, running. Empty string when there is nothing to run.
+def _poster_url(app: App, job_id: int, attempt_n: int) -> str | None:
+    """The still the play button is drawn on: the strip, else the last frame.
 
-    ``summary`` wraps the frame in a collapsed ``<details>`` — the job page
-    shows the latest attempt open and every earlier attempt folded away, so a
-    five-attempt job is not five sketches running at once.
+    The strip is four frames of the run and says more about a sketch than one
+    does, so it is preferred; ``gate.png`` is the fallback for an attempt whose
+    strip could not be produced. A run the budget stopped part way through still
+    has both, of the frames it did step.
+    """
+    gate_dir = app.jobs_root / str(job_id) / f"attempt-{attempt_n}" / ".gate"
+    for name in ("strip.png", "gate.png"):
+        if (gate_dir / name).is_file():
+            return f"/jobs/{job_id}/attempt-{attempt_n}/.gate/{name}"
+    return None
+
+
+def cost_chip(report: dict[str, Any] | None) -> str:
+    """What the gate's run cost, as a chip, and a warning when it is news.
+
+    Two numbers and one judgement. ``total_s`` is how long the gate took, which
+    is the tell that found job 45 and job 166 in the first place; the frame
+    budget is what the gate now measures directly. The chip is a warning when
+    either says so, and a warning on this page means: do not press play on a
+    machine you cannot afford to lose.
+    """
+    if not report:
+        return '<span class="chip cost dim">no gate report</span>'
+    timings = report.get("timings") or {}
+    checks = report.get("checks") or {}
+    total = timings.get("total_s")
+    rate = timings.get("ms_per_frame")
+    budget_failed = checks.get("frame_budget") is False
+    slow = isinstance(total, (int, float)) and total > SLOW_GATE_S
+    parts = []
+    parts.append("gate " + (human_seconds(total) if total is not None else "—"))
+    if rate is not None:
+        parts.append(f"{rate:g} ms/frame")
+    else:
+        parts.append("ms/frame not recorded")
+    text = " · ".join(parts)
+    if budget_failed or slow:
+        why = ("the frame budget failed" if budget_failed
+               else f"the gate took longer than {human_seconds(SLOW_GATE_S)}")
+        return (f'<span class="chip cost warn" title="{esc(why)} — running this '
+                f'costs the same here as it did there">⚠ {esc(text)}</span>')
+    return f'<span class="chip cost">{esc(text)}</span>'
+
+
+def preview_frame(
+    app: App,
+    job_id: int,
+    attempt_n: int,
+    *,
+    summary: str | None = None,
+    report: dict[str, Any] | None = None,
+) -> str:
+    """The attempt, as a still with a play button. Empty when there is nothing.
+
+    It does NOT run. Until 2026-09-15 this returned a live ``<iframe>``, and the
+    Held page embedded one per held entry, so opening that page started every
+    held sketch at once in the operator's browser — which is how entry 165 and
+    entry 269 each ran a laptop out of memory. Nothing here autoplays now: the
+    poster is a button, the script below builds the frame on a click, and it
+    builds at most one on the page at a time.
+
+    ``summary`` still wraps the poster in a collapsed ``<details>``; it is now
+    tidiness rather than safety, because a folded poster and an open one cost
+    the same.
     """
     if not has_preview(app, job_id, attempt_n):
         return ""
     url = f"/preview/{job_id}/{attempt_n}/"
+    poster = _poster_url(app, job_id, attempt_n)
+    label = f"job {job_id}, attempt {attempt_n}"
+    still = (
+        f'<img src="{esc(poster)}" alt="four frames the gate saw of {esc(label)}" '
+        f'loading="lazy">'
+        if poster else
+        '<span class="no-still">no frame on disk</span>'
+    )
     frame = (
-        f'<iframe class="preview" src="{esc(url)}" '
-        f'width="{PREVIEW_W}" height="{PREVIEW_H}" loading="lazy" '
-        f'title="job {job_id}, attempt {attempt_n}, running"></iframe>'
+        f'<div class="preview-run" data-preview data-src="{esc(url)}" '
+        f'data-label="{esc(label)}" data-w="{PREVIEW_W}" data-h="{PREVIEW_H}">'
+        f'<button type="button" class="play" data-play '
+        f'aria-label="run {esc(label)}">{still}'
+        f'<span class="play-label" data-play-label>run ▸</span></button>'
+        f"</div>"
         f'<p class="dim" style="font-size:12px">'
+        f'{cost_chip(report)} '
         f'<a href="{esc(url)}" target="_blank" rel="noopener">open in a tab ↗</a>'
         f"</p>"
     )
@@ -1773,6 +1860,75 @@ def preview_frame(
         f'<details class="preview-fold"><summary>{esc(summary)}</summary>'
         f"{frame}</details>"
     )
+
+
+PREVIEW_SCRIPT = """<script>
+// Click to run, one at a time, and gone when you stop.
+//
+// The Held page used to embed a live iframe per held entry, so opening it ran
+// every held sketch at once; two of those sketches allocated a GPU buffer per
+// line() per frame and the machine went down. So: the server renders a still
+// with a play button and no frame at all, this builds the frame on a click, and
+// starting one stops whichever was already running. Stopping REMOVES the
+// element rather than hiding it — a hidden iframe is still a running sketch
+// still holding its buffers.
+(function () {
+  var running = null;
+
+  function stop() {
+    if (!running) { return; }
+    var host = running;
+    running = null;
+    var frame = host.querySelector("iframe.preview");
+    if (frame) { frame.remove(); }
+    host.classList.remove("running");
+    var label = host.querySelector("[data-play-label]");
+    if (label) { label.textContent = "run \u25b8"; }
+    var button = host.querySelector("[data-play]");
+    if (button) {
+      button.setAttribute("aria-label", "run " + (host.getAttribute("data-label") || "sketch"));
+    }
+  }
+
+  function start(host) {
+    stop();
+    var button = host.querySelector("[data-play]");
+    if (!button) { return; }
+    var frame = document.createElement("iframe");
+    frame.className = "preview";
+    frame.src = host.getAttribute("data-src");
+    frame.width = host.getAttribute("data-w") || "640";
+    frame.height = host.getAttribute("data-h") || "400";
+    frame.title = (host.getAttribute("data-label") || "sketch") + ", running";
+    // Scripts and nothing else: no same-origin, no forms, no top navigation.
+    // The same sandbox the gallery's own pages use.
+    frame.setAttribute("sandbox", "%s");
+    host.insertBefore(frame, button);
+    host.classList.add("running");
+    var label = host.querySelector("[data-play-label]");
+    if (label) { label.textContent = "stop \u25a0"; }
+    button.setAttribute("aria-label", "stop " + (host.getAttribute("data-label") || "sketch"));
+    running = host;
+  }
+
+  document.addEventListener("click", function (event) {
+    var button = event.target.closest ? event.target.closest("[data-play]") : null;
+    if (!button) { return; }
+    var host = button.closest("[data-preview]");
+    if (!host) { return; }
+    event.preventDefault();
+    if (running === host) { stop(); } else { start(host); }
+  });
+
+  // Leaving the page, or folding the attempt away, should not leave a sketch
+  // running behind it.
+  window.addEventListener("pagehide", stop);
+  document.addEventListener("toggle", function (event) {
+    if (event.target && event.target.tagName === "DETAILS" && !event.target.open
+        && running && event.target.contains(running)) { stop(); }
+  }, true);
+})();
+</script>""" % (PREVIEW_SANDBOX,)
 
 
 def _artefacts(app: App, job_id: int, attempt_n: int) -> str:
@@ -1840,7 +1996,8 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
             f'<div class="grid"><div>{_check_list(report)}</div>'
             f"<div>{_artefacts(app, job.id, attempt.n)}</div></div>"
             + preview_frame(
-                app, job.id, attempt.n, summary=f"Run attempt {attempt.n}"
+                app, job.id, attempt.n, summary=f"Run attempt {attempt.n}",
+                report=report,
             )
             + f"{evidence}"
             '<p class="dim" style="font-size:12px">'
@@ -1894,10 +2051,15 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
     # The latest attempt, running, above the fold: the instructor's reason for
     # this screen is to look at the sketch before publishing it, and a frame
     # strip is not a sketch.
-    latest = preview_frame(app, job.id, attempt_n) if attempt_n else ""
+    latest_report = _report_for(app, job.id, attempts[-1]) if attempts else None
+    latest = (
+        preview_frame(app, job.id, attempt_n, report=latest_report)
+        if attempt_n else ""
+    )
     preview = (
-        '<section class="panel"><h2>Running sketch — '
-        f"<span style='text-transform:none'>attempt {attempt_n}</span></h2>"
+        '<section class="panel"><h2>The sketch — '
+        f"<span style='text-transform:none'>attempt {attempt_n}, "
+        f"click the still to run it</span></h2>"
         f"{latest}</section>"
         if latest
         else ""
@@ -2172,10 +2334,19 @@ def _held_preview(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
             wanted = int(name[8:])
             numbers = [wanted] + [n for n in numbers if n != wanted]
     for n in numbers:
-        frame = preview_frame(app, job_id, n)
+        frame = preview_frame(app, job_id, n, report=_report_for_n(app, job_id, n))
         if frame:
             return frame
     return ""
+
+
+def _report_for_n(app: App, job_id: int, attempt_n: int) -> dict[str, Any] | None:
+    """report.json for one attempt, by its number rather than its row."""
+    path = app.jobs_root / str(job_id) / f"attempt-{attempt_n}" / ".gate" / "report.json"
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 def _lineage_note(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
@@ -2716,7 +2887,7 @@ class OpHandler(BaseHTTPRequestHandler):
                 control=control,
                 back=f"/job/{job.id}",
                 flash=self.flash(),
-                page_script=JOB_SCRIPT,
+                page_script=JOB_SCRIPT + PREVIEW_SCRIPT,
                 nav_marks=marks,
             )
         )
@@ -2895,6 +3066,7 @@ class OpHandler(BaseHTTPRequestHandler):
                 control=control,
                 back="/held",
                 flash=self.flash(),
+                page_script=PREVIEW_SCRIPT,
                 nav_marks=marks,
             )
         )

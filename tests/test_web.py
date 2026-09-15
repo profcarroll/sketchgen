@@ -1095,7 +1095,12 @@ class TestPreview(WebTestCase):
     The instructor's finding: a person cannot decide to publish from a frame
     strip. These tests are about the route that fixes that — that it serves the
     sketch, that it serves only the sketch's own directory, and that the two
-    screens where the decision is made actually frame it.
+    screens where the decision is made offer it.
+
+    *Offer*, since 2026-09-15. They used to frame it, and the Held page framed
+    every held entry at once, which is how entry 165 and entry 269 each ran the
+    operator's laptop out of memory. Nothing renders an iframe now; a click
+    builds one.
     """
 
     def raw(self, path):
@@ -1156,24 +1161,86 @@ class TestPreview(WebTestCase):
         # prompt.txt sits in the same directory and is not part of the sketch
         self.assertEqual(self.raw(f"/preview/{self.held_id}/1/prompt.txt")[0], 404)
 
-    def test_the_job_page_frames_the_running_sketch(self):
+    def test_the_job_page_offers_the_sketch_without_running_it(self):
         page = self.text(f"/job/{self.held_id}")
-        self.assertIn(f'src="/preview/{self.held_id}/1/"', page)
-        self.assertIn("<iframe", page)
+        self.assertIn(f'data-src="/preview/{self.held_id}/1/"', page)
+        self.assertNotIn("<iframe", page)
+        # the poster is the strip the gate saw, inside the button
+        self.assertIn("data-play", page)
+        self.assertIn(f"/jobs/{self.held_id}/attempt-1/.gate/strip.png", page)
         # and is openable on its own
         self.assertIn("open in a tab", page)
         # every attempt is reachable, folded away
         self.assertIn("<details", page)
 
-    def test_the_held_card_frames_the_running_sketch(self):
+    def test_the_held_card_offers_the_sketch_without_running_it(self):
         page = self.text("/held")
-        self.assertIn(f'src="/preview/{self.held_id}/1/"', page)
+        self.assertIn(f'data-src="/preview/{self.held_id}/1/"', page)
         # the strip the gate saw is still there, below it
         self.assertIn("strip.png", page)
 
-    def test_a_job_with_no_index_html_frames_nothing(self):
+    def test_the_held_page_renders_no_iframe_at_all(self):
+        # The one that matters. Opening /held used to start every held sketch
+        # in the operator's browser at once; two of them allocated a GPU buffer
+        # per line() per frame, and the machine went down. There is no amount of
+        # iframe on this page that is safe, so there is none.
+        page = self.text("/held")
+        body = page.split("<main>", 1)[1].split("</main>", 1)[0]
+        self.assertNotIn("<iframe", body)
+        self.assertNotIn("<iframe", page.split("<script>")[0])
+        # what it renders instead
+        self.assertIn("data-preview", body)
+        self.assertIn("data-play", body)
+
+    def test_the_frame_a_click_builds_is_sandboxed(self):
+        page = self.text("/held")
+        self.assertIn('frame.setAttribute("sandbox", "allow-scripts")', page)
+        self.assertIn("frame.remove()", page)
+
+    def test_the_cards_carry_what_the_gate_run_cost(self):
+        page = self.text("/held")
+        # the seeded report is 4.2 s and records no ms_per_frame
+        self.assertIn("gate 4s", page)
+        self.assertIn("ms/frame not recorded", page)
+        self.assertNotIn("chip cost warn", page)
+
+    def test_a_slow_gate_run_gets_a_warning_chip(self):
+        report = report_json(self.jobs_dir / str(self.held_id) / "attempt-1")
+        report["timings"] = {"launch_s": 0.7, "load_s": 0.3, "total_s": 208.8,
+                             "ms_per_frame": 1093.0}
+        self.assertIn("chip cost warn", web.cost_chip(report))
+        self.assertIn("1093 ms/frame", web.cost_chip(report))
+        self.assertIn("3m 28s", web.cost_chip(report))
+
+    def test_a_failed_frame_budget_gets_a_warning_chip_however_quick_the_run(self):
+        # The wall ceiling stops a run early, so a budget failure can come with
+        # a short total_s. The chip is about the sketch, not the clock.
+        report = report_json(self.jobs_dir / str(self.held_id) / "attempt-1")
+        report["timings"] = {"launch_s": 0.7, "load_s": 0.3, "total_s": 12.0,
+                             "ms_per_frame": 340.0}
+        report["checks"]["frame_budget"] = False
+        chip = web.cost_chip(report)
+        self.assertIn("chip cost warn", chip)
+        self.assertIn("the frame budget failed", chip)
+
+    def test_a_report_that_clears_the_budget_gets_a_plain_chip(self):
+        report = report_json(self.jobs_dir / str(self.held_id) / "attempt-1")
+        report["timings"] = {"launch_s": 0.7, "load_s": 0.3, "total_s": 2.4,
+                             "ms_per_frame": 9.2}
+        report["checks"]["frame_budget"] = True
+        chip = web.cost_chip(report)
+        self.assertNotIn("warn", chip)
+        self.assertIn("9.2 ms/frame", chip)
+
+    def test_no_report_says_so_rather_than_saying_nothing(self):
+        self.assertIn("no gate report", web.cost_chip(None))
+
+    def test_a_job_with_no_index_html_offers_nothing_to_run(self):
         page = self.text(f"/job/{self.queued_id}")
         self.assertNotIn("<iframe", page)
+        # The script that knows how to build one is on every page; what this
+        # page has none of is something for it to build.
+        self.assertNotIn('data-src="/preview/', page)
 
 
 class TestLiveTranscript(WebTestCase):
