@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>p5.js Skills Showcase</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/addons/p5.sound.min.js"></script>
+    <style>
+        body { 
+            margin: 0; 
+            padding: 0;
+            display: flex; 
+            justify-content: center; 
+            align-items: center; 
+            min-height: 100vh; 
+            background: linear-gradient(135deg, #1a1a2e, #16213e, #0f3460);
+            font-family: 'Courier New', monospace;
+            overflow: hidden;
+        }
+        #info {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: white;
+            background: rgba(0,0,0,0.7);
+            padding: 15px;
+            border-radius: 10px;
+            max-width: 300px;
+            backdrop-filter: blur(5px);
+        }
+        #info h1 {
+            margin: 0 0 10px 0;
+            font-size: 1.2em;
+            color: #4cc9f0;
+        }
+        #info p {
+            margin: 5px 0;
+            font-size: 0.9em;
+            line-height: 1.4;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: white;
+            background: rgba(0,0,0,0.7);
+            padding: 15px;
+            border-radius: 10px;
+            backdrop-filter: blur(5px);
+        }
+    </style>
+</head>
+<body>
+    <div id="info">
+        <h1>p5.js Skills Showcase</h1>
+        <p>• Interactive generative art</p>
+        <p>• Real-time particle systems</p>
+        <p>• Dynamic color mixing</p>
+        <p>• Physics simulation</p>
+        <p>• Responsive design</p>
+        <p>• Audio-reactive visuals</p>
+    </div>
+    <div id="controls">
+        <p>Click to add particles | Drag to create forces</p>
+    </div>
+    <script src="sketch.js"></script>
+</body>
+</html>

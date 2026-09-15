@@ -2,7 +2,9 @@
 """sketchgen — the one CLI.
 
 Today: `db init`, `db status`, `execute`, `plan`, `install-unit`, `keygen`,
-`publish`, `reject`, `worker`, `control` and `enqueue`. Later packets add subcommands
+`publish`, `reject`, `worker`, `control` and `enqueue`, plus whatever
+sketchgen/cli/ registers (`backup`, `gallery`, `lineage`, `web`, …). Later
+packets add subcommands
 
 Exit codes: 0 success, 1 failure, 3 refused.
 """
@@ -35,7 +37,8 @@ EXIT_REFUSED = 3
 REPO_ROOT = Path(__file__).resolve().parent.parent
 UNIT_SOURCE_DIR = REPO_ROOT / "systemd"
 UNIT_FILES = ("sketchgen-worker.service", "sketchgen-worker.timer", "sketchgen-web.service",
-              "sketchgen-sync.service", "sketchgen-sync.timer")
+              "sketchgen-sync.service", "sketchgen-sync.timer",
+              "sketchgen-backup.service", "sketchgen-backup.timer")
 
 # Per key: which repo it is registered on, which permission, what it is used for.
 KEY_ROLES = {
@@ -487,6 +490,11 @@ def _print_enable_help(target_dir: Path) -> None:
     print()
     print("  the write-path sync (votes, likes, views), a five-minute drip; needs ~/sketchgen/writepath.token:")
     print("    systemctl --user enable --now sketchgen-sync.timer")
+    print()
+    print("  the nightly backup (04:10 UTC) — the record's only copy is on this instance:")
+    print("    systemctl --user enable --now sketchgen-backup.timer")
+    print("    python3 bin/sketchgen backup snapshot --to ~/sketchgen/backups   # take the first one now")
+    print("    (and on the OPERATOR's machine: bin/pull-backup.sh, which is the copy that leaves)")
     print()
     print(f"  units installed under: {target_dir}")
 
