@@ -383,3 +383,173 @@ summary.filter-label::before { content: "\25b8\a0"; }
 .critique { color: var(--ink); font-style: italic; margin: 0 0 0.3rem; }
 .dim { color: var(--ink-soft); font-style: normal; font-size: 0.85rem; }
 .node.waits { border-left-style: dashed; }
+
+/* The ledger — the entry page's lineage panel (plan §6).
+ *
+ * One row per generation, oldest at the top: the frame that generation
+ * produced on the left, the critique that asked for it on the right. It is a
+ * two-column grid at every width, because the alternative on a phone is a
+ * column of images with their captions a screen away from them; only the tile
+ * narrows. Nothing in here scrolls sideways.
+ *
+ * Every tile is the first frame of that entry's strip.png — cover, anchored
+ * left, on the gate's own 64:45 box — so the ledger costs no new image files.
+ */
+.ledger { list-style: none; margin: 0; padding: 0; }
+
+.ledger-row {
+  align-items: start;
+  border-radius: 8px;
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: max-content 1fr;
+  padding: 0.4rem;
+}
+/* This entry, in its own line: the ring is what the eye finds first, and the
+ * row is the one that is not a link, because it is already here. */
+.ledger-row.here {
+  background: var(--chip);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.ledger-tile { position: relative; }
+.ledger-tile.narrow { width: 6.5rem; }
+.ledger-tile.wide { width: 100%; }
+.ledger-tile img, .ledger-tile.blank {
+  aspect-ratio: 64 / 45;
+  background: var(--chip);
+  border-radius: 6px;
+  display: block;
+  object-fit: cover;
+  object-position: left;
+  width: 100%;
+}
+/* A generation with no public page still gets its place in the column, so the
+ * rows stay aligned and the count stays right. */
+.ledger-tile.blank { border: 1px dashed var(--line); }
+.ledger-tile .play {
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  display: block;
+  padding: 0;
+  width: 100%;
+}
+.ledger-tile .play:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* While it runs, the same button is a stop control lying over the frame's
+ * corner rather than a box under it: the row must not change height when the
+ * sketch starts, or everything below it jumps. */
+.ledger-tile .play.running {
+  background: var(--chip);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  bottom: 0.3rem;
+  font-size: 0.7rem;
+  left: 0.3rem;
+  padding: 0 0.5rem;
+  position: absolute;
+  width: auto;
+  z-index: 1;
+}
+.ledger-tile .play.running img { display: none; }
+.ledger-tile iframe.sketch { aspect-ratio: 64 / 45; height: auto; width: 100%; }
+
+.ledger-text { min-width: 0; }
+.ledger-prompt { font-weight: 600; margin: 0 0 0.15rem; }
+.ledger-critique { margin: 0 0 0.15rem; }
+.ledger-critique .revise {
+  color: var(--ink-soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8rem;
+}
+/* Full length in the ledger — the critique is the reason the generation
+ * exists — and three lines in the descendants grid, where it is a caption. */
+.ledger-critique.clamp {
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  display: -webkit-box;
+  line-clamp: 3;
+  overflow: hidden;
+}
+.ledger-meta { color: var(--ink-soft); font-size: 0.85rem; margin: 0; }
+
+/* Who asked for this generation: a model in the agent colour, a person in the
+ * ok colour, the same two colours the rest of the site uses for the two
+ * populations. Lowercase, because these are names and not stamps. */
+.chip.model { color: var(--agent); }
+.chip.human { background: var(--ok-ground); color: var(--ok-ink); }
+.chip.model, .chip.human, .chip.unpublished, .chip.heavy {
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* The middle of a long line, behind a disclosure that opens without script. */
+.ledger-folded { margin: 0.1rem 0; }
+summary.fold-label {
+  color: var(--ink-soft);
+  cursor: pointer;
+  font-size: 0.85rem;
+  list-style: none;
+  padding: 0.2rem 0.4rem;
+}
+summary.fold-label::-webkit-details-marker { display: none; }
+summary.fold-label::before { content: "\25b8\a0"; }
+details.fold[open] > summary.fold-label::before { content: "\25be\a0"; }
+.ledger-folded .ledger {
+  border-left: 2px solid var(--line);
+  margin-left: 0.7rem;
+  padding-left: 0.5rem;
+}
+
+/* A fork: the other children of this entry's parent, indented under it. */
+.ledger-forks {
+  border-left: 2px solid var(--line);
+  margin: 0 0 0.4rem 1.2rem;
+  padding-left: 0.6rem;
+}
+.ledger-fork-label { color: var(--ink-soft); font-size: 0.85rem; margin: 0.2rem 0 0; }
+
+.ledger-rule { border: 0; border-top: 1px solid var(--line); margin: 0.9rem 0 0.6rem; }
+.ledger-after { font-weight: 600; margin: 0 0 0.6rem; }
+.ledger-grid {
+  display: grid;
+  gap: 0.8rem;
+  grid-template-columns: repeat(auto-fill, minmax(9.5rem, 1fr));
+}
+.ledger-card .ledger-text { margin-top: 0.35rem; }
+.ledger-more, .ledger-plain { color: var(--ink-soft); font-size: 0.85rem; margin: 0.5rem 0 0; }
+
+/* An entry the gate had to grind through does not start itself; its stage is
+ * the strip and a play button, run by the same helper the ledger uses. */
+.stage-run { margin: 0; position: relative; }
+.stage-run img { border-radius: 6px; display: block; width: 100%; }
+.stage-run .play {
+  background: none;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+  display: block;
+  padding: 0;
+  width: 100%;
+}
+.stage-run .play:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.stage-run .play.running {
+  background: var(--chip);
+  border: 1px solid var(--line);
+  margin: 0.5rem 0 0;
+  padding: 0.25rem 0.8rem;
+  width: auto;
+}
+.stage-run .play.running img { display: none; }
+.stage-run iframe.sketch { aspect-ratio: 64 / 45; height: auto; width: 100%; }
+.stage-heavy { color: var(--ink-soft); font-size: 0.85rem; margin: 0.6rem 0 0; }
+
+@media (max-width: 40rem) {
+  .ledger-tile.narrow { width: 5.5rem; }
+  /* Two columns rather than one: a single column of tiles this wide is a
+   * scroll, and the grid is meant to be scanned. */
+  .ledger-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ledger-forks { margin-left: 0.4rem; padding-left: 0.5rem; }
+  .ledger-folded .ledger { margin-left: 0.3rem; padding-left: 0.4rem; }
+}
