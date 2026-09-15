@@ -317,6 +317,103 @@ class TestEntriesToCritique(DbTestCase):
         self.assertIn(parent, db.entries_to_critique(self.conn, "critic-v3", 50))
 
 
+class TestEntryTransitions(DbTestCase):
+    """The entry state machine of the lineage ledger's §5.1."""
+
+    def held(self, prompt="a held one"):
+        """A job carried to held with an entry on it, as the worker leaves it."""
+        job_id = self.enqueue(prompt=prompt)
+        db.transition(self.conn, job_id, "executing")
+        db.transition(self.conn, job_id, "gating")
+        db.transition(self.conn, job_id, "held")
+        return job_id, db.create_entry(self.conn, job_id, "held", prompt=prompt)
+
+    def kept(self, prompt="one the gate refused", **fields):
+        job_id = self.enqueue(prompt=prompt)
+        db.transition(self.conn, job_id, "failed")
+        return job_id, db.create_entry(
+            self.conn, job_id, "failed-kept", prompt=prompt, **fields
+        )
+
+    def state(self, entry_id):
+        return db.get_entry(self.conn, entry_id)["state"]
+
+    def test_held_goes_to_published_rejected_or_archived(self):
+        for target in ("published", "rejected", "archived"):
+            with self.subTest(target=target):
+                _, entry_id = self.held()
+                db.entry_transition(self.conn, entry_id, target)
+                self.assertEqual(target, self.state(entry_id))
+
+    def test_rejecting_stores_the_reason_on_the_entry(self):
+        _, entry_id = self.held()
+        db.entry_transition(self.conn, entry_id, "rejected", reject_reason="off brief")
+        row = db.get_entry(self.conn, entry_id)
+        self.assertEqual("rejected", row["state"])
+        self.assertEqual("off brief", row["reject_reason"])
+
+    def test_an_unpublished_kept_failure_can_be_archived(self):
+        _, entry_id = self.kept()
+        db.entry_transition(self.conn, entry_id, "archived")
+        self.assertEqual("archived", self.state(entry_id))
+
+    def test_a_published_kept_failure_cannot_be_archived(self):
+        # It is on the site. Taking it down again would be the deletion this
+        # project does not do (§5.1).
+        _, entry_id = self.kept(published_utc=TIMESTAMP)
+        with self.assertRaises(db.IllegalTransition):
+            db.entry_transition(self.conn, entry_id, "archived")
+        self.assertEqual("failed-kept", self.state(entry_id))
+
+    def test_published_to_archived_is_refused(self):
+        _, entry_id = self.held()
+        db.entry_transition(self.conn, entry_id, "published")
+        with self.assertRaises(db.IllegalTransition):
+            db.entry_transition(self.conn, entry_id, "archived")
+        self.assertEqual("published", self.state(entry_id))
+
+    def test_archived_and_rejected_are_terminal(self):
+        for terminal in ("archived", "rejected"):
+            with self.subTest(terminal=terminal):
+                _, entry_id = self.held()
+                db.entry_transition(self.conn, entry_id, terminal)
+                for target in ("published", "held", "archived", "rejected"):
+                    with self.assertRaises(db.IllegalTransition):
+                        db.entry_transition(self.conn, entry_id, target)
+
+    def test_an_unknown_entry_and_an_unknown_state_are_told_apart(self):
+        with self.assertRaises(db.UnknownEntry):
+            db.entry_transition(self.conn, 9999, "archived")
+        _, entry_id = self.held()
+        with self.assertRaises(db.IllegalTransition):
+            db.entry_transition(self.conn, entry_id, "vanished")
+
+    def test_archive_entry_moves_the_job_and_leaves_a_failed_one_alone(self):
+        job_id, entry_id = self.held()
+        db.archive_entry(self.conn, entry_id)
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual("rejected", job.state)
+        self.assertEqual(db.ARCHIVED_BY_OPERATOR, job.last_error)
+
+        # A kept failure's job is already terminal; it keeps the state that
+        # says the gate ended it, and only says who archived the entry.
+        kept_job, kept_entry = self.kept()
+        db.archive_entry(self.conn, kept_entry)
+        job = db.get_job(self.conn, kept_job)
+        self.assertEqual("failed", job.state)
+        self.assertEqual(db.ARCHIVED_BY_OPERATOR, job.last_error)
+
+    def test_archiving_deletes_nothing(self):
+        _, entry_id = self.held()
+        before = dict(db.get_entry(self.conn, entry_id))
+        db.archive_entry(self.conn, entry_id)
+        after = dict(db.get_entry(self.conn, entry_id))
+        self.assertEqual(
+            {k: v for k, v in before.items() if k != "state"},
+            {k: v for k, v in after.items() if k != "state"},
+        )
+
+
 class TestRequeue(DbTestCase):
     def test_requeue_from_gating_and_not_from_held(self):
         job_id = self.enqueue()

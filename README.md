@@ -215,6 +215,13 @@ A job's legal moves are enforced in `sketchgen/db.py` (`TRANSITIONS`), not in SQ
 `queued` for the worker's stop-now control. An illegal move raises
 `IllegalTransition` and changes nothing.
 
+An entry has a second, smaller machine beside it (`ENTRY_TRANSITIONS`), because a
+job is over when the worker stops and an entry is not: a person still has to decide
+about it. `held → published`, `held → rejected` (which publishes it to the
+rejections page with the reason, rather than hiding it), and `held → archived` or
+`failed-kept → archived` for anything the operator wants off their lists.
+`archived` is terminal and never public. Nothing in either machine deletes a file.
+
 ## The worker
 
 One job at a time, from the queue to `held` or to a kept failure:
