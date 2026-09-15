@@ -430,9 +430,23 @@ def _public_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return rows
 
 
-def _forest(conn: sqlite3.Connection) -> tuple[dict[int, int | None], dict[int, list[int]]]:
-    """(parent by id, children by id) over the public entries, id order."""
+def _forest(
+    conn: sqlite3.Connection, *, admit: int | None = None
+) -> tuple[dict[int, int | None], dict[int, list[int]]]:
+    """(parent by id, children by id) over the public entries, id order.
+
+    ``admit`` is the entry being published: the publisher renders it while the
+    row is still ``held``, because the row only flips once the push of these
+    files lands. Without it the entry is absent from the forest, its own parent
+    lookup misses, and ``null`` is frozen into its meta.json forever — which is
+    how 74 of 101 public non-root entries came to claim they have no parent.
+    Admitting the one entry we are in the middle of publishing is the fix; the
+    site's tree pages, which render entries that are already public, pass
+    nothing and are unchanged.
+    """
     ids = [int(row["id"]) for row in _public_rows(conn)]
+    if admit is not None and int(admit) not in ids:
+        ids.append(int(admit))
     parent: dict[int, int | None] = {}
     children: dict[int, list[int]] = {i: [] for i in ids}
     for entry_id in ids:
@@ -1227,7 +1241,7 @@ def render_entry(
     config = _resolve_config(dest, config)
     row = _entry(conn, int(entry_id), publishing=publishing)
     attempts = _attempt_rows(conn, int(row["job_id"]))
-    parent, children = _forest(conn)
+    parent, children = _forest(conn, admit=int(entry_id))
     written = _Written(dest)
     try:
         out = _write_entry(conn, row, attempts, dest, config, parent, children, written)
