@@ -193,20 +193,36 @@
     });
   }
 
-  function loadCounts() {
-    var ids = entryIds();
-    if (!base() || ids.length === 0) { return; }
-    fetch(base() + "/counts?entries=" + encodeURIComponent(ids.join(",")), {
+  /* The write path answers one statement per ask, and its database binds at
+   * most a hundred parameters to a statement. The grid passed that many entries
+   * long ago, so the ids go over in batches of a hundred: a gallery of any size
+   * gets its counts, and one batch that fails leaves the others painted. */
+  var COUNTS_BATCH = 100;
+
+  function fetchCounts(ids) {
+    return fetch(base() + "/counts?entries=" + encodeURIComponent(ids.join(",")), {
       credentials: "include",
       headers: authHeaders()
     })
       .then(function (response) { return response.json(); })
       .then(function (data) {
         paintCounts(data && data.counts ? data.counts : data || {});
-        // The numbers the "most liked" order sorts on have only just arrived.
-        if (currentSort() === "liked") { applySort("liked"); }
       })
-      .catch(function () { /* leave the em dashes where they are */ });
+      .catch(function () { /* leave this batch's em dashes where they are */ });
+  }
+
+  function loadCounts() {
+    var ids = entryIds();
+    if (!base() || ids.length === 0) { return; }
+    var batches = [];
+    for (var at = 0; at < ids.length; at += COUNTS_BATCH) {
+      batches.push(fetchCounts(ids.slice(at, at + COUNTS_BATCH)));
+    }
+    // The numbers the "most liked" order sorts on have only just arrived, and
+    // only the last batch makes that order right.
+    return Promise.all(batches).then(function () {
+      if (currentSort() === "liked") { applySort("liked"); }
+    });
   }
 
   function wireLike() {
