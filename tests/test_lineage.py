@@ -145,6 +145,67 @@ class LineageTestCase(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class TestSplitPrompt(unittest.TestCase):
+    """The prompt comes apart again, because compose_prompt is its only writer."""
+
+    def test_a_root_with_no_revisions_is_the_whole_prompt(self):
+        root, revisions = lineage.split_prompt(
+            "sixty circles drifting on their own noise paths"
+        )
+        self.assertEqual("sixty circles drifting on their own noise paths", root)
+        self.assertEqual([], revisions)
+
+    def test_the_empty_prompt_splits_into_nothing(self):
+        self.assertEqual(("", []), lineage.split_prompt(""))
+        self.assertEqual(("", []), lineage.split_prompt("   \n\n "))
+
+    def test_one_generation_round_trips(self):
+        prompt = lineage.compose_prompt(
+            "sixty circles drifting", "let one fall out of phase with the rest"
+        )
+        root, revisions = lineage.split_prompt(prompt)
+        self.assertEqual("sixty circles drifting", root)
+        self.assertEqual(["let one fall out of phase with the rest"], revisions)
+        self.assertEqual(prompt, lineage.compose_prompt(root, revisions[0]))
+
+    def test_ten_generations_come_back_in_order(self):
+        prompt = "a cityscape from sunrise to sunset"
+        critiques = [f"revision number {n}" for n in range(1, 11)]
+        for text in critiques:
+            prompt = lineage.compose_prompt(prompt, text)
+        root, revisions = lineage.split_prompt(prompt)
+        self.assertEqual("a cityscape from sunrise to sunset", root)
+        self.assertEqual(critiques, revisions)
+        # and the whole prompt rebuilds from the pieces, in order
+        rebuilt = root
+        for text in revisions:
+            rebuilt = lineage.compose_prompt(rebuilt, text)
+        self.assertEqual(prompt, rebuilt)
+
+    def test_the_heading_mid_sentence_is_a_sentence_not_a_generation(self):
+        prompt = lineage.compose_prompt(
+            "a poster that says Revise: nothing is ever finished",
+            "make the type larger",
+        )
+        root, revisions = lineage.split_prompt(prompt)
+        self.assertEqual("a poster that says Revise: nothing is ever finished", root)
+        self.assertEqual(["make the type larger"], revisions)
+
+    def test_a_multiline_root_keeps_its_own_line_breaks(self):
+        prompt = lineage.compose_prompt(
+            "a first line\nand a second line", "one more thing"
+        )
+        root, revisions = lineage.split_prompt(prompt)
+        self.assertEqual("a first line\nand a second line", root)
+        self.assertEqual(["one more thing"], revisions)
+
+    def test_a_revision_is_collapsed_the_way_compose_prompt_wrote_it(self):
+        prompt = "the root\n\nRevise:   spread    over\ntwo lines"
+        root, revisions = lineage.split_prompt(prompt)
+        self.assertEqual("the root", root)
+        self.assertEqual(["spread over two lines"], revisions)
+
+
 class TestSpawn(LineageTestCase):
     def test_spawn_from_published_composes_the_prompt_and_keeps_the_parent(self):
         job_id = lineage.spawn(
