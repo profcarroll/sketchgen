@@ -1,0 +1,37 @@
+# sketchgen-backup.timer — one snapshot a day, 04:10 UTC.
+#
+# The service is a oneshot, so this timer is the only thing that starts it;
+# enable the timer, not the service:
+#
+#   systemctl --user enable --now sketchgen-backup.timer
+#   systemctl --user list-timers --all | grep sketchgen-backup
+#   journalctl --user -u sketchgen-backup -n 30
+#
+# OnCalendar=…04:10:00 UTC  the zone is spelled out rather than trusted to the
+#                     node's clock: the node is UTC today, the operator's laptop
+#                     is not, and a recovered instance may come up as anything.
+#                     The ten minutes are deliberate — a snapshot on the hour
+#                     shares its minute with every other cron-shaped thing in
+#                     the world, and this one takes an SQLite write lock.
+# Persistent=true     a snapshot missed while the node was down is taken once on
+#                     the next boot rather than skipped in silence. A backup
+#                     timer that quietly skips is the exact failure this whole
+#                     packet exists to prevent.
+# RandomizedDelaySec  deliberately NOT set: the puller on the operator's machine
+#                     runs on its own schedule and wants a predictable window.
+#
+# The snapshot takes a second or two on a 6 MB database and the service runs at
+# Nice=10 with idle IO, so it does not contend with a job in flight. It does not
+# pause the worker and does not need to: the online backup API takes a
+# consistent copy of a WAL database while it is being written.
+[Unit]
+Description=sketchgen backup drip: one verified snapshot daily at 04:10 UTC
+Documentation=file:%h/sketchgen/app/docs/OPERATIONS.md
+
+[Timer]
+OnCalendar=*-*-* 04:10:00 UTC
+Persistent=true
+Unit=sketchgen-backup.service
+
+[Install]
+WantedBy=timers.target

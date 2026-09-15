@@ -21,7 +21,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI = REPO_ROOT / "bin" / "sketchgen"
 UNIT_DIR = REPO_ROOT / "systemd"
 UNIT_FILES = ("sketchgen-worker.service", "sketchgen-worker.timer", "sketchgen-web.service",
-              "sketchgen-sync.service", "sketchgen-sync.timer")
+              "sketchgen-sync.service", "sketchgen-sync.timer",
+              "sketchgen-backup.service", "sketchgen-backup.timer")
 
 SECTION_RE = re.compile(r"^\[[A-Za-z][A-Za-z0-9]*\]$")
 KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9]*=")
