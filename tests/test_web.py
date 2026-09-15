@@ -1160,8 +1160,8 @@ class TestPreview(WebTestCase):
         page = self.text(f"/job/{self.held_id}")
         self.assertIn(f'src="/preview/{self.held_id}/1/"', page)
         self.assertIn("<iframe", page)
-        # and says why it will not look like gate.png
-        self.assertIn("unseeded", page)
+        # and is openable on its own
+        self.assertIn("open in a tab", page)
         # every attempt is reachable, folded away
         self.assertIn("<details", page)
 

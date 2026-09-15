@@ -738,14 +738,18 @@ class GridOrderTests(GalleryTestCase):
             with self.subTest(page=name):
                 self.assertEqual(page.count('class="card"'), page.count("data-published="))
 
-    def test_the_grid_offers_the_four_sorts(self):
+    def test_the_grid_offers_every_sort(self):
+        sorts = (
+            "newest", "oldest", "random", "liked",
+            "reviewed", "controversial", "consensus",
+        )
         for name, page in (("index", self.index), ("rejections", self.failed)):
             with self.subTest(page=name):
-                for sort in ("newest", "oldest", "random", "liked"):
+                for sort in sorts:
                     self.assertIn(
                         f'<button type="button" class="sort" data-sort="{sort}"', page
                     )
-                self.assertEqual(page.count('class="sort"'), 4)
+                self.assertEqual(page.count('class="sort"'), len(sorts))
                 # the order the HTML is already in is the one marked current
                 self.assertIn('data-sort="newest" aria-current="true"', page)
 

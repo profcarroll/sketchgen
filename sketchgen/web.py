@@ -1747,12 +1747,6 @@ def has_preview(app: App, job_id: int, attempt_n: int) -> bool:
     return (attempt_dir(app, job_id, attempt_n) / "index.html").is_file()
 
 
-PREVIEW_NOTE = (
-    "The preview runs unseeded, on the real clock, in your browser — the gate "
-    "ran it seeded and frozen, so this will not match gate.png frame for frame."
-)
-
-
 def preview_frame(
     app: App, job_id: int, attempt_n: int, *, summary: str | None = None
 ) -> str:
@@ -1771,7 +1765,7 @@ def preview_frame(
         f'title="job {job_id}, attempt {attempt_n}, running"></iframe>'
         f'<p class="dim" style="font-size:12px">'
         f'<a href="{esc(url)}" target="_blank" rel="noopener">open in a tab ↗</a>'
-        f" — {esc(PREVIEW_NOTE)}</p>"
+        f"</p>"
     )
     if summary is None:
         return frame
