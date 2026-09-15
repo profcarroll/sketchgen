@@ -167,6 +167,9 @@ systemd/                    user-level units
   sketchgen-web.service     operator UI on 127.0.0.1:8081
   sketchgen-sync.service    write-path pull (oneshot)
   sketchgen-sync.timer      5-minute sync timer
+  sketchgen-backup.service  one verified snapshot of the database (oneshot)
+  sketchgen-backup.timer    daily at 04:10 UTC
+  operator/                 units for the OPERATOR's machine, not the node
 
 writepath/                  Cloudflare Worker for the gallery's write side
   worker.js                 votes, likes, views, GitHub OAuth
@@ -175,7 +178,7 @@ writepath/                  Cloudflare Worker for the gallery's write side
 bin/pull-backup.sh          pull the node's snapshots and jobs/ to this machine
 requirements.txt            the venv's one pin: playwright==1.62.0
 
-tests/                      16 files, stdlib unittest
+tests/                      17 files, stdlib unittest
 docs/OPERATIONS.md          running the worker, the UI, the sync, and recovery
 ```
 

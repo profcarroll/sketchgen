@@ -290,6 +290,249 @@ deploy key; clone the repo to `~/sketchgen/gallery` with that key in
 is made with the checkout's identity, not one this tool invents; then publish one
 entry with `--dry-run` before publishing it for real.
 
+## Backups: the nightly snapshot and the pull
+
+The database and the attempt archive are the only parts of this system with no
+copy anywhere else. The code is pushed, the gallery is pushed, votes and likes
+are in D1 — but `sketchgen.db` holds a thousand-odd agent judgments, the
+critiques and the lineage rows, and `jobs/` holds every attempt's code and
+evidence. They are on a free-tier instance the provider may reclaim.
+
+Two halves, and **both are needed**: a snapshot on the node, and a pull that
+takes it off the node.
+
+### On the node: one verified snapshot a day
+
+```
+systemctl --user enable --now sketchgen-backup.timer        # 04:10 UTC, daily
+python3 bin/sketchgen backup snapshot --to ~/sketchgen/backups   # the first one, now
+systemctl --user list-timers --all | grep sketchgen-backup
+journalctl --user -u sketchgen-backup -n 30
+```
+
+Each run writes `~/sketchgen/backups/<utc>/` holding three files —
+`sketchgen.db`, `gate.tar.gz`, `manifest.json` — then re-opens what it wrote and
+verifies it, then removes all but the newest fourteen. The database is copied
+through SQLite's **online backup API**, not `cp`: a file copy of a WAL database
+taken while the worker is writing can be torn, and opens perfectly well
+afterwards while being silently short. The worker is not paused and does not
+need to be.
+
+The manifest records sizes and SHA-256s, the schema version, a row count for
+every table, the number of job directories, and the commit both checkouts were
+on. `jobs/` is **not** tarred — 300 MB that only grows is the wrong shape for a
+nightly tarball, so the puller rsyncs it and the manifest's job count is what a
+pull is checked against.
+
+Nothing in a snapshot is a credential. `~/.ssh` and `writepath.token` are never
+read, and a snapshot refuses outright if a credential turns up inside the one
+directory it walks.
+
+```
+python3 bin/sketchgen backup verify ~/sketchgen/backups        # the newest one
+python3 bin/sketchgen backup verify ~/sketchgen/backups/<utc>  # a named one
+```
+
+`verify` runs `PRAGMA integrity_check`, re-digests every file the manifest names
+and compares every row count. Exit 1 on any disagreement. An unopened backup is
+a belief, not a backup.
+
+### On the operator's machine: the pull, which is the actual backup
+
+The snapshot above is a good copy on the same disk that would be lost with the
+instance. This is the part that gets it off:
+
+```
+bin/pull-backup.sh sld-cloud                  # from the operator's clone
+bin/pull-backup.sh sld-cloud --no-jobs        # snapshots only, for a quick check
+```
+
+It rsyncs `~/sketchgen/backups/` (mirrored, deletions followed) and
+`~/sketchgen/jobs/` (**added to, never deleted from**) into
+`~/sketchgen-backups/sld-cloud/`, verifies the newest snapshot it just pulled,
+and prints one line: date, database size, row count, job directories, verified
+or not. It **exits non-zero when the newest snapshot is more than 36 hours
+old**, because a timer that stops on the node is silent by nature and this is
+the only thing that notices.
+
+A pull, not a push, on purpose: no new credential goes on a box whose whole
+problem is that it may be taken away. The SSH connection is one that already
+exists.
+
+Daily, unattended, on a Linux operator machine:
+
+```
+cp systemd/operator/sketchgen-pull.{service,timer} ~/.config/systemd/user/
+$EDITOR ~/.config/systemd/user/sketchgen-pull.service   # WorkingDirectory + the host name
+systemctl --user daemon-reload
+systemctl --user enable --now sketchgen-pull.timer
+systemctl --user list-timers --all | grep sketchgen-pull
+```
+
+On macOS there is no `systemctl --user`; use launchd, cron, or run the script by
+hand. What must not happen is nobody running it.
+
+An optional third copy, to Oracle Object Storage, exists behind a flag and is
+not wired into any timer — it is the only thing here that would put a cloud
+credential back on the node:
+
+```
+python3 bin/sketchgen backup push --bucket sketchgen ~/sketchgen/backups --dry-run
+```
+
+It refuses with instructions if the `oci` CLI is not installed.
+
+## Recovery
+
+Last rehearsed: not yet
+
+Every step is a command. The elapsed time goes on the line above once somebody
+has actually run this against a throwaway instance from a real snapshot; until
+then this section is a plan, not a runbook, and packet 0 is not finished.
+
+**Before you start**, on the machine holding the mirror:
+
+```bash
+ls -1 ~/sketchgen-backups/sld-cloud/backups/ | tail -3
+bin/pull-backup.sh sld-cloud --no-jobs      # if the old node is still reachable
+python3 bin/sketchgen backup verify ~/sketchgen-backups/sld-cloud/backups
+cat ~/sketchgen-backups/sld-cloud/backups/<utc>/manifest.json   # keep this open; it is the acceptance test
+```
+
+**1. A new instance.** Ubuntu 24.04, the same shape as before (ARM, 24 GB is
+what the free tier gives). Add it to `~/.ssh/config` as `sld-cloud-new` so the
+old entry still points at whatever is left of the old one.
+
+```bash
+ssh sld-cloud-new 'lsb_release -d && nproc && free -g && df -h /'
+```
+
+**2. Packages, and linger.** Linger is what lets a `--user` unit survive logout
+and a reboot; without it nothing here stays up.
+
+```bash
+ssh sld-cloud-new 'sudo apt-get update && sudo apt-get install -y python3 python3-venv git rsync sqlite3'
+ssh sld-cloud-new 'loginctl enable-linger $USER && loginctl show-user $USER | grep Linger'
+```
+
+**3. Clone the app.** Read-only deploy key first, so the clone is the same one
+`update.sh` will pull with later.
+
+```bash
+ssh sld-cloud-new 'mkdir -p ~/sketchgen && cd ~/sketchgen && git clone https://github.com/profcarroll/sketchgen.git app'
+ssh sld-cloud-new 'cd ~/sketchgen/app && git log --oneline -1'   # compare with manifest.git.app.commit
+```
+
+**4. The venv, Playwright, Chromium.** Pinned, because the gate is the referee:
+
+```bash
+ssh sld-cloud-new 'python3 -m venv ~/sketchgen/.venv'
+ssh sld-cloud-new '~/sketchgen/.venv/bin/pip install -r ~/sketchgen/app/requirements.txt'
+ssh sld-cloud-new '~/sketchgen/.venv/bin/playwright install chromium'
+ssh sld-cloud-new '~/sketchgen/.venv/bin/pip show playwright | head -2'   # must say 1.62.0
+```
+
+**5. Ollama and the two models, by name.** These are large and they are the long
+pole; start them before anything else that can wait.
+
+```bash
+ssh sld-cloud-new 'curl -fsSL https://ollama.com/install.sh | sh'
+ssh sld-cloud-new 'systemctl is-active ollama'
+ssh sld-cloud-new 'ollama pull qwen3-coder:30b-a3b-q4_K_M'
+ssh sld-cloud-new 'ollama pull gemma4:e4b'
+ssh sld-cloud-new 'ollama list'
+```
+
+**6. Restore the database.** From the newest verified snapshot in the mirror.
+The snapshot is one self-contained file: there is no `-wal` to carry with it.
+
+```bash
+SNAP=~/sketchgen-backups/sld-cloud/backups/<utc>
+python3 bin/sketchgen backup verify "$SNAP"                     # verify BEFORE shipping it
+scp "$SNAP/sketchgen.db" sld-cloud-new:sketchgen/sketchgen.db
+ssh sld-cloud-new 'sqlite3 ~/sketchgen/sketchgen.db "PRAGMA integrity_check;"'
+ssh sld-cloud-new '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen db status'
+```
+
+Bring the schema up to the code, in case the restored database is older than the
+clone (`migrate` is safe to rerun and does nothing when there is nothing to do):
+
+```bash
+ssh sld-cloud-new '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen db init'
+```
+
+**7. Restore the attempt archive.** 300 MB; run it in a screen or accept the
+wait. This is a push from the mirror, the only push in this runbook.
+
+```bash
+rsync -a --info=progress2 ~/sketchgen-backups/sld-cloud/jobs/ sld-cloud-new:sketchgen/jobs/
+ssh sld-cloud-new 'ls -1 ~/sketchgen/jobs | wc -l'   # compare with manifest.jobs_directories
+```
+
+**8. New deploy keys, on both repositories.** The old private halves are gone
+with the old instance and that is the correct outcome; generate new ones and
+revoke the old entries in each repository's *Deploy keys* page.
+
+```bash
+ssh sld-cloud-new '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen keygen app'
+ssh sld-cloud-new '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen keygen gallery'
+# paste each printed public half into that repo's Deploy keys page:
+#   sketchgen          READ-ONLY
+#   sketchgen-gallery  WRITE
+# then delete the old node's keys from both pages.
+```
+
+Re-point the app clone at SSH and clone the gallery with the write key:
+
+```bash
+ssh sld-cloud-new 'cd ~/sketchgen/app && git remote set-url origin git@github.com:profcarroll/sketchgen.git'
+ssh sld-cloud-new 'GIT_SSH_COMMAND="ssh -i ~/.ssh/sketchgen-gallery -o IdentitiesOnly=yes" git clone git@github.com:profcarroll/sketchgen-gallery.git ~/sketchgen/gallery'
+ssh sld-cloud-new 'cd ~/sketchgen/gallery && git config user.name "sketchgen publisher" && git config user.email "<the publisher address>"'
+```
+
+**9. A new write-path token.** The old bearer is gone with the instance; rotate
+it in the Cloudflare Worker rather than trying to recover it.
+
+```bash
+# in the writepath/ Worker's settings, set a new SKETCHGEN_TOKEN secret, then:
+ssh sld-cloud-new 'install -m 600 /dev/stdin ~/sketchgen/writepath.token' <<< '<the new token>'
+ssh sld-cloud-new 'ls -l ~/sketchgen/writepath.token'    # must be -rw-------
+```
+
+**10. Install the units and start the timers.** `install-unit` copies and
+reloads; enabling stays a keystroke.
+
+```bash
+ssh sld-cloud-new '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen install-unit'
+ssh sld-cloud-new 'systemctl --user enable --now sketchgen-web.service'
+ssh sld-cloud-new 'systemctl --user enable --now sketchgen-sync.timer'
+ssh sld-cloud-new 'systemctl --user enable --now sketchgen-backup.timer'
+ssh sld-cloud-new 'systemctl --user enable --now sketchgen-worker.service'   # or the .timer, for drip
+ssh sld-cloud-new 'systemctl --user list-timers --all | grep sketchgen'
+```
+
+**11. Prove it.** The gate first, because it is the referee and a recovered node
+whose gate does not run cannot make another entry:
+
+```bash
+ssh sld-cloud-new '. ~/sketchgen/.venv/bin/activate && ~/sketchgen/app/gate/accept.sh'
+ssh sld-cloud-new '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen db status'
+ssh -f -N -L 8081:127.0.0.1:8081 sld-cloud-new && open http://localhost:8081/held
+ssh sld-cloud-new '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen backup snapshot --to ~/sketchgen/backups'
+bin/pull-backup.sh sld-cloud-new --no-jobs
+```
+
+**Recovered means all four of these, not three:**
+
+1. `db status` row counts match `manifest.json`'s `row_counts`;
+2. `ls ~/sketchgen/jobs | wc -l` matches `manifest.jobs_directories`;
+3. the operator UI shows the held queue at http://localhost:8081/held;
+4. `accept.sh` passes every fixture, and one new job runs end to end.
+
+**Then rename the host** to `sld-cloud` in `~/.ssh/config` so every script and
+unit in this document works unchanged, and write the date and elapsed time on
+the `Last rehearsed:` line above.
+
 ## The 10/1 shrink
 
 Nothing to do. The unit encodes no core count, no memory figure and no
