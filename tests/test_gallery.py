@@ -16,6 +16,7 @@ data may survive a render.
 import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sketchgen import db  # noqa: E402
 from sketchgen import gallery  # noqa: E402
+from sketchgen import lineage  # noqa: E402
+from sketchgen.cli import gallery as cli_gallery  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI = REPO_ROOT / "bin" / "sketchgen"
@@ -801,6 +804,197 @@ class LineageJsonTests(GalleryTestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# Packet 4: the title is the root prompt, the subtitle is the latest revision
+# ---------------------------------------------------------------------------
+
+
+def heading(text: str) -> str:
+    """The `h1` of a page, tags stripped, entities resolved."""
+    inner = text.split("<h1>", 1)[1].split("</h1>", 1)[0]
+    return html.unescape(re.sub(r"<[^>]+>", "", inner)).strip()
+
+
+def subtitle(text: str) -> str:
+    """The `p.sub` under the heading, tags stripped. Empty when there is none."""
+    match = re.search(r'<p class="sub">(.*?)</p>', text, re.S)
+    if match is None:
+        return ""
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", match.group(1))).split())
+
+
+def head_title(text: str) -> str:
+    return html.unescape(text.split("<title>", 1)[1].split("</title>", 1)[0])
+
+
+class TitleTests(GalleryTestCase):
+    """A root, a first revision, and the generation-10 case that forced this.
+
+    Entry 230 on the live site is generation 10: its prompt is the root
+    sentence with ten critiques stapled under `Revise:` headings, 1,700
+    characters that the heading used to print in full. The fixture here is the
+    same shape, built by composing each generation's prompt the way
+    `lineage.compose_prompt` does, so the split the page does is the real one.
+    """
+
+    #: The critiques, in order, that turn the root into a generation-10 prompt.
+    #: One per generation: entry 230 carries ten headings and its lineage row
+    #: says generation 10, and entry 82 carries six and says 6.
+    REVISIONS = [
+        "try again with a different colour palette and mood",
+        "slow the drift until a single circle can be followed",
+        "let the ground breathe instead of holding one value",
+        "give the cursor less power over the whole field",
+        "bring back some of the contrast the last pass lost",
+        "let one circle be larger than the rest and lead",
+        "hold the palette but change what the click does",
+        "make the return after a scatter take longer",
+        "end on stillness rather than on motion",
+        "keep the stillness but let the ground hold one more hue",
+    ]
+
+    def setUp(self):
+        super().setUp()
+        self.root_id = self.ids[0]
+        self.root_prompt = " ".join(
+            self.conn.execute(
+                "SELECT prompt FROM entries WHERE id = ?", (self.root_id,)
+            ).fetchone()["prompt"].split()
+        )
+        prompt = self.root_prompt
+        parent = self.root_id
+        self.chain = []
+        for n, critique in enumerate(self.REVISIONS, start=1):
+            prompt = lineage.compose_prompt(prompt, critique)
+            parent = add_child(
+                self.conn, self.tmp, parent, state="published", prompt=prompt,
+                critique=critique, generation=n,
+                # a critic model on the odd generations, a person on the even
+                critique_by="gemma4:e4b" if n % 2 else "profcarroll",
+            )
+            self.chain.append(parent)
+        self.render()
+
+    def page(self, entry_id: int) -> str:
+        return (self.dest / "e" / str(entry_id) / "index.html").read_text(
+            encoding="utf-8"
+        )
+
+    def test_a_root_is_its_own_title_and_has_no_subtitle(self):
+        page = self.page(self.root_id)
+        self.assertEqual(self.root_prompt, heading(page))
+        self.assertEqual("", subtitle(page))
+        self.assertNotIn("Revise:", page.split("<section", 1)[0])
+
+    def test_the_first_revision_names_itself_and_counts_no_others(self):
+        page = self.page(self.chain[0])
+        self.assertEqual(self.root_prompt, heading(page))
+        sub = subtitle(page)
+        self.assertIn("Revise:", sub)
+        self.assertIn(self.REVISIONS[0], sub)
+        self.assertIn("generation 1", sub)
+        # one revision, so there are no earlier ones to send anybody below
+        self.assertNotIn("earlier revision", sub)
+
+    def test_a_model_critic_wears_the_model_chip_without_its_size(self):
+        # generation 1 was asked for by gemma4:e4b; the chip is the critic, not
+        # the quantisation, so the tag after the colon is not in it
+        page = self.page(self.chain[0])
+        self.assertIn('<span class="chip model">gemma4</span>', page)
+        self.assertNotIn("gemma4:e4b", subtitle(page))
+
+    def test_the_generation_ten_title_is_one_sentence(self):
+        entry_id = self.chain[-1]
+        page = self.page(entry_id)
+        self.assertEqual(self.root_prompt, heading(page))
+        # the thing this packet exists to stop: nine amendments in the heading
+        self.assertNotIn("Revise:", page.split("</h1>", 1)[0])
+        for revision in self.REVISIONS:
+            self.assertNotIn(revision, page.split("</h1>", 1)[0])
+
+    def test_the_generation_ten_subtitle_names_the_latest_revision(self):
+        page = self.page(self.chain[-1])
+        sub = subtitle(page)
+        self.assertIn(self.REVISIONS[-1], sub)
+        self.assertNotIn(self.REVISIONS[0], sub)
+        self.assertIn("generation 10", sub)
+        self.assertIn("9 earlier revisions in the lineage below", sub)
+        # the critique on the last generation came from a person
+        self.assertIn('<span class="chip person">profcarroll</span>', page)
+
+    def test_the_head_title_is_the_root_truncated_at_eighty(self):
+        for entry_id in (self.root_id, self.chain[0], self.chain[-1]):
+            with self.subTest(entry=entry_id):
+                self.assertEqual(
+                    self.root_prompt[:80], head_title(self.page(entry_id))
+                )
+
+    def test_provenance_keeps_the_whole_prompt(self):
+        """The title is shorter; the record is not."""
+        page = self.page(self.chain[-1])
+        meta = json.loads(
+            (self.dest / "e" / str(self.chain[-1]) / "meta.json").read_text()
+        )
+        for revision in self.REVISIONS:
+            with self.subTest(revision=revision):
+                self.assertIn(revision, meta["prompt"])
+                self.assertIn(html.escape(revision), page)
+
+    def test_a_card_shows_the_root_and_the_latest_revision(self):
+        index = (self.dest / "index.html").read_text(encoding="utf-8")
+        card = index.split(f'data-entry="{self.chain[-1]}"', 1)[1].split("</div>", 1)[0]
+        self.assertIn(html.escape(self.root_prompt), card)
+        self.assertIn("card-revision", card)
+        self.assertIn(f"g10 · {self.REVISIONS[-1]}", html.unescape(card))
+        # the nine earlier revisions are in data-search and nowhere visible
+        shown = html.unescape(card.split('data-search="', 1)[1].split('">', 1)[1])
+        for revision in self.REVISIONS[:-1]:
+            with self.subTest(revision=revision):
+                self.assertNotIn(revision, shown)
+
+    def test_the_entry_eighty_two_case_reads_g6(self):
+        """Six headings, lineage generation 6, and the card says so.
+
+        Entry 82 on the live site: `generation` in the lineage row is the
+        number of `Revise:` headings in the prompt, not one more than it, and
+        the card takes the number from the row either way.
+        """
+        entry_id = self.chain[5]
+        self.assertEqual(
+            6,
+            int(self.conn.execute(
+                "SELECT generation FROM lineage WHERE child_entry_id = ?",
+                (entry_id,),
+            ).fetchone()["generation"]),
+        )
+        index = (self.dest / "index.html").read_text(encoding="utf-8")
+        card = index.split(f'data-entry="{entry_id}"', 1)[1].split("</div>", 1)[0]
+        self.assertIn(f"g6 · {self.REVISIONS[5]}", html.unescape(card))
+        sub = subtitle(self.page(entry_id))
+        self.assertIn("generation 6", sub)
+        self.assertIn("5 earlier revisions in the lineage below", sub)
+
+    def test_search_still_finds_an_early_revision(self):
+        index = (self.dest / "index.html").read_text(encoding="utf-8")
+        haystack = card_search(index)[str(self.chain[-1])]
+        for revision in self.REVISIONS:
+            with self.subTest(revision=revision):
+                self.assertIn(revision, html.unescape(haystack))
+
+    def test_only_the_root_card_on_a_line_page_carries_the_prompt(self):
+        line = (self.dest / "lines" / f"{self.root_id}.html").read_text(
+            encoding="utf-8"
+        )
+        # the card that closes a line at DECIDE[lineage-depth] has one too; it
+        # is not a generation, so it is not part of this count
+        self.assertEqual(1, line.split('class="node depth-6 waits"')[0].count("node-prompt"))
+        self.assertIn(html.escape(self.root_prompt), line)
+        for revision in self.REVISIONS:
+            with self.subTest(revision=revision):
+                # each critique is on the line page once, as a critique
+                self.assertEqual(1, line.count(html.escape(revision)))
+
+
 class IndexTests(GalleryTestCase):
 
     def setUp(self):
@@ -816,7 +1010,8 @@ class IndexTests(GalleryTestCase):
         self.assertNotIn(f'data-entry="{three}"', self.index)
         self.assertIn(f'data-entry="{three}"', self.failed)
         self.assertNotIn(f'data-entry="{one}"', self.failed)
-        self.assertIn("REJECTED", self.failed)
+        # The chip says whose rejection it is, not just that there was one.
+        self.assertIn("rejected · gate", self.failed)
         self.assertIn("AudioContext is suspended", self.failed)
 
     def test_the_cards_carry_what_the_grid_shows(self):
@@ -1078,6 +1273,105 @@ class CompareRejectionTests(GalleryTestCase):
         # nothing outside the reveal, and no verdict baked into the HTML
         self.assertEqual(1, self.compare.count("data-rejected-note"))
         self.assertNotIn("rejected by the gate", self.compare)
+
+
+class OperatorRejectionTests(GalleryTestCase):
+    """§5.2: a rejection a person made is public, and says so in their words."""
+
+    def reject(self, entry_id, reason, published_utc="2026-09-14T06:00:00Z"):
+        """Turn one of the fixture's entries into a published operator rejection."""
+        self.conn.execute(
+            "UPDATE entries SET state = 'rejected', reject_reason = ?, "
+            "published_utc = ? WHERE id = ?",
+            (reason, published_utc, entry_id),
+        )
+        self.conn.commit()
+        return entry_id
+
+    def test_a_rejected_entry_renders_with_the_operator_chip_and_the_reason(self):
+        entry_id = self.reject(self.ids[1], "drifted from the prompt")
+        self.render()
+        page = (self.dest / "e" / str(entry_id) / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("rejected · operator", page)
+        self.assertIn(
+            "Rejected by the operator: drifted from the prompt", page
+        )
+        # The gate's own wording is not borrowed for a decision a person made.
+        self.assertNotIn("REJECTED BY THE GATE", page)
+        self.assertEqual(
+            "rejected",
+            json.loads(
+                (self.dest / "e" / str(entry_id) / "meta.json").read_text("utf-8")
+            )["state"],
+        )
+
+    def test_rejections_html_shows_both_kinds(self):
+        gate = self.ids[2]
+        operator = self.reject(self.ids[1], "second version better")
+        self.render()
+        page = (self.dest / "rejections.html").read_text(encoding="utf-8")
+        self.assertIn(f'data-entry="{gate}"', page)
+        self.assertIn(f'data-entry="{operator}"', page)
+        self.assertIn("rejected · gate", page)
+        self.assertIn("rejected · operator", page)
+        # Each card's own reason, from its own source: the entry's column for
+        # the operator's, the job's last_error for the gate's.
+        self.assertIn("second version better", page)
+        self.assertIn("AudioContext is suspended", page)
+        # ...and it is off the grid.
+        index = (self.dest / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn(f'data-entry="{operator}"', index)
+
+    def test_a_rejection_with_no_reason_recorded_says_so(self):
+        entry_id = self.reject(self.ids[1], None)
+        self.render()
+        page = (self.dest / "e" / str(entry_id) / "index.html").read_text("utf-8")
+        self.assertIn("Rejected by the operator: reason not recorded", page)
+
+    def test_a_rejection_nobody_published_is_on_no_page(self):
+        # The same rule the kept failures have had: the state flip is not the
+        # decision to show it, the push is (§5.2).
+        job = db.enqueue(self.conn, "a rejection nobody pushed", "profcarroll")
+        entry_id = db.create_entry(
+            self.conn, job, state="rejected", prompt="a rejection nobody pushed",
+            reject_reason="off brief",
+        )
+        with self.assertRaises(gallery.UnknownEntry):
+            gallery.render_entry(self.conn, entry_id, self.dest, self.config)
+        self.render()
+        page = (self.dest / "rejections.html").read_text(encoding="utf-8")
+        self.assertNotIn(f'data-entry="{entry_id}"', page)
+
+    def test_an_archived_entry_is_never_public(self):
+        job = db.enqueue(self.conn, "one taken off the lists", "profcarroll")
+        entry_id = db.create_entry(
+            self.conn, job, state="archived", prompt="one taken off the lists",
+        )
+        self.assertNotIn("archived", gallery.PUBLIC_STATES)
+        with self.assertRaises(gallery.UnknownEntry):
+            gallery.render_entry(self.conn, entry_id, self.dest, self.config)
+        for publishing in (False, True):
+            with self.subTest(publishing=publishing):
+                with self.assertRaises(gallery.UnknownEntry):
+                    gallery.render_entry(
+                        self.conn, entry_id, self.dest, self.config,
+                        publishing=publishing,
+                    )
+        self.render()
+        self.assertFalse((self.dest / "e" / str(entry_id)).exists())
+
+    def test_a_rejected_entry_keeps_its_place_in_the_lineage_file(self):
+        # The whole point of §5.2: a rejected parent is a public entry with a
+        # strip, so a child's ledger has a frame to show instead of a blank.
+        entry_id = self.reject(self.ids[1], "prompt drift")
+        self.render()
+        index = json.loads((self.dest / "lineage.json").read_text("utf-8"))
+        item = index["entries"][str(entry_id)]
+        self.assertEqual("rejected", item["state"])
+        self.assertTrue(item["public"])
+        self.assertEqual(f"e/{entry_id}/strip.png", item["strip"])
 
 
 class GridSearchTests(GalleryTestCase):
@@ -1711,7 +2005,7 @@ class LedgerPanelTests(GalleryTestCase):
         # so the root prints the word and no number (gallery._generation_label).
         self.assertIn(f'<a href="../{self.ids[0]}/">entry {self.ids[0]}</a> · root ·', root)
         self.assertNotIn("generation 1", root)
-        self.assertIn('<span class="chip human">profcarroll</span>', root)
+        self.assertIn('<span class="chip person">profcarroll</span>', root)
 
     def test_the_middle_of_the_line_folds_into_one_disclosure(self):
         panel = self.panel()
@@ -1891,6 +2185,100 @@ class HeavyStageTests(GalleryTestCase):
         self.reported(self.ids[0], total_s=12.0, ms_per_frame=100.0)
         page = self.page_of(self.ids[0])
         self.assertIn('<iframe class="sketch" src="sketch/"', page)
+class PublishRejectedTests(GalleryTestCase):
+    """§5.4: the one-time backfill of the rejections that were only a state flip."""
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(CLI), "publish-rejected", *args],
+            capture_output=True, text=True, check=False, env=dict(os.environ),
+        )
+
+    def waiting(self, prompt, last_error, entry_reason=None):
+        """A rejected entry nobody has published, with its job's last word."""
+        job = db.enqueue(self.conn, prompt, "profcarroll")
+        self.conn.execute(
+            "UPDATE jobs SET state = 'rejected', last_error = ? WHERE id = ?",
+            (last_error, job),
+        )
+        entry_id = db.create_entry(
+            self.conn, job, state="rejected", prompt=prompt,
+            reject_reason=entry_reason,
+        )
+        self.conn.commit()
+        return entry_id
+
+    def test_the_reason_is_read_from_the_job_only_when_a_person_wrote_it(self):
+        for last_error, expected in (
+            ("prompt drift", "prompt drift"),
+            ("entry rejected: too illegible", "too illegible"),
+            # the placeholder the old UI wrote for an empty reason box
+            ("rejected by operator", cli_gallery.NO_REASON),
+            ("", cli_gallery.NO_REASON),
+            (None, cli_gallery.NO_REASON),
+            # the machine's own words, which are not a person's verdict
+            ("gate exit 1: checks failed", cli_gallery.NO_REASON),
+            ("executor: no js block in the response", cli_gallery.NO_REASON),
+            ("x" * 400, cli_gallery.NO_REASON),
+        ):
+            with self.subTest(last_error=last_error):
+                self.assertEqual(expected, cli_gallery.backfill_reason(last_error))
+
+    def test_dry_run_lists_every_waiting_rejection_and_its_reason(self):
+        one = self.waiting("one a person refused", "prompt drift")
+        two = self.waiting("one with nothing written down", "rejected by operator")
+        result = self.run_cli(
+            "--all", "--dry-run", "--db", str(self.tmp / "sketchgen.db")
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"entry {one}: prompt drift", result.stdout)
+        self.assertIn(f"entry {two}: {cli_gallery.NO_REASON}", result.stdout)
+        self.assertIn("2 rejected entries would be published", result.stdout)
+        # A dry run writes nothing, not even the reason it would record.
+        self.assertIsNone(db.get_entry(self.conn, two)["reject_reason"])
+
+    def test_a_rejection_already_on_the_site_is_not_in_the_backlog(self):
+        done = self.waiting("one already pushed", "prompt drift")
+        self.conn.execute(
+            "UPDATE entries SET published_utc = ? WHERE id = ?",
+            ("2026-09-14T06:00:00Z", done),
+        )
+        self.conn.commit()
+        result = self.run_cli(
+            "--all", "--dry-run", "--db", str(self.tmp / "sketchgen.db")
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(f"entry {done}:", result.stdout)
+
+    def test_an_entrys_own_reason_wins_over_the_jobs_last_error(self):
+        entry_id = self.waiting("one with both", "prompt drift", "what a person typed")
+        result = self.run_cli(
+            "--all", "--dry-run", "--db", str(self.tmp / "sketchgen.db")
+        )
+        self.assertIn(f"entry {entry_id}: what a person typed", result.stdout)
+
+    def test_named_ids_narrow_the_run_and_a_wrong_one_refuses(self):
+        one = self.waiting("one a person refused", "prompt drift")
+        self.waiting("another", "lacks cohesion")
+        db_arg = str(self.tmp / "sketchgen.db")
+        result = self.run_cli(str(one), "--dry-run", "--db", db_arg)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("1 rejected entries would be published", result.stdout)
+        # An id that is not a rejection waiting to be published is a refusal,
+        # not a silent no-op: the operator typed a number and meant it.
+        wrong = self.run_cli(str(self.ids[0]), "--dry-run", "--db", db_arg)
+        self.assertEqual(wrong.returncode, 3, wrong.stdout)
+        self.assertIn("refused", wrong.stderr)
+
+    def test_saying_nothing_at_all_is_refused(self):
+        result = self.run_cli("--dry-run", "--db", str(self.tmp / "sketchgen.db"))
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn("refused", result.stderr)
+
+    def test_help_exits_zero(self):
+        result = self.run_cli("--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--dry-run", result.stdout)
 
 
 if __name__ == "__main__":

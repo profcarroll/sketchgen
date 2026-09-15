@@ -233,9 +233,25 @@ class PublishTests(PublishTestCase):
         self.assertEqual(self.entry_row()["state"], "failed-kept")
         self.assertIsNotNone(self.entry_row()["publish_commit"])
 
-    def test_rejected_entries_do_not_publish(self):
+    def test_rejected_entries_publish_and_keep_their_state(self):
+        # The lineage ledger's §5.2 turned this test around: an operator
+        # rejection used to be refused here and so stayed invisible with all
+        # of its files still on disk. It now publishes, onto the rejections
+        # page, and keeps the state that puts it there rather than becoming
+        # 'published'.
         self.conn.execute(
-            "UPDATE entries SET state = 'rejected' WHERE id = ?", (self.entry_id,)
+            "UPDATE entries SET state = 'rejected', reject_reason = 'off brief' "
+            "WHERE id = ?",
+            (self.entry_id,),
+        )
+        result = self.publish_cli()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.entry_row()["state"], "rejected")
+        self.assertIsNotNone(self.entry_row()["publish_commit"])
+
+    def test_archived_entries_do_not_publish(self):
+        self.conn.execute(
+            "UPDATE entries SET state = 'archived' WHERE id = ?", (self.entry_id,)
         )
         result = self.publish_cli()
         self.assertEqual(result.returncode, 3, result.stdout)
