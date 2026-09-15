@@ -1133,9 +1133,19 @@ def main(argv=None):
                 notes.append(str(exc))
                 notes.append(
                     "frame_budget: the run stopped at %d of the %d idle frames and "
-                    "did not finish the probes or the assertions; the artefacts on "
-                    "disk are of the frames it did step"
+                    "did not finish the probes or the assertions"
                     % (budget.frames, IDLE_FRAMES))
+                # One readback before the browser closes, so the operator UI has
+                # a still to draw its play button on and a person can see what
+                # the sketch was doing without running it. Best effort: a page
+                # that is already broken is not worth failing the report over.
+                try:
+                    if save_data_url(page.evaluate("() => window.__gate.png()"),
+                                     out_dir / "gate.png"):
+                        notes.append("gate.png is the frame the run stopped on")
+                except Exception as snap:  # noqa: BLE001
+                    notes.append("no frame could be read back after the budget "
+                                 "stopped the run: %s" % snap)
 
             # console cleanliness is judged over the whole run
             checks["console_clean"] = rec.clean

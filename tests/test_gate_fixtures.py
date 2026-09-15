@@ -45,7 +45,7 @@ FIXTURES = GATE_DIR / "fixtures"
 #: above the --budget-s wall ceiling. The previous value, which is the one the
 #: node and the course repo carry until this is deployed, was
 #: 426e8e7429984b1f5377c068886bebeaab8795a2a102a687c06938bb6a66b658.
-GATE_SHA256 = "6fdf97b2e6ee63d8266a7b16fdc66cb3b88cea2f4b3bb43053dc8528d6b01e00"
+GATE_SHA256 = "2cd5f5156f3669ee558f051d69939655a4a7bc82707b1469ffcb48cb54d1a85e"
 
 #: How long the seven fixtures are allowed to take together. On the node a
 #: single gate run is about four seconds and the harness does thirteen of them —

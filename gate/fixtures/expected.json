@@ -79,7 +79,7 @@
       "audio_context_running": null,
       "frame_budget": false
     },
-    "notes": "The cost bug from job 166 with nothing else wrong: every check this gate had before 2026-09-15 passes and the sketch still takes about a third of a second to draw one frame. is_looping and frame_advancing are deliberately NOT listed here. Both are read at the end of the idle window, and this run does not reach the end of it \u2014 the budget stops it early \u2014 so on a slow machine they are null and on a fast one they are true, and neither is what the fixture is for. exit 1 and frame_budget false hold on both."
+    "notes": "The cost bug from job 166 with nothing else wrong: every check this gate had before 2026-09-15 passes and the sketch still takes about a third of a second to draw one frame. is_looping and frame_advancing are deliberately NOT listed here. Both are read at the end of the idle window, and this run does not reach the end of it \u2014 the budget stops it early \u2014 so on a slow machine they are null and on a fast one they are true, and neither is what the fixture is for. exit 1 and frame_budget false hold on both. The run still writes gate.png \u2014 the frame it stopped on \u2014 so the operator UI has a still to draw a play button on."
   },
   "assertions_expected": {
     "bad-frozen": {
