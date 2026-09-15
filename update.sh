@@ -9,6 +9,7 @@
 # What it does, in order:
 #   1. Pulls the generator repo (~/sketchgen/app)
 #   2. Re-installs the unit files into ~/.config/systemd/user and reloads
+#   2b. Applies any pending database migration (db init)
 #   3. Pulls the gallery checkout (~/sketchgen/gallery)
 #   4. Re-renders the gallery index from the database (new templates → new HTML)
 #   5. Pushes the re-rendered gallery to GitHub
@@ -51,6 +52,16 @@ step "Re-installing unit files"
 cd "$APP"
 "$VENV" bin/sketchgen install-unit || die "install-unit failed"
 green "unit files up to date"
+
+# --- 2b. Migrate the database ------------------------------------------------
+# A pull can bring a migration with it, and the code that follows assumes the
+# schema it was written against: the 2026-09-15 deploy of packet 2 ran the
+# backfill before anyone ran `db init`, and it fell over on a column that was
+# not there yet. `db init` applies what is pending and is a no-op otherwise.
+step "Migrating the database"
+cd "$APP"
+"$VENV" bin/sketchgen db init --db "$DB" || die "db init (migrate) failed"
+green "database schema up to date"
 
 # --- 3. Pull the gallery checkout --------------------------------------------
 step "Pulling gallery checkout (~/sketchgen/gallery)"
