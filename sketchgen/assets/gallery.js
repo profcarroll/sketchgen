@@ -726,62 +726,82 @@
    * frame budget and over the audio context, and the comparison stops being
    * about the sketches.
    *
-   * This is the whole of the toggle's state: the .side element whose sketch is
+   * The compare page and the entry page's ledger both need exactly this, so it
+   * lives here rather than inside wireCompare: one toggle, one rule about what
+   * may be playing, one sandbox. Every caller hands over a host element that
+   * holds a [data-play] button, the src of the sketch page, and the words it
+   * wants spoken; nothing else about the two pages is shared.
+   *
+   * This is the whole of the toggle's state: the host element whose sketch is
    * playing, or null. Stopping REMOVES the iframe rather than hiding it —
    * display:none does not unload a document, so a hidden frame keeps drawing
    * and keeps its AudioContext open. */
   var running = null;
 
-  function runNote(side, text) {
-    var note = side.querySelector("[data-run-note]");
+  function runNote(host, text) {
+    var note = host.querySelector("[data-run-note]");
     if (note) { note.textContent = text; }
   }
 
   function stopSketch() {
     if (!running) { return; }
-    var side = running;
+    var state = running;
     running = null;
-    var frame = side.querySelector("iframe.sketch");
+    var frame = state.host.querySelector("iframe.sketch");
     if (frame) { frame.remove(); }
-    var button = side.querySelector("[data-play]");
+    var button = state.button;
     if (button) {
       button.className = "play";
-      button.setAttribute("aria-label", "run sketch " + side.getAttribute("data-side"));
+      button.setAttribute("aria-label", "run " + state.name);
       var label = button.querySelector("[data-play-label]");
       if (label) { label.textContent = ""; }
     }
-    runNote(side, "click to run");
+    runNote(state.host, state.idle);
   }
 
-  function startSketch(side, entry) {
+  function startSketch(host, src, options) {
     stopSketch();
-    var thumb = side.querySelector("[data-thumb]");
-    var button = side.querySelector("[data-play]");
-    if (!thumb || !button) { return; }
-    var letter = side.getAttribute("data-side");
+    var opts = options || {};
+    var mount = opts.mount || host;
+    var button = host.querySelector("[data-play]");
+    if (!button) { return; }
+    var name = opts.name || "this sketch";
     var frame = document.createElement("iframe");
     frame.className = "sketch";
-    frame.src = ROOT + entry.href + "sketch/";
-    frame.title = "sketch " + letter + " running";
-    // Exactly the entry page's sandbox, so a sketch behaves the same on both
-    // pages: scripts yes, and nothing else — no same-origin, no forms, no top
-    // navigation. p5.sound still works; the viewer's click is the gesture that
-    // lets the frame start audio.
+    frame.src = src;
+    frame.title = name + " running";
+    // Exactly the entry page's sandbox, so a sketch behaves the same wherever
+    // it is run: scripts yes, and nothing else — no same-origin, no forms, no
+    // top navigation. p5.sound still works; the viewer's click is the gesture
+    // that lets the frame start audio.
     frame.setAttribute("sandbox", "allow-scripts");
-    thumb.insertBefore(frame, button);
+    mount.insertBefore(frame, button);
     button.className = "play running";
-    button.setAttribute("aria-label", "stop sketch " + letter);
+    button.setAttribute("aria-label", "stop " + name);
     var label = button.querySelector("[data-play-label]");
     if (label) { label.textContent = "stop"; }
-    running = side;
-    runNote(side, "running · click to stop");
+    running = {
+      host: host,
+      button: button,
+      name: name,
+      idle: opts.idle === undefined ? "" : opts.idle
+    };
+    runNote(host, opts.note === undefined ? "" : opts.note);
+  }
+
+  /** Make one [data-play] button start and stop one sketch in its own box. */
+  function runInPlace(host, src, options) {
+    return function () {
+      if (running && running.host === host) { stopSketch(); }
+      else { startSketch(host, src, options); }
+    };
   }
 
   function paintSide(side, entry) {
     var thumb = side.querySelector("[data-thumb]");
     var brief = side.querySelector("[data-brief]");
     if (thumb) {
-      if (running === side) { stopSketch(); }
+      if (running && running.host === side) { stopSketch(); }
       thumb.textContent = "";
       var img = document.createElement("img");
       img.src = ROOT + entry.strip;
@@ -802,14 +822,295 @@
         var label = document.createElement("span");
         label.setAttribute("data-play-label", "");
         button.appendChild(label);
-        button.addEventListener("click", function () {
-          if (running === side) { stopSketch(); } else { startSketch(side, entry); }
-        });
+        // The same helper the ledger's tiles use, with the compare page's own
+        // words: the side is the host, the thumbnail is where the frame goes.
+        button.addEventListener("click", runInPlace(side, ROOT + entry.href + "sketch/", {
+          mount: thumb,
+          name: "sketch " + side.getAttribute("data-side"),
+          idle: "click to run",
+          note: "running · click to stop"
+        }));
         thumb.appendChild(button);
         runNote(side, "click to run");
       }
     }
     if (brief) { brief.textContent = entry.brief || entry.prompt || "(no brief recorded)"; }
+  }
+
+  /* ---- the ledger ------------------------------------------------------ */
+
+  /* The entry page's lineage panel. Its ancestry is static HTML: it was true
+   * when the entry was published and it stays true. Everything below this
+   * entry is not — a sibling or a child can arrive a month after the page was
+   * rendered — so the server leaves those containers empty and they are
+   * painted here from lineage.json, which render_index rewrites on every push.
+   * With no script the page keeps the ancestry and the plain children line. */
+
+  function ledgerNumber(a, b) { return Number(a) - Number(b); }
+
+  function generationOf(item) {
+    // Whatever the database recorded, printed as it stands; see the note on
+    // gallery._generation_label for why a root and its first child agree.
+    return (item && item.generation) || 1;
+  }
+
+  function criticChip(item, isRoot) {
+    var who = String((isRoot ? (item || {}).submitted_by : (item || {}).critique_by) || "").trim();
+    if (!who) { return null; }
+    var chip = document.createElement("span");
+    var model = who.indexOf(":") >= 0;
+    chip.className = "chip " + (model ? "model" : "human");
+    chip.textContent = model ? who.split(":")[0] : who;
+    return chip;
+  }
+
+  function plainChip(text) {
+    var chip = document.createElement("span");
+    chip.className = "chip unpublished";
+    chip.textContent = text;
+    return chip;
+  }
+
+  function ledgerTile(id, item, width) {
+    var tile = document.createElement("div");
+    var public_ = !!(item && item.public);
+    tile.className = "ledger-tile " + width + (public_ ? "" : " blank");
+    if (!public_) {
+      tile.setAttribute("aria-hidden", "true");
+      return tile;
+    }
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "play";
+    button.setAttribute("data-play", "");
+    button.setAttribute("aria-label", "run entry " + id);
+    var img = document.createElement("img");
+    img.src = "../" + id + "/strip.png";
+    img.loading = "lazy";
+    img.alt = "the first frame of entry " + id;
+    button.appendChild(img);
+    // Empty while the frame is showing, "stop" while the sketch runs, so one
+    // control does both without the row changing height.
+    var label = document.createElement("span");
+    label.setAttribute("data-play-label", "");
+    button.appendChild(label);
+    button.addEventListener("click", runInPlace(tile, "../" + id + "/sketch/", {
+      name: "entry " + id
+    }));
+    tile.appendChild(button);
+    return tile;
+  }
+
+  function ledgerText(id, item, options) {
+    var opts = options || {};
+    var text = document.createElement("div");
+    text.className = "ledger-text";
+    var critique = String((item || {}).critique || "").trim();
+    if (critique) {
+      var line = document.createElement("p");
+      line.className = "ledger-critique" + (opts.clamp ? " clamp" : "");
+      var revise = document.createElement("span");
+      revise.className = "revise";
+      revise.textContent = "Revise:";
+      line.appendChild(revise);
+      line.appendChild(document.createTextNode(" "));
+      var em = document.createElement("em");
+      em.textContent = critique;
+      line.appendChild(em);
+      text.appendChild(line);
+    }
+    var meta = document.createElement("p");
+    meta.className = "ledger-meta";
+    if (item && item.public) {
+      var link = document.createElement("a");
+      link.href = "../" + id + "/";
+      link.textContent = "entry " + id;
+      meta.appendChild(link);
+    } else {
+      meta.appendChild(document.createTextNode("entry " + id));
+    }
+    meta.appendChild(document.createTextNode(" · generation " + generationOf(item)));
+    if (opts.tail) { meta.appendChild(document.createTextNode(" · " + opts.tail)); }
+    var chip = criticChip(item, false);
+    if (chip) {
+      meta.appendChild(document.createTextNode(" · "));
+      meta.appendChild(chip);
+    }
+    if (!(item && item.public)) {
+      meta.appendChild(document.createTextNode(" · "));
+      meta.appendChild(plainChip("not published"));
+    }
+    text.appendChild(meta);
+    return text;
+  }
+
+  function ledgerRow(id, item, options) {
+    var opts = options || {};
+    var row = document.createElement(opts.card ? "div" : "li");
+    row.className = opts.card ? "ledger-card" : "ledger-row";
+    row.appendChild(ledgerTile(id, item, opts.card ? "wide" : "narrow"));
+    row.appendChild(ledgerText(id, item, opts));
+    return row;
+  }
+
+  function moreLine(text, root) {
+    var line = document.createElement("p");
+    line.className = "ledger-more";
+    var link = document.createElement("a");
+    link.href = "../../lines/" + root + ".html";
+    link.textContent = text;
+    line.appendChild(link);
+    return line;
+  }
+
+  function countOf(n, one, many) { return n + " " + (n === 1 ? one : many); }
+
+  function paintForks(panel, entries, id, mine) {
+    var host = panel.querySelector("[data-ledger-forks]");
+    if (!host || mine.parent === null || mine.parent === undefined) { return; }
+    var parent = entries[String(mine.parent)] || {};
+    var siblings = (parent.children || [])
+      .filter(function (kid) { return String(kid) !== String(id); })
+      .sort(ledgerNumber);
+    if (!siblings.length) { return; }
+    host.textContent = "";
+    var label = document.createElement("p");
+    label.className = "ledger-fork-label";
+    label.textContent = "also from entry " + mine.parent;
+    host.appendChild(label);
+    var list = document.createElement("ol");
+    list.className = "ledger";
+    siblings.slice(0, 4).forEach(function (kid) {
+      var item = entries[String(kid)];
+      var kids = ((item || {}).children || []).length;
+      list.appendChild(ledgerRow(kid, item, {
+        tail: kids ? countOf(kids, "child", "children") : ""
+      }));
+    });
+    host.appendChild(list);
+    if (siblings.length > 4) {
+      host.appendChild(moreLine(
+        "…and " + (siblings.length - 4) + " more from entry " + mine.parent,
+        mine.root
+      ));
+    }
+    host.hidden = false;
+  }
+
+  function descendantsOf(entries, id) {
+    var out = [];
+    var seen = {};
+    var queue = ((entries[String(id)] || {}).children || []).slice();
+    while (queue.length) {
+      var next = queue.shift();
+      if (seen[String(next)]) { continue; }
+      seen[String(next)] = true;
+      out.push(next);
+      queue = queue.concat(((entries[String(next)] || {}).children || []).slice());
+    }
+    return out;
+  }
+
+  function paintDescendants(panel, entries, id, mine) {
+    var after = panel.querySelector("[data-ledger-after]");
+    var grid = panel.querySelector("[data-ledger-tiles]");
+    var plain = panel.querySelector("[data-ledger-plain]");
+    var kids = (mine.children || []).slice().sort(ledgerNumber);
+    var all = descendantsOf(entries, id);
+    if (!all.length) {
+      if (after) { after.textContent = "No children yet."; }
+      return;
+    }
+    var generations = {};
+    all.forEach(function (one) {
+      generations[String(generationOf(entries[String(one)]))] = true;
+    });
+    if (after) {
+      after.textContent = "After this entry: " + countOf(kids.length, "child", "children") +
+        ", " + countOf(Object.keys(generations).length, "generation", "generations") +
+        " so far";
+    }
+    if (!grid) { return; }
+    // Direct children first, then the rest of the line in generation order:
+    // the question a reader has is "what came of this one", and the answer
+    // starts with the entries that came of it directly.
+    var rest = all.filter(function (one) { return kids.indexOf(one) < 0; });
+    rest.sort(function (a, b) {
+      var ga = generationOf(entries[String(a)]);
+      var gb = generationOf(entries[String(b)]);
+      return ga === gb ? ledgerNumber(a, b) : ga - gb;
+    });
+    var order = kids.concat(rest);
+    grid.textContent = "";
+    order.slice(0, 8).forEach(function (one) {
+      grid.appendChild(ledgerRow(one, entries[String(one)], { card: true, clamp: true }));
+    });
+    grid.hidden = false;
+    if (order.length > 8) {
+      grid.parentNode.insertBefore(
+        moreLine("…and " + (order.length - 8) + " more in the line", mine.root),
+        grid.nextSibling
+      );
+    }
+    // The script has painted what this line said in words; the words would
+    // only repeat it.
+    if (plain) { plain.hidden = true; }
+  }
+
+  function paintDepth(panel, entries, mine, id) {
+    var deepest = 1;
+    Object.keys(entries).forEach(function (key) {
+      if (String(entries[key].root) === String(mine.root)) {
+        deepest = Math.max(deepest, generationOf(entries[key]));
+      }
+    });
+    var slot = document.querySelector("[data-ledger-deepest]");
+    if (slot) {
+      slot.textContent = String(deepest);
+      return;
+    }
+    // A root that had no children when its page was rendered and has some now:
+    // there is no number in the heading to replace, so the phrase changes.
+    var head = document.querySelector("[data-ledger-head]");
+    if (head && deepest > 1 && String(mine.root) === String(id)) {
+      head.textContent = "the root of a line " + deepest + " generations deep";
+    }
+  }
+
+  function paintLedger(panel, id, entries) {
+    var mine = entries[String(id)];
+    if (!mine) { return; }
+    paintDepth(panel, entries, mine, id);
+    paintForks(panel, entries, id, mine);
+    paintDescendants(panel, entries, id, mine);
+  }
+
+  /** Every play button the server wrote: the ledger's tiles, and the stage of
+   *  an entry too expensive to start itself. */
+  function wireRunButtons(scope) {
+    Array.prototype.forEach.call(scope.querySelectorAll("[data-run-href]"), function (button) {
+      if (button.getAttribute("data-run-wired")) { return; }
+      button.setAttribute("data-run-wired", "1");
+      var host = button.parentNode;
+      button.addEventListener("click", runInPlace(host, button.getAttribute("data-run-href"), {
+        name: button.getAttribute("data-run-name") || "this sketch",
+        idle: "click to run",
+        note: "running · click to stop"
+      }));
+      // Only now that something will happen when it is clicked.
+      runNote(host, "click to run");
+    });
+  }
+
+  function wireLedger() {
+    wireRunButtons(document);
+    var panel = document.querySelector("[data-ledger]");
+    if (!panel) { return; }
+    var id = panel.getAttribute("data-ledger");
+    fetch(ROOT + "lineage.json")
+      .then(function (response) { return response.json(); })
+      .then(function (data) { paintLedger(panel, id, (data && data.entries) || {}); })
+      .catch(function () { /* the ancestry and the plain children line stand */ });
   }
 
   function wireCompare() {
@@ -899,6 +1200,7 @@
       loadCounts();
       wireLike();
       wireCompare();
+      wireLedger();
       loadMe();
     });
   });
