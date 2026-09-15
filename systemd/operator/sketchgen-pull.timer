@@ -1,0 +1,35 @@
+# sketchgen-pull.timer — one pull a day, on the OPERATOR'S machine.
+#
+# Install with its service; see the comment at the top of
+# sketchgen-pull.service for the two lines to edit first:
+#
+#   cp ~/sketchgen/systemd/operator/sketchgen-pull.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sketchgen-pull.timer
+#
+# OnCalendar=…07:30  a local wall clock on purpose, unlike everything on the
+#                    node: this one wants to fire while its machine is awake and
+#                    on a network, which is a fact about the operator's day, not
+#                    about UTC. The node's snapshot is taken at 04:10 UTC, so
+#                    any reasonable morning here is after the newest one exists.
+# Persistent=true    a laptop is closed more often than a server; a pull missed
+#                    while it was shut runs once when it comes back rather than
+#                    being skipped in silence.
+# RandomizedDelaySec a laptop's 07:30 is whenever it woke up, and there is no
+#                    reason for several machines to knock on the node at once.
+#
+# The first pull moves 300 MB of attempt archive and takes a while; every one
+# after that is a few megabytes, because rsync only sends what changed and the
+# archive only ever grows.
+[Unit]
+Description=sketchgen pull drip: mirror the node's backups here every morning
+Documentation=file:%h/sketchgen/docs/OPERATIONS.md
+
+[Timer]
+OnCalendar=*-*-* 07:30:00
+RandomizedDelaySec=20min
+Persistent=true
+Unit=sketchgen-pull.service
+
+[Install]
+WantedBy=timers.target

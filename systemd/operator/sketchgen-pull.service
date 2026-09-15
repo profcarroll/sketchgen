@@ -1,0 +1,49 @@
+# sketchgen-pull.service — runs on the OPERATOR'S machine, not on the node.
+#
+# Everything else in systemd/ is installed on the instance. This directory is
+# the other end of the wire: the unit that pulls the node's snapshots and its
+# attempt archive down to a machine the cloud provider cannot reclaim. Nothing
+# in update.sh touches it and `sketchgen install-unit` does not copy it, because
+# install-unit runs on the node and this must not.
+#
+# INSTALL (on the operator's Linux machine, once):
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp ~/sketchgen/systemd/operator/sketchgen-pull.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now sketchgen-pull.timer
+#   systemctl --user list-timers --all | grep sketchgen-pull
+#   journalctl --user -u sketchgen-pull -n 30
+#
+# EDIT TWO LINES FIRST. They are the only things here that are not portable:
+#
+#   - WorkingDirectory below is the operator's clone of the app repo. The
+#     default assumes ~/sketchgen. If your clone is elsewhere, change it.
+#   - sld-cloud in ExecStart is an ssh(1) destination out of ~/.ssh/config. If
+#     you reach the node by another name, change it.
+#
+# ON A MAC there is no `systemctl --user`. Use launchd, or a cron line, or just
+# run bin/pull-backup.sh by hand — the script is the deliverable and the timer
+# is a convenience. What must not happen is nobody running it: a backup timer on
+# the node with no puller on this side is a copy that never leaves the instance.
+#
+# THE SSH KEY. This unit runs non-interactively, so the key it uses must not
+# have a passphrase prompt in its way — either an agent the user session already
+# holds (usually true on a desktop with linger set) or a key with no passphrase
+# used only for this host. It reads the node; it never writes to it.
+#
+# FAILURE IS THE POINT. The script exits non-zero when the newest snapshot it
+# can see is more than 36 hours old, so `systemctl --user status sketchgen-pull`
+# and the journal show a stalled timer on the node. A pull unit that always
+# succeeds tells you nothing.
+[Unit]
+Description=sketchgen pull: mirror the node's snapshots and attempt archive here
+Documentation=file:%h/sketchgen/docs/OPERATIONS.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/sketchgen
+ExecStart=%h/sketchgen/bin/pull-backup.sh sld-cloud
+Nice=10
+IOSchedulingClass=idle
