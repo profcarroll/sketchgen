@@ -70,6 +70,8 @@ Default: a pull from the operator's machine over the SSH connection already in u
 
 Acceptance is a rehearsal: run the runbook on a throwaway instance from a real snapshot until `sketchgen db status` matches the manifest counts and the operator UI shows the held queue. Record the date and the elapsed time at the top of the section. Packet 0 is not done until that date is there.
 
+Venue: **etk-cloud**, the operator's second Oracle node (4 CPU, 23 GB, aarch64, Ubuntu 24.04, checked 2026-09-15). It has no Ollama and no Playwright, so the provisioning steps get exercised for real, and it runs Docker builds for other projects, so the rehearsal lives in its own Unix user and is removed with one command afterward. Rules: one snapshot is pulled and verified on the operator's machine before the rehearsal starts; deploy keys and the write-path token are throwaways, never the real ones, and the gallery is cloned read-only so a rehearsal cannot push; the rehearsal does not rename the host to `sld-cloud`, that step is for a real recovery; the 30b coder model is optional on a 4x24 shape and the record says "full" or "without the executor" accordingly. Student instances are not needed.
+
 ### 3.6 Acceptance
 
 - `test_backup.py`: snapshot of a WAL-mode fixture database verifies; retention keeps 14; the manifest counts match; secrets are absent from the snapshot directory.
