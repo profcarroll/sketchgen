@@ -1566,6 +1566,60 @@ class DeterminismTests(GalleryTestCase):
                 self.assertEqual(data, second[name])
 
 
+class RenderAllRereadsTests(GalleryTestCase):
+    """render-all rebuilds the record and touches no row (spec §4.4).
+
+    It is run once on the node after the forest fix, over entries published
+    months ago, so the question it has to answer is whether re-rendering an
+    entry rewrites anything about when or how it was published. It does not:
+    every stamp on the page comes from the row, and the generator only writes
+    files.
+    """
+
+    def stamps(self):
+        return {
+            int(row["id"]): (row["state"], row["published_utc"], row["publish_commit"])
+            for row in self.conn.execute(
+                "SELECT id, state, published_utc, publish_commit FROM entries"
+            )
+        }
+
+    def test_re_rendering_rewrites_the_files_and_no_row(self):
+        self.conn.execute(
+            "UPDATE entries SET publish_commit = ? WHERE id = ?",
+            ("0123456789abcdef0123456789abcdef01234567", self.ids[0]),
+        )
+        self.render()
+        before = self.stamps()
+        entry_dir = self.dest / "e" / str(self.ids[0])
+        meta_before = (entry_dir / "meta.json").read_text(encoding="utf-8")
+        shutil.rmtree(entry_dir)
+
+        self.render()
+
+        self.assertEqual(before, self.stamps())
+        self.assertTrue((entry_dir / "index.html").is_file())
+        self.assertEqual(meta_before, (entry_dir / "meta.json").read_text(encoding="utf-8"))
+        meta = json.loads(meta_before)
+        self.assertEqual("2026-09-14T04:02:11Z", meta["published_utc"])
+        self.assertEqual(
+            "0123456789abcdef0123456789abcdef01234567", meta["publish_commit"]
+        )
+
+    def test_the_cli_render_all_leaves_the_stamps_alone(self):
+        before = self.stamps()
+        result = subprocess.run(
+            [sys.executable, str(CLI), "render-all",
+             "--gallery-dir", str(self.dest),
+             "--db", str(self.tmp / "sketchgen.db"),
+             "--write-path", "https://write.example.invalid/api"],
+            capture_output=True, text=True, check=False, env=dict(os.environ),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(before, self.stamps())
+        self.assertIn(str(self.dest / "lineage.json"), result.stdout)
+
+
 class CommandLineTests(GalleryTestCase):
     """The three subcommands, as the shell sees them: --help and the codes."""
 

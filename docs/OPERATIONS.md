@@ -290,6 +290,45 @@ deploy key; clone the repo to `~/sketchgen/gallery` with that key in
 is made with the checkout's identity, not one this tool invents; then publish one
 entry with `--dry-run` before publishing it for real.
 
+### Operator step, once: re-render every entry after the lineage fix
+
+Until the lineage fix, the publisher rendered an entry while its row was still
+`held`, so the entry could not find itself in the forest and froze
+`"parent_entry_id": null` into its own `meta.json` — 74 of 101 public non-root
+entries claim to be roots, and their parents' files are missing the children to
+match. The database was always right; only the published files are wrong, and
+one `render-all` fixes every one of them.
+
+Run it **once**, on the node, after the fix is deployed:
+
+```
+ssh sld-cloud 'bash ~/sketchgen/app/update.sh'     # pull, re-render, push
+```
+
+or by hand, to look before anything is pushed:
+
+```
+~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen render-all \
+    --gallery-dir ~/sketchgen/gallery --db ~/sketchgen/sketchgen.db
+git -C ~/sketchgen/gallery diff --stat
+git -C ~/sketchgen/gallery add -A
+git -C ~/sketchgen/gallery commit -m "re-render: every entry's lineage restored"
+GIT_SSH_COMMAND='ssh -i ~/.ssh/sketchgen-gallery' git -C ~/sketchgen/gallery push
+```
+
+Expect **one large commit touching every `e/*/meta.json`**, plus a new
+`lineage.json` at the gallery root. That is intended; it is the point of the
+step. `render-all` writes files and nothing else — it never updates a database
+row, so `published_utc` and `publish_commit` come back out of the rows exactly
+as they went in, and nothing is re-published or re-dated by re-rendering it.
+
+Spot-check afterwards:
+
+```
+jq .lineage ~/sketchgen/gallery/e/230/meta.json    # parent_entry_id 176
+jq .lineage ~/sketchgen/gallery/e/176/meta.json    # children [230]
+```
+
 ## Backups: the nightly snapshot and the pull
 
 The database and the attempt archive are the only parts of this system with no
