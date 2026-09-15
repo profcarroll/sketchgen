@@ -470,6 +470,7 @@ class TreeTests(GalleryTestCase):
             f"e/{three}/index.html",
             "rejections.html",
             "index.html",
+            "lineage.json",
             f"lines/{one}.html",
         ]
         for relative in expected:
@@ -678,6 +679,125 @@ class PublishTimeLineageTests(GalleryTestCase):
             (self.dest / "e" / str(parent) / "meta.json").read_text(encoding="utf-8")
         )
         self.assertEqual([child], meta["lineage"]["children"])
+
+
+class LineageJsonTests(GalleryTestCase):
+    """<gallery>/lineage.json, the shape packet 3's panel reads (spec §4.2)."""
+
+    def setUp(self):
+        super().setUp()
+        # A line of four: 1 -> 2 (both published from build_db), then a third
+        # published generation, then a held child nobody has published.
+        self.third = add_child(
+            self.conn, self.tmp, self.ids[1], state="published",
+            prompt="the same field, slower, in one colour", generation=3,
+        )
+        self.held = add_child(
+            self.conn, self.tmp, self.third, state="held",
+            prompt="slower still, and let the ground breathe",
+            critique="slow it further and let the ground breathe",
+            generation=4,
+        )
+        self.render()
+        self.data = json.loads(
+            (self.dest / "lineage.json").read_text(encoding="utf-8")
+        )
+        self.entries = self.data["entries"]
+
+    def test_the_file_is_stamped_and_keyed_by_entry_id_as_a_string(self):
+        self.assertRegex(
+            self.data["generated_utc"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
+        )
+        self.assertEqual({"generated_utc", "entries"}, set(self.data))
+        self.assertEqual(
+            sorted(str(i) for i in (*self.ids, self.third, self.held)),
+            sorted(self.entries),
+        )
+
+    def test_every_entry_is_here_whatever_its_state(self):
+        # including the held child, which is on no page of the site at all
+        self.assertIn(str(self.held), self.entries)
+        self.assertEqual("held", self.entries[str(self.held)]["state"])
+        self.assertFalse(self.entries[str(self.held)]["public"])
+
+    def test_a_public_entry_carries_its_strip_prompt_and_submitter(self):
+        item = self.entries[str(self.ids[1])]
+        self.assertTrue(item["public"])
+        self.assertEqual("published", item["state"])
+        self.assertEqual(self.ids[0], item["parent"])
+        self.assertEqual([self.third], item["children"])
+        self.assertEqual(2, item["generation"])
+        self.assertEqual(self.ids[0], item["root"])
+        self.assertEqual("astudent", item["submitted_by"])
+        self.assertEqual(f"e/{self.ids[1]}/strip.png", item["strip"])
+        self.assertEqual(
+            "the same field, but it holds still and earns it", item["root_prompt"]
+        )
+        self.assertIn("The motion is doing the work", item["critique"])
+        self.assertEqual("gemma4:e4b", item["critique_by"])
+
+    def test_a_non_public_entry_carries_nothing_of_its_own(self):
+        item = self.entries[str(self.held)]
+        self.assertEqual(
+            {"state", "public", "parent", "children", "generation", "root",
+             "critique", "critique_by"},
+            set(item),
+        )
+        # its place in the line, and its critique, which came from its parent
+        self.assertEqual(self.third, item["parent"])
+        self.assertEqual([], item["children"])
+        self.assertEqual(4, item["generation"])
+        self.assertEqual(self.ids[0], item["root"])
+        self.assertEqual("slow it further and let the ground breathe", item["critique"])
+
+    def test_a_held_child_counts_as_a_child_of_its_public_parent(self):
+        # _forest stops at the public entries; this file does not, which is the
+        # whole reason the panel can say a generation exists but is not shown.
+        self.assertEqual([self.held], self.entries[str(self.third)]["children"])
+
+    def test_a_root_has_no_parent_and_is_its_own_root(self):
+        item = self.entries[str(self.ids[0])]
+        self.assertIsNone(item["parent"])
+        self.assertEqual(self.ids[0], item["root"])
+        self.assertIsNone(item["critique"])
+        self.assertIsNone(item["critique_by"])
+        self.assertEqual([self.ids[1]], item["children"])
+
+    def test_the_root_prompt_is_the_prompt_without_its_revisions(self):
+        composed = gallery.lineage.compose_prompt(
+            "a cityscape from sunrise to sunset", "try a colder palette"
+        )
+        self.conn.execute(
+            "UPDATE entries SET prompt = ? WHERE id = ?", (composed, self.ids[1])
+        )
+        data = gallery._lineage_index(self.conn, "2026-09-14T04:02:11Z")
+        self.assertEqual(
+            "a cityscape from sunrise to sunset",
+            data["entries"][str(self.ids[1])]["root_prompt"],
+        )
+
+    def test_the_file_stays_under_a_hundred_kilobytes(self):
+        self.assertLess(
+            (self.dest / "lineage.json").stat().st_size, gallery.LINEAGE_JSON_LIMIT
+        )
+
+    def test_over_the_limit_the_root_prompts_are_capped(self):
+        long_prompt = "x" * 4_000
+        for entry_id in (*self.ids, self.third):
+            self.conn.execute(
+                "UPDATE entries SET prompt = ? WHERE id = ?", (long_prompt, entry_id)
+            )
+        # The real limit at three hundred entries; here, a limit these four
+        # entries can cross, which is the same arithmetic.
+        limit = gallery.LINEAGE_JSON_LIMIT
+        gallery.LINEAGE_JSON_LIMIT = 4_000
+        self.addCleanup(setattr, gallery, "LINEAGE_JSON_LIMIT", limit)
+        data = gallery._lineage_index(self.conn, "2026-09-14T04:02:11Z")
+        for entry_id in (*self.ids, self.third):
+            self.assertEqual(
+                gallery.LINEAGE_ROOT_PROMPT_CAP,
+                len(data["entries"][str(entry_id)]["root_prompt"]),
+            )
 
 
 class IndexTests(GalleryTestCase):
@@ -1417,6 +1537,15 @@ class GuardTests(GalleryTestCase):
 
 
 class DeterminismTests(GalleryTestCase):
+
+    def render(self):
+        # lineage.json carries a generated_utc, the one clock a render reads.
+        # Pinning it here is what lets this test ask the question it means to
+        # ask — does the same database give the same bytes — rather than
+        # whether the two renders fell in the same second.
+        return gallery.render_all(
+            self.conn, self.dest, self.config, generated_utc="2026-09-14T04:02:11Z"
+        )
 
     def test_a_second_render_all_is_byte_identical(self):
         self.render()
