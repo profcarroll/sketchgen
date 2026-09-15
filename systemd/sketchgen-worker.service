@@ -59,6 +59,13 @@
 # Set the two limits to 0 to leave the node entirely idle between jobs — the
 # quickest way to hand the slot to someone else without pausing the worker.
 # Do not change ExecStart to add them; they are environment, not arguments.
+#
+# THE GATE MOVED (packet 0, 2026-09-15). SKETCHGEN_GATE was %h/sketchgen/gate/ —
+# a directory that existed only on this instance, holding the one referee the
+# whole record depends on. It is tracked in the repo now, so the path below is
+# inside the checkout and a recovered node gets the gate with `git clone`. For
+# one release ~/sketchgen/gate stays as a symlink to app/gate so that a unit not
+# yet reloaded keeps working; docs/OPERATIONS.md says when to remove it.
 
 [Unit]
 Description=sketchgen worker: one p5.js sketch job at a time, slot-fenced
@@ -70,7 +77,7 @@ Type=simple
 WorkingDirectory=%h/sketchgen/app
 Environment=SKETCHGEN_DB=%h/sketchgen/sketchgen.db
 Environment=SKETCHGEN_JOBS=%h/sketchgen/jobs
-Environment=SKETCHGEN_GATE=%h/sketchgen/gate/sketch_gate.py
+Environment=SKETCHGEN_GATE=%h/sketchgen/app/gate/sketch_gate.py
 Environment=OLLAMA_HOST_URL=http://127.0.0.1:11434
 ExecStart=%h/sketchgen/.venv/bin/python3 %h/sketchgen/app/bin/sketchgen worker
 Restart=on-failure
