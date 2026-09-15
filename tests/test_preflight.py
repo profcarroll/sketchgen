@@ -1,4 +1,4 @@
-"""Unit tests for sketchgen.preflight — the p5 name a sketch hid from itself.
+"""Unit tests for sketchgen.preflight — both scans.
 
 Run:  python3 -m unittest tests.test_preflight
 
@@ -11,6 +11,13 @@ pointing at working code.
 
 The two passing sketches under tests/fixtures/sketches/ are the gate's own
 references. Nothing in them is shadowed and nothing may be reported.
+
+The cost scan has its own three, under tests/fixtures/cost/, and they are the
+two unsafe sketches themselves: job 166 attempt 3 and job 270 attempt 1 as the
+executor wrote them (kept on the node as sketch.unsafe.js.txt beside the bounded
+rewrites that replaced them), and the rewrite of job 270, which must come back
+clean. If the first two ever stop tripping, this scan has stopped doing the one
+thing it was built for.
 """
 
 import subprocess
@@ -32,6 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI = REPO_ROOT / "bin" / "sketchgen"
 SHADOWING = REPO_ROOT / "tests" / "fixtures" / "shadowing"
 SKETCHES = REPO_ROOT / "tests" / "fixtures" / "sketches"
+COST = REPO_ROOT / "tests" / "fixtures" / "cost"
 
 LINE_SENTENCE = "your variable `line` hides p5's `line()` function; rename it"
 SCALE_SENTENCE = "your variable `scale` hides p5's `scale()` function; rename it"
@@ -353,3 +361,243 @@ class WorkerEvidenceTests(test_worker.WorkerTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# The cost scan (2026-09-15, after job 166 and job 270)
+# ---------------------------------------------------------------------------
+
+WEBGL_HEAD = "function setup() { createCanvas(400, 400, WEBGL); }\n"
+
+
+def rules(source):
+    return sorted({finding.rule for finding in preflight.scan_cost(source)})
+
+
+class UnsafeSketchTests(unittest.TestCase):
+    """The two sketches that actually took the operator's laptop down."""
+
+    def read(self, name):
+        return (COST / name).read_text(encoding="utf-8")
+
+    def test_job166_attempt3_trips_all_three_of_its_rules(self):
+        found = preflight.scan_cost(self.read("job166-attempt3.unsafe.js"))
+        self.assertEqual(
+            ["all_pairs", "geometry_in_loop", "immediate_in_loop"],
+            sorted({f.rule for f in found}),
+        )
+        # And each one points at the line that does it, not at the top of draw().
+        by_rule = {f.rule: f for f in found}
+        self.assertIn("sphere", by_rule["geometry_in_loop"].name)
+        self.assertIn("line", by_rule["immediate_in_loop"].name)
+
+    def test_job270_attempt1_trips_even_though_its_pair_loop_is_in_setup(self):
+        # The all-pairs walk that built `connections` is in setup(), where it is
+        # paid once; what draw() does is a sphere per particle and three batches
+        # of immediate-mode line(). The scan must say the second and not the
+        # first, or the repair moves the wrong loop.
+        found = preflight.scan_cost(self.read("job270-attempt1.unsafe.js"))
+        self.assertEqual(
+            ["geometry_in_loop", "immediate_in_loop"], sorted({f.rule for f in found})
+        )
+
+    def test_the_bounded_rewrite_of_job270_is_clean(self):
+        # Same picture, three shapes a frame: one point cloud, one capped batch
+        # of neighbour lines, one batch of grid lines. If this ever starts
+        # tripping, the scan has learned to refuse the fix as well as the bug.
+        self.assertEqual([], preflight.scan_cost(self.read("job270-attempt1.neutralised.js")))
+
+    def test_neither_unsafe_sketch_shadows_anything(self):
+        # The two scans are independent, and these two sketches are the case
+        # where the cost scan has something to say and the shadow scan does not.
+        for name in ("job166-attempt3.unsafe.js", "job270-attempt1.unsafe.js"):
+            self.assertEqual([], preflight.scan(self.read(name)), name)
+
+    def test_the_findings_reach_the_evidence_as_one_sentence_each(self):
+        lines = preflight.evidence_lines(
+            preflight.scan_cost(self.read("job166-attempt3.unsafe.js"))
+        )
+        self.assertTrue(lines)
+        for line in lines:
+            self.assertTrue(line.startswith("preflight: "))
+            self.assertIn("sketch.js line ", line)
+            self.assertEqual(1, line.count("\n") + 1)
+
+
+class CostRuleTests(unittest.TestCase):
+    """Each rule on its own, and the near miss it must not report."""
+
+    def test_geometry_in_a_draw_loop_over_an_array(self):
+        source = WEBGL_HEAD + (
+            "function draw() { for (let i = 0; i < things.length; i++)"
+            " { push(); sphere(3); pop(); } }\n"
+        )
+        self.assertEqual(["geometry_in_loop"], rules(source))
+
+    def test_geometry_in_a_small_countable_loop_is_left_alone(self):
+        source = WEBGL_HEAD + (
+            "function draw() { for (let i = 0; i < 8; i++)"
+            " { push(); box(10); pop(); } }\n"
+        )
+        self.assertEqual([], rules(source))
+
+    def test_nested_small_loops_multiply_up_to_the_threshold(self):
+        few = WEBGL_HEAD + (
+            "function draw() { for (let i = 0; i < 8; i++)"
+            " { for (let j = 0; j < 20; j++) { box(2); } } }\n"
+        )
+        many = WEBGL_HEAD + (
+            "function draw() { for (let i = 0; i < 40; i++)"
+            " { for (let j = 0; j < 40; j++) { box(2); } } }\n"
+        )
+        self.assertEqual([], rules(few))          # 160, under the budget
+        self.assertEqual(["geometry_in_loop"], rules(many))   # 1,600, over it
+
+    def test_a_named_constant_is_resolved_like_a_literal(self):
+        source = ("const N = 12;\n" + WEBGL_HEAD +
+                  "function draw() { for (let i = 0; i < N; i++) { sphere(2); } }\n")
+        self.assertEqual([], rules(source))
+
+    def test_geometry_outside_a_loop_is_not_a_finding(self):
+        source = WEBGL_HEAD + "function draw() { push(); sphere(50); pop(); }\n"
+        self.assertEqual([], rules(source))
+
+    def test_geometry_in_a_loop_in_setup_is_not_a_finding(self):
+        source = ("function setup() { createCanvas(9, 9, WEBGL);"
+                  " for (let i = 0; i < things.length; i++) { sphere(1); } }\n"
+                  "function draw() { background(0); }\n")
+        self.assertEqual([], rules(source))
+
+    def test_a_2d_sketch_is_not_judged_on_webgl_rules(self):
+        source = ("function setup() { createCanvas(400, 400); }\n"
+                  "function draw() { for (let i = 0; i < pts.length; i++)"
+                  " { line(0, 0, pts[i].x, pts[i].y); } }\n")
+        self.assertEqual([], rules(source))
+
+    def test_line_in_a_webgl_draw_loop_is_immediate_mode(self):
+        source = WEBGL_HEAD + (
+            "function draw() { for (let i = 0; i < pts.length; i++)"
+            " { line(0, 0, 0, pts[i].x, pts[i].y, pts[i].z); } }\n"
+        )
+        self.assertEqual(["immediate_in_loop"], rules(source))
+        self.assertIn("beginShape(LINES)", preflight.scan_cost(source)[0].sentence)
+
+    def test_point_gets_the_points_batch_not_the_lines_one(self):
+        source = WEBGL_HEAD + (
+            "function draw() { for (let i = 0; i < pts.length; i++)"
+            " { point(pts[i].x, pts[i].y, pts[i].z); } }\n"
+        )
+        self.assertIn("beginShape(POINTS)", preflight.scan_cost(source)[0].sentence)
+
+    def test_vertex_inside_a_begin_shape_is_the_fix_and_is_never_reported(self):
+        source = WEBGL_HEAD + (
+            "function draw() { beginShape(LINES);"
+            " for (let i = 0; i < pts.length; i++) { vertex(pts[i].x, pts[i].y); }"
+            " endShape(); }\n"
+        )
+        self.assertEqual([], rules(source))
+
+    def test_the_classic_all_pairs_header(self):
+        source = ("function draw() { for (let i = 0; i < ps.length; i++)"
+                  " { for (let j = i + 1; j < ps.length; j++) { d(i, j); } } }\n")
+        self.assertEqual(["all_pairs"], rules(source))
+
+    def test_two_loops_over_the_same_array(self):
+        source = ("function draw() { for (let i = 0; i < ps.length; i++)"
+                  " { for (let k = 0; k < ps.length; k++) { d(i, k); } } }\n")
+        self.assertEqual(["all_pairs"], rules(source))
+
+    def test_a_grid_is_not_an_all_pairs_loop(self):
+        # Two nested loops over the same integer bound is how every grid in this
+        # corpus is drawn, and none of them compares every item with every
+        # other. Only the `.length` of one array counts as "the same array".
+        source = ("const GRID = 20;\n"
+                  "function draw() { for (let i = 0; i < GRID; i++)"
+                  " { for (let j = 0; j < GRID; j++) { g(i, j); } } }\n")
+        self.assertEqual([], rules(source))
+
+    def test_two_loops_over_different_arrays_are_not_all_pairs(self):
+        source = ("function draw() { for (let i = 0; i < ps.length; i++)"
+                  " { for (let k = 0; k < qs.length; k++) { d(i, k); } } }\n")
+        self.assertEqual([], rules(source))
+
+    def test_an_all_pairs_loop_in_setup_is_paid_once(self):
+        source = ("function setup() { for (let i = 0; i < ps.length; i++)"
+                  " { for (let j = i + 1; j < ps.length; j++) { d(i, j); } } }\n"
+                  "function draw() { background(0); }\n")
+        self.assertEqual([], rules(source))
+
+    def test_allocation_in_draw_needs_no_loop(self):
+        source = "function draw() { let g = createGraphics(200, 200); image(g, 0, 0); }\n"
+        self.assertEqual(["allocation_in_draw"], rules(source))
+
+    def test_allocation_in_setup_is_where_it_belongs(self):
+        source = ("function setup() { buffer = createGraphics(200, 200); }\n"
+                  "function draw() { image(buffer, 0, 0); }\n")
+        self.assertEqual([], rules(source))
+
+    def test_filter_in_a_loop_is_a_full_canvas_pass_per_iteration(self):
+        # Job 45: twelve BLUR passes a frame, 504 s of gate time, and nobody
+        # noticed because the gate said yes.
+        source = ("function draw() { for (let i = 0; i < 12; i++)"
+                  " { filter(BLUR, i); } }\n")
+        self.assertEqual(["filter_in_loop"], rules(source))
+
+    def test_filter_once_a_frame_is_fine(self):
+        source = "function draw() { background(0); filter(BLUR, 3); }\n"
+        self.assertEqual([], rules(source))
+
+    def test_an_arrays_own_filter_method_is_not_p5s(self):
+        source = ("function draw() { for (let i = 0; i < 12; i++)"
+                  " { live = items.filter(function (x) { return x.on; }); } }\n")
+        self.assertEqual([], rules(source))
+
+    def test_an_instance_mode_draw_is_read_too(self):
+        source = ("let s = function (p) { p.setup = function () "
+                  "{ p.createCanvas(9, 9, p.WEBGL); };\n"
+                  " p.draw = function () { for (let i = 0; i < ps.length; i++)"
+                  " { p.push(); sphere(2); p.pop(); } }; };\n")
+        self.assertEqual(["geometry_in_loop"], rules(source))
+
+    def test_a_comment_describing_the_bug_is_not_the_bug(self):
+        source = WEBGL_HEAD + (
+            "function draw() {\n"
+            "  // do NOT do: for (...) { sphere(p.size); }\n"
+            "  background(0);\n"
+            "}\n"
+        )
+        self.assertEqual([], rules(source))
+
+
+class ScanAllTests(unittest.TestCase):
+    """Both scans, one list, in line order — which is what the worker reads."""
+
+    def test_a_sketch_with_both_kinds_of_finding_reports_both_in_order(self):
+        source = (
+            "function setup() { createCanvas(9, 9, WEBGL); }\n"
+            "function draw() {\n"
+            "  let width = 3;\n"
+            "  for (let i = 0; i < ps.length; i++) { sphere(width); }\n"
+            "}\n"
+        )
+        found = preflight.scan_all(source)
+        self.assertEqual([3, 4], [f.line for f in found])
+        self.assertIn("hides p5's `width`", found[0].sentence)
+        self.assertIn("one lit mesh per item per frame", found[1].sentence)
+
+    def test_scan_dir_runs_both(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "sketch.js").write_text(
+                WEBGL_HEAD + "function draw() { for (let i = 0; i < ps.length; i++)"
+                " { sphere(2); } }\n",
+                encoding="utf-8",
+            )
+            lines = preflight.evidence_lines(preflight.scan_dir(directory))
+            self.assertEqual(1, len(lines))
+            self.assertIn("sphere()", lines[0])
+
+    def test_the_gates_own_clean_fixtures_stay_clean(self):
+        for name in ("good-motion", "good-static-noloop"):
+            source = (SKETCHES / name / "sketch.js").read_text(encoding="utf-8")
+            self.assertEqual([], preflight.scan_cost(source), name)

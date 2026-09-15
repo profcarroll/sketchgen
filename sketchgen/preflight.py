@@ -1,4 +1,22 @@
-"""preflight.py — the p5 name a sketch hid from itself, said in one sentence.
+"""preflight.py — what a sketch does to itself, said in one sentence each.
+
+Two scans, one mechanism. The first is the p5 name a sketch hid from itself;
+the second, added 2026-09-15, is the frame a sketch cannot afford to draw.
+Both produce findings with a ``line`` and a ``sentence``, both go into the
+evidence the next attempt reads, and neither is a verdict — the gate is still
+the only thing that says yes or no.
+
+THE SECOND SCAN, IN ONE PARAGRAPH. Job 166 (entry 165) and job 270 (entry 269)
+each drew about 1,500 ``sphere()`` meshes and tens of thousands of
+immediate-mode ``line()`` calls per frame in WEBGL. Both passed the gate; both
+took minutes of gate time; both pinned about 4 GB of GPU buffers and took the
+operator's laptop down when the Held page previewed them. ``gate/sketch_gate.py``
+now measures that cost and fails ``frame_budget``, which is the authority. This
+scan is the *cause* beside that symptom, in the same place and for the same
+reason the shadow scan is: "1093 ms per frame" is a number, and
+"``sphere()`` is called inside a loop inside ``draw()``" is a line to change.
+Job 270 was written under an executor prompt that already carries a frame
+budget in prose, so prose alone does not hold.
 
 Seven of the eleven crashing attempts the gate has ever recorded are one bug,
 and it is always the same shape: the model declares a variable whose name is a
@@ -54,9 +72,12 @@ __all__ = [
     "P5_GLOBALS",
     "P5_VARIABLES",
     "SKETCH_FILE",
+    "Cost",
     "Shadow",
     "evidence_lines",
     "scan",
+    "scan_all",
+    "scan_cost",
     "scan_dir",
 ]
 
@@ -119,6 +140,16 @@ class Shadow:
                 f"function; rename it"
             )
         return f"your variable `{self.name}` hides p5's `{self.name}`; rename it"
+
+
+@dataclass(frozen=True)
+class Cost:
+    """One thing a sketch does per frame that a frame cannot pay for."""
+
+    rule: str      # the name the gate's frame_budget check would blame
+    name: str      # the call or construct that costs, e.g. "sphere"
+    line: int
+    sentence: str
 
 
 # ---------------------------------------------------------------------------
@@ -387,8 +418,315 @@ def scan(source: str) -> list[Shadow]:
     return found
 
 
-def scan_dir(sketch_dir) -> list[Shadow]:
-    """:func:`scan` over ``<sketch_dir>/sketch.js``; empty when there is none.
+# ---------------------------------------------------------------------------
+# The cost scan
+# ---------------------------------------------------------------------------
+#
+# Same regex-not-a-parser bargain as above, and the same bias: a scan that says
+# nothing costs one ordinary repair attempt, a scan that invents a finding costs
+# the attempt AND misdirects the next one. Every rule below was run over all 372
+# attempt sketches on the node before it was allowed to stay, and the ones that
+# fired on ordinary published work were narrowed until they did not.
+
+#: p5's 3D primitives. Each one builds (or looks up) a lit mesh; at p5 1.11's
+#: default detail a ``sphere()`` is 24x16 quads. One per particle per frame is
+#: what job 166 and job 270 both did.
+GEOMETRY_CALLS = ("sphere", "box", "cylinder", "cone", "torus", "ellipsoid")
+
+#: In WEBGL these two are immediate mode: every call builds and uploads its own
+#: vertex buffer. 19,493 ``line()`` calls a frame is 19,493 buffer allocations a
+#: frame, which is time on the node and memory in a real browser tab.
+IMMEDIATE_CALLS = ("line", "point")
+
+#: Allocations that belong in ``setup()``. A ``createGraphics()`` in ``draw()``
+#: is a new framebuffer sixty times a second, and ``loadImage()`` is an
+#: asynchronous fetch started again on every frame.
+ALLOCATING_CALLS = ("createGraphics", "createImage", "loadImage", "loadShader",
+                    "createShader", "loadFont")
+
+#: A full-canvas shader pass. Job 45 ran twelve of them per frame inside a loop
+#: and took 504 s to pass the gate — the slowest run the node has recorded.
+FILTER_CALL = "filter"
+
+#: How many times a loop has to run before what is inside it is worth a
+#: sentence. 300 is the WEBGL shape-call budget the executor prompt already
+#: carries, so the scan and the prompt agree on the number rather than each
+#: having its own. A loop whose bound cannot be read — ``things.length``, a
+#: ``for … of``, anything computed — is treated as large, because in this corpus
+#: that bound is a particle array and the count is the thing that got away.
+MIN_ITERATIONS = 300
+
+#: Only a literal or a plainly-initialised constant is resolved. Chasing
+#: ``things.length`` back to the ``push()`` that filled it is a data-flow
+#: analysis, and this module's bargain (see the docstring) is that it would
+#: rather say nothing than guess: an unreadable bound stays unread.
+_BOUND_RE = re.compile(r";\s*[A-Za-z_$][\w$]*\s*<=?\s*([^;]+);")
+_LITERAL_RE = re.compile(r"^\s*(\d+)\s*$")
+
+#: How a WEBGL sketch announces itself. p5 has no other way to ask for it, and
+#: an instance-mode sketch spells it ``p.WEBGL``, so a receiver is allowed.
+_WEBGL_RE = re.compile(r"(?<![\w$])WEBGL(?![\w$])")
+
+_LOOP_RE = re.compile(r"(?<![\w$.])(for|while)\s*\(")
+_DRAW_RE = re.compile(
+    r"(?<![\w$.])(?:function\s+draw\s*\(|"          # function draw()
+    r"(?:[\w$]+\s*\.\s*)?draw\s*=\s*(?:function|\()|"   # p.draw = function / = (
+    r"draw\s*\(\s*\)\s*\{)"                          # draw() { — a class method
+)
+
+#: ``for (let j = i + 1; …)``: the all-pairs loop, written the way every
+#: textbook writes it.
+_PAIR_HEADER_RE = re.compile(
+    r"(?:let|const|var)?\s*([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*\+\s*1\b"
+)
+#: ``i < things.length``: the bound that names the array being walked. Only the
+#: ``.length`` form counts as "the same array", because two loops over the same
+#: plain integer are how every grid in this corpus is drawn and none of them is
+#: an all-pairs loop.
+_LENGTH_BOUND_RE = re.compile(r"([A-Za-z_$][\w$]*)\s*\.\s*length\b")
+
+
+def _call_positions(blanked: str, name: str, receiver: bool = False) -> list[int]:
+    """Offsets of every call to ``name``.
+
+    A ``.`` before the name normally disqualifies it — ``obj.line(…)`` is
+    somebody else's method. ``receiver=True`` allows exactly one identifier in
+    front, which is how an instance-mode sketch spells p5's own calls
+    (``p.sphere(2)``) and how a sketch draws into a ``createGraphics`` buffer.
+    It is off for ``filter``, because every JavaScript array has one of those
+    and reporting ``items.filter(…)`` would be a finding about working code.
+    """
+    if receiver:
+        pattern = re.compile(r"(?<![\w$.])(?:[A-Za-z_$][\w$]*\s*\.\s*)?"
+                             + re.escape(name) + r"\s*\(")
+    else:
+        pattern = re.compile(r"(?<![\w$.])" + re.escape(name) + r"\s*\(")
+    return [m.end() - len(name) - 1 if receiver else m.start()
+            for m in pattern.finditer(blanked)]
+
+
+def _block_after(source: str, position: int) -> tuple[int, int]:
+    """The span of the ``{…}`` block that follows ``position``.
+
+    Used for both a function's body and a loop's. A loop written without braces
+    (``for (…) line(a, b, c, d);``) gets the rest of that statement instead,
+    which is the smallest honest answer and still catches the one-line form.
+    """
+    index = position
+    end = len(source)
+    while index < end and source[index] in " \t\n\r":
+        index += 1
+    if index < end and source[index] == "{":
+        return index, _matching(source, index)
+    stop = source.find(";", index)
+    return index, (end if stop == -1 else stop)
+
+
+def _draw_bodies(blanked: str) -> list[tuple[int, int]]:
+    """The span of every ``draw()`` body in the sketch, global or instance mode."""
+    bodies = []
+    for match in _DRAW_RE.finditer(blanked):
+        # Step over the parameter list to the body's opening brace. A class
+        # method's regex already consumed its ``{``, so back up onto it.
+        index = match.end()
+        if blanked[match.end() - 1] == "{":
+            index = match.end() - 1
+        else:
+            paren = blanked.find("(", match.end() - 1)
+            if paren == -1:
+                continue
+            index = _matching(blanked, paren) + 1
+            arrow = blanked.find("=>", index)
+            if 0 <= arrow <= index + 3:
+                index = arrow + 2
+        start, stop = _block_after(blanked, index)
+        if stop > start:
+            bodies.append((start, stop))
+    return bodies
+
+
+def _loops_within(blanked: str, start: int, stop: int) -> list[tuple[int, int, int]]:
+    """``(header_start, body_start, body_end)`` for every loop in a span."""
+    loops = []
+    for match in _LOOP_RE.finditer(blanked, start, stop):
+        header = _matching(blanked, match.end() - 1)
+        body_start, body_end = _block_after(blanked, header + 1)
+        loops.append((match.start(), body_start, min(body_end, stop)))
+    return loops
+
+
+def _inside(position: int, spans) -> bool:
+    return any(start <= position < stop for start, stop in spans)
+
+
+def _const_value(blanked: str, name: str) -> int | None:
+    """``const N = 1500`` anywhere in the sketch, or None."""
+    match = re.search(
+        r"(?<![\w$.])(?:let|const|var)\s+" + re.escape(name) + r"\s*=\s*(\d+)\b",
+        blanked,
+    )
+    return int(match.group(1)) if match else None
+
+
+def _iterations(blanked: str, header: int, body_start: int) -> int | None:
+    """How many times this loop runs, when that can be read off its header."""
+    match = _BOUND_RE.search(blanked, header, body_start)
+    if match is None:
+        return None
+    bound = match.group(1).strip()
+    literal = _LITERAL_RE.match(bound)
+    if literal:
+        return int(literal.group(1))
+    if re.fullmatch(r"[A-Za-z_$][\w$]*", bound):
+        return _const_value(blanked, bound)
+    subtraction = re.fullmatch(r"([A-Za-z_$][\w$]*)\s*-\s*(\d+)", bound)
+    if subtraction:
+        value = _const_value(blanked, subtraction.group(1))
+        return None if value is None else value - int(subtraction.group(2))
+    return None
+
+
+def _runs_often(blanked: str, loops, position: int) -> bool:
+    """Whether the loops around ``position`` run ``MIN_ITERATIONS`` times or more.
+
+    Nested loops multiply: eight bands of twenty is a hundred and sixty, which
+    is under the budget and stays quiet. One unreadable bound anywhere in the
+    nest makes the whole product unreadable, and an unreadable count is treated
+    as large.
+    """
+    product = 1
+    for header, body_start, body_end in loops:
+        if not body_start <= position < body_end:
+            continue
+        count = _iterations(blanked, header, body_start)
+        if count is None:
+            return True
+        product *= count
+    return product >= MIN_ITERATIONS
+
+
+def _all_pairs(blanked: str, loops) -> list[int]:
+    """Offsets of the inner loop of every all-pairs walk in ``loops``.
+
+    Two shapes, both from real attempts: ``for (let j = i + 1; …)`` nested in a
+    loop over ``i``, and two nested loops whose bounds are the *same array's*
+    ``.length``. A nested pair of loops over the same integer — ``i < GRID`` and
+    ``j < GRID`` — is a grid, not an all-pairs walk, and is left alone.
+    """
+    found = []
+    for outer_header, outer_start, outer_end in loops:
+        outer_bound = _LENGTH_BOUND_RE.search(blanked, outer_header, outer_start)
+        outer_var = _loop_variable(blanked, outer_header, outer_start)
+        for header, body_start, _body_end in loops:
+            if not (outer_start <= header < outer_end):
+                continue
+            pair = _PAIR_HEADER_RE.search(blanked, header, body_start)
+            if pair is not None and outer_var and pair.group(2) == outer_var:
+                found.append(header)
+                continue
+            inner_bound = _LENGTH_BOUND_RE.search(blanked, header, body_start)
+            if (outer_bound is not None and inner_bound is not None
+                    and outer_bound.group(1) == inner_bound.group(1)):
+                found.append(header)
+    return found
+
+
+def _loop_variable(blanked: str, header: int, body_start: int) -> str | None:
+    """The counter a ``for`` header declares, when it declares one."""
+    match = re.search(r"(?:let|const|var)\s+([A-Za-z_$][\w$]*)\s*=",
+                      blanked[header:body_start])
+    return match.group(1) if match else None
+
+
+def scan_cost(source: str) -> list[Cost]:
+    """Every per-frame cost this sketch pays that a frame cannot afford.
+
+    Five rules, in the order they have actually cost this project time. All but
+    the last two are restricted to ``draw()``, because the same call in
+    ``setup()`` is paid once and is exactly where the repair should move it to.
+    """
+    blanked = _blank(source)
+    starts = _line_starts(blanked)
+    webgl = bool(_WEBGL_RE.search(blanked))
+    bodies = _draw_bodies(blanked)
+    found: list[Cost] = []
+    seen: set[tuple[str, str, int]] = set()
+
+    def add(rule: str, name: str, position: int, sentence: str) -> None:
+        line = _line_of(starts, position)
+        if (rule, name, line) in seen:
+            return
+        seen.add((rule, name, line))
+        found.append(Cost(rule=rule, name=name, line=line, sentence=sentence))
+
+    draw_loops = []
+    for start, stop in bodies:
+        draw_loops.extend(_loops_within(blanked, start, stop))
+    loop_bodies = [(body_start, body_end) for _h, body_start, body_end in draw_loops]
+
+    if webgl:
+        for name in GEOMETRY_CALLS:
+            for position in _call_positions(blanked, name, receiver=True):
+                if not _inside(position, loop_bodies):
+                    continue
+                if not _runs_often(blanked, draw_loops, position):
+                    continue
+                add("geometry_in_loop", name, position,
+                    f"`{name}()` is called inside a loop inside `draw()`, so this "
+                    f"sketch builds one lit mesh per item per frame; draw the "
+                    f"items as one `beginShape(POINTS)` or build the mesh once in "
+                    f"`setup()` with `buildGeometry()`")
+
+        for name in IMMEDIATE_CALLS:
+            for position in _call_positions(blanked, name, receiver=True):
+                if not _inside(position, loop_bodies):
+                    continue
+                if not _runs_often(blanked, draw_loops, position):
+                    continue
+                add("immediate_in_loop", name, position,
+                    f"`{name}()` inside a loop inside `draw()` is immediate mode in "
+                    f"WEBGL — every call builds and uploads its own vertex buffer; "
+                    f"batch them into one "
+                    f"`beginShape({'LINES' if name == 'line' else 'POINTS'})` with "
+                    f"`vertex()` per point")
+
+    for position in _all_pairs(blanked, draw_loops):
+        add("all_pairs", "for", position,
+            "this is an all-pairs loop inside `draw()`: every item is compared "
+            "with every other one, so the work grows with the square of the count; "
+            "use a spatial hash, or compare squared distances over a capped "
+            "neighbour list")
+
+    for name in ALLOCATING_CALLS:
+        for position in _call_positions(blanked, name):
+            if not _inside(position, bodies):
+                continue
+            add("allocation_in_draw", name, position,
+                f"`{name}()` is called inside `draw()`, so this sketch allocates "
+                f"it again on every frame; do it once in `setup()` and keep the "
+                f"result in a variable")
+
+    for position in _call_positions(blanked, FILTER_CALL):
+        if not _inside(position, loop_bodies):
+            continue
+        add("filter_in_loop", FILTER_CALL, position,
+            "`filter()` is a full-canvas pass and it is inside a loop, so the "
+            "whole canvas is re-processed once per iteration; call it at most "
+            "once per frame")
+
+    found.sort(key=lambda cost: (cost.line, cost.rule, cost.name))
+    return found
+
+
+def scan_all(source: str) -> list:
+    """Both scans over one sketch, in line order: the findings, all of them."""
+    findings = list(scan(source)) + list(scan_cost(source))
+    findings.sort(key=lambda finding: (finding.line, finding.sentence))
+    return findings
+
+
+def scan_dir(sketch_dir) -> list:
+    """:func:`scan_all` over ``<sketch_dir>/sketch.js``; empty when there is none.
 
     An attempt that never got as far as a sketch file (a malformed executor
     response, a directory the gate refused) is not an error here: there is
@@ -399,12 +737,16 @@ def scan_dir(sketch_dir) -> list[Shadow]:
         source = path.read_text(encoding="utf-8", errors="replace")
     except (OSError, ValueError):
         return []
-    return scan(source)
+    return scan_all(source)
 
 
-def evidence_lines(shadows) -> list[str]:
-    """The findings as the lines that go into the repair attempt's evidence."""
+def evidence_lines(findings) -> list[str]:
+    """The findings as the lines that go into the repair attempt's evidence.
+
+    One shape for both scans, because the executor should not have to learn two:
+    what is wrong, then where it is.
+    """
     return [
-        f"preflight: {shadow.sentence} ({SKETCH_FILE} line {shadow.line})"
-        for shadow in shadows
+        f"preflight: {finding.sentence} ({SKETCH_FILE} line {finding.line})"
+        for finding in findings
     ]
