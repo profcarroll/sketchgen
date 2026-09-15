@@ -103,6 +103,19 @@ function placeholders(n) {
   return new Array(n).fill("?").join(", ");
 }
 
+// D1's ceiling on bound parameters per statement. Anything that binds one
+// parameter per entry id has to come through chunked() to stay under it.
+export const BIND_LIMIT = 100;
+
+// The most ids one /counts call may name, whatever the chunking underneath.
+export const MAX_COUNT_IDS = 1000;
+
+export function chunked(items, size) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
@@ -470,14 +483,23 @@ async function routeCounts(request, env, url) {
     }
     if (!ids.includes(value)) ids.push(value);
   }
+  // A ceiling so one request cannot ask for an unbounded number of statements.
+  // Well above any gallery this serves; the page chunks its own asks anyway.
+  if (ids.length > MAX_COUNT_IDS) {
+    return json({ error: `entries must name at most ${MAX_COUNT_IDS} ids` }, 400, request, env);
+  }
   const counts = {};
   for (const id of ids) counts[id] = { views: 0, likes: 0 };
-  if (ids.length) {
-    const views = await env.DB.prepare(sqlCountViews(ids.length)).bind(...ids).all();
+  // D1 binds at most BIND_LIMIT parameters to one statement, and the gallery
+  // asks for every entry on the page at once. Past that many entries the whole
+  // request used to throw, so every count on the grid read "—". One statement
+  // per chunk instead: the answer is the same shape whatever the gallery's size.
+  for (const chunk of chunked(ids, BIND_LIMIT)) {
+    const views = await env.DB.prepare(sqlCountViews(chunk.length)).bind(...chunk).all();
     for (const row of views?.results || []) {
       counts[row.entry_id] = { views: row.count, likes: counts[row.entry_id].likes };
     }
-    const likes = await env.DB.prepare(sqlCountLikes(ids.length)).bind(...ids).all();
+    const likes = await env.DB.prepare(sqlCountLikes(chunk.length)).bind(...chunk).all();
     for (const row of likes?.results || []) {
       counts[row.entry_id] = { views: counts[row.entry_id].views, likes: row.n };
     }
