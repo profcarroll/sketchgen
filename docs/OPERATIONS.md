@@ -372,7 +372,21 @@ python3 bin/sketchgen publish 12 --from /path/to/e12 --by <github-username>
 python3 bin/sketchgen reject  12 --reason "off brief"            # no git at all
 ```
 
-The entry must be `held` or `failed-kept`, and the gallery checkout (`--gallery-dir`,
+Rejecting from the **operator UI** does more than that CLI line: since the
+lineage ledger's packet 2 the Reject button stores the reason on the entry and
+then publishes it to the rejections page, beside the gate's own rejections. The
+CLI `reject` above is still the state flip on its own, for a rejection that
+should not go out at all. Neither one deletes or moves a single file, and nor
+does Archive below: the entry row, its attempt directories under `jobs/` and its
+strip all stay exactly where they are.
+
+The third button on the Held page is **Archive**. It takes a held entry, or a
+kept failure nobody published, off the Held page and the kept list and does
+nothing else — no publish, no push, no deletion. An archived entry is in no
+list at all; it is still readable by id at `/entry/<id>` in the operator UI, and
+the console's funnel counts it.
+
+The entry must be `held`, `failed-kept` or `rejected`, and the gallery checkout (`--gallery-dir`,
 default `$SKETCHGEN_GALLERY` or `~/sketchgen/gallery`) must be a clean git work tree
 on its default branch. The files land in `e/<id>/`; the commit names the executor
 model as `Co-Authored-By:` (ATTRIBUTION.md, carried into the gallery) and the person
@@ -427,6 +441,43 @@ Spot-check afterwards:
 jq .lineage ~/sketchgen/gallery/e/230/meta.json    # parent_entry_id 176
 jq .lineage ~/sketchgen/gallery/e/176/meta.json    # children [230]
 ```
+
+### Operator step, once: publish the rejections that were only a state flip
+
+Rejecting an entry used to be a state flip and nothing else, so every rejection
+made before packet 2 is invisible with all of its files still on the node — 32
+of them when the packet was written, and each one a hole in some published
+entry's lineage. `publish-rejected` renders and pushes them, in id order, one
+commit per entry, exactly as the Publish button does. The reason comes from the
+entry's `reject_reason`, or from the originating job's `last_error` where that
+reads as something a person typed; where it does not — the placeholder the old
+UI wrote for an empty reason box, or an error message from the gate — the page
+says the reason was not recorded rather than inventing one.
+
+Deploy the code first, so the migration has run:
+
+```
+ssh sld-cloud 'bash ~/sketchgen/app/update.sh'     # pull, migrate, re-render, push
+```
+
+Then look before anything is pushed, and run it once:
+
+```
+~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen publish-rejected \
+    --all --dry-run                                 # one line per entry and its reason
+~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen publish-rejected \
+    --all --by <github-username>
+```
+
+`--dry-run` reads the database and nothing else: no checkout, no push, no
+write. The real run stops at the first entry it cannot publish rather than
+carrying on; the entries already pushed stay pushed, and running it again picks
+up where it stopped, because a published entry is no longer in the backlog.
+Name ids instead of `--all` to do a few at a time.
+
+Afterwards the rejections page lists those entries beside the gate's, each with
+its chip — `rejected · operator` against `rejected · gate` — and every entry
+whose parent was one of them has a real frame in its lineage instead of a blank.
 
 ## Backups: the nightly snapshot and the pull
 

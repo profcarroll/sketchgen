@@ -59,7 +59,12 @@ __all__ = [
 
 #: The states a person may publish from. ``failed-kept`` is here on purpose:
 #: a sketch the gate failed is still a result, and the gallery shows it as one.
-PUBLISHABLE = frozenset({"held", "failed-kept"})
+#: ``rejected`` joined them in the lineage ledger's §5.2, for the same reason
+#: read from the other end: a sketch a *person* refused is also a result, and
+#: rejecting now means publishing it to the rejections catalog with the reason.
+#: The entry keeps its state through the publish; only ``held`` becomes
+#: ``published``.
+PUBLISHABLE = frozenset({"held", "failed-kept", "rejected"})
 
 DEFAULT_GALLERY_DIR = os.environ.get(
     "SKETCHGEN_GALLERY", str(Path.home() / "sketchgen" / "gallery")
@@ -447,9 +452,10 @@ def publish(
             raise PublishFailed(pushed.stderr.strip() or "git push failed")
 
         now = db.utc_now()
-        # Only a held entry becomes 'published'. A kept rejection stays
-        # 'failed-kept' — that is what puts it on the rejections page rather
-        # than the grid — and gains the timestamp and commit like any other.
+        # Only a held entry becomes 'published'. A rejection — the gate's
+        # 'failed-kept' or the operator's 'rejected' — keeps its state, which
+        # is what puts it on the rejections page rather than the grid, and
+        # gains the timestamp and commit like any other.
         new_state = "published" if entry["state"] == "held" else entry["state"]
         conn.execute(
             "UPDATE entries SET state = ?, published_utc = ?, "
@@ -519,8 +525,8 @@ def publish_index(
     # published_utc is still waiting for that decision (spec §9), and a
     # re-render is not the place it gets made.
     rows = conn.execute(
-        "SELECT id FROM entries WHERE state IN ('published', 'failed-kept') "
-        "AND published_utc IS NOT NULL ORDER BY id"
+        "SELECT id FROM entries WHERE state IN ('published', 'failed-kept', "
+        "'rejected') AND published_utc IS NOT NULL ORDER BY id"
     ).fetchall()
     for row in rows:
         gallery.render_entry(conn, row["id"], checkout, config)
@@ -657,16 +663,21 @@ def reject(
 ) -> str:
     """Mark a held entry rejected. Touches no git repository and no files.
 
-    The schema has no column for a reason, so an explanatory ``--reason`` is
-    recorded in the originating job's ``last_error`` — the one free-text field
-    that belongs to the same piece of work — and returned for printing.
+    Since migration 007 the reason has a column of its own, ``reject_reason``;
+    it is also still written to the originating job's ``last_error``, where
+    this function has always put it and where the operator UI's job page reads
+    it. This is the CLI's path and it stops at the state flip: the UI's
+    ``web.reject_entry`` goes on to publish the entry to the rejections
+    catalog (§5.2). Either way no file is touched and nothing is deleted.
     """
     entry = _entry(conn, entry_id)
     if entry["state"] != "held":
         raise PublishRefused(
             f"entry {entry_id} is {entry['state']}; only held can be rejected"
         )
-    conn.execute("UPDATE entries SET state = 'rejected' WHERE id = ?", (entry_id,))
+    db.entry_transition(
+        conn, entry_id, "rejected", reject_reason=(reason or "").strip() or None
+    )
     job = db.get_job(conn, entry["job_id"]) if entry["job_id"] is not None else None
     if job is not None and job.state == "held":
         db.transition(conn, job.id, "rejected", last_error=f"entry rejected: {reason or ''}".rstrip(": "))

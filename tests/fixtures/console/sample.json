@@ -87,6 +87,7 @@
     "held": {"now": 3, "session": 9, "per_day": 14.0, "total": 28},
     "rejected": {"now": 0, "session": 2, "per_day": 3.5, "total": 7},
     "failed_kept": {"now": 0, "session": 4, "per_day": 6.5, "total": 13},
+    "archived": {"now": 0, "session": 1, "per_day": 1.0, "total": 2},
     "children": {"now": 1, "session": 5, "per_day": 8.5, "total": 17}
   },
   "per_sketch": {

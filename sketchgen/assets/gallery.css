@@ -136,6 +136,14 @@ iframe.sketch {
 }
 
 .chip.failed { background: var(--failed-ground); color: var(--failed-ink); }
+/* An operator rejection wears the same ground as the gate's: both are
+ * rejections and neither is a lesser one. The chip's own text is what
+ * separates them - "rejected . gate" against "rejected . operator" - so the
+ * two read as lowercase phrases rather than stamps, which is also the only
+ * way the middle dot survives being uppercased. */
+.chip.rejected { background: var(--failed-ground); color: var(--failed-ink); }
+.chip.failed, .chip.rejected { letter-spacing: 0; text-transform: none; }
+p.chip.rejected { text-transform: none; letter-spacing: 0; border-radius: 8px; padding: 0.5rem 0.75rem; }
 .chip.agree { background: var(--ok-ground); color: var(--ok-ink); }
 /* A critic chip names who asked for the revision: a model in the agent
  * colour, a person in the ok colour, the same two colours the scores use. */

@@ -30,6 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sketchgen import db  # noqa: E402
 from sketchgen import gallery  # noqa: E402
 from sketchgen import lineage  # noqa: E402
+from sketchgen.cli import gallery as cli_gallery  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI = REPO_ROOT / "bin" / "sketchgen"
@@ -1009,7 +1010,8 @@ class IndexTests(GalleryTestCase):
         self.assertNotIn(f'data-entry="{three}"', self.index)
         self.assertIn(f'data-entry="{three}"', self.failed)
         self.assertNotIn(f'data-entry="{one}"', self.failed)
-        self.assertIn("REJECTED", self.failed)
+        # The chip says whose rejection it is, not just that there was one.
+        self.assertIn("rejected · gate", self.failed)
         self.assertIn("AudioContext is suspended", self.failed)
 
     def test_the_cards_carry_what_the_grid_shows(self):
@@ -1271,6 +1273,105 @@ class CompareRejectionTests(GalleryTestCase):
         # nothing outside the reveal, and no verdict baked into the HTML
         self.assertEqual(1, self.compare.count("data-rejected-note"))
         self.assertNotIn("rejected by the gate", self.compare)
+
+
+class OperatorRejectionTests(GalleryTestCase):
+    """§5.2: a rejection a person made is public, and says so in their words."""
+
+    def reject(self, entry_id, reason, published_utc="2026-09-14T06:00:00Z"):
+        """Turn one of the fixture's entries into a published operator rejection."""
+        self.conn.execute(
+            "UPDATE entries SET state = 'rejected', reject_reason = ?, "
+            "published_utc = ? WHERE id = ?",
+            (reason, published_utc, entry_id),
+        )
+        self.conn.commit()
+        return entry_id
+
+    def test_a_rejected_entry_renders_with_the_operator_chip_and_the_reason(self):
+        entry_id = self.reject(self.ids[1], "drifted from the prompt")
+        self.render()
+        page = (self.dest / "e" / str(entry_id) / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("rejected · operator", page)
+        self.assertIn(
+            "Rejected by the operator: drifted from the prompt", page
+        )
+        # The gate's own wording is not borrowed for a decision a person made.
+        self.assertNotIn("REJECTED BY THE GATE", page)
+        self.assertEqual(
+            "rejected",
+            json.loads(
+                (self.dest / "e" / str(entry_id) / "meta.json").read_text("utf-8")
+            )["state"],
+        )
+
+    def test_rejections_html_shows_both_kinds(self):
+        gate = self.ids[2]
+        operator = self.reject(self.ids[1], "second version better")
+        self.render()
+        page = (self.dest / "rejections.html").read_text(encoding="utf-8")
+        self.assertIn(f'data-entry="{gate}"', page)
+        self.assertIn(f'data-entry="{operator}"', page)
+        self.assertIn("rejected · gate", page)
+        self.assertIn("rejected · operator", page)
+        # Each card's own reason, from its own source: the entry's column for
+        # the operator's, the job's last_error for the gate's.
+        self.assertIn("second version better", page)
+        self.assertIn("AudioContext is suspended", page)
+        # ...and it is off the grid.
+        index = (self.dest / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn(f'data-entry="{operator}"', index)
+
+    def test_a_rejection_with_no_reason_recorded_says_so(self):
+        entry_id = self.reject(self.ids[1], None)
+        self.render()
+        page = (self.dest / "e" / str(entry_id) / "index.html").read_text("utf-8")
+        self.assertIn("Rejected by the operator: reason not recorded", page)
+
+    def test_a_rejection_nobody_published_is_on_no_page(self):
+        # The same rule the kept failures have had: the state flip is not the
+        # decision to show it, the push is (§5.2).
+        job = db.enqueue(self.conn, "a rejection nobody pushed", "profcarroll")
+        entry_id = db.create_entry(
+            self.conn, job, state="rejected", prompt="a rejection nobody pushed",
+            reject_reason="off brief",
+        )
+        with self.assertRaises(gallery.UnknownEntry):
+            gallery.render_entry(self.conn, entry_id, self.dest, self.config)
+        self.render()
+        page = (self.dest / "rejections.html").read_text(encoding="utf-8")
+        self.assertNotIn(f'data-entry="{entry_id}"', page)
+
+    def test_an_archived_entry_is_never_public(self):
+        job = db.enqueue(self.conn, "one taken off the lists", "profcarroll")
+        entry_id = db.create_entry(
+            self.conn, job, state="archived", prompt="one taken off the lists",
+        )
+        self.assertNotIn("archived", gallery.PUBLIC_STATES)
+        with self.assertRaises(gallery.UnknownEntry):
+            gallery.render_entry(self.conn, entry_id, self.dest, self.config)
+        for publishing in (False, True):
+            with self.subTest(publishing=publishing):
+                with self.assertRaises(gallery.UnknownEntry):
+                    gallery.render_entry(
+                        self.conn, entry_id, self.dest, self.config,
+                        publishing=publishing,
+                    )
+        self.render()
+        self.assertFalse((self.dest / "e" / str(entry_id)).exists())
+
+    def test_a_rejected_entry_keeps_its_place_in_the_lineage_file(self):
+        # The whole point of §5.2: a rejected parent is a public entry with a
+        # strip, so a child's ledger has a frame to show instead of a blank.
+        entry_id = self.reject(self.ids[1], "prompt drift")
+        self.render()
+        index = json.loads((self.dest / "lineage.json").read_text("utf-8"))
+        item = index["entries"][str(entry_id)]
+        self.assertEqual("rejected", item["state"])
+        self.assertTrue(item["public"])
+        self.assertEqual(f"e/{entry_id}/strip.png", item["strip"])
 
 
 class GridSearchTests(GalleryTestCase):
@@ -1847,6 +1948,102 @@ class CommandLineTests(GalleryTestCase):
         )
         self.assertEqual(result.returncode, 3, result.stdout)
         self.assertIn("refused", result.stderr)
+
+
+class PublishRejectedTests(GalleryTestCase):
+    """§5.4: the one-time backfill of the rejections that were only a state flip."""
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(CLI), "publish-rejected", *args],
+            capture_output=True, text=True, check=False, env=dict(os.environ),
+        )
+
+    def waiting(self, prompt, last_error, entry_reason=None):
+        """A rejected entry nobody has published, with its job's last word."""
+        job = db.enqueue(self.conn, prompt, "profcarroll")
+        self.conn.execute(
+            "UPDATE jobs SET state = 'rejected', last_error = ? WHERE id = ?",
+            (last_error, job),
+        )
+        entry_id = db.create_entry(
+            self.conn, job, state="rejected", prompt=prompt,
+            reject_reason=entry_reason,
+        )
+        self.conn.commit()
+        return entry_id
+
+    def test_the_reason_is_read_from_the_job_only_when_a_person_wrote_it(self):
+        for last_error, expected in (
+            ("prompt drift", "prompt drift"),
+            ("entry rejected: too illegible", "too illegible"),
+            # the placeholder the old UI wrote for an empty reason box
+            ("rejected by operator", cli_gallery.NO_REASON),
+            ("", cli_gallery.NO_REASON),
+            (None, cli_gallery.NO_REASON),
+            # the machine's own words, which are not a person's verdict
+            ("gate exit 1: checks failed", cli_gallery.NO_REASON),
+            ("executor: no js block in the response", cli_gallery.NO_REASON),
+            ("x" * 400, cli_gallery.NO_REASON),
+        ):
+            with self.subTest(last_error=last_error):
+                self.assertEqual(expected, cli_gallery.backfill_reason(last_error))
+
+    def test_dry_run_lists_every_waiting_rejection_and_its_reason(self):
+        one = self.waiting("one a person refused", "prompt drift")
+        two = self.waiting("one with nothing written down", "rejected by operator")
+        result = self.run_cli(
+            "--all", "--dry-run", "--db", str(self.tmp / "sketchgen.db")
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"entry {one}: prompt drift", result.stdout)
+        self.assertIn(f"entry {two}: {cli_gallery.NO_REASON}", result.stdout)
+        self.assertIn("2 rejected entries would be published", result.stdout)
+        # A dry run writes nothing, not even the reason it would record.
+        self.assertIsNone(db.get_entry(self.conn, two)["reject_reason"])
+
+    def test_a_rejection_already_on_the_site_is_not_in_the_backlog(self):
+        done = self.waiting("one already pushed", "prompt drift")
+        self.conn.execute(
+            "UPDATE entries SET published_utc = ? WHERE id = ?",
+            ("2026-09-14T06:00:00Z", done),
+        )
+        self.conn.commit()
+        result = self.run_cli(
+            "--all", "--dry-run", "--db", str(self.tmp / "sketchgen.db")
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(f"entry {done}:", result.stdout)
+
+    def test_an_entrys_own_reason_wins_over_the_jobs_last_error(self):
+        entry_id = self.waiting("one with both", "prompt drift", "what a person typed")
+        result = self.run_cli(
+            "--all", "--dry-run", "--db", str(self.tmp / "sketchgen.db")
+        )
+        self.assertIn(f"entry {entry_id}: what a person typed", result.stdout)
+
+    def test_named_ids_narrow_the_run_and_a_wrong_one_refuses(self):
+        one = self.waiting("one a person refused", "prompt drift")
+        self.waiting("another", "lacks cohesion")
+        db_arg = str(self.tmp / "sketchgen.db")
+        result = self.run_cli(str(one), "--dry-run", "--db", db_arg)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("1 rejected entries would be published", result.stdout)
+        # An id that is not a rejection waiting to be published is a refusal,
+        # not a silent no-op: the operator typed a number and meant it.
+        wrong = self.run_cli(str(self.ids[0]), "--dry-run", "--db", db_arg)
+        self.assertEqual(wrong.returncode, 3, wrong.stdout)
+        self.assertIn("refused", wrong.stderr)
+
+    def test_saying_nothing_at_all_is_refused(self):
+        result = self.run_cli("--dry-run", "--db", str(self.tmp / "sketchgen.db"))
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn("refused", result.stderr)
+
+    def test_help_exits_zero(self):
+        result = self.run_cli("--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--dry-run", result.stdout)
 
 
 if __name__ == "__main__":
