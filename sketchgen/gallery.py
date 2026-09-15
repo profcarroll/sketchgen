@@ -1082,6 +1082,19 @@ def _assertions(row: sqlite3.Row) -> list[str]:
     return [str(word) for word in value] if isinstance(value, list) else []
 
 
+def _timing(report: dict[str, Any], key: str) -> float | None:
+    """One of the gate's timings as a number, or None when it is not there.
+
+    The earliest reports have no ``timings.ms_per_frame`` at all — the frame
+    budget came later — and a report written by a crashed run can carry a
+    string. Either way the honest answer is null, not a guess.
+    """
+    value = (report.get("timings") or {}).get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
 def _gate_log(attempts: list[sqlite3.Row]) -> list[dict[str, Any]]:
     """What each attempt's gate run said — §7's "and what each attempt's gate
     run said", from report.json where there is one."""
@@ -1105,6 +1118,13 @@ def _gate_log(attempts: list[sqlite3.Row]) -> list[dict[str, Any]]:
                 "prompt_tokens": attempt["prompt_tokens"],
                 "completion_tokens": attempt["completion_tokens"],
                 "wall_s": attempt["wall_s"],
+                # How long the gate's own run took, and what a virtual frame
+                # cost inside it. 29 published entries are over the budget the
+                # gate now enforces (100 ms a frame) and their pages should not
+                # start themselves; this is what the page reads to decide.
+                # Inside "gate" on purpose, so META_KEYS does not change.
+                "total_s": _timing(report, "total_s"),
+                "ms_per_frame": _timing(report, "ms_per_frame"),
             }
         )
     return log
@@ -1192,11 +1212,79 @@ def _byline(row: sqlite3.Row, meta: dict[str, Any]) -> str:
     )
 
 
-def _frame(has_sketch: bool, title: str) -> str:
+#: Over either of these the stage waits for a click instead of starting itself.
+#: The second is the gate's own frame budget (gate/README.md: a virtual frame
+#: costing more than 100 ms is a sketch the machine cannot keep up with); the
+#: first catches the runs that are slow without any one frame being slow. 29
+#: published entries are over one or the other, and every one of them used to
+#: start playing the moment the page opened.
+HEAVY_TOTAL_S = 30.0
+HEAVY_MS_PER_FRAME = 100.0
+
+
+def _heavy(meta: dict[str, Any]) -> dict[str, float | None] | None:
+    """The published attempt's timings, when the gate found it expensive.
+
+    The published attempt is the last one, the same attempt ``_source_dir``
+    takes; ``None`` means an ordinary sketch and an ordinary autoplaying stage.
+    """
+    log = meta.get("gate") or []
+    if not log:
+        return None
+    attempt = log[-1]
+    total_s = attempt.get("total_s")
+    ms_per_frame = attempt.get("ms_per_frame")
+    over = (total_s is not None and total_s > HEAVY_TOTAL_S) or (
+        ms_per_frame is not None and ms_per_frame > HEAVY_MS_PER_FRAME
+    )
+    if not over:
+        return None
+    return {"total_s": total_s, "ms_per_frame": ms_per_frame}
+
+
+def _heavy_chip(heavy: dict[str, float | None]) -> str:
+    ms = heavy.get("ms_per_frame")
+    if ms is not None:
+        text = f"heavy · {ms:.0f} ms per frame"
+    else:
+        # No frame rate in the report — the older runs have none — so say the
+        # measurement that did put it over the line rather than invent one.
+        text = f"heavy · {heavy.get('total_s') or 0:.0f} s in the gate"
+    return f'<span class="chip heavy">{_esc(text)}</span>'
+
+
+def _frame(
+    has_sketch: bool,
+    title: str,
+    *,
+    heavy: dict[str, float | None] | None = None,
+    has_strip: bool = False,
+) -> str:
+    """The stage: an iframe that starts itself, or a frame that waits.
+
+    A sketch the gate had to grind through does not get to start itself the
+    moment somebody opens the page. It renders as the strip with a play button
+    — the same run-in-place helper the ledger tiles use — and says why.
+    """
     if not has_sketch:
         return (
             '<p class="none">The sketch source is not in this checkout, so there '
             "is nothing to run here.</p>"
+        )
+    if heavy is not None and has_strip:
+        return (
+            '<div class="stage-run" data-stage-run>\n'
+            '      <button type="button" class="play" data-play data-run-href="sketch/"'
+            ' data-run-name="this sketch" aria-label="run this sketch">'
+            f'<img src="strip.png" alt="four frames from {_esc(title)}">'
+            '<span data-play-label></span></button>\n'
+            # The note lives inside the box the frame appears in, because that
+            # is where runInPlace looks for it.
+            '      <p class="run-note" data-run-note></p>\n'
+            '    </div>\n'
+            f'    <p class="stage-heavy">{_heavy_chip(heavy)} The gate had to grind '
+            "through this one, so it waits for a click rather than starting itself."
+            "</p>"
         )
     return (
         f'<iframe class="sketch" src="sketch/" title="{_esc(title)}" '
@@ -1204,7 +1292,322 @@ def _frame(has_sketch: bool, title: str) -> str:
     )
 
 
-def _lineage_panel(meta: dict[str, Any], line_page: bool) -> str:
+# ---------------------------------------------------------------------------
+# The ledger: the lineage panel
+# ---------------------------------------------------------------------------
+
+#: Ancestors strictly between the root and the grandparent fold away when there
+#: are at least this many. A single one reads better inline than behind a
+#: disclosure that says "1 generation folded".
+LEDGER_FOLD_MIN = 2
+
+
+def _ledger_index(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The same entries ``lineage.json`` carries, for the server's own use.
+
+    The panel's ancestry is static HTML written at publish time, so it is built
+    from exactly the shape the script later paints the rest of the panel from.
+    One producer, one vocabulary: a row the server draws and a row the script
+    draws cannot disagree about a generation or a chip.
+    """
+    return _lineage_index(conn, "")["entries"]
+
+
+def _ledger_chain(index: dict[str, Any], entry_id: int) -> list[int]:
+    """Root first, this entry last. Cycle-safe, because the data is not."""
+    chain: list[int] = []
+    seen: set[int] = set()
+    walk: int | None = int(entry_id)
+    while walk is not None and walk not in seen:
+        seen.add(walk)
+        chain.append(walk)
+        item = index.get(str(walk))
+        walk = item.get("parent") if item else None
+    chain.reverse()
+    return chain
+
+
+def _ledger_generation(item: dict[str, Any] | None) -> int:
+    return int((item or {}).get("generation") or 1)
+
+
+def _generation_label(item: dict[str, Any] | None, *, is_root: bool) -> str:
+    """"root", or the generation the database recorded.
+
+    THE NUMBERING IS INCONSISTENT AND THAT IS ON PURPOSE. ``lineage`` counts a
+    root as generation 0, so a root's first child is recorded as generation 1;
+    a root has no ``lineage`` row at all and ``meta.json`` and ``lineage.json``
+    both write it down as generation 1 as well. Two entries one step apart
+    therefore both say "generation 1". Every meta.json already published
+    carries those numbers and they are frozen at publish time, so nothing here
+    renumbers anything: the ledger prints the root as "root" with no number,
+    which is the one place the collision showed, and prints every other row's
+    recorded generation exactly as the database has it.
+    """
+    if is_root:
+        return "root"
+    return f"generation {_ledger_generation(item)}"
+
+
+def _critic_chip(item: dict[str, Any] | None, *, is_root: bool) -> str:
+    """Who asked for this generation: a model in the agent colour, a person in
+    the ok colour. The root's asker is whoever submitted the prompt."""
+    item = item or {}
+    who = item.get("submitted_by") if is_root else item.get("critique_by")
+    who = str(who or "").strip()
+    if not who:
+        return ""
+    if ":" in who:
+        # "gemma4:e4b" is one model at one size; the size is in the Provenance
+        # table and would be noise five times down a column.
+        return f'<span class="chip model">{_esc(who.split(":", 1)[0])}</span>'
+    return f'<span class="chip human">{_esc(who)}</span>'
+
+
+def _ledger_chips(item: dict[str, Any] | None, *, is_root: bool) -> str:
+    chips = [_critic_chip(item, is_root=is_root)]
+    if not (item or {}).get("public"):
+        # Still a generation, still counted: it just has no page to link to.
+        chips.append('<span class="chip unpublished">not published</span>')
+    return " ".join(chip for chip in chips if chip)
+
+
+def _ledger_tile(entry_id: int, item: dict[str, Any] | None, width: str) -> str:
+    """The first frame of the strip, as a button that runs the sketch here.
+
+    ``object-fit: cover`` with ``object-position: left`` on a 64:45 box shows
+    the first of the strip's four frames without a second file being made.
+    """
+    if not (item or {}).get("public"):
+        return f'<div class="ledger-tile {width} blank" aria-hidden="true"></div>'
+    return (
+        f'<div class="ledger-tile {width}">'
+        f'<button type="button" class="play" data-play '
+        f'data-run-href="../{entry_id}/sketch/" '
+                f'aria-label="run entry {entry_id}" data-run-name="entry {entry_id}">'
+        f'<img src="../{entry_id}/strip.png" loading="lazy" '
+        f'alt="the first frame of entry {entry_id}">'
+        f"<span data-play-label></span></button></div>"
+    )
+
+
+def _ledger_body(
+    entry_id: int,
+    item: dict[str, Any] | None,
+    *,
+    is_root: bool,
+    here: bool,
+    extra: str = "",
+) -> str:
+    item = item or {}
+    lines: list[str] = []
+    if is_root:
+        prompt = str(item.get("root_prompt") or "").strip()
+        if prompt:
+            lines.append(f'<p class="ledger-prompt">{_esc(prompt)}</p>')
+    else:
+        critique = " ".join(str(item.get("critique") or "").split())
+        if critique:
+            # Full length, never clamped: the critique is the reason this
+            # generation exists and a clamped one reads as a caption.
+            lines.append(
+                '<p class="ledger-critique"><span class="revise">Revise:</span> '
+                f"<em>{_esc(critique)}</em></p>"
+            )
+    if here or not item.get("public"):
+        name = f"entry {entry_id}"
+    else:
+        name = f'<a href="../{entry_id}/">entry {entry_id}</a>'
+    meta_bits = [name, _esc(_generation_label(item, is_root=is_root))]
+    if extra:
+        meta_bits.append(extra)
+    chips = _ledger_chips(item, is_root=is_root)
+    if chips:
+        meta_bits.append(chips)
+    lines.append('<p class="ledger-meta">' + " · ".join(meta_bits) + "</p>")
+    return '<div class="ledger-text">' + "".join(lines) + "</div>"
+
+
+def _ledger_row(
+    entry_id: int,
+    item: dict[str, Any] | None,
+    *,
+    is_root: bool = False,
+    here: bool = False,
+    extra: str = "",
+) -> str:
+    classes = "ledger-row" + (" here" if here else "")
+    current = ' aria-current="true"' if here else ""
+    return (
+        f'<li class="{classes}"{current}>'
+        + _ledger_tile(entry_id, item, "narrow")
+        + _ledger_body(entry_id, item, is_root=is_root, here=here, extra=extra)
+        + "</li>"
+    )
+
+
+def _fold_summary(folded: list[int], index: dict[str, Any]) -> str:
+    ids = ", ".join(str(one) for one in folded)
+    critics: list[str] = []
+    for one in folded:
+        who = str((index.get(str(one)) or {}).get("critique_by") or "").strip()
+        who = who.split(":", 1)[0] if who else ""
+        if who and who not in critics:
+            critics.append(who)
+    if not critics:
+        by = ""
+    elif len(critics) == 1:
+        by = f" · all by {critics[0]}"
+    else:
+        by = " · by " + " and ".join([", ".join(critics[:-1]), critics[-1]])
+    plural = "s" if len(folded) != 1 else ""
+    return _esc(f"{len(folded)} generation{plural} folded · {ids}{by}")
+
+
+def _ledger_fold(folded: list[int], index: dict[str, Any]) -> str:
+    rows = "".join(
+        _ledger_row(one, index.get(str(one))) for one in folded
+    )
+    return (
+        '<li class="ledger-folded"><details class="fold">'
+        f'<summary class="fold-label">{_fold_summary(folded, index)}</summary>'
+        f'<ol class="ledger">{rows}</ol>'
+        "</details></li>"
+    )
+
+
+def _line_href(root: int, line_page: bool) -> str | None:
+    return f"../../lines/{root}.html" if line_page else None
+
+
+def _ledger_heading(
+    entry_id: int,
+    index: dict[str, Any],
+    root: int,
+    deepest: int,
+    line_page: bool,
+) -> str:
+    href = _line_href(root, line_page)
+    where = (
+        f'<a href="{href}">entry {root}</a>' if href else f"entry {root}"
+    )
+    # The deepest generation is the one number in the heading that goes stale:
+    # a page rendered today is read after the line has grown. It sits in its
+    # own span so the script can replace the number and leave the link alone.
+    depth = f'<span data-ledger-deepest>{deepest}</span>'
+    if entry_id == root:
+        if deepest > 1:
+            text = f"the root of a line {depth} generations deep"
+        else:
+            text = "a root prompt, no children yet"
+    else:
+        generation = _ledger_generation(index.get(str(entry_id)))
+        text = f"generation {generation} of {depth} in the line from {where}"
+    return f'<h2>Lineage · <span data-ledger-head>{text}</span></h2>'
+
+
+def _lineage_panel(
+    meta: dict[str, Any],
+    line_page: bool,
+    index: dict[str, Any] | None = None,
+) -> str:
+    """The ledger: one row per generation, oldest first, this entry highlighted.
+
+    What the server writes is the part that cannot change — the ancestry was
+    settled the moment this entry existed. Siblings, children and descendants
+    arrive later than the page does, so their containers go out empty with the
+    ids the script needs, and ``gallery.js`` paints them from ``lineage.json``.
+    With no script the page still carries the whole ancestry and the plain
+    "Children: entry 124" line it has always had.
+    """
+    lineage = meta["lineage"]
+    entry_id = int(meta["entry_id"])
+    index = index or {}
+    mine = index.get(str(entry_id))
+    if mine is None:
+        # No index (a caller that has not built one): the old text panel is
+        # still true, and a panel that says less is better than one that lies.
+        return _lineage_text_panel(meta, line_page)
+
+    chain = _ledger_chain(index, entry_id)
+    root = chain[0]
+    line = [
+        int(key)
+        for key, item in index.items()
+        if item.get("root") == root
+    ]
+    deepest = max(
+        [_ledger_generation(index.get(str(one))) for one in line] or [1]
+    )
+    parent_id = index[str(entry_id)].get("parent")
+
+    rows: list[str] = []
+    ancestors = chain[:-1]
+    folded: list[int] = []
+    if len(ancestors[1:-2]) >= LEDGER_FOLD_MIN:
+        folded = ancestors[1:-2]
+    shown = [one for one in ancestors if one not in folded]
+    for one in shown:
+        item = index.get(str(one))
+        extra = ""
+        kids = list((item or {}).get("children") or [])
+        if len(kids) > 1 and one != parent_id:
+            # The other branch is a whole line of its own; the line page draws
+            # it, and the ledger says where to look.
+            href = _line_href(root, line_page)
+            extra = (
+                f'<a href="{href}">forked</a>' if href else "forked"
+            )
+        rows.append(
+            _ledger_row(one, item, is_root=(one == root), extra=extra)
+        )
+        if folded and one == root:
+            rows.append(_ledger_fold(folded, index))
+    rows.append(
+        _ledger_row(entry_id, mine, is_root=(entry_id == root), here=True)
+    )
+
+    kids = list(lineage["children"] or [])
+    if kids:
+        links = ", ".join(f'<a href="../{kid}/">entry {kid}</a>' for kid in kids)
+        fallback = f"<p class=\"ledger-plain\" data-ledger-plain>Children: {links}.</p>"
+        after = f"After this entry: {_count(len(kids), 'child', 'children')}"
+    else:
+        fallback = '<p class="ledger-plain" data-ledger-plain>No children yet.</p>'
+        after = "No children yet."
+
+    href = _line_href(root, line_page)
+    whole = (
+        f'<a href="{href}">The whole line from entry {root}</a>.'
+        if href
+        else "This is the whole line so far."
+    )
+    return "\n    ".join(
+        [
+            _ledger_heading(entry_id, index, root, deepest, line_page),
+            f'<div class="ledger-panel" data-ledger="{entry_id}" '
+            f'data-ledger-root="{root}"'
+            + (f' data-ledger-parent="{parent_id}"' if parent_id else "")
+            + ">",
+            f'<ol class="ledger">{"".join(rows)}</ol>',
+            '<div class="ledger-forks" data-ledger-forks hidden></div>',
+            '<hr class="ledger-rule">',
+            f'<p class="ledger-after" data-ledger-after>{_esc(after)}</p>',
+            '<div class="ledger-grid" data-ledger-tiles hidden></div>',
+            fallback,
+            "</div>",
+            '<p class="note">Click a frame to run that sketch in place; one at a '
+            f"time. {whole}</p>",
+        ]
+    )
+
+
+def _count(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+def _lineage_text_panel(meta: dict[str, Any], line_page: bool) -> str:
+    """The panel as it was before the ledger: paragraphs, no index needed."""
     lineage = meta["lineage"]
     parts = ["<h2>Lineage</h2>"]
     parent_id = lineage["parent_entry_id"]
@@ -1386,10 +1789,12 @@ def _write_entry(
             written.copy(sketch_js, out / "sketch" / "sketch.js")
             written.copy(index_html, out / "sketch" / "index.html")
             has_sketch = True
+    has_strip = False
     for which, name in (("strip", "strip.png"), ("png", "gate.png")):
         artefact = _artefact(row, attempts, which)
         if artefact is not None:
             written.copy(artefact, out / name)
+            has_strip = has_strip or which == "strip"
 
     statement = meta["statement"] or ""
     written.write_text(
@@ -1420,7 +1825,7 @@ def _write_entry(
         title=_esc(title),
         byline=_byline(row, meta),
         failed_note=failed_note,
-        frame=_frame(has_sketch, title),
+        frame=_frame(has_sketch, title, heavy=_heavy(meta), has_strip=has_strip),
         seed=_dash(meta["seed"]),
         state_chip=_state_chip(row["state"]),
         brief=_paragraphs(str(row["brief"] or ""), "No brief was recorded for this job."),
@@ -1438,7 +1843,7 @@ def _write_entry(
         compare_href=f"../../compare.html?a={entry_id}",
         source_rows=_source_rows(meta),
         provenance_rows=_provenance_rows(meta),
-        lineage=_lineage_panel(meta, has_line),
+        lineage=_lineage_panel(meta, has_line, _ledger_index(conn)),
     )
     written.write_text(out / "index.html", page)
     return out
