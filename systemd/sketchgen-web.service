@@ -15,7 +15,7 @@ Type=simple
 WorkingDirectory=%h/sketchgen/app
 Environment=SKETCHGEN_DB=%h/sketchgen/sketchgen.db
 Environment=SKETCHGEN_JOBS=%h/sketchgen/jobs
-Environment=SKETCHGEN_GATE=%h/sketchgen/gate/sketch_gate.py
+Environment=SKETCHGEN_GATE=%h/sketchgen/app/gate/sketch_gate.py
 Environment=SKETCHGEN_GALLERY=%h/sketchgen/gallery
 Environment=OLLAMA_HOST_URL=http://127.0.0.1:11434
 ExecStart=%h/sketchgen/.venv/bin/python3 %h/sketchgen/app/bin/sketchgen web --bind 127.0.0.1 --port 8081

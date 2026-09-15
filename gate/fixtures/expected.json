@@ -1,0 +1,73 @@
+{
+  "good-motion": {
+    "exit": 0,
+    "checks": {
+      "console_clean": true,
+      "is_looping": true,
+      "frame_advancing": true,
+      "sound_lib_ok": null,
+      "audio_context_running": null
+    },
+    "notes": "The clean pass: a gate that fails this is broken, and it is the only fixture that must satisfy both motion(idle) and responds(click)."
+  },
+  "good-static-noloop": {
+    "exit": 0,
+    "checks": {
+      "console_clean": true,
+      "is_looping": false,
+      "frame_advancing": null,
+      "sound_lib_ok": null,
+      "audio_context_running": null
+    },
+    "notes": "Deliberately still and correct: is_looping false is a declaration by the sketch, not a failed check, so the runner skips frame_advancing and still exits 0."
+  },
+  "bad-missing-p5sound": {
+    "exit": 1,
+    "checks": {
+      "console_clean": false,
+      "is_looping": true,
+      "frame_advancing": false,
+      "sound_lib_ok": false,
+      "audio_context_running": null
+    },
+    "notes": "The missing-library bug: setup() throws, frameCount stays 0 while isLooping() is still true, and audio_context_running is null because with no p5.sound there is no getAudioContext to ask."
+  },
+  "bad-audio-no-gesture": {
+    "exit": 1,
+    "checks": {
+      "console_clean": true,
+      "is_looping": true,
+      "frame_advancing": true,
+      "sound_lib_ok": true,
+      "audio_context_running": false
+    },
+    "notes": "The runtime-only bug from 2026-09-13: everything a reader can check passes and only the suspended AudioContext gives it away, which needs a secure-context origin (http://localhost or 127.0.0.1, not file:// and not a bare hostname) or p5.sound fails to load its worklet and the fixture tests the wrong thing."
+  },
+  "bad-console-error": {
+    "exit": 1,
+    "checks": {
+      "console_clean": false,
+      "is_looping": true,
+      "frame_advancing": false,
+      "sound_lib_ok": null,
+      "audio_context_running": null
+    },
+    "notes": "A late failure, at frame 11: a gate that only reads the console at load time passes it, and the throw also stops frameCount while isLooping() stays true."
+  },
+  "bad-frozen": {
+    "exit": 0,
+    "checks": {
+      "console_clean": true,
+      "is_looping": true,
+      "frame_advancing": true,
+      "sound_lib_ok": null,
+      "audio_context_running": null
+    },
+    "notes": "Running correctly on silence: every fixed check passes and only the motion(idle) frame-diff assertion catches it, which is why exit is 0 here."
+  },
+  "assertions_expected": {
+    "bad-frozen": { "motion(idle)": false },
+    "good-motion": { "motion(idle)": true, "responds(click)": true },
+    "good-static-noloop": { "no_motion": true }
+  }
+}

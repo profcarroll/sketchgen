@@ -156,6 +156,11 @@ prompts/                    versioned prompt templates
   rules/control.md          A/B control arm (generic context)
   rules/treatment.md        A/B treatment arm (p5.js conventions)
 
+gate/                       the deterministic referee, run by the worker
+  sketch_gate.py            headless Chromium: five fixed checks + assertions
+  accept.sh                 the harness: every fixture against expected.json
+  fixtures/                 six sketches, one bug each, and what the gate must say
+
 systemd/                    user-level units
   sketchgen-worker.service  the worker (daemon or drip mode)
   sketchgen-worker.timer    5-minute drip timer
@@ -167,7 +172,10 @@ writepath/                  Cloudflare Worker for the gallery's write side
   worker.js                 votes, likes, views, GitHub OAuth
   schema.sql                D1 tables
 
-tests/                      14 files, stdlib unittest
+bin/pull-backup.sh          pull the node's snapshots and jobs/ to this machine
+requirements.txt            the venv's one pin: playwright==1.62.0
+
+tests/                      16 files, stdlib unittest
 docs/OPERATIONS.md          running the worker, the UI, the sync, and recovery
 ```
 

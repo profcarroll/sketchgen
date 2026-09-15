@@ -189,6 +189,64 @@ The attempt rows that job already has are kept, and it resumes at the next
 attempt number. Nothing has to be recovered by hand: `db status` shows the state
 and the next pass picks it up.
 
+## The venv and the gate
+
+The pipeline is stdlib-only; the venv exists for one thing, the gate, which
+drives headless Chromium through Playwright. Both halves are pinned, because the
+gate is the referee and a node whose Playwright drifted is a node whose verdicts
+cannot be compared with the ones already in the database:
+
+```
+python3 -m venv ~/sketchgen/.venv
+~/sketchgen/.venv/bin/pip install -r ~/sketchgen/app/requirements.txt   # playwright==1.62.0
+~/sketchgen/.venv/bin/playwright install chromium                       # ~/.cache/ms-playwright
+```
+
+The browser is not pip-installable, so the second line is not optional and is
+not implied by the first. With no Chromium the gate refuses with exit 3 rather
+than passing anything.
+
+The gate itself is now **tracked in the repo**, at `gate/`: `sketch_gate.py`,
+`accept.sh`, `fixtures/` and a README saying what it checks. Until 2026-09-15 it
+lived only at `~/sketchgen/gate/` on the node, which made the one referee the
+one thing a reclaimed instance would have taken with it. Run its harness after
+touching it:
+
+```
+. ~/sketchgen/.venv/bin/activate
+~/sketchgen/app/gate/accept.sh          # six fixtures, PASS or MISMATCH each, non-zero on any
+```
+
+### Operator step: retire ~/sketchgen/gate (one release, then gone)
+
+The units now set `SKETCHGEN_GATE=%h/sketchgen/app/gate/sketch_gate.py`, and
+`update.sh` re-installs them, so the next update switches the worker and the UI
+over by itself. The old directory stays for one release as a **symlink**, so
+that a unit somebody has not reloaded yet still finds a gate. Do this by hand,
+on the node, after an `update.sh` that has landed the repo copy:
+
+```bash
+ssh sld-cloud
+cd ~/sketchgen
+sha256sum gate/sketch_gate.py app/gate/sketch_gate.py   # must be the same hash, twice
+mv gate gate.pre-repo                                    # keep it until the symlink is gone
+ln -s app/gate gate
+ls -l gate && ~/sketchgen/.venv/bin/python3 gate/sketch_gate.py --help >/dev/null && echo ok
+systemctl --user restart sketchgen-worker.service sketchgen-web.service
+journalctl --user -u sketchgen-worker -n 20              # watch one job pass the gate
+```
+
+One release later, when no unit refers to the old path and a job has passed the
+gate through the new one, remove both:
+
+```bash
+ssh sld-cloud 'rm ~/sketchgen/gate && rm -rf ~/sketchgen/gate.pre-repo'
+```
+
+Nothing in the pipeline reads `~/sketchgen/gate` except through
+`$SKETCHGEN_GATE`, so the symlink is a courtesy to stale units and to muscle
+memory, not a dependency.
+
 ## The two deploy keys
 
 ```
