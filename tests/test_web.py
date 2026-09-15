@@ -920,6 +920,140 @@ class TestHeld(WebTestCase):
         self.assertEqual(job.last_error, "off brief")
 
 
+class TestArchiveAndReject(WebTestCase):
+    """Packet 2 of the lineage ledger: §5.2's reject-and-publish, §5.3's archive."""
+
+    def make_entry(self, state, prompt="one more", **fields):
+        """A job and an entry in ``state``, removed again after the test."""
+        conn = self.db()
+        try:
+            job_id = db.enqueue(conn, prompt, "student-three")
+            job_state = {"held": "held", "published": "published"}.get(state, "failed")
+            if job_state == "failed":
+                conn.execute(
+                    "UPDATE jobs SET state = 'failed' WHERE id = ?", (job_id,)
+                )
+            else:
+                db.transition(conn, job_id, "executing")
+                db.transition(conn, job_id, "gating")
+                db.transition(conn, job_id, "held")
+                if job_state == "published":
+                    db.transition(conn, job_id, "published")
+            entry_id = db.create_entry(conn, job_id, state, prompt=prompt, **fields)
+            conn.commit()
+        finally:
+            conn.close()
+
+        def clean():
+            conn = self.db()
+            conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+            conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+            conn.commit()
+            conn.close()
+
+        self.addCleanup(clean)
+        return job_id, entry_id
+
+    def row(self, entry_id):
+        conn = self.db()
+        try:
+            return conn.execute(
+                "SELECT * FROM entries WHERE id = ?", (entry_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+
+    # -- reject ------------------------------------------------------------
+
+    def test_reject_stores_the_reason_and_takes_the_publish_path(self):
+        _, entry_id = self.make_entry("held", prompt="one to refuse")
+        app = web.App(db_path=str(self.db_path), jobs_dir=str(self.jobs_dir))
+        seen = []
+        original = web.publish_entry
+        web.publish_entry = lambda a, c, i: seen.append(i) or "handed to the publisher"
+        try:
+            conn = self.db()
+            try:
+                message = web.reject_entry(app, conn, entry_id, " off brief ")
+                conn.commit()
+            finally:
+                conn.close()
+        finally:
+            web.publish_entry = original
+        self.assertEqual([entry_id], seen)
+        self.assertIn("off brief", message)
+        self.assertIn("publisher", message)
+        row = self.row(entry_id)
+        self.assertEqual("rejected", row["state"])
+        self.assertEqual("off brief", row["reject_reason"])
+
+    def test_a_rejection_whose_push_fails_stays_pending(self):
+        # There is no gallery checkout here, so the publisher refuses. The
+        # entry is rejected with a null published_utc, which is exactly how a
+        # kept failure waits (§5.2), and the flash says what happened.
+        _, entry_id = self.make_entry("held", prompt="one whose push fails")
+        status, location = self.post(
+            f"/held/{entry_id}/reject", {"reason": "drifted from the prompt"}
+        )
+        self.assertEqual(303, status)
+        self.assertIn("drifted%20from%20the%20prompt", location)
+        row = self.row(entry_id)
+        self.assertEqual("rejected", row["state"])
+        self.assertIsNone(row["published_utc"])
+
+    # -- archive -----------------------------------------------------------
+
+    def test_archive_takes_a_held_entry_off_the_held_page(self):
+        _, entry_id = self.make_entry("held", prompt="one to shelve")
+        self.assertIn(f'id="entry-{entry_id}"', self.text("/held"))
+        status, location = self.post(f"/held/{entry_id}/archive", {"back": "/held"})
+        self.assertEqual(303, status)
+        self.assertTrue(location.startswith("/held?flash="), location)
+        self.assertEqual("archived", self.row(entry_id)["state"])
+        self.assertNotIn(f'id="entry-{entry_id}"', self.text("/held"))
+
+    def test_archive_takes_an_unpublished_kept_failure_off_the_kept_list(self):
+        _, entry_id = self.make_entry("failed-kept", prompt="one the gate refused")
+        page = self.text("/held")
+        self.assertIn(f'action="/held/{entry_id}/archive"', page)
+        self.post(f"/held/{entry_id}/archive", {"back": "/held"})
+        self.assertEqual("archived", self.row(entry_id)["state"])
+        self.assertNotIn(f'id="entry-{entry_id}"', self.text("/held"))
+
+    def test_archive_on_a_published_entry_is_refused_with_a_flash(self):
+        _, entry_id = self.make_entry("published", prompt="one already on the site")
+        status, location = self.post(f"/held/{entry_id}/archive", {"back": "/held"})
+        # A refusal, not a 500: the operator reads it on the page.
+        self.assertEqual(303, status)
+        self.assertIn("refused", location)
+        self.assertEqual("published", self.row(entry_id)["state"])
+
+    def test_archive_of_an_entry_that_is_not_there_is_a_flash_too(self):
+        status, location = self.post("/held/99999/archive", {"back": "/held"})
+        self.assertEqual(303, status)
+        self.assertIn("no%20entry%2099999", location)
+
+    def test_an_archived_entry_is_still_readable_by_id(self):
+        _, entry_id = self.make_entry("held", prompt="one to shelve and find again")
+        self.post(f"/held/{entry_id}/archive", {"back": "/held"})
+        page = self.text(f"/entry/{entry_id}")
+        self.assertIn(f"Entry {entry_id}", page)
+        self.assertIn("one to shelve and find again", page)
+        self.assertIn("Nothing was deleted", page)
+        # Read-only: no button on this page acts on the entry.
+        self.assertNotIn(f'action="/held/{entry_id}/', page)
+        self.assertNotIn(f'action="/entry/{entry_id}/spawn"', page)
+
+    def test_the_console_summary_counts_archived_entries(self):
+        _, entry_id = self.make_entry("held", prompt="one for the count")
+        self.post(f"/held/{entry_id}/archive", {"back": "/held"})
+        status, _, body = self.get("/api/console.json")
+        self.assertEqual(200, status)
+        funnel = json.loads(body)["funnel"]
+        self.assertIn("archived", funnel)
+        self.assertGreaterEqual(funnel["archived"]["total"], 1)
+
+
 class TestSpawn(WebTestCase):
     """POST /entry/<id>/spawn — packet 5.3's one write to the operator UI."""
 

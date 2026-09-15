@@ -224,7 +224,17 @@ TERMINAL_STATES = frozenset({"published", "rejected", "failed"})
 
 # What a state is CALLED on screen. The database keeps its names; the UI says
 # who rejected the work. Anything not listed is shown as its state name.
-STATE_LABELS = {"failed": "rejected · gate", "rejected": "rejected · operator"}
+#
+#: Both job states and entry states are in
+#: here — the two machines share three names and the label is the same either
+#: way — so the queue's pill, the job page and the entry page all say the same
+#: words. ``gallery.STATE_CHIPS`` carries the two rejection labels onto the
+#: public site, deliberately the same strings.
+STATE_LABELS = {
+    "failed": "rejected · gate",
+    "failed-kept": "rejected · gate",
+    "rejected": "rejected · operator",
+}
 
 
 def state_label(state: str) -> str:
@@ -1145,6 +1155,7 @@ FUNNEL_ORDER = (
     ("held", "held"),
     ("rejected", "rejected"),
     ("failed_kept", "rejections (gate), kept"),
+    ("archived", "archived"),
     ("children", "children"),
 )
 
@@ -1439,10 +1450,13 @@ def entry_cell(entry: tuple[int, str] | None) -> str:
     entry_id, state = entry
     if state == "held":
         href = f"/held#entry-{entry_id}"
-    elif state in ("published", "failed-kept"):
+    elif state in ("published", "failed-kept", "rejected"):
         href = f"{GALLERY_URL}e/{entry_id}/"
     else:
-        return f'<td class="n" title="entry {entry_id}, {esc(state)}">{entry_id}</td>'
+        # Archived, and anything else with no public page: the id still links
+        # somewhere, because /entry/<id> is the only way back to an archived
+        # entry and a dead number in this column helps nobody.
+        href = f"/entry/{entry_id}"
     return (
         f'<td class="n"><a href="{esc(href)}" title="entry {entry_id}, {esc(state)}" '
         f'onclick="event.stopPropagation()">{entry_id}</a></td>'
@@ -2366,6 +2380,25 @@ def _lineage_note(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
     return "a root prompt, no lineage"
 
 
+def _archive_form(row: sqlite3.Row, back: str) -> str:
+    """The third button on a decision card: neither yes nor no, but not now.
+
+    A held entry nobody will publish and nobody wants to reject, and a kept
+    failure nobody will ever put on the site, otherwise sit on this page for
+    good. Archiving takes them off it. Nothing is deleted — the row, the
+    attempt directories and the strip all stay — and the entry is still
+    readable at /entry/<id>, which the note on the button says.
+    """
+    entry_id = int(row["id"])
+    return (
+        f'<form method="post" action="/held/{entry_id}/archive">'
+        f'<input type="hidden" name="back" value="{esc(back)}">'
+        f'<button type="submit">Archive entry {entry_id}</button>'
+        '<span class="dim" style="font-size:12px">off this page, nothing '
+        'deleted</span></form>'
+    )
+
+
 def _decision_card(
     app: App, conn: sqlite3.Connection, row: sqlite3.Row, *, kept: bool
 ) -> str:
@@ -2409,6 +2442,7 @@ def _decision_card(
         f'<form method="post" action="/held/{row["id"]}/publish">'
         f'<button type="submit">Publish entry {row["id"]}</button></form>'
         f"{reject}"
+        f"{_archive_form(row, '/held')}"
         "</div>"
         f'<div class="actions">{spawn_form(row, "/held")}</div>'
         "</section>"
@@ -2441,6 +2475,51 @@ def held_page(app: App, conn: sqlite3.Connection) -> str:
         cards="\n".join(cards),
         kept_count=len(kept),
         kept_cards="\n".join(kept_cards),
+    )
+
+
+def entry_page(app: App, conn: sqlite3.Connection, entry_id: int) -> str:
+    """One entry by id, read-only. The only way back to an archived one.
+
+    No page lists archived entries — that is what archiving them was for — so
+    this is where they are still readable, along with every other entry whose
+    id somebody has written down. It renders and it does nothing: no publish,
+    no reject, no archive, no spawn. The decisions live on /held, where the
+    entries waiting for one are.
+    """
+    row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+    if row is None:
+        return (
+            f'<section class="panel"><h2>Entry {entry_id}</h2>'
+            '<p class="dim">there is no such entry.</p></section>'
+        )
+    state = str(row["state"])
+    if state == "archived":
+        where = (
+            "Archived by the operator: off the Held page and the kept list, "
+            "and nowhere else. Nothing was deleted — this row, its attempts "
+            "under jobs/ and its strip are all still on disk."
+        )
+    elif state == "held":
+        where = f'Waiting for a decision on <a href="/held#entry-{entry_id}">Held</a>.'
+    elif row["published_utc"]:
+        where = f'On the site: <a href="{esc(GALLERY_URL)}e/{entry_id}/">e/{entry_id}/</a>.'
+    else:
+        where = "Not on the site: nobody has published it."
+    return (
+        f'<section class="panel card" id="entry-{entry_id}">'
+        f"<h2>Entry {entry_id}</h2>"
+        f'<p class="dim" style="font-size:12px;margin:-6px 0 8px">'
+        f'{esc(state_label(state))} · made by job '
+        f'<a href="/job/{row["job_id"]}">{row["job_id"]}</a></p>'
+        f"{_held_preview(app, conn, row)}"
+        f"{_entry_image(app, row)}"
+        f"<p>{esc(truncate(row['prompt'], 400))}</p>"
+        f'<p class="dim" style="font-size:12px">{esc(_gate_summary(conn, row["job_id"]))}'
+        f" · {esc(_lineage_note(conn, row))} · {esc(row['executor'] or '—')}"
+        f" · rules {esc(row['rules_file'] or '—')}</p>"
+        f'<p class="dim" style="font-size:12px">{where}</p>'
+        "</section>"
     )
 
 
@@ -2482,8 +2561,28 @@ def publish_entry(app: App, conn: sqlite3.Connection, entry_id: int) -> str:
     return f"Entry {entry_id} handed to the publisher"
 
 
-def reject_entry(conn: sqlite3.Connection, entry_id: int, reason: str) -> str:
-    """Move one held entry to rejected, with its job. Returns the flash message."""
+def reject_entry(
+    app: App, conn: sqlite3.Connection, entry_id: int, reason: str
+) -> str:
+    """Reject one held entry and publish it to the rejections catalog.
+
+    Rejecting used to be a state flip and nothing else, which is how 32
+    sketches came to be invisible with every one of their files still on the
+    node, and how eleven published entries came to descend from a parent the
+    site had never heard of. So a rejection now goes out the same way a
+    publication does: the reason is stored on the entry, and the entry is
+    handed to the same render-and-push path :func:`publish_entry` uses (§5.2).
+    A person pressed the button, which is what spec §9 asks of anything that
+    reaches the public repository.
+
+    **No file is deleted or moved.** The attempt directories under ``jobs/``,
+    the strip and the gate report are exactly where they were; this question
+    has been asked once already and the answer is in the code now.
+
+    A push that fails leaves the entry ``rejected`` with a null
+    ``published_utc``, which is how the console already shows a kept failure
+    that is waiting: pending, and publishable again later.
+    """
     row = conn.execute(
         "SELECT id, job_id, state FROM entries WHERE id = ?", (entry_id,)
     ).fetchone()
@@ -2492,30 +2591,36 @@ def reject_entry(conn: sqlite3.Connection, entry_id: int, reason: str) -> str:
     if row["state"] != "held":
         return f"entry {entry_id} is {row['state']}, not held — nothing changed"
     reason = reason.strip() or "rejected by operator"
-    for name in ("reject_entry", "set_entry_state", "entry_transition"):
-        helper = getattr(db, name, None)
-        if callable(helper):
-            try:
-                _call_matching(
-                    helper,
-                    conn=conn,
-                    entry_id=entry_id,
-                    id=entry_id,
-                    state="rejected",
-                    new_state="rejected",
-                    reason=reason,
-                )
-                break
-            except Exception:
-                continue
-    else:
-        conn.execute(
-            "UPDATE entries SET state = 'rejected' WHERE id = ?", (entry_id,)
-        )
+    try:
+        db.entry_transition(conn, entry_id, "rejected", reject_reason=reason)
+    except (db.IllegalTransition, db.UnknownEntry) as exc:
+        return f"refused: {exc}"
     job = db.get_job(conn, int(row["job_id"]))
     if job is not None and job.state == "held":
         db.transition(conn, job.id, "rejected", last_error=reason)
-    return f"Entry {entry_id} rejected — {reason}"
+    published = publish_entry(app, conn, entry_id)
+    return f"Entry {entry_id} rejected — {reason}. {published}"
+
+
+def archive_entry(conn: sqlite3.Connection, entry_id: int) -> str:
+    """Take one entry off the operator's lists without deleting anything.
+
+    **No file is deleted or moved**, and nor is the row: archiving is about
+    which lists an entry appears on, and about nothing else. Legal from
+    ``held``, and from ``failed-kept`` while nobody has published it; refused
+    with a message on anything else, which is the whole point of doing it
+    through the entry state machine rather than an UPDATE here (§5.3).
+    """
+    try:
+        db.archive_entry(conn, entry_id)
+    except db.UnknownEntry:
+        return f"there is no entry {entry_id}"
+    except db.IllegalTransition as exc:
+        return f"refused: {exc} — nothing changed, and no file was touched"
+    return (
+        f"Entry {entry_id} archived — off the lists, nothing deleted; "
+        f"it is still at /entry/{entry_id}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2630,6 +2735,8 @@ ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     ("GET", re.compile(r"^/held$"), "page_held"),
     ("POST", re.compile(r"^/held/(?P<entry_id>\d+)/publish$"), "post_publish"),
     ("POST", re.compile(r"^/held/(?P<entry_id>\d+)/reject$"), "post_reject"),
+    ("POST", re.compile(r"^/held/(?P<entry_id>\d+)/archive$"), "post_archive"),
+    ("GET", re.compile(r"^/entry/(?P<entry_id>\d+)$"), "page_entry"),
     ("POST", re.compile(r"^/entry/(?P<entry_id>\d+)/spawn$"), "post_spawn"),
     ("POST", re.compile(r"^/control$"), "post_control"),
     ("GET", re.compile(r"^/preview/(?P<job_id>\d+)/(?P<n>\d+)$"), "preview_slash"),
@@ -3085,10 +3192,43 @@ class OpHandler(BaseHTTPRequestHandler):
         reason = (form.get("reason") or [""])[0]
         conn = self.app.connect()
         try:
-            message = reject_entry(conn, int(entry_id), reason)
+            message = reject_entry(self.app, conn, int(entry_id), reason)
         finally:
             conn.close()
         self.redirect("/held", message)
+
+    def post_archive(self, entry_id: str) -> None:
+        form = self.form()
+        back = (form.get("back") or ["/held"])[0]
+        if not back.startswith("/") or back.startswith("//"):
+            back = "/held"
+        conn = self.app.connect()
+        try:
+            message = archive_entry(conn, int(entry_id))
+        finally:
+            conn.close()
+        self.redirect(back, message)
+
+    def page_entry(self, entry_id: str) -> None:
+        conn = self.app.connect()
+        try:
+            control = db.get_control(conn)
+            body = entry_page(self.app, conn, int(entry_id))
+            marks = nav_summary(conn)
+        finally:
+            conn.close()
+        self.html(
+            layout(
+                title=f"Entry {entry_id}",
+                here="/held",
+                body=body,
+                control=control,
+                back=f"/entry/{entry_id}",
+                flash=self.flash(),
+                page_script=PREVIEW_SCRIPT,
+                nav_marks=marks,
+            )
+        )
 
     def post_spawn(self, entry_id: str) -> None:
         form = self.form()
