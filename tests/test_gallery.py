@@ -16,6 +16,7 @@ data may survive a render.
 import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -28,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sketchgen import db  # noqa: E402
 from sketchgen import gallery  # noqa: E402
+from sketchgen import lineage  # noqa: E402
 from sketchgen.cli import gallery as cli_gallery  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -375,6 +377,7 @@ def build_db(tmp: Path):
 def add_child(conn, tmp: Path, parent_entry: int, *, state: str = "held",
               prompt: str = "the same field, slower, in one colour",
               critique: str = "let the whole thing slow down and lose a colour",
+              critique_by: str = "profcarroll",
               generation: int = 3) -> int:
     """One more entry in the line, with a real attempt directory behind it.
 
@@ -386,7 +389,7 @@ def add_child(conn, tmp: Path, parent_entry: int, *, state: str = "held",
         conn, prompt, "profcarroll",
         brief="One hue, half the speed.", assertions=["motion(idle)"],
         planner="gemma4:e4b", executor="qwen3.5:4b", rules_file="treatment",
-        parent_entry_id=parent_entry, critique=critique, critique_by="profcarroll",
+        parent_entry_id=parent_entry, critique=critique, critique_by=critique_by,
     )
     attempt = write_attempt(jobs, job, 1, "good-motion", STATEMENT_ONE,
                             exit_code=0, assertions=["motion(idle)"])
@@ -418,7 +421,7 @@ def add_child(conn, tmp: Path, parent_entry: int, *, state: str = "held",
     )
     db.add_lineage(
         conn, entry, parent_entry, generation=generation,
-        critique_by="profcarroll", critique=critique,
+        critique_by=critique_by, critique=critique,
     )
     return entry
 
@@ -799,6 +802,197 @@ class LineageJsonTests(GalleryTestCase):
                 gallery.LINEAGE_ROOT_PROMPT_CAP,
                 len(data["entries"][str(entry_id)]["root_prompt"]),
             )
+
+
+# ---------------------------------------------------------------------------
+# Packet 4: the title is the root prompt, the subtitle is the latest revision
+# ---------------------------------------------------------------------------
+
+
+def heading(text: str) -> str:
+    """The `h1` of a page, tags stripped, entities resolved."""
+    inner = text.split("<h1>", 1)[1].split("</h1>", 1)[0]
+    return html.unescape(re.sub(r"<[^>]+>", "", inner)).strip()
+
+
+def subtitle(text: str) -> str:
+    """The `p.sub` under the heading, tags stripped. Empty when there is none."""
+    match = re.search(r'<p class="sub">(.*?)</p>', text, re.S)
+    if match is None:
+        return ""
+    return " ".join(html.unescape(re.sub(r"<[^>]+>", " ", match.group(1))).split())
+
+
+def head_title(text: str) -> str:
+    return html.unescape(text.split("<title>", 1)[1].split("</title>", 1)[0])
+
+
+class TitleTests(GalleryTestCase):
+    """A root, a first revision, and the generation-10 case that forced this.
+
+    Entry 230 on the live site is generation 10: its prompt is the root
+    sentence with ten critiques stapled under `Revise:` headings, 1,700
+    characters that the heading used to print in full. The fixture here is the
+    same shape, built by composing each generation's prompt the way
+    `lineage.compose_prompt` does, so the split the page does is the real one.
+    """
+
+    #: The critiques, in order, that turn the root into a generation-10 prompt.
+    #: One per generation: entry 230 carries ten headings and its lineage row
+    #: says generation 10, and entry 82 carries six and says 6.
+    REVISIONS = [
+        "try again with a different colour palette and mood",
+        "slow the drift until a single circle can be followed",
+        "let the ground breathe instead of holding one value",
+        "give the cursor less power over the whole field",
+        "bring back some of the contrast the last pass lost",
+        "let one circle be larger than the rest and lead",
+        "hold the palette but change what the click does",
+        "make the return after a scatter take longer",
+        "end on stillness rather than on motion",
+        "keep the stillness but let the ground hold one more hue",
+    ]
+
+    def setUp(self):
+        super().setUp()
+        self.root_id = self.ids[0]
+        self.root_prompt = " ".join(
+            self.conn.execute(
+                "SELECT prompt FROM entries WHERE id = ?", (self.root_id,)
+            ).fetchone()["prompt"].split()
+        )
+        prompt = self.root_prompt
+        parent = self.root_id
+        self.chain = []
+        for n, critique in enumerate(self.REVISIONS, start=1):
+            prompt = lineage.compose_prompt(prompt, critique)
+            parent = add_child(
+                self.conn, self.tmp, parent, state="published", prompt=prompt,
+                critique=critique, generation=n,
+                # a critic model on the odd generations, a person on the even
+                critique_by="gemma4:e4b" if n % 2 else "profcarroll",
+            )
+            self.chain.append(parent)
+        self.render()
+
+    def page(self, entry_id: int) -> str:
+        return (self.dest / "e" / str(entry_id) / "index.html").read_text(
+            encoding="utf-8"
+        )
+
+    def test_a_root_is_its_own_title_and_has_no_subtitle(self):
+        page = self.page(self.root_id)
+        self.assertEqual(self.root_prompt, heading(page))
+        self.assertEqual("", subtitle(page))
+        self.assertNotIn("Revise:", page.split("<section", 1)[0])
+
+    def test_the_first_revision_names_itself_and_counts_no_others(self):
+        page = self.page(self.chain[0])
+        self.assertEqual(self.root_prompt, heading(page))
+        sub = subtitle(page)
+        self.assertIn("Revise:", sub)
+        self.assertIn(self.REVISIONS[0], sub)
+        self.assertIn("generation 1", sub)
+        # one revision, so there are no earlier ones to send anybody below
+        self.assertNotIn("earlier revision", sub)
+
+    def test_a_model_critic_wears_the_model_chip_without_its_size(self):
+        # generation 1 was asked for by gemma4:e4b; the chip is the critic, not
+        # the quantisation, so the tag after the colon is not in it
+        page = self.page(self.chain[0])
+        self.assertIn('<span class="chip model">gemma4</span>', page)
+        self.assertNotIn("gemma4:e4b", subtitle(page))
+
+    def test_the_generation_ten_title_is_one_sentence(self):
+        entry_id = self.chain[-1]
+        page = self.page(entry_id)
+        self.assertEqual(self.root_prompt, heading(page))
+        # the thing this packet exists to stop: nine amendments in the heading
+        self.assertNotIn("Revise:", page.split("</h1>", 1)[0])
+        for revision in self.REVISIONS:
+            self.assertNotIn(revision, page.split("</h1>", 1)[0])
+
+    def test_the_generation_ten_subtitle_names_the_latest_revision(self):
+        page = self.page(self.chain[-1])
+        sub = subtitle(page)
+        self.assertIn(self.REVISIONS[-1], sub)
+        self.assertNotIn(self.REVISIONS[0], sub)
+        self.assertIn("generation 10", sub)
+        self.assertIn("9 earlier revisions in the lineage below", sub)
+        # the critique on the last generation came from a person
+        self.assertIn('<span class="chip person">profcarroll</span>', page)
+
+    def test_the_head_title_is_the_root_truncated_at_eighty(self):
+        for entry_id in (self.root_id, self.chain[0], self.chain[-1]):
+            with self.subTest(entry=entry_id):
+                self.assertEqual(
+                    self.root_prompt[:80], head_title(self.page(entry_id))
+                )
+
+    def test_provenance_keeps_the_whole_prompt(self):
+        """The title is shorter; the record is not."""
+        page = self.page(self.chain[-1])
+        meta = json.loads(
+            (self.dest / "e" / str(self.chain[-1]) / "meta.json").read_text()
+        )
+        for revision in self.REVISIONS:
+            with self.subTest(revision=revision):
+                self.assertIn(revision, meta["prompt"])
+                self.assertIn(html.escape(revision), page)
+
+    def test_a_card_shows_the_root_and_the_latest_revision(self):
+        index = (self.dest / "index.html").read_text(encoding="utf-8")
+        card = index.split(f'data-entry="{self.chain[-1]}"', 1)[1].split("</div>", 1)[0]
+        self.assertIn(html.escape(self.root_prompt), card)
+        self.assertIn("card-revision", card)
+        self.assertIn(f"g10 · {self.REVISIONS[-1]}", html.unescape(card))
+        # the nine earlier revisions are in data-search and nowhere visible
+        shown = html.unescape(card.split('data-search="', 1)[1].split('">', 1)[1])
+        for revision in self.REVISIONS[:-1]:
+            with self.subTest(revision=revision):
+                self.assertNotIn(revision, shown)
+
+    def test_the_entry_eighty_two_case_reads_g6(self):
+        """Six headings, lineage generation 6, and the card says so.
+
+        Entry 82 on the live site: `generation` in the lineage row is the
+        number of `Revise:` headings in the prompt, not one more than it, and
+        the card takes the number from the row either way.
+        """
+        entry_id = self.chain[5]
+        self.assertEqual(
+            6,
+            int(self.conn.execute(
+                "SELECT generation FROM lineage WHERE child_entry_id = ?",
+                (entry_id,),
+            ).fetchone()["generation"]),
+        )
+        index = (self.dest / "index.html").read_text(encoding="utf-8")
+        card = index.split(f'data-entry="{entry_id}"', 1)[1].split("</div>", 1)[0]
+        self.assertIn(f"g6 · {self.REVISIONS[5]}", html.unescape(card))
+        sub = subtitle(self.page(entry_id))
+        self.assertIn("generation 6", sub)
+        self.assertIn("5 earlier revisions in the lineage below", sub)
+
+    def test_search_still_finds_an_early_revision(self):
+        index = (self.dest / "index.html").read_text(encoding="utf-8")
+        haystack = card_search(index)[str(self.chain[-1])]
+        for revision in self.REVISIONS:
+            with self.subTest(revision=revision):
+                self.assertIn(revision, html.unescape(haystack))
+
+    def test_only_the_root_card_on_a_line_page_carries_the_prompt(self):
+        line = (self.dest / "lines" / f"{self.root_id}.html").read_text(
+            encoding="utf-8"
+        )
+        # the card that closes a line at DECIDE[lineage-depth] has one too; it
+        # is not a generation, so it is not part of this count
+        self.assertEqual(1, line.split('class="node depth-6 waits"')[0].count("node-prompt"))
+        self.assertIn(html.escape(self.root_prompt), line)
+        for revision in self.REVISIONS:
+            with self.subTest(revision=revision):
+                # each critique is on the line page once, as a critique
+                self.assertEqual(1, line.count(html.escape(revision)))
 
 
 class IndexTests(GalleryTestCase):
