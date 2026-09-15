@@ -172,7 +172,17 @@ quiet. Run the same scan by hand over any attempt directory:
 python3 bin/sketchgen preflight ~/sketchgen/jobs/16/attempt-1
 ```
 
-Exit 0 is clean, 1 is something shadowed, 2 is a directory with no `sketch.js`.
+Exit 0 is clean, 1 is something found, 2 is a directory with no `sketch.js`.
+
+Since 2026-09-15 the same scan reads a second thing: what a frame costs. The
+gate's `frame_budget` check is the authority on whether a sketch is too
+expensive, and it says *1093 ms per frame*; this says which line does it —
+`sphere()` inside a loop inside `draw()` in a WEBGL sketch, `line()`/`point()`
+the same way (in WEBGL both are immediate mode and allocate a vertex buffer per
+call), an all-pairs loop inside `draw()`, an allocation inside `draw()`, a
+`filter()` inside a loop. Same mechanism, same place in the evidence, same
+bargain: it adds nothing when the gate passes and would rather say nothing than
+guess.
 
 **A job nobody is attending goes back on the queue.** At startup, and again on
 every idle cycle, the worker re-queues any job left in `planning`, `executing`,
@@ -188,6 +198,95 @@ sweep: job 5 sat in planning for 47 minutes with no worker attending it; re-queu
 The attempt rows that job already has are kept, and it resumes at the next
 attempt number. Nothing has to be recovered by hand: `db status` shows the state
 and the next pass picks it up.
+
+## An unsafe sketch
+
+Twice now — entry 165 (job 166, 2026-09-15) and entry 269 (job 270) — the
+pipeline has produced a sketch that passed every check and then took the
+operator's laptop down. Both drew about 1,500 `sphere()` meshes plus tens of
+thousands of immediate-mode `line()` calls per frame in WEBGL. In the gate that
+costs time; in a real browser tab, unseeded and at full speed, p5's WEBGL
+`line()` builds and uploads a vertex buffer per call, so it costs memory until
+something is killed. About 4 GB of GPU buffers, a `firefox CanvasRenderer` in
+`ASAHI_GEM_CREATE`, and the oom-killer.
+
+**Until this change is deployed on the node, do not open `/held` on a machine
+you cannot afford to lose.** The page embeds a live iframe per held entry, so
+opening it runs every held sketch at once. Look at one entry's job page instead,
+or better, `gate-audit` first (below) and then decide what to open. After
+deployment nothing on those screens autoplays: each card shows the strip as a
+play button, one frame runs at a time, and stopping removes it.
+
+### Spotting one
+
+```
+sketchgen gate-audit --over 30
+```
+
+Every attempt with a report, slowest gate run first, with its entry id, the
+entry's state and — for runs from 2026-09-15 on — `ms_per_frame`. It reads the
+database and the report files, runs no browser and never runs the gate, so it is
+safe against a working node. Sorting by `timings.total_s` is how both incidents
+were found after the fact, and how job 45 (504 s, twelve `filter(BLUR)` passes a
+frame) and job 43 (120 s) turned up behind them. The gate's median run is about
+2 s; a run in the hundreds is not a slow machine, it is a sketch.
+
+A `frame_budget` of `FAILED` is the same finding made at the time, by the gate
+itself. A blank `ms/frame` means the report predates the budget.
+
+On the operator's own machine, after a crash, the kernel is the witness:
+
+```
+journalctl -k -b -1 | grep -i oom
+```
+
+`-b -1` is the boot before this one — the one that ended. A line naming the
+browser process is the confirmation that the tab, and not something else, is
+what went down.
+
+### Neutralising one
+
+The precedent is job 166, and job 270 was done the same way. The rule is that
+nothing is deleted: the attempt directory is the canonical record (spec §10) and
+the unsafe sketch is evidence of what the pipeline did.
+
+In `~/sketchgen/jobs/<job>/attempt-<n>/`:
+
+1. `git mv`-style rename, by hand: `sketch.js` → **`sketch.unsafe.js.txt`**. The
+   `.txt` is the point — nothing serves it, nothing runs it, and it is still
+   readable.
+2. `.gate/` → **`.gate.unsafe/`**. The original run's report, strip and console
+   are the measurement of the bug and must not be overwritten by the re-gate.
+3. Write a **bounded rewrite** into `sketch.js`: the same picture, inside the
+   frame budget. For both incidents that meant batching the particles into one
+   `beginShape(POINTS)` cloud, finding neighbours through a spatial hash and
+   drawing them as one capped `beginShape(LINES)`, `frameRate(30)`, no
+   `sphere()` and no `push()`/`pop()` per particle. `sketchgen preflight` on the
+   directory should come back clean.
+4. **Re-gate with the same assertions and the same seed** as the original run —
+   both are in the original `report.json`, under `assertions` and `seed`. Same
+   question, same conditions, or the two runs are not comparable:
+
+   ```
+   . ~/sketchgen/.venv/bin/activate
+   python3 ~/sketchgen/app/gate/sketch_gate.py ~/sketchgen/jobs/270/attempt-1 \
+       --assert 'motion(idle)' --assert 'uses(webgl)' --seed 1
+   ```
+
+5. Write **`neutralised.md`** beside them: the date, what the original did
+   measured rather than described (calls per frame, ms per frame, the gate's
+   `total_s`), what the rewrite does instead, and the two numbers side by side.
+   Job 166's is `~/sketchgen/jobs/166/forensics.md` and job 270's is
+   `~/sketchgen/jobs/270/attempt-1/neutralised.md`.
+
+The database is not edited. The entry still points at the same attempt
+directory, and what changed inside it is recorded in the file that says so.
+
+### Afterwards
+
+Run `gate-audit --over 30` over the whole archive and read the list. A published
+entry with a slow gate run is public, and the gate that passed it could not see
+what it cost.
 
 ## The venv and the gate
 

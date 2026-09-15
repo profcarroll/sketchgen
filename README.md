@@ -137,7 +137,7 @@ sketchgen/                  the package
   judge.py                  blind paired comparison, local + paid judges
   pairs.py                  Bradley–Terry scoring (Hunter 2004 MM algorithm)
   lineage.py                critique → child prompt, generation depth
-  preflight.py              p5.js name-shadowing detector
+  preflight.py              p5.js name shadowing, and per-frame cost
   publish.py                held entry → git commit → push to Pages
   sync.py                   write-path pull (votes, likes, views) into the DB
   gallery.py                static site renderer: entries, grid, compare, lines
@@ -157,7 +157,7 @@ prompts/                    versioned prompt templates
   rules/treatment.md        A/B treatment arm (p5.js conventions)
 
 gate/                       the deterministic referee, run by the worker
-  sketch_gate.py            headless Chromium: five fixed checks + assertions
+  sketch_gate.py            headless Chromium: six fixed checks + assertions
   accept.sh                 the harness: every fixture against expected.json
   fixtures/                 six sketches, one bug each, and what the gate must say
 
