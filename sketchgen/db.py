@@ -1,5 +1,5 @@
 """SQLite access for sketchgen: connection, migrations, typed helpers, and the
-job state machine.
+job and entry state machines.
 
 Plain stdlib, Python 3.12, no ORM. Every timestamp written here is UTC, ISO 8601
 with a trailing Z, and every column holding one is named ``*_utc``.
@@ -18,21 +18,26 @@ from typing import Any, Iterable
 
 __all__ = [
     "DEFAULT_DB_PATH",
+    "ENTRY_TRANSITIONS",
     "TRANSITIONS",
     "IllegalTransition",
+    "UnknownEntry",
     "UnknownJob",
     "Attempt",
     "Control",
     "Job",
     "add_attempt",
     "add_lineage",
+    "archive_entry",
     "claim_next",
     "connect",
     "create_entry",
     "enqueue",
     "entries_to_critique",
+    "entry_transition",
     "get_control",
     "get_critique",
+    "get_entry",
     "get_job",
     "get_meta",
     "init",
@@ -97,13 +102,46 @@ REQUEUABLE = frozenset({"planning", "executing", "gating", "repairing"})
 
 CONTROL_STATES = frozenset({"running", "pausing", "paused"})
 
+# ---------------------------------------------------------------------------
+# The entry state machine
+# ---------------------------------------------------------------------------
+
+#: Legal successors for an ENTRY, which is a different machine from the job's
+#: above even though the two share three state names. An entry is the
+#: gallery-visible half of a job and it moves only when a person moves it.
+#:
+#: ``archived`` (lineage ledger §5.1) is the terminal state for something the
+#: operator wants off their primary lists without deleting it: a held entry
+#: they will not publish and will not reject, or a kept failure nobody ever put
+#: on the site. Nothing on disk is touched by it and the row stays. It is not a
+#: public state, so an archived entry has no page under ``e/``.
+#:
+#: ``rejected`` is terminal and, since §5.2, public: rejecting publishes the
+#: entry to the rejections catalog with the operator's reason, because a
+#: rejection that vanishes is not a record of a decision.
+ENTRY_TRANSITIONS: dict[str, frozenset[str]] = {
+    "held": frozenset({"published", "rejected", "archived"}),
+    # A kept failure can only be archived, and only while nobody has published
+    # it: once it is on the rejections page it is part of the public record and
+    # taking it down again would be the deletion this project does not do.
+    "failed-kept": frozenset({"archived"}),
+    # terminal
+    "published": frozenset(),
+    "rejected": frozenset(),
+    "archived": frozenset(),
+}
+
 
 class IllegalTransition(Exception):
-    """A job was asked to move to a state that is not a legal successor."""
+    """A job or entry was asked to move to a state that is not a legal successor."""
 
 
 class UnknownJob(Exception):
     """No job with that id."""
+
+
+class UnknownEntry(Exception):
+    """No entry with that id."""
 
 
 # ---------------------------------------------------------------------------
@@ -228,9 +266,43 @@ def migrate(conn: sqlite3.Connection, directory: Path = MIGRATIONS_DIR) -> list[
     """Apply every unapplied migrations/NNN_*.sql in order. Safe to rerun.
 
     Returns the versions applied by this call (empty when there was nothing to do).
+
+    Migrations run with ``PRAGMA foreign_keys`` **off**, and ``PRAGMA
+    foreign_key_check`` runs over the whole database afterwards. That is
+    SQLite's own procedure, and 007 is why it is needed here: changing a CHECK
+    constraint means rebuilding the table, and dropping a parent table counts
+    one deferred violation per child row without counting them back down when
+    the replacement takes its name, so a rebuild with foreign keys on is
+    refused at the COMMIT although nothing dangles. The pragma is a no-op
+    inside a transaction and each migration is one, so this is the only place
+    it can be set. The check afterwards is the price of turning it off: a
+    migration that really did leave a dangling reference fails here, in the
+    call that made it, rather than at some unrelated write weeks later.
     """
     _ensure_schema_version_table(conn)
     done = {row["version"] for row in conn.execute("SELECT version FROM schema_version")}
+    applied: list[int] = []
+    was_on = bool(conn.execute("PRAGMA foreign_keys").fetchone()[0])
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        applied = _apply(conn, directory, done)
+    finally:
+        if was_on:
+            conn.execute("PRAGMA foreign_keys = ON")
+    if applied:
+        broken = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if broken:
+            rows = ", ".join(f"{row[0]} row {row[1]} -> {row[2]}" for row in broken[:5])
+            raise sqlite3.IntegrityError(
+                f"migrations {applied} left dangling references: {rows}"
+            )
+    return applied
+
+
+def _apply(
+    conn: sqlite3.Connection, directory: Path, done: set[int]
+) -> list[int]:
+    """The loop :func:`migrate` runs; see its docstring for the pragma around it."""
     applied: list[int] = []
     for version, path in _migration_files(directory):
         if version in done:
@@ -481,6 +553,9 @@ _ENTRY_FIELDS = (
     "png_path",
     "published_utc",
     "publish_commit",
+    # Migration 007: why a person rejected it, in a column of its own rather
+    # than overloading the job's last_error, which belongs to the executor.
+    "reject_reason",
 )
 
 
@@ -499,6 +574,96 @@ def create_entry(
         f"INSERT INTO entries ({','.join(columns)}) VALUES ({placeholders})", values
     )
     return int(cur.lastrowid)
+
+
+def get_entry(conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM entries WHERE id = ?", (int(entry_id),)
+    ).fetchone()
+
+
+def entry_transition(
+    conn: sqlite3.Connection, entry_id: int, new_state: str, **fields: Any
+) -> sqlite3.Row:
+    """Move an entry to ``new_state`` under :data:`ENTRY_TRANSITIONS`.
+
+    The entry's own machine, checked in one IMMEDIATE transaction like
+    :func:`transition` checks the job's, so a move and the columns that explain
+    it land together or not at all. Extra keyword arguments update entry
+    columns in the same statement — ``reject_reason`` with the move to
+    ``rejected``, for one.
+
+    Raises :class:`IllegalTransition` for a move the machine does not allow and
+    :class:`UnknownEntry` when there is no such entry.
+    """
+    _check_fields(fields.keys(), _ENTRY_FIELDS, "entry")
+    if new_state not in ENTRY_TRANSITIONS:
+        raise IllegalTransition(f"unknown entry state {new_state!r}")
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT state, published_utc FROM entries WHERE id = ?", (int(entry_id),)
+        ).fetchone()
+        if row is None:
+            raise UnknownEntry(f"no entry {entry_id}")
+        current = str(row["state"])
+        if new_state not in ENTRY_TRANSITIONS.get(current, frozenset()):
+            raise IllegalTransition(f"{current} -> {new_state} (entry {entry_id})")
+        # The one guard the table above cannot express: a kept failure may be
+        # archived only while nobody has published it (§5.1).
+        if current == "failed-kept" and new_state == "archived" and row["published_utc"]:
+            raise IllegalTransition(
+                f"entry {entry_id} is a kept failure that is already on the site "
+                f"(published {row['published_utc']}); it cannot be archived"
+            )
+        columns = ["state = ?"]
+        values: list[Any] = [new_state]
+        for key, value in sorted(fields.items()):
+            columns.append(f"{key} = ?")
+            values.append(value)
+        values.append(int(entry_id))
+        conn.execute(f"UPDATE entries SET {', '.join(columns)} WHERE id = ?", values)
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+    return get_entry(conn, entry_id)
+
+
+#: What the job row says about an entry the operator archived. There is no
+#: ``archived`` job state and there is not going to be one: the job is over
+#: either way, and a sixth terminal job state would mean touching every count,
+#: filter and funnel in the console to say nothing new.
+ARCHIVED_BY_OPERATOR = "archived by operator"
+
+
+def archive_entry(conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row:
+    """Archive one held entry or unpublished kept failure. Deletes nothing.
+
+    The files are untouched: the attempt directories under ``jobs/``, the
+    strip, the gate report and the entry row itself all stay exactly where they
+    are. Archiving is about the operator's lists, not about the record.
+
+    The job follows its entry into ``rejected`` when the machine allows it (a
+    ``held`` job does); a job that is already ``failed`` is already terminal and
+    keeps that state, which is the one the console reads as "rejected · gate".
+    Either way its ``last_error`` says who ended it.
+    """
+    row = entry_transition(conn, entry_id, "archived")
+    job_id = row["job_id"]
+    if job_id is None:  # pragma: no cover - the schema says NOT NULL
+        return row
+    job = get_job(conn, int(job_id))
+    if job is None:
+        return row
+    if "rejected" in TRANSITIONS.get(job.state, frozenset()):
+        transition(conn, job.id, "rejected", last_error=ARCHIVED_BY_OPERATOR)
+    else:
+        conn.execute(
+            "UPDATE jobs SET last_error = ?, updated_utc = ? WHERE id = ?",
+            (ARCHIVED_BY_OPERATOR, utc_now(), job.id),
+        )
+    return get_entry(conn, entry_id)
 
 
 def record_judgment(

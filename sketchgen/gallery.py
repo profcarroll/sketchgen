@@ -89,12 +89,19 @@ DEFAULT_REPOSITORY = "https://github.com/profcarroll/sketchgen-gallery"
 LICENCE = "CC BY 4.0"
 LICENCE_URL = "https://creativecommons.org/licenses/by/4.0/"
 
-#: The states that get a directory under ``e/``. ``held`` and ``rejected`` are
+#: The states that get a directory under ``e/``. ``held`` and ``archived`` are
 #: not public: publication holds for a person (spec §9, DECIDE[publication-gate]).
-#: A ``failed-kept`` row is public only once that person has published it, which
-#: is when the publisher stamps ``published_utc``; before that it is as private
-#: as a held entry, and ``_entries`` says so.
-PUBLIC_STATES = ("published", "failed-kept")
+#: A ``failed-kept`` or ``rejected`` row is public only once that person has
+#: acted, which is when the publisher stamps ``published_utc``; before that it
+#: is as private as a held entry, and ``_entries`` says so.
+#:
+#: ``rejected`` joined this tuple in the lineage ledger's §5.2. An operator
+#: rejection used to be a state flip and nothing else, so 32 sketches, their
+#: files all still on disk, were invisible and eleven published entries
+#: descended from a parent the site had never heard of. Rejecting now publishes
+#: the entry to the rejections catalog with the reason, next to the gate's own
+#: rejections: never deleted, never invisible, still reachable through lineage.
+PUBLIC_STATES = ("published", "failed-kept", "rejected")
 
 #: Every key ``meta.json`` carries: the spec §7 provenance, plus the four the
 #: packet adds. The tests assert this exactly.
@@ -330,11 +337,21 @@ def _resolve_config(dest_dir: Path, config: Config | None) -> Config:
 # ---------------------------------------------------------------------------
 
 
+#: What each public state reads as on a page. The two kinds of rejection are
+#: both rejections and a reader deserves to know which: the gate refused one
+#: after every attempt, a person refused the other. These are the labels
+#: ``web.STATE_LABELS`` already uses on the operator side, so the two halves of
+#: the project say the same words about the same row.
+STATE_CHIPS = {
+    "failed-kept": ("failed", "rejected · gate"),
+    "rejected": ("rejected", "rejected · operator"),
+}
+
+
 def _state_chip(state: str) -> str:
-    """The chip a public entry wears: the gate's rejections say so on every page."""
-    if state == "failed-kept":
-        return '<span class="chip failed">rejected</span>'
-    return f'<span class="chip {_esc(state)}">{_esc(state)}</span>'
+    """The chip a public entry wears: a rejection says so, and says whose."""
+    css, label = STATE_CHIPS.get(state, (state, state))
+    return f'<span class="chip {_esc(css)}">{_esc(label)}</span>'
 
 
 def _entry(conn: sqlite3.Connection, entry_id: int, *, publishing: bool = False) -> sqlite3.Row:
@@ -354,9 +371,9 @@ def _entry(conn: sqlite3.Connection, entry_id: int, *, publishing: bool = False)
             f"entry {entry_id} is {row['state']}: only "
             f"{' and '.join(PUBLIC_STATES)} entries are public"
         )
-    if row["state"] == "failed-kept" and not row["published_utc"] and not publishing:
+    if row["state"] in STATE_CHIPS and not row["published_utc"] and not publishing:
         raise UnknownEntry(
-            f"entry {entry_id} is a kept rejection nobody has published yet: "
+            f"entry {entry_id} is a rejection nobody has published yet: "
             "publish it first (spec §9)"
         )
     return row
@@ -1406,11 +1423,18 @@ def _write_entry(
     title = " ".join(str(row["prompt"] or f"entry {entry_id}").split())
     failed_note = ""
     if row["state"] == "failed-kept":
-        job = _job(conn, int(row["job_id"]))
-        reason = (job["last_error"] if job is not None else None) or "reason not recorded"
+        reason = _rejection_reason(conn, row)
         failed_note = (
             '<p class="chip failed">REJECTED BY THE GATE — kept, because a gallery that only '
             f"shows successes is not a record of anything: {_esc(reason)}</p>"
+        )
+    elif row["state"] == "rejected":
+        # One line, under the stage, in the operator's own words. The chip in
+        # stage-meta says the state; this says why, because "rejected" without
+        # a reason is a verdict with no evidence behind it.
+        failed_note = (
+            '<p class="chip rejected">Rejected by the operator: '
+            f"{_esc(_rejection_reason(conn, row))}</p>"
         )
 
     page = _template("entry.html").substitute(
@@ -1474,6 +1498,20 @@ def _search_text(entry_id: int, row: sqlite3.Row) -> str:
     return _esc(" ".join(" ".join(str(part) for part in parts).split()).lower())
 
 
+def _rejection_reason(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    """Why this entry is on the rejections page, in one line.
+
+    An operator rejection carries the sentence a person typed, in the entry's
+    own ``reject_reason`` (migration 007). A gate rejection has no such
+    sentence — nobody wrote one — so the job's ``last_error`` stands in, which
+    is the gate's last word on it and what this page has always shown.
+    """
+    if str(row["state"]) == "rejected":
+        return str(row["reject_reason"] or "reason not recorded")
+    job = _job(conn, int(row["job_id"]))
+    return str((job["last_error"] if job is not None else None) or "reason not recorded")
+
+
 def _card(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -1486,10 +1524,11 @@ def _card(
     reason = ""
     chip = ""
     if failed:
-        job = _job(conn, int(row["job_id"]))
-        text = (job["last_error"] if job is not None else None) or "reason not recorded"
+        text = _rejection_reason(conn, row)
         reason = f'<p class="reason">{_esc(text)}</p>'
-        chip = '<span class="chip failed">REJECTED</span> '
+        # The chip names which kind this is. Both are rejections and both are
+        # kept; only one of them had a person behind it.
+        chip = _state_chip(str(row["state"])) + " "
     return template.substitute(
         entry_id=entry_id,
         href=f"e/{entry_id}/",
@@ -1727,7 +1766,9 @@ def render_index(
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
     published = _entries(conn, "published")
-    failed = _entries(conn, "failed-kept")
+    # Both kinds of rejection on one page, as §5.2 asks: the gate's and the
+    # operator's. _grid_page puts them in newest-published order.
+    failed = _entries(conn, "failed-kept") + _entries(conn, "rejected")
     parent, children = _forest(conn)
     by_id = {int(row["id"]): row for row in _public_rows(conn)}
 
@@ -1756,8 +1797,9 @@ def render_index(
                 failed,
                 heading="Rejections",
                 intro=(
-                    "Entries the gate rejected after every attempt, kept on purpose: a "
-                    "gallery that only shows successes is not a record of anything."
+                    "Entries the gate rejected after every attempt, and entries a "
+                    "person rejected, kept on purpose: a gallery that only shows "
+                    "successes is not a record of anything."
                 ),
                 page="rejections.html",
                 failed=True,

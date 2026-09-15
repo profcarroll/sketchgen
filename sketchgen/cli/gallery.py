@@ -1,4 +1,4 @@
-"""`sketchgen render`, `render-index` and `render-all` — the static gallery.
+"""`sketchgen render`, `render-index`, `render-all` and `publish-rejected`.
 
 Packet 3.1. Registered by bin/sketchgen through sketchgen/cli/__init__.py, so
 this file is the only one the packet adds to the CLI surface.
@@ -14,12 +14,14 @@ for a person, spec §9).
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import sys
 from pathlib import Path
 
 from sketchgen import db
 from sketchgen import gallery
+from sketchgen import publish as publication
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -127,6 +129,146 @@ def cmd_render_all(args: argparse.Namespace) -> int:
     return _run(args, lambda conn, dest, config: gallery.render_all(conn, dest, config))
 
 
+# ---------------------------------------------------------------------------
+# publish-rejected — the one-time backfill of §5.2
+# ---------------------------------------------------------------------------
+
+#: What a rejection with nothing written down says on the page. Two of the
+#: three placeholders the old operator UI wrote are indistinguishable from a
+#: real reason by shape alone, so they are named here rather than guessed at.
+NO_REASON = "rejected by operator (reason not recorded)"
+
+#: The placeholders the old ``web.reject_entry`` wrote when the operator left
+#: the reason box empty. They are not reasons and this backfill does not
+#: pretend they are.
+PLACEHOLDERS = frozenset({"rejected by operator", "entry rejected", ""})
+
+#: Fragments that mean a machine wrote the line: the gate, the executor or a
+#: traceback, reaching ``last_error`` by some path other than a person typing
+#: into the reject box. None of these is an operator's reason.
+MACHINE_MARKERS = (
+    "traceback",
+    "gate exit",
+    "executor:",
+    "planner:",
+    "exit code",
+    "console_clean",
+    "frame_advancing",
+    "archived by operator",
+)
+
+
+def backfill_reason(last_error: str | None) -> str:
+    """The reason to record for an existing rejection, from the job's last_error.
+
+    Before migration 007 the operator UI wrote the reason a person typed into
+    the originating job's ``last_error`` and nowhere else, so that column is
+    the only record of it and this is where it is read back. It is read
+    carefully: ``last_error`` is also where the executor and the planner put
+    their failures, and an empty reject box wrote a placeholder rather than
+    nothing. Anything that is not plainly a person's sentence becomes
+    :data:`NO_REASON`, which is honest, rather than a machine's error message
+    dressed up as a verdict.
+    """
+    text = " ".join((last_error or "").split())
+    if text.lower().startswith("entry rejected:"):
+        # publish.reject's own spelling; what follows the colon is the reason.
+        text = text.split(":", 1)[1].strip()
+    if text.lower() in PLACEHOLDERS:
+        return NO_REASON
+    if len(text) > 200:
+        return NO_REASON
+    lowered = text.lower()
+    if any(marker in lowered for marker in MACHINE_MARKERS):
+        return NO_REASON
+    return text
+
+
+def _rejected_backlog(conn: sqlite3.Connection, ids: list[int] | None) -> list:
+    """Rejected entries nobody has published, id order, with their reasons."""
+    rows = conn.execute(
+        "SELECT e.id AS id, e.reject_reason AS reject_reason, "
+        "j.last_error AS last_error FROM entries e "
+        "LEFT JOIN jobs j ON j.id = e.job_id "
+        "WHERE e.state = 'rejected' AND e.published_utc IS NULL ORDER BY e.id"
+    ).fetchall()
+    if ids is not None:
+        wanted = set(ids)
+        rows = [row for row in rows if int(row["id"]) in wanted]
+    return rows
+
+
+def cmd_publish_rejected(args: argparse.Namespace) -> int:
+    """Render and push the rejections that were only ever a state flip.
+
+    One entry at a time, in id order, each through :func:`publish.publish` —
+    the same path and the same one-commit-per-entry shape the operator's
+    Publish button uses. A failure stops the run rather than carrying on: the
+    entries already pushed stay pushed, and the next run picks up where this
+    one stopped, because a published entry is no longer in the backlog.
+    """
+    ids = sorted(set(args.entry_id)) if args.entry_id else None
+    if ids is None and not args.all:
+        print(
+            "refused: say which — `--all`, or one or more entry ids",
+            file=sys.stderr,
+        )
+        return EXIT_REFUSED
+    database = Path(args.db).expanduser()
+    if not database.is_file():
+        print(f"refused: no database at {database}", file=sys.stderr)
+        return EXIT_REFUSED
+    conn = db.connect(database)
+    try:
+        rows = _rejected_backlog(conn, ids)
+        if ids is not None:
+            missing = sorted(set(ids) - {int(row["id"]) for row in rows})
+            if missing:
+                print(
+                    "refused: not a rejected entry awaiting publication: "
+                    + ", ".join(str(i) for i in missing),
+                    file=sys.stderr,
+                )
+                return EXIT_REFUSED
+        if not rows:
+            print("nothing to publish: no rejected entry is waiting")
+            return EXIT_OK
+        if args.dry_run:
+            for row in rows:
+                reason = row["reject_reason"] or backfill_reason(row["last_error"])
+                print(f"entry {int(row['id'])}: {reason}")
+            print(f"{len(rows)} rejected entries would be published")
+            return EXIT_OK
+        for row in rows:
+            entry_id = int(row["id"])
+            reason = row["reject_reason"] or backfill_reason(row["last_error"])
+            if not row["reject_reason"]:
+                conn.execute(
+                    "UPDATE entries SET reject_reason = ? WHERE id = ?",
+                    (reason, entry_id),
+                )
+                conn.commit()
+            try:
+                result = publication.publish(
+                    conn,
+                    entry_id,
+                    gallery_dir=args.gallery_dir,
+                    key=os.path.expanduser(args.key) if args.key else None,
+                    remote=args.remote,
+                    by=args.by,
+                )
+            except publication.PublishRefused as exc:
+                print(f"refused at entry {entry_id}: {exc}", file=sys.stderr)
+                return EXIT_REFUSED
+            except publication.PublishFailed as exc:
+                print(f"failed at entry {entry_id}: {exc}", file=sys.stderr)
+                return EXIT_FAIL
+            print(f"entry {entry_id}: {result.commit} — {reason}")
+    finally:
+        conn.close()
+    return EXIT_OK
+
+
 def register(top: argparse._SubParsersAction) -> None:
     render = top.add_parser(
         "render",
@@ -166,3 +308,57 @@ def register(top: argparse._SubParsersAction) -> None:
     )
     _add_common(every)
     every.set_defaults(func=cmd_render_all, _parser=every)
+
+
+    backfill = top.add_parser(
+        "publish-rejected",
+        help="publish the operator's existing rejections to the rejections page",
+        description=(
+            "The one-time backfill for the lineage ledger's §5.2. Rejecting an "
+            "entry used to be a state flip and nothing else, so every rejection "
+            "made before that change is invisible with all of its files still "
+            "on disk. This renders and pushes each of them, in id order, one "
+            "commit per entry, exactly as the operator's Publish button does. "
+            "The reason comes from the entry's reject_reason, or from the "
+            "originating job's last_error where that reads as something a "
+            "person typed; where it does not, the page says the reason was "
+            "not recorded rather than inventing one. --dry-run reads the "
+            "database and nothing else: no checkout, no push, no write."
+        ),
+    )
+    backfill.add_argument(
+        "entry_id", type=int, nargs="*", metavar="ID",
+        help="the entries to publish; omit and pass --all for every one waiting",
+    )
+    backfill.add_argument(
+        "--all", action="store_true",
+        help="every rejected entry whose published_utc is null",
+    )
+    backfill.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="print what would be published, and the reason each would carry",
+    )
+    backfill.add_argument(
+        "--db",
+        default=db.DEFAULT_DB_PATH,
+        metavar="P",
+        help="database file (default: $SKETCHGEN_DB, else ~/sketchgen/sketchgen.db)",
+    )
+    backfill.add_argument(
+        "--gallery-dir",
+        default=publication.DEFAULT_GALLERY_DIR,
+        metavar="D",
+        help="the gallery checkout to commit into",
+    )
+    backfill.add_argument(
+        "--key",
+        default=publication.DEFAULT_KEY_PATH,
+        metavar="F",
+        help="deploy key for an ssh remote (default: ~/.ssh/sketchgen-gallery)",
+    )
+    backfill.add_argument("--remote", default=None, metavar="URL")
+    backfill.add_argument(
+        "--by", default=None, metavar="USER",
+        help="the GitHub username for the commit's Published-By: trailer",
+    )
+    backfill.set_defaults(func=cmd_publish_rejected, _parser=backfill)
