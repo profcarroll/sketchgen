@@ -240,6 +240,10 @@ CHECK_NOTE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "is_looping": ("is_looping", "noloop"),
     "sound_lib_ok": ("sound_lib_ok", "p5.sound", "addon"),
     "audio_context_running": ("audio_context_running", "audiocontext"),
+    # The gate writes every frame-budget note with "frame_budget:" in front of
+    # it, so the name alone finds them; "ms per frame" is here for the day
+    # somebody writes a note that forgets to.
+    "frame_budget": ("frame_budget", "ms per frame"),
 }
 
 #: Notes worth carrying even when nothing failed on them: the two runtime facts

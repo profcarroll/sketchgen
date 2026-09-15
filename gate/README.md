@@ -6,16 +6,18 @@ be left alone overnight.
 
 Until 2026-09-15 this directory existed **only** on the node, at
 `~/sketchgen/gate/`. That made the gate the one piece of the pipeline that a
-reclaimed free-tier instance would have taken with it. It is tracked here now;
-the copy on the node is byte-identical (sha256 of `sketch_gate.py`:
-`426e8e7429984b1f5377c068886bebeaab8795a2a102a687c06938bb6a66b658`, the same as
-the copy in the course repo at
-`sld-fall-2026/examples/week11-self-hosted-ai/sketch-gate/`).
+reclaimed free-tier instance would have taken with it. It is tracked here now,
+and the repo is the copy that leads: the three copies — here, the node, the
+course repo at `sld-fall-2026/examples/week11-self-hosted-ai/sketch-gate/` —
+share one sha256, recorded as `GATE_SHA256` in `tests/test_gate_fixtures.py`,
+and the other two match it once this branch is deployed. The frame budget below
+changed that hash; until `update.sh` runs on the node, the node's copy is the
+one before it.
 
 ## What it checks
 
 `sketch_gate.py` loads one sketch directory (`index.html` plus `sketch.js`) in
-headless Chromium through Playwright's sync API and reports five fixed checks on
+headless Chromium through Playwright's sync API and reports six fixed checks on
 every sketch:
 
 | check | false means |
@@ -25,6 +27,59 @@ every sketch:
 | `frame_advancing` | `frameCount` stopped moving in the second half of the idle window |
 | `sound_lib_ok` | the sketch asked for p5.sound and did not get it |
 | `audio_context_running` | audio was started without a user gesture, so the context is suspended |
+| `frame_budget` | one frame of the idle window cost more wall time than `--frame-budget-ms`, or the whole run passed the `--budget-s` ceiling |
+
+## The frame budget
+
+Added 2026-09-15, after job 166 (entry 165) and job 270 (entry 269). Both drew
+about 1,500 `sphere()` meshes and tens of thousands of immediate-mode `line()`
+calls per frame in WEBGL; both passed every check above; both took minutes of
+gate time (209 s and 284 s against a median of 2 s) and pinned about 4 GB of GPU
+buffers when the operator opened the preview, which took the laptop down. The
+gate had timed that window all along and never read the number. `gate.png` looks
+fine, so nothing a person could see was wrong.
+
+    --frame-budget-ms MS    default 100
+    --budget-s S            default 90
+
+`timings.ms_per_frame` in `report.json` is the wall time this runner spends
+inside `__gate.step()` over the 120-frame idle window, divided by the frames it
+stepped. The runner's own work — the snapshots between the three step calls, the
+PNG readbacks, the assertion diffs — is outside the timed stretch, and so are
+the priming frames and the probes after the window; only the deadline applies to
+those.
+
+**Where 100 ms came from.** Per-frame cost derived from the 371 gate reports on
+the node on 2026-09-15 — `(total_s - launch_s - load_s - settle) / frames
+stepped` — has a median of 12.0 ms, of which about 3.3 ms is the runner's own
+fixed overhead spread over the window. The median sketch therefore costs roughly
+9 ms a frame and clears 100 ms by more than ten times. Forty-six of the 371
+derive above 100 ms, and the top of that list is job 45 (3,311 ms), job 270
+attempt 1 (1,867 ms) and job 166 attempt 3 (1,370 ms) — the sketches this check
+exists for. 100 ms is also three frames at 30 fps: past it a sketch has stopped
+being animation.
+
+**Where 90 s came from.** Eight of those 371 runs took longer than 90 s and all
+eight are sketches the budget should refuse; the median run is 2.4 s. The
+ceiling is far below the worker's own 600 s subprocess timeout on purpose — a
+run killed out there writes no `report.json` at all, and the evidence the next
+attempt got from that was *"gate did not finish"*, a sentence with no cause in
+it.
+
+The run stops early rather than finishing the window in two cases: when the wall
+deadline passes, and when the running mean is already more than twice the budget
+(`EARLY_TRIP_FACTOR`). A chunk of frames is the finest grain available — the
+`page.evaluate` that steps it cannot be interrupted from here — so a very
+expensive sketch can overshoot the ceiling by up to one chunk. Below twice the
+budget the window is always finished, because the check is about the mean over
+the window and one expensive first frame is not the bug being looked for.
+
+The evidence sentence names the number, the window and the budget, and then what
+to do about it:
+
+    frame_budget: 1093 ms per frame over the first 30 frames of the 120-frame
+    idle window, budget 100 ms — batch points and lines into one shape, no
+    sphere() per particle, no all-pairs loop
 
 Then it evaluates the small closed vocabulary of assertions the planner is
 allowed to choose from (`--assert motion(idle)`, `responds(click)`,
@@ -38,6 +93,7 @@ word, an unusable sketch directory.
 ```
 python3 gate/sketch_gate.py <sketch_dir> [--assert WORD ...] [--seed N]
                             [--out DIR] [--timeout S] [--json]
+                            [--frame-budget-ms MS] [--budget-s S]
 ```
 
 Determinism is bought with a virtual clock, hand-stepped frames, seeded
@@ -48,15 +104,23 @@ where determinism stops; read it before changing any sampling window.
 
 ## The fixtures and `accept.sh`
 
-`fixtures/` holds six sketch directories, each one a bug the gate was built to
+`fixtures/` holds seven sketch directories, each one a bug the gate was built to
 catch (or a clean pass it must not fail), and `fixtures/expected.json` records
-for each the expected exit code, the expected value of all five checks, the
-assertions a planner would have chosen for it, and a note saying *why that
-fixture exists*. Two of them are subtle enough to be worth naming here:
-`bad-audio-no-gesture` passes everything a reader can check and is caught only
-by the suspended `AudioContext`, and `bad-frozen` passes every fixed check while
-drawing nothing, so only `motion(idle)` catches it — which is why its expected
-exit is 0.
+for each the expected exit code, the expected value of the checks that fixture
+is about, the assertions a planner would have chosen for it, and a note saying
+*why that fixture exists*. Three of them are subtle enough to be worth naming
+here: `bad-audio-no-gesture` passes everything a reader can check and is caught
+only by the suspended `AudioContext`; `bad-frozen` passes every fixed check
+while drawing nothing, so only `motion(idle)` catches it — which is why its
+expected exit is 0; and `bad-frame-budget` passes every check the gate had
+before 2026-09-15 and still takes about a third of a second to draw one frame,
+which is job 166's bug with nothing else wrong with it.
+
+A fixture's expected `checks` object need not name every check — only the keys
+it lists are compared. `bad-frame-budget` uses that: the budget stops its run
+before `is_looping` and `frame_advancing` are read at the end of the idle
+window, so on a slow machine they come back null and on a fast one true, and
+neither is what the fixture is for.
 
 `accept.sh` is the harness: for every fixture it runs the gate twice, once plain
 for the fixed checks and once with that fixture's assertions, compares both
