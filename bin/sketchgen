@@ -3,8 +3,8 @@
 
 Today: `db init`, `db status`, `execute`, `plan`, `install-unit`, `keygen`,
 `publish`, `reject`, `worker`, `control` and `enqueue`, plus whatever
-sketchgen/cli/ registers (`backup`, `gallery`, `lineage`, `web`, …). Later
-packets add subcommands
+sketchgen/cli/ registers (`backup`, `gallery`, `gate-audit`, `lineage`,
+`preflight`, `web`, …). Later packets add subcommands
 
 Exit codes: 0 success, 1 failure, 3 refused.
 """

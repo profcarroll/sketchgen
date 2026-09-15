@@ -136,6 +136,37 @@ iframe.preview {
   display: block; max-width: 100%; border: 1px solid var(--line);
   border-radius: 5px; background: #000;
 }
+/* Click to run. Nothing on this page autoplays since 2026-09-15: a held sketch
+   that allocates a GPU buffer per line() per frame costs the operator's machine
+   the same as it cost the gate, and the Held page used to start all of them at
+   once. The poster is the strip the gate saw; the frame is built by
+   PREVIEW_SCRIPT on a click and removed on stop. */
+.preview-run { position: relative; display: inline-block; max-width: 100%; }
+.preview-run button.play {
+  display: block; padding: 0; border: 1px solid var(--line); border-radius: 5px;
+  background: #000; cursor: pointer; overflow: hidden; line-height: 0;
+  max-width: 100%;
+}
+.preview-run button.play img { display: block; max-width: 100%; border: 0;
+                               border-radius: 4px; }
+.preview-run .no-still {
+  display: block; padding: 28px 16px; color: var(--dim); font-size: 12px;
+  line-height: 1.4;
+}
+.preview-run .play-label {
+  position: absolute; left: 8px; bottom: 8px; padding: 3px 10px;
+  border-radius: 999px; background: rgba(0, 0, 0, .66); color: #fff;
+  font-size: 12px; line-height: 1.5; letter-spacing: .04em;
+  pointer-events: none;
+}
+.preview-run.running button.play { border-color: var(--accent); }
+.preview-run.running button.play img { display: none; }
+.chip.cost {
+  display: inline-block; padding: 1px 9px; border-radius: 999px;
+  border: 1px solid var(--line); font-size: 12px; font-variant-numeric: tabular-nums;
+  color: var(--dim); margin-right: 4px;
+}
+.chip.cost.warn { border-color: var(--bad); color: var(--bad); font-weight: 600; }
 details.preview-fold { margin: 10px 0 0; }
 details.preview-fold > summary {
   cursor: pointer; font-size: 12px; text-transform: uppercase;
