@@ -17,6 +17,8 @@ import worker, {
   readSession,
   sqlCountViews,
   sqlCountLikes,
+  BIND_LIMIT,
+  MAX_COUNT_IDS,
 } from "../worker.js";
 
 const GALLERY_URL = "https://profcarroll.github.io/sketchgen-gallery";
@@ -400,6 +402,42 @@ test("/counts is public and returns views and likes per entry", async () => {
 
   const bad = await worker.fetch(get("/counts?entries=1,notanumber"), env);
   assert.equal(bad.status, 400);
+});
+
+test("/counts answers a gallery larger than the database's bind limit", async () => {
+  const { env, store, statements } = makeEnv();
+  const ids = [];
+  for (let id = 1; id <= BIND_LIMIT * 2 + 7; id++) {
+    ids.push(id);
+    store.views.set(id, { entry_id: id, count: id, updated_utc: "2026-09-14T00:00:01Z" });
+  }
+
+  const response = await worker.fetch(get(`/counts?entries=${ids.join(",")}`), env);
+  assert.equal(response.status, 200);
+
+  // Every id asked for is answered, not just the first chunk's worth.
+  const body = await response.json();
+  assert.equal(Object.keys(body).length, ids.length);
+  for (const id of ids) assert.deepEqual(body[id], { views: id, likes: 0 });
+
+  // And no single statement went over the limit that made this fail before.
+  assert.ok(statements.length > 2);
+  for (const statement of statements) {
+    assert.ok(
+      statement.args.length <= BIND_LIMIT,
+      `a statement bound ${statement.args.length} parameters`,
+    );
+  }
+});
+
+test("/counts refuses an ask naming more ids than it will answer", async () => {
+  const { env, statements } = makeEnv();
+  const ids = [];
+  for (let id = 1; id <= MAX_COUNT_IDS + 1; id++) ids.push(id);
+
+  const response = await worker.fetch(get(`/counts?entries=${ids.join(",")}`), env);
+  assert.equal(response.status, 400);
+  assert.deepEqual(statements, []);
 });
 
 // ---------------------------------------------------------------------------
