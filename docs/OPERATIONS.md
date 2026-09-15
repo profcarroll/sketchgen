@@ -399,6 +399,54 @@ python3 bin/sketchgen backup verify ~/sketchgen-backups/sld-cloud/backups
 cat ~/sketchgen-backups/sld-cloud/backups/<utc>/manifest.json   # keep this open; it is the acceptance test
 ```
 
+### Rehearsing on etk-cloud
+
+The rehearsal venue is `etk-cloud`, the operator's second Oracle node: 4 CPU,
+23 GB, aarch64, Ubuntu 24.04, checked 2026-09-15. It has neither Ollama nor
+Playwright, so steps 2 through 5 get exercised for real rather than found
+already done. It also runs Docker builds for other projects, so the rehearsal
+lives in its own Unix user and leaves with one command.
+
+Set it up so every command below works verbatim:
+
+```bash
+ssh etk-cloud 'sudo adduser --disabled-password --gecos "sketchgen rehearsal" sketchgen-rehearsal && sudo loginctl enable-linger sketchgen-rehearsal'
+ssh etk-cloud 'sudo install -d -m 700 -o sketchgen-rehearsal ~sketchgen-rehearsal/.ssh && sudo cp ~/.ssh/authorized_keys ~sketchgen-rehearsal/.ssh/ && sudo chown sketchgen-rehearsal ~sketchgen-rehearsal/.ssh/authorized_keys'
+cat >> ~/.ssh/config <<'CFG'
+Host sld-cloud-new
+    HostName <etk-cloud's address>
+    User sketchgen-rehearsal
+CFG
+ssh sld-cloud-new 'id && loginctl show-user $USER | grep Linger'
+```
+
+What a rehearsal does differently from a recovery:
+
+- **Before step 1**, the mirror on the operator's machine holds at least one
+  verified snapshot (`bin/pull-backup.sh sld-cloud` has printed `VERIFIED`).
+  Nothing in a rehearsal reads the live node.
+- **Step 5**: pull `gemma4:e4b`; try `qwen3-coder:30b-a3b-q4_K_M` and let it
+  fail if 23 GB is not enough. Record which.
+- **Step 8**: generate the keys, add the *app* key as read-only if you want
+  `update.sh` exercised, and **do not add the gallery write key**. Clone the
+  gallery over HTTPS instead, so a rehearsal cannot push:
+  `git clone https://github.com/profcarroll/sketchgen-gallery.git ~/sketchgen/gallery`.
+- **Step 9**: write a made-up token. The sync will fail with a 401 in its log,
+  which is the correct proof that the timer runs and the real token is not here.
+- **Step 10**: enable the worker's `.timer`, not the service, so at most one
+  drip job runs; a held entry is the end-to-end proof, and holding never pushes.
+- **Do not rename the host** to `sld-cloud`. That step is for a real recovery.
+
+Then clean up, revoke the throwaway app key on GitHub, and write the record:
+
+```bash
+ssh etk-cloud 'sudo loginctl disable-linger sketchgen-rehearsal && sudo userdel -r sketchgen-rehearsal'
+# remove the sld-cloud-new block from ~/.ssh/config
+```
+
+The `Last rehearsed:` line reads `<date>, etk-cloud, <elapsed>, full` or
+`..., without the executor` when the 30b model did not fit.
+
 **1. A new instance.** Ubuntu 24.04, the same shape as before (ARM, 24 GB is
 what the free tier gives). Add it to `~/.ssh/config` as `sld-cloud-new` so the
 old entry still points at whatever is left of the old one.
