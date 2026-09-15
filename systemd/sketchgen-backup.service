@@ -1,0 +1,47 @@
+# sketchgen-backup.service — one verified snapshot of the record, then exit.
+#
+# Started by sketchgen-backup.timer; runs once and exits (Type=oneshot). It
+# copies ~/sketchgen/sketchgen.db through SQLite's online backup API into a
+# dated directory under ~/sketchgen/backups, tars the gate beside it, writes a
+# manifest of sizes, digests, schema version, row counts, the number of job
+# directories and both git commits, opens what it just wrote and verifies it,
+# and then removes all but the newest fourteen snapshots.
+#
+# Why this unit exists at all: the database and the attempt archive are the only
+# parts of this system with no copy anywhere else, and they sit on an Oracle
+# free-tier instance the provider may reclaim. 1,114 agent judgments, 158
+# critiques and 191 lineage rows exist here and nowhere.
+#
+# THIS UNIT DOES NOT GET THE DATA OFF THE INSTANCE. It makes a good copy on the
+# same disk that would be lost with it. The copy that leaves is a *pull* from
+# the operator's machine — bin/pull-backup.sh and systemd/operator/ — so that no
+# new credential has to live on the node. Enabling this timer and not running
+# the pull is the failure mode to watch for; pull-backup.sh exits non-zero when
+# the newest snapshot it can see is more than 36 hours old, which is how a
+# stalled timer on this side gets noticed on that one.
+#
+# jobs/ is not tarred here. It is 300 MB, it only grows, and a nightly tarball
+# of it is the wrong shape; the puller rsyncs it. The manifest records how many
+# job directories there were so that a pull can be checked against the snapshot.
+#
+# No secrets, ever. Nothing here reads ~/.ssh or ~/sketchgen/writepath.token,
+# and `sketchgen backup` refuses outright if a credential ever turns up inside
+# the one directory it walks. A backup is the artefact most likely to be copied
+# around; it must not be a copy of the keys.
+#
+# Failures are loud by design: a snapshot that cannot be re-opened and matched
+# against its own manifest exits non-zero, so `systemctl --user list-timers` and
+# the journal show it rather than a green timer over a broken file.
+[Unit]
+Description=sketchgen backup: one verified snapshot of the database and the gate
+Documentation=file:%h/sketchgen/app/docs/OPERATIONS.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/sketchgen/app
+Environment=SKETCHGEN_DB=%h/sketchgen/sketchgen.db
+Environment=SKETCHGEN_JOBS=%h/sketchgen/jobs
+Environment=SKETCHGEN_GALLERY=%h/sketchgen/gallery
+ExecStart=%h/sketchgen/.venv/bin/python3 %h/sketchgen/app/bin/sketchgen backup snapshot --to %h/sketchgen/backups
+Nice=10
+IOSchedulingClass=idle
