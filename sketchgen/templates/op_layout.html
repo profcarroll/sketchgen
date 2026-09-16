@@ -194,6 +194,52 @@ form.stack textarea { min-height: 6em; }
 .err { color: var(--bad); }
 .actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
 .actions form { margin: 0; }
+/* The decision card: one number, one image, one input, four verbs. The card
+   used to print the entry id six times, in the heading and in every button
+   label, and drew the gate's four-frame strip twice — once as the run button's
+   poster and once again underneath. What is left says each thing once, so the
+   type does the ranking instead: the number is the heading, the prompt is the
+   sentence, the revision is the critique, the meta line is provenance.
+   The Held grid is minmax(300px, 1fr) and this is drawn to fit there: every
+   row wraps and nothing has a min-width wider than the column, so a phone
+   scrolls down and never sideways. */
+.card .id { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline;
+            margin: 0 0 10px; }
+.card .id .n { font-size: 22px; font-weight: 700; line-height: 1.1;
+               font-variant-numeric: tabular-nums; }
+.card .id .dim { font-size: 12px; }
+/* The poster fills the card; the cost chip sits under it, not a line away. */
+.card .preview-run { display: block; }
+.card .preview-run button.play, .card .preview-run button.play img { width: 100%; }
+.card .preview-run + p { margin: 6px 0 0; }
+.card .prompt { margin: 10px 0 0; font-weight: 600; }
+.card .rev { margin: 4px 0 0; font-style: italic; }
+.card .rev .k {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-style: normal; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--dim); margin-right: 4px;
+}
+.card .meta { margin: 8px 0 0; font-size: 12px; color: var(--dim); }
+.card .say { margin: 12px 0 0; }
+.card .say input[type=text] {
+  font: inherit; width: 100%; padding: 6px 8px; border: 1px solid var(--line);
+  border-radius: 5px; background: var(--bg); color: var(--fg);
+}
+/* Four verbs, one colour each, in the order a decision is usually made. They
+   wrap before they shrink: a button whose label is cut in half is a button
+   pressed by mistake. */
+.acts { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
+.acts button { flex: 1 1 auto; }
+.acts button:hover:not(:disabled) { border-color: currentColor; }
+.acts .pub { color: var(--ok); }
+.acts .rej { color: var(--bad); }
+.acts .cri { color: var(--accent); }
+.acts .arc { color: var(--dim); }
+.card .hint { margin: 8px 0 0; font-size: 12px; color: var(--dim); }
+/* Entry states the queue's pills never show: the gate's own rejection, and
+   the shelf. Same vocabulary as the site's chips. */
+.pill.failed-kept { border-color: var(--bad); color: var(--bad); }
+.pill.archived { border-color: var(--dim); color: var(--dim); }
 </style>
 </head>
 <body>
