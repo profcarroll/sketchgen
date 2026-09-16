@@ -7,7 +7,7 @@ https://claude.ai/artifact/7qS4YhN7GTCmWxcjFZNSRC
 
 Repositories:
 
-- Pipeline: `profcarroll/sketchgen`, local clone `/home/dave/sketchgen`, on the node at `~/sketchgen/app`. Python 3.12, stdlib only, `pytest tests/`. Templates are `string.Template` files in `sketchgen/templates/`. Gallery CSS and JS ship from `sketchgen/assets/` (copied into the gallery by `render_index`).
+- Pipeline: `profcarroll/sketchgen`, local clone `/home/dave/sketchgen`, on the node at `~/sketchgen/app`. Python 3.12, stdlib only, `python3 -m unittest discover -s tests` (there is no pytest here and the suite does not use it). Templates are `string.Template` files in `sketchgen/templates/`. Gallery CSS and JS ship from `sketchgen/assets/` (copied into the gallery by `render_index`).
 - Gallery: `profcarroll/sketchgen-gallery`, generated output only. Never hand-edit it; every commit there is made by the publisher on the node.
 
 Conventions: small PRs, one packet per branch, commit messages in the repo's existing voice (see `git log`). Every packet lands with tests in `tests/`. Do not touch `prompts/` or `tests/test_executor.py`; another session owns those uncommitted changes on the node.
