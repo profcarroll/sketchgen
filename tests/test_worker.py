@@ -194,6 +194,10 @@ class StubCritic:
         self.text = text
         self.fails = fails
         self.calls = []
+        # critic-v3: the real lineage.critique never returns without having
+        # looked, so neither does the stub that stands in for it.
+        self.strip_path = "/tmp/strip.png"
+        self.strip_sha256 = "a" * 64
 
     def __call__(self, conn, entry_id, *, model, host, **kwargs):
         self.calls.append(entry_id)
@@ -204,6 +208,8 @@ class StubCritic:
             text=self.text,
             model=model,
             prompt_version=lineage.prompt_version(),
+            strip_path=self.strip_path,
+            strip_sha256=self.strip_sha256,
             raw=self.text,
         )
 
@@ -620,6 +626,21 @@ class IdleTestCase(WorkerTestCase):
             self.conn, job_id, state="published", prompt=prompt, brief="a brief",
             statement="the model's own words", submitted_by=by,
             rules_file="treatment", assertions_json=json.dumps(["motion(idle)"]),
+            strip_path="/tmp/strip.png",  # critic-v3 only offers entries it can see
+        )
+        self.states.clear()
+        return job_id, entry_id
+
+    def publish_without_a_strip(self, prompt="a blind field", by="octocat"):
+        """A published entry the gate left no strip for: the critic is blind to it."""
+        job_id = db.enqueue(self.conn, prompt, by, rules_file="random",
+                            brief="a brief", assertions=["motion(idle)"])
+        for state in ("executing", "gating", "held", "published"):
+            db.transition(self.conn, job_id, state)
+        entry_id = db.create_entry(
+            self.conn, job_id, state="published", prompt=prompt, brief="a brief",
+            statement="the model's own words", submitted_by=by,
+            rules_file="treatment", assertions_json=json.dumps(["motion(idle)"]),
         )
         self.states.clear()
         return job_id, entry_id
@@ -674,6 +695,28 @@ class TestIdleRound(IdleTestCase):
         # the line inherits the SETTING, so a random line stays random
         self.assertEqual("random", child["rules_file"])
         self.assertIn(lineage.REVISE_HEADING, child["prompt"])
+
+    def test_a_blind_entry_does_not_stall_the_idle_critic(self):
+        """critic-v3 regression: a strip-less entry must not hold the line.
+
+        It is published first, so oldest-first would offer it on every round;
+        a refusal writes no critique row, so nothing would ever mark it tried
+        and the entry behind it would never be critiqued.
+        """
+        _, blind = self.publish_without_a_strip()
+        _, sighted = self.publish(prompt="a field with a strip")
+        critic_fn = StubCritic()
+        run = self.make_worker(judge_fn=StubJudge(judged=0), critic_fn=critic_fn,
+                               idle_judge=1, idle_critique=1)
+        self.assertEqual(0, run.run_once())
+
+        self.assertEqual([sighted], critic_fn.calls)  # stepped over the blind one
+        rows = self.critiques()
+        self.assertEqual(1, len(rows))
+        self.assertEqual(sighted, rows[0]["entry_id"])
+        self.assertEqual(
+            [], [r["entry_id"] for r in rows if r["entry_id"] == blind]
+        )
 
     def test_a_second_round_judges_nothing_and_critiques_nothing(self):
         self.publish()  # one entry, so the first round leaves nothing to do

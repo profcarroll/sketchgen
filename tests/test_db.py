@@ -262,6 +262,7 @@ class TestEntriesToCritique(DbTestCase):
         entry = db.create_entry(
             self.conn, job, "published", prompt=prompt,
             published_utc="2026-09-14T12:00:00Z",
+            strip_path="/tmp/strip.png",  # critic-v3 only offers entries it can see
         )
         self.conn.commit()
         return entry
@@ -281,6 +282,38 @@ class TestEntriesToCritique(DbTestCase):
             )
         self.conn.commit()
         return job, entry
+
+    def parent_without_a_strip(self, prompt="a blind root"):
+        """A published entry the gate left no strip for."""
+        job = self.enqueue(prompt)
+        self.conn.execute("UPDATE jobs SET state = 'published' WHERE id = ?", (job,))
+        entry = db.create_entry(
+            self.conn, job, "published", prompt=prompt,
+            published_utc="2026-09-13T12:00:00Z",  # older than parent()'s
+        )
+        self.conn.commit()
+        return entry
+
+    def test_an_entry_with_no_strip_is_never_offered(self):
+        """critic-v3 refuses what it cannot see, so it is not offered at all."""
+        blind = self.parent_without_a_strip()
+        self.assertEqual([], db.entries_to_critique(self.conn, "critic-v3", 5))
+        # and an empty string is as blind as a NULL
+        self.conn.execute(
+            "UPDATE entries SET strip_path = '   ' WHERE id = ?", (blind,)
+        )
+        self.conn.commit()
+        self.assertEqual([], db.entries_to_critique(self.conn, "critic-v3", 5))
+
+    def test_a_blind_entry_does_not_block_the_one_behind_it(self):
+        """The head-of-line case: refusing writes no row, so it must not queue.
+
+        The blind entry is older, so oldest-first would hand it back on every
+        round and the sighted one behind it would never be reached.
+        """
+        self.parent_without_a_strip()
+        sighted = self.parent(prompt="a root with a strip")
+        self.assertEqual([sighted], db.entries_to_critique(self.conn, "critic-v3", 1))
 
     def test_a_parent_with_no_child_is_offered_oldest_first(self):
         one = self.parent("first")
