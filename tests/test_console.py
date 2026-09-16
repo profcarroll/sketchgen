@@ -307,5 +307,114 @@ class TestResidentEntry(unittest.TestCase):
         )
 
 
+class TestActivity(ConsoleTestCase):
+    """The process status card's one reader (packet 5).
+
+    The worker is a different process; everything here is what this one can
+    know about it from the database and one stat of /proc.
+    """
+
+    #: A pid nothing can have: /proc has no entry for it, so `live` is false.
+    #: Larger than any pid_max on a 64-bit Linux, and never recycled onto us.
+    DEAD_PID = 4194305
+
+    def step(self, step="writing", headline="Writing the sketch", **kwargs):
+        return db.begin_step(self.conn, step=step, headline=headline, **kwargs)
+
+    def closed(self, step, seconds, count=1):
+        """`count` finished rows of `step`, each `seconds` long."""
+        for _ in range(count):
+            self.conn.execute(
+                "INSERT INTO activity (step, headline, pid, started_utc, ended_utc) "
+                "VALUES (?,?,?,?,?)",
+                (step, f"a finished {step}", os.getpid(),
+                 "2026-09-15T14:00:00Z",
+                 f"2026-09-15T14:{seconds // 60:02d}:{seconds % 60:02d}Z"),
+            )
+
+    def test_an_open_step_by_this_process_is_live_and_running(self):
+        self.step(detail="qwen3-coder:30b · job 1, attempt 1 of 3",
+                  job_id=self.job_id, model="qwen3-coder:30b")
+        card = console.activity(self.conn)
+        self.assertEqual("writing", card["step"])
+        self.assertEqual("running", card["state"])
+        self.assertTrue(card["live"])
+        self.assertEqual(os.getpid(), card["pid"])
+        self.assertIsNotNone(card["elapsed_s"])
+
+    def test_a_pid_that_is_gone_says_the_worker_is_not_running(self):
+        self.step(step="evaluating", headline="Evaluating the sketch in a browser",
+                  job_id=self.job_id, pid=self.DEAD_PID)
+        card = console.activity(self.conn)
+        self.assertFalse(card["live"])
+        self.assertEqual("gone", card["state"])
+        self.assertIn("Worker not running", card["headline"])
+        self.assertIn(f"evaluating job {self.job_id}", card["headline"])
+        self.assertIn("systemctl --user status sketchgen-worker", card["detail"])
+
+    def test_five_samples_give_a_median_and_four_give_none(self):
+        self.step()  # the step being measured, opened once and left open
+        for seconds in (30, 60, 65, 90):
+            self.closed("writing", seconds)
+        self.assertIsNone(console.activity(self.conn)["median_s"])
+        self.closed("writing", 300)  # one slow run does not move a median
+        self.assertEqual(65.0, console.activity(self.conn)["median_s"])
+        # …and only of the same step: a judging row is not a writing sample
+        self.closed("judging", 600, count=5)
+        self.assertEqual(65.0, console.activity(self.conn)["median_s"])
+
+    def test_a_step_that_has_outlasted_every_other_one_is_stalled(self):
+        self.conn.execute(
+            "INSERT INTO activity (step, headline, pid, started_utc) "
+            "VALUES ('writing', 'Writing the sketch', ?, '2026-01-01T00:00:00Z')",
+            (os.getpid(),),
+        )
+        card = console.activity(self.conn)
+        self.assertEqual("stalled", card["state"])
+        self.assertIn("check the transcript", card["detail"])
+
+    def test_idle_work_is_not_a_running_job(self):
+        for step in console.ACTIVITY_IDLE_STEPS:
+            with self.subTest(step=step):
+                self.step(step=step, headline="Nothing to do")
+                self.assertEqual("idle", console.activity(self.conn)["state"])
+
+    def test_paused_wins_over_whatever_the_row_claims(self):
+        self.step()
+        db.set_control(self.conn, "paused", "deploying the gate")
+        card = console.activity(self.conn)
+        self.assertEqual("paused", card["state"])
+        self.assertEqual("deploying the gate", card["detail"])
+        # the step itself is still named: the operator paused something
+        self.assertEqual("writing", card["step"])
+
+    def test_no_rows_at_all_is_unknown_rather_than_an_error(self):
+        card = console.activity(self.conn)
+        self.assertEqual("unknown", card["state"])
+        self.assertIsNone(card["step"])
+        self.assertEqual([], card["recent"])
+
+    def test_the_trail_is_the_three_steps_just_before_newest_first(self):
+        for n in range(5):
+            self.step(step="idle", headline=f"step {n}")
+        self.step()
+        card = console.activity(self.conn)
+        self.assertEqual(["step 4", "step 3", "step 2"],
+                         [row["headline"] for row in card["recent"]])
+        self.assertTrue(all(row["seconds"] is not None for row in card["recent"]))
+
+    def test_the_document_carries_the_card_the_poll_carries(self):
+        self.step()
+        document = self.collect()
+        self.assertEqual(document["activity"]["headline"],
+                         console.activity(self.conn)["headline"])
+
+    def test_the_text_view_says_what_the_worker_is_doing(self):
+        self.step(detail="qwen3-coder:30b · job 1, attempt 1 of 3")
+        text = console.render_text(self.collect())
+        self.assertIn("now   Writing the sketch", text)
+        self.assertIn("qwen3-coder:30b · job 1, attempt 1 of 3", text)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

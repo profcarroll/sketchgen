@@ -329,10 +329,14 @@ class TestPages(WebTestCase):
             'data-k="funnel.passed_gate.total"',
             'data-k="per_sketch.all.cost_usd_4_24"',
             'data-k="model.instant.decode_tok_s"',
-            'data-k="worker.job_in_flight"',
             'data-k="odometer.session.slot_ours_pct"',
+            # the Worker tiles became the status card in packet 5; control, up
+            # since and slot survive in its foot line
+            'data-act="headline"',
+            'data-act="foot"',
         ):
             self.assertIn(path, page)
+        self.assertNotIn('data-k="worker.job_in_flight"', page)
 
     def test_console_renders_one_bar_per_core(self):
         """One bar per core in whatever document the server actually served."""
@@ -553,6 +557,107 @@ class TestHeaderMarks(WebTestCase):
             self.assertIn("node CPU 0%", title)
         finally:
             web.node_cpu_pct = original
+
+
+class TestStatusCard(WebTestCase):
+    """Packet 5: the process status card, on both pages and in the poll.
+
+    The worker is a different process and is not running in these tests, so
+    every row here is written by hand — which is also the point: the card is
+    whatever the database says, and nothing else.
+    """
+
+    def step(self, *, step="writing", headline="Writing the sketch",
+             detail="qwen3-coder:30b · job 42, attempt 2 of 3", pid=None):
+        conn = self.db()
+        try:
+            conn.execute("DELETE FROM activity")
+            db.begin_step(conn, step=step, headline=headline, detail=detail,
+                          pid=pid or os.getpid())
+            conn.commit()
+        finally:
+            conn.close()
+        self.addCleanup(self.clear)
+
+    def clear(self):
+        conn = self.db()
+        try:
+            conn.execute("DELETE FROM activity")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_the_console_and_the_queue_both_carry_the_card(self):
+        self.step()
+        console_page = self.text("/")
+        self.assertIn('class="panel status"', console_page)
+        self.assertIn('data-act="pill"', console_page)
+        self.assertIn("Writing the sketch", console_page)
+        self.assertIn("qwen3-coder:30b · job 42, attempt 2 of 3", console_page)
+        # the Console's Worker tiles are gone; their three values are in the foot
+        self.assertNotIn("<h3>Worker</h3>", console_page)
+        self.assertIn('data-act="foot"', console_page)
+
+        queue_page = self.text("/queue")
+        self.assertIn('class="panel status compact"', queue_page)
+        self.assertIn("Writing the sketch", queue_page)
+        self.assertIn("Console ↗", queue_page)
+        # one card on that page, not a second panel
+        self.assertEqual(1, queue_page.count('class="panel status compact"'))
+
+    def test_control_json_carries_the_card_the_poll_paints(self):
+        self.step()
+        status, content_type, body = self.get("/api/control.json")
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", content_type)
+        card = json.loads(body)["activity"]
+        self.assertEqual("writing", card["step"])
+        self.assertEqual("Writing the sketch", card["headline"])
+        self.assertEqual("running", card["state"])
+        # the pill and the elapsed text are decided server-side, so the page
+        # script never has to know what a state means
+        self.assertEqual("running", card["pill_text"])
+        self.assertEqual("ok", card["pill_class"])
+        self.assertIn("elapsed_text", card)
+        self.assertIn("recent", card)
+
+    def test_no_rows_renders_the_unknown_card_rather_than_raising(self):
+        self.clear()
+        page = self.text("/")
+        self.assertIn('class="panel status"', page)
+        self.assertIn("Nothing recorded yet", page)
+        self.assertIn('class="pill quiet" data-act="pill">unknown', page)
+        card = json.loads(self.get("/api/control.json")[2])["activity"]
+        self.assertEqual("unknown", card["state"])
+
+    def test_a_worker_that_is_gone_says_so_with_the_command_to_check_it(self):
+        self.step(step="evaluating",
+                  headline="Evaluating the sketch in a browser", pid=4194305)
+        page = self.text("/")
+        self.assertIn("Worker not running", page)
+        self.assertIn("systemctl --user status sketchgen-worker", page)
+        self.assertIn('class="pill bad" data-act="pill">not running', page)
+
+    def test_a_detail_a_model_wrote_is_escaped(self):
+        self.step(detail='<script>alert("nope")</script> & co')
+        page = self.text("/")
+        self.assertNotIn("<script>alert", page)
+        self.assertIn("&lt;script&gt;alert", page)
+
+    def test_a_step_with_no_median_draws_no_bar(self):
+        self.step()
+        page = self.text("/")
+        self.assertIn('data-act="track" hidden', page)
+
+    def test_a_step_past_its_median_keeps_its_track_and_turns_amber(self):
+        card = web.activity_card({"activity": {
+            "headline": "Writing the sketch", "detail": "…",
+            "elapsed_s": 300.0, "median_s": 67.0, "state": "running",
+            "recent": [],
+        }})
+        self.assertIn('style="width:100.0%"', card)
+        self.assertIn('class="over"', card)
+        self.assertIn("5m 00s of about 1m 07s", card)
 
 
 class TestTokensGauge(WebTestCase):

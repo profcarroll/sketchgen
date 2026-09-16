@@ -1145,6 +1145,173 @@ def _tile(key: str, value: str, sub: str = "") -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# The process status card (packet 5)
+#
+# One renderer for both pages, so the Console's card and the Queue's one-line
+# copy cannot drift apart, and one reader behind both — console.activity() —
+# so the page load and the two-second poll cannot disagree about the sentence
+# on screen. Every value carries data-act, the way the console's numbers carry
+# data-k, and the poll at the bottom of op_layout.html repaints those and
+# nothing else.
+# ---------------------------------------------------------------------------
+
+#: The card's state as the pill says it: (text, css class). The poll does not
+#: mirror this table — /api/control.json sends the pill it should wear, already
+#: decided here — so there is one mapping from state to colour and it is in
+#: Python. Idle work is deliberately not green: an idle worker is not a working
+#: one, and a green pill over "Nothing to do" tells the operator the opposite
+#: of what is true.
+ACTIVITY_PILLS: dict[str, tuple[str, str]] = {
+    "running": ("running", "ok"),
+    "idle": ("idle", "quiet"),
+    "paused": ("paused", "bad"),
+    "gone": ("not running", "bad"),
+    "stalled": ("stalled", "warn"),
+    "unknown": ("unknown", "quiet"),
+}
+
+#: What the card shows when the document has no activity block at all: an old
+#: cached document, or a console module that predates packet 5. The same shape
+#: console.activity() answers for an empty table, so nothing downstream has to
+#: ask which of the two it is holding.
+ACTIVITY_NONE: dict[str, Any] = {
+    "step": None,
+    "headline": "Nothing recorded yet",
+    "detail": "the worker writes this card as it works",
+    "elapsed_s": None,
+    "median_s": None,
+    "state": "unknown",
+    "recent": [],
+}
+
+
+def activity_of(doc: dict[str, Any]) -> dict[str, Any]:
+    """The document's activity block, or the empty card."""
+    block = doc.get("activity") if isinstance(doc, dict) else None
+    return block if isinstance(block, dict) else ACTIVITY_NONE
+
+
+def activity_pill(act: dict[str, Any]) -> tuple[str, str]:
+    return ACTIVITY_PILLS.get(str(act.get("state")), ACTIVITY_PILLS["unknown"])
+
+
+def activity_elapsed(act: dict[str, Any]) -> str:
+    """The time under the bar: how long this step has run, against the median.
+
+    "of about" because the median is a measurement of the last fifty of this
+    step on this node, not a promise. With fewer than five of them there is no
+    median, and then this is just the elapsed time — which is still the useful
+    half.
+    """
+    elapsed = act.get("elapsed_s")
+    if elapsed is None:
+        return "—"
+    median = act.get("median_s")
+    if median:
+        return f"{human_seconds(elapsed)} of about {human_seconds(median)}"
+    return human_seconds(elapsed)
+
+
+def activity_bar_pct(act: dict[str, Any]) -> float | None:
+    """Elapsed as a percentage of the median, capped, or None for no bar.
+
+    Capped rather than overflowing: a step that is past its median keeps a full
+    track and turns amber, so a stuck step looks stuck instead of looking like
+    a progress bar somebody drew too long.
+    """
+    elapsed, median = act.get("elapsed_s"), act.get("median_s")
+    if elapsed is None or not median:
+        return None
+    return min(100.0, max(0.0, float(elapsed) / float(median) * 100.0))
+
+
+def activity_foot(doc: dict[str, Any]) -> str:
+    """The three Worker tiles this card replaced, on one line.
+
+    Control, up since and slot were the Console's Worker tiles until packet 5;
+    nothing is lost by taking the tiles out, because the card is the thing an
+    operator reads first and these three belong under it rather than beside it.
+    They move on the scale of a session rather than of a step, so the poll
+    leaves this line alone — /api/control.json deliberately does not call the
+    collector, and up-since and slot are the collector's to know.
+    """
+    control = _dig(doc, "worker.control", "?")
+    started = _parse_utc(_dig(doc, "worker.started_utc"))
+    up = (
+        human_seconds((datetime.now(timezone.utc) - started).total_seconds())
+        if started is not None
+        else "—"
+    )
+    parts = [
+        str(control),
+        f"up {up}",
+        f"slot {_dig(doc, 'model.slot.state', '—')}",
+        f"{_dig(doc, 'funnel.generated.session', 0)} jobs this session",
+    ]
+    return " · ".join(parts)
+
+
+def activity_trail(act: dict[str, Any]) -> str:
+    """The three steps just before this one, newest first."""
+    rows = []
+    for row in (act.get("recent") or [])[:3]:
+        if not isinstance(row, dict):  # pragma: no cover - a malformed document
+            continue
+        rows.append(
+            f'<li><span class="h">{esc(row.get("headline"))}</span>'
+            f'<span class="s">{esc(human_seconds(row.get("seconds")))}</span></li>'
+        )
+    if not rows:
+        rows.append('<li><span class="h">nothing before this</span></li>')
+    return "".join(rows)
+
+
+def activity_card(doc: dict[str, Any], *, compact: bool = False) -> str:
+    """The card, full on the Console and one line above the Queue's table.
+
+    Everything here goes through :func:`esc`: a detail line can carry a
+    sentence a model wrote about a sketch a student asked for, and neither of
+    those is trusted markup.
+    """
+    act = activity_of(doc)
+    text, css = activity_pill(act)
+    pill = f'<span class="pill {esc(css)}" data-act="pill">{esc(text)}</span>'
+    headline = esc(act.get("headline") or "—")
+    detail = esc(act.get("detail") or "")
+
+    if compact:
+        return (
+            '<section class="panel status compact">'
+            f"{pill}"
+            f'<span class="now" data-act="headline">{headline}</span>'
+            f'<span class="who" data-act="detail">{detail}</span>'
+            '<a class="more" href="/">Console ↗</a>'
+            "</section>"
+        )
+
+    pct = activity_bar_pct(act)
+    over = pct is not None and float(act.get("elapsed_s") or 0) > float(
+        act.get("median_s") or 0
+    )
+    track = (
+        f'<div class="bar" data-act="track"{"" if pct is not None else " hidden"}>'
+        f'<span data-act="bar" class="{"over" if over else ""}" '
+        f'style="width:{_width(pct if pct is not None else 0):.1f}%"></span></div>'
+    )
+    return (
+        '<section class="panel status">'
+        f'<div class="head"><h2>Worker</h2>{pill}</div>'
+        f'<p class="now" data-act="headline">{headline}</p>'
+        f'<p class="who" data-act="detail">{detail}</p>'
+        f'<div class="prog">{track}'
+        f'<span class="t" data-act="elapsed">{esc(activity_elapsed(act))}</span></div>'
+        f'<div class="trail"><ol data-act="recent">{activity_trail(act)}</ol></div>'
+        f'<p class="foot" data-act="foot">{esc(activity_foot(doc))}</p>'
+        "</section>"
+    )
+
+
 #: The funnel's stages, in the order the pipeline walks them (spec §2). Any
 #: stage the collector adds later is rendered after these, under its own key.
 FUNNEL_ORDER = (
@@ -1296,26 +1463,6 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None) -> s
             '<tr><td colspan="5" class="dim">no model resident</td></tr>'
         )
 
-    worker_tiles = "".join(
-        [
-            _tile(
-                "control",
-                field(doc, "worker.control"),
-                field(doc, "worker.reason"),
-            ),
-            _tile(
-                "job in flight",
-                field(doc, "worker.job_in_flight", "int"),
-                "since " + field(doc, "worker.updated_utc"),
-            ),
-            _tile(
-                "worker up since",
-                field(doc, "worker.started_utc"),
-                "a systemd --user unit, not a tool call",
-            ),
-        ]
-    )
-
     odometer = "".join(
         [
             _tile(
@@ -1401,7 +1548,7 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None) -> s
         model_tiles=model_tiles,
         ollama_version=field(doc, "model.ollama_version"),
         resident_rows="\n".join(resident_rows),
-        worker_tiles=worker_tiles,
+        activity=activity_card(doc),
         odometer=odometer,
         funnel_rows="\n".join(funnel_rows),
         per_sketch_rows="\n".join(per_sketch_rows),
@@ -1547,7 +1694,12 @@ def queue_page(conn: sqlite3.Connection, doc: dict[str, Any], control) -> str:
             '<a href="/new">write the first job</a></td></tr>'
         )
 
-    return render("op_queue", tiles=tiles, rows="\n".join(rows))
+    return render(
+        "op_queue",
+        tiles=tiles,
+        activity=activity_card(doc, compact=True),
+        rows="\n".join(rows),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2893,6 +3045,18 @@ class OpHandler(BaseHTTPRequestHandler):
         try:
             control = db.get_control(conn)
             marks = nav_summary(conn)
+            # Three small queries and one stat, not console.collect(): this
+            # route runs every two seconds on every open page, and the
+            # collector sleeps 100 ms for its second /proc/stat reading. As
+            # with the collector itself, a card that cannot be read is an
+            # empty card and never a 500 on the page that shows the pill.
+            now = ACTIVITY_NONE
+            reader = getattr(console, "activity", None) if console else None
+            if callable(reader):
+                try:
+                    now = reader(conn)
+                except Exception as exc:  # noqa: BLE001 - never take the UI down
+                    sys.stderr.write(f"{db.utc_now()} activity failed: {exc}\n")
         finally:
             conn.close()
         text, css, tooltip = pill_for(control)
@@ -2908,6 +3072,12 @@ class OpHandler(BaseHTTPRequestHandler):
                 # The header's marks ride along with the pill: one poll keeps
                 # the whole header honest, and nothing else has to be fetched.
                 "nav": marks,
+                # …and so does the status card, with the pill it should wear,
+                # so the page script never has to know what a state means.
+                "activity": dict(now, pill_text=activity_pill(now)[0],
+                                 pill_class=activity_pill(now)[1],
+                                 elapsed_text=activity_elapsed(now),
+                                 bar_pct=activity_bar_pct(now)),
             }
         )
 
