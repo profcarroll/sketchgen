@@ -734,16 +734,23 @@ def record_critique(
     prompt_version: str,
     spawned_job_id: int | None = None,
     rejected_reason: str | None = None,
+    strip_path: str | None = None,
+    strip_sha256: str | None = None,
 ) -> int:
     """Record one critique of one entry, whether or not it spawned anything.
 
     One row per (entry, prompt_version): the UNIQUE constraint in migration 006
     is what stops the worker critiquing the same entry on every idle round, so a
     second call for the same pair raises ``sqlite3.IntegrityError`` by design.
+
+    ``strip_path`` and ``strip_sha256`` (migration 009) are the frame strip the
+    critic was shown and the sha256 of exactly those bytes. Both are NULL for
+    every row written under critic-v2, which was blind.
     """
     cur = conn.execute(
         "INSERT INTO critiques (entry_id, critique, critique_by, prompt_version, "
-        "spawned_job_id, rejected_reason, created_utc) VALUES (?,?,?,?,?,?,?)",
+        "spawned_job_id, rejected_reason, strip_path, strip_sha256, created_utc) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
         (
             int(entry_id),
             critique,
@@ -751,6 +758,8 @@ def record_critique(
             prompt_version,
             spawned_job_id,
             rejected_reason,
+            strip_path or None,
+            strip_sha256 or None,
             utc_now(),
         ),
     )
@@ -783,6 +792,15 @@ def entries_to_critique(
     one dead child). "No critique yet" is per prompt version, which is
     migration 006's UNIQUE constraint read from the other side, so a parent
     gets one more chance per version, not an endless supply.
+
+    An entry with no ``strip_path`` is not offered at all. Since critic-v3
+    :func:`sketchgen.lineage.critique` refuses an entry it cannot see, and a
+    refusal writes no row, so nothing marks the entry as tried: offered oldest
+    first at LIMIT 1 it would be picked again every round, and one strip-less
+    entry would stop the idle critic for good. That is the same head-of-line
+    block a dead child used to cause above, and it is excluded here for the
+    same reason -- the query offers only entries a critique can actually be
+    written for.
     """
     if int(limit) <= 0:
         return []
@@ -798,6 +816,7 @@ def entries_to_critique(
         "                    AND c.state NOT IN ('rejected', 'failed-kept')) "
         "  AND NOT EXISTS (SELECT 1 FROM critiques q WHERE q.entry_id = e.id "
         "                    AND q.prompt_version = ?) "
+        "  AND e.strip_path IS NOT NULL AND TRIM(e.strip_path) <> '' "
         "ORDER BY e.created_utc, e.id LIMIT ?",
         (prompt_version, int(limit)),
     ).fetchall()

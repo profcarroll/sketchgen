@@ -61,7 +61,9 @@ what the next attempt is given.
 the worker does one bounded round of idle work before it sleeps: it judges up to
 ``SKETCHGEN_IDLE_JUDGE`` pairs with the local judge (packet 5.2) and critiques up
 to ``SKETCHGEN_IDLE_CRITIQUE`` published entries, spawning the child each
-critique asks for (packet 5.3). The instructor's decision of 2026-09-14 is that
+critique asks for (packet 5.3) — and since critic-v3 the critic is shown the
+gate's frame strip and refuses an entry it cannot see, so both halves of the
+idle round now look at the sketch rather than reading about it. The instructor's decision of 2026-09-14 is that
 this is scheduled *inside this loop* rather than by a second timer, and the
 reason is the one fact the whole system is built around: there is one inference
 slot. A second unit would need its own fence, and two fences racing each other
@@ -867,7 +869,14 @@ def default_judge(conn, **kwargs: Any) -> dict[str, int]:
 
 
 def default_critic(conn, entry_id: int, **kwargs: Any):
-    """:func:`sketchgen.lineage.critique` — one sentence about one entry."""
+    """:func:`sketchgen.lineage.critique` — one sentence about one entry.
+
+    Since critic-v3 that call sends the entry's frame strip with the words and
+    refuses an entry it cannot see, so an idle round skips a published entry
+    with no ``strip_path`` on record instead of critiquing it blind. The refusal
+    does not consume the entry: nothing is written, and the entry is offered
+    again on the next round.
+    """
     return lineage.critique(conn, entry_id, **kwargs)
 
 
@@ -1477,6 +1486,8 @@ class Worker:
             return False
         except lineage.CritiqueFailed as exc:
             raw = " ".join(str(getattr(exc, "raw", "") or "").split())[:1000]
+            # The words failed the validator, but the model still saw a picture.
+            # Record which one, so a rejected row is as readable as a good one.
             db.record_critique(
                 self.conn,
                 entry_id,
@@ -1485,6 +1496,8 @@ class Worker:
                 prompt_version=version,
                 spawned_job_id=None,
                 rejected_reason=str(exc),
+                strip_path=getattr(exc, "strip_path", "") or None,
+                strip_sha256=getattr(exc, "strip_sha256", "") or None,
             )
             self.log(f"idle: critiqued entry {entry_id} but it was rejected: {exc}")
             return True
@@ -1515,6 +1528,8 @@ class Worker:
             prompt_version=version,
             spawned_job_id=job_id,
             rejected_reason=reason,
+            strip_path=getattr(critique, "strip_path", "") or None,
+            strip_sha256=getattr(critique, "strip_sha256", "") or None,
         )
         if job_id is None:
             self.log(f"idle: critiqued entry {entry_id}, spawned nothing: {reason}")
