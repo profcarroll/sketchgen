@@ -1,14 +1,18 @@
 # writepath — the one place the gallery can write
 
 The gallery is a static GitHub Pages site and cannot write. The node must not
-listen on a public address. Compare votes, likes and view counts therefore go to
-a small Cloudflare Worker over a D1 (SQLite) database, and the node's worker
-pulls them down on its own schedule with `sketchgen sync`. `GET /pull` is the
-only route the node ever calls; the node opens no port for any of this.
+listen on a public address. Compare votes, likes, view counts and the prompts
+and critiques visitors submit therefore go to a small Cloudflare Worker over a
+D1 (SQLite) database, and the node's worker pulls them down on its own schedule
+with `sketchgen sync`. `GET /pull` is the only route the node ever calls; the
+node opens no port for any of this.
 
 - `worker.js` — the Worker. `/login` `/callback` `/me` `/logout` `/vote` `/like`
-  `/view` `/counts` `/pull`. Its comments, not this file, are authoritative.
-- `schema.sql` — the D1 tables.
+  `/view` `/counts` `/prompt` `/critique` `/pull`. Its comments, not this file,
+  are authoritative.
+- `schema.sql` — the D1 tables: `votes`, `likes`, `views`, `view_log`,
+  `oauth_state`, `submissions`. `IF NOT EXISTS` throughout and safe to rerun,
+  which is how a new table gets there.
 - `wrangler.toml` — names and placeholders. No secret is ever written here.
 - `test/worker.test.js` — `node --test writepath/test/`. No npm install, no
   network: a fake `env.DB` and a fake `fetch` stand in.
@@ -35,7 +39,8 @@ from the address bar on load and sends it as `Authorization: Bearer`.
 
 The token **carries no secret of the service** — a username, an expiry, a
 signature. The signing key never leaves the Worker, the token cannot mint
-another, and it opens nothing but this viewer's own votes and likes; `/pull`
+another, and it opens nothing but this viewer's own votes, likes and
+submissions; `/pull`
 takes the node's separate `PULL_TOKEN` and refuses a session. There is no
 session table to leak: `/logout` clears the cookie and the page drops its copy.
 `view_log` holds SHA-256 of the token, never the token. Signed-out views are
@@ -46,6 +51,45 @@ identifies the viewer.
 visitors. The agent-judge code (packet 5.2) must never call it — engagement is
 not judgment, and an agent that has seen a like count is no longer answering the
 question the humans answered.
+
+## Submissions — and why one is not a job
+
+`POST /prompt` takes `{"prompt": "…"}` and `POST /critique` takes
+`{"entry_id": 412, "critique": "…"}`. Both need a session, exactly as `/vote`
+does; neither accepts `PULL_TOKEN`. Both answer
+`{"ok": true, "id": …, "created_utc": "…", "prompts_left"|"critiques_left": …}`,
+and `GET /me` carries the same two counts so the page can draw the budget
+without a second call. `GET /pull` grows a `submissions` array beside `votes`,
+`likes` and `views`, on the same inclusive watermark.
+
+**A submission is not a job.** It lands in the `submissions` table and nothing
+else. This Worker knows nothing about jobs, entries or the pipeline, and cannot:
+the operator releases a row on the node, and only then does it become a
+`publication='hold'` job like any other. Nothing a stranger types can reach a
+model because a queue happened to be looking.
+
+**The budget** is `PROMPTS_PER_DAY` and `CRITIQUES_PER_DAY` at the top of
+`worker.js` — 3 and 5 — per GitHub login, per **UTC** day. It is counted off the
+rows themselves (`COUNT(*)` by username, kind and the start of the day), so
+there is no counter to drift, nothing to reset at midnight, and a refused
+submission costs nothing. UTC and not the visitor's zone, because the Worker is
+not told where anyone is and is not going to start asking.
+
+**The rules on the text** are `lineage.validate`'s, ported to JavaScript with
+its sentences word for word: no code marks (`CODE_MARKS`, which is
+`lineage._CODE_MARKS` copied by hand and exported so the two can be read side by
+side), and for a critique one sentence and under 40 words. A prompt is capped at
+240 characters instead and is *not* held to the one-sentence rule — that rule is
+the revision line's. Three copies of this validation exist deliberately: the
+gallery page refuses before the round trip, this Worker refuses whatever the
+page does, and `sync.py` refuses again on the way into the node.
+
+`entry_id` is only checked for being a positive integer. There is no entries
+table in this database and pretending to know which ids exist would be a lie;
+the node refuses an unknown parent when it applies the row.
+
+Deploying this needs no new secret and no new binding — re-run step 3 below for
+the table, then `wrangler deploy`.
 
 ## Hand steps, in order
 

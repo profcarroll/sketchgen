@@ -19,6 +19,11 @@ import worker, {
   sqlCountLikes,
   BIND_LIMIT,
   MAX_COUNT_IDS,
+  CODE_MARKS,
+  PROMPTS_PER_DAY,
+  CRITIQUES_PER_DAY,
+  MAX_PROMPT_CHARS,
+  MAX_CRITIQUE_WORDS,
 } from "../worker.js";
 
 const GALLERY_URL = "https://profcarroll.github.io/sketchgen-gallery";
@@ -38,7 +43,9 @@ function makeDB() {
     views: new Map(), // entry_id
     viewLog: new Map(), // `${session_hash}|${entry_id}`
     oauthState: new Map(), // state
+    submissions: new Map(), // id, as SQLite's AUTOINCREMENT hands them out
   };
+  let nextSubmissionId = 1;
   const statements = []; // every {sql, args} the worker issued, in order
 
   const sorted = (rows, keys) =>
@@ -142,6 +149,38 @@ function makeDB() {
             ["updated_utc", "entry_id"],
           ).slice(0, args[1]),
         };
+
+      case SQL.insertSubmission: {
+        const [kind, username, entryId, text, created, updated] = args;
+        const id = nextSubmissionId;
+        nextSubmissionId += 1;
+        store.submissions.set(id, {
+          id,
+          kind,
+          username,
+          entry_id: entryId,
+          text,
+          created_utc: created,
+          updated_utc: updated,
+        });
+        // What D1 reports for an INSERT: the rowid SQLite assigned.
+        return { rows: [], lastRowId: id };
+      }
+      case SQL.countToday: {
+        const [username, kind, dayStart] = args;
+        const n = [...store.submissions.values()].filter(
+          (r) => r.username === username && r.kind === kind && r.created_utc >= dayStart,
+        ).length;
+        return { rows: [{ n }] };
+      }
+      case SQL.pullSubmissions:
+        return {
+          rows: sorted(
+            [...store.submissions.values()].filter((r) => r.updated_utc >= args[0]),
+            ["updated_utc", "id"],
+          ).slice(0, args[1]),
+        };
+
       default:
         break;
     }
@@ -171,8 +210,8 @@ function makeDB() {
         bind(...args) {
           return {
             async run() {
-              execute(sql, args);
-              return { success: true };
+              const result = execute(sql, args);
+              return { success: true, meta: { last_row_id: result.lastRowId ?? null } };
             },
             async all() {
               return { results: execute(sql, args).rows, success: true };
@@ -667,10 +706,16 @@ test("/callback keeps only the login and discards everything else GitHub sends",
     assert.ok(seen[1].url.startsWith("https://api.github.com/user"));
     assert.equal(seen[1].init.headers.Authorization, `Bearer ${ACCESS_TOKEN}`);
 
-    // /me now answers with the username and nothing else.
+    // /me now answers with the username and the day's budget, and nothing
+    // else: the budget is two counts off this login's own rows, not a fact
+    // about the person.
     const me = await worker.fetch(get("/me", { cookie: session }), env);
     assert.equal(me.status, 200);
-    assert.deepEqual(await me.json(), { username: "octocat" });
+    assert.deepEqual(await me.json(), {
+      username: "octocat",
+      prompts_left: PROMPTS_PER_DAY,
+      critiques_left: CRITIQUES_PER_DAY,
+    });
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -741,7 +786,11 @@ test("/callback hands the gallery the same token in the fragment", async () => {
     // SameSite=Lax cookie never reaches a cross-site call from the gallery.
     const me = await worker.fetch(get("/me", { bearer: token }), env);
     assert.equal(me.status, 200);
-    assert.deepEqual(await me.json(), { username: "octocat" });
+    assert.deepEqual(await me.json(), {
+      username: "octocat",
+      prompts_left: PROMPTS_PER_DAY,
+      critiques_left: CRITIQUES_PER_DAY,
+    });
   } finally {
     globalThis.fetch = realFetch;
   }
@@ -856,4 +905,473 @@ test("/logout answers JSON and clears the cookie", async () => {
   assert.deepEqual(await response.json(), { ok: true });
   assert.match(response.headers.get("Set-Cookie"), /^sg_session=;/);
   assert.match(response.headers.get("Set-Cookie"), /Max-Age=0/);
+});
+
+// ---------------------------------------------------------------------------
+// Submissions — a prompt or a critique, which is not a job
+// ---------------------------------------------------------------------------
+
+/** A POST carrying the session as a bearer, the way the gallery sends it. */
+function postAuth(path, body, token) {
+  const headers = { "Content-Type": "application/json", Origin: GALLERY_ORIGIN };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  return new Request(`${WORKER}${path}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body),
+  });
+}
+
+const A_PROMPT = "a tide of small triangles that drifts toward the cursor";
+const A_CRITIQUE = "let the lines thin as they near the edge";
+
+/** N words, one sentence, no code mark: the shape the length rules are about. */
+function words(n) {
+  return new Array(n).fill("line").join(" ");
+}
+
+test("the code marks are lineage._CODE_MARKS, in the same order", () => {
+  // Copied by hand from sketchgen/lineage.py, `_CODE_MARKS`. The point of this
+  // assertion is that the two lists sit here side by side and a reader can see
+  // that they still match; if the Python list gains a mark, this fails.
+  assert.deepEqual(CODE_MARKS, [
+    "```", "{", "}", ";", "()", "=>", "function ", "<script", "//", "$",
+  ]);
+});
+
+test("a prompt needs a session, and the node's token is not one", async () => {
+  const { env, store, statements } = makeEnv();
+
+  const none = await worker.fetch(postAuth("/prompt", { prompt: A_PROMPT }), env);
+  assert.equal(none.status, 401);
+  assert.deepEqual(await none.json(), { error: "sign in to submit a prompt" });
+
+  // PULL_TOKEN opens /pull and nothing else. It is not a session and is not
+  // treated as one just because it arrives in the same header.
+  const node = await worker.fetch(
+    postAuth("/prompt", { prompt: A_PROMPT }, PULL_TOKEN),
+    env,
+  );
+  assert.equal(node.status, 401);
+
+  const signedOutCritique = await worker.fetch(
+    postAuth("/critique", { entry_id: 412, critique: A_CRITIQUE }), env,
+  );
+  assert.equal(signedOutCritique.status, 401);
+  assert.deepEqual(await signedOutCritique.json(), { error: "sign in to submit a critique" });
+
+  // None of the three touched the database at all.
+  assert.equal(store.submissions.size, 0);
+  assert.deepEqual(statements, []);
+});
+
+test("a signed-in prompt is one row, and the receipt names it", async () => {
+  const { env, store } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  const response = await worker.fetch(
+    postAuth("/prompt", { prompt: `  ${A_PROMPT}\n ` }, token),
+    env,
+  );
+  assert.equal(response.status, 200);
+  const receipt = await response.json();
+  assert.equal(receipt.ok, true);
+  assert.equal(receipt.prompts_left, PROMPTS_PER_DAY - 1);
+  assert.match(receipt.created_utc, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
+
+  assert.equal(store.submissions.size, 1);
+  const row = store.submissions.get(receipt.id); // the id the receipt gave back
+  assert.equal(row.kind, "prompt");
+  assert.equal(row.username, "octocat");
+  assert.equal(row.entry_id, null); // a prompt has no parent
+  assert.equal(row.text, A_PROMPT); // whitespace collapsed, as validate() does
+  assert.equal(row.updated_utc, row.created_utc); // it rides the same watermark
+});
+
+test("a signed-in critique is one row, with its parent on it", async () => {
+  const { env, store } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  const response = await worker.fetch(
+    postAuth("/critique", { entry_id: 412, critique: A_CRITIQUE }, token),
+    env,
+  );
+  assert.equal(response.status, 200);
+  const receipt = await response.json();
+  assert.equal(receipt.critiques_left, CRITIQUES_PER_DAY - 1);
+
+  const row = store.submissions.get(receipt.id);
+  assert.equal(row.kind, "critique");
+  assert.equal(row.entry_id, 412);
+  assert.equal(row.text, A_CRITIQUE);
+});
+
+test("the fourth prompt of a UTC day is refused and writes nothing", async () => {
+  const { env, store, statements } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  for (let i = 0; i < PROMPTS_PER_DAY; i += 1) {
+    const response = await worker.fetch(
+      postAuth("/prompt", { prompt: `${A_PROMPT} ${i}` }, token),
+      env,
+    );
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).prompts_left, PROMPTS_PER_DAY - 1 - i);
+  }
+
+  const refused = await worker.fetch(postAuth("/prompt", { prompt: A_PROMPT }, token), env);
+  assert.equal(refused.status, 429);
+  assert.deepEqual(await refused.json(), {
+    error: `${PROMPTS_PER_DAY} prompts a day`,
+    prompts_left: 0,
+  });
+
+  // Refused means refused: the row is not written and then hidden.
+  assert.equal(store.submissions.size, PROMPTS_PER_DAY);
+  assert.equal(
+    statements.filter((s) => s.sql === SQL.insertSubmission).length,
+    PROMPTS_PER_DAY,
+  );
+});
+
+test("the sixth critique of a UTC day is refused and writes nothing", async () => {
+  const { env, store } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  for (let i = 0; i < CRITIQUES_PER_DAY; i += 1) {
+    const response = await worker.fetch(
+      postAuth("/critique", { entry_id: 412, critique: `${A_CRITIQUE} ${i}` }, token),
+      env,
+    );
+    assert.equal(response.status, 200);
+    assert.equal((await response.json()).critiques_left, CRITIQUES_PER_DAY - 1 - i);
+  }
+
+  const refused = await worker.fetch(
+    postAuth("/critique", { entry_id: 412, critique: A_CRITIQUE }, token),
+    env,
+  );
+  assert.equal(refused.status, 429);
+  assert.deepEqual(await refused.json(), {
+    error: `${CRITIQUES_PER_DAY} critiques a day`,
+    critiques_left: 0,
+  });
+  assert.equal(store.submissions.size, CRITIQUES_PER_DAY);
+});
+
+test("a prompt does not spend the critique budget, nor one login another's", async () => {
+  const { env } = makeEnv();
+  const octocat = await forgeSession("octocat");
+  const hubot = await forgeSession("hubot");
+
+  for (let i = 0; i < PROMPTS_PER_DAY; i += 1) {
+    await worker.fetch(postAuth("/prompt", { prompt: `${A_PROMPT} ${i}` }, octocat), env);
+  }
+
+  // The prompts are gone; every critique is still there.
+  const critique = await worker.fetch(
+    postAuth("/critique", { entry_id: 412, critique: A_CRITIQUE }, octocat),
+    env,
+  );
+  assert.equal(critique.status, 200);
+  assert.equal((await critique.json()).critiques_left, CRITIQUES_PER_DAY - 1);
+
+  const me = await (await worker.fetch(get("/me", { bearer: octocat }), env)).json();
+  assert.deepEqual(me, {
+    username: "octocat",
+    prompts_left: 0,
+    critiques_left: CRITIQUES_PER_DAY - 1,
+  });
+
+  // And the budget is one person's, not the service's.
+  const other = await worker.fetch(postAuth("/prompt", { prompt: A_PROMPT }, hubot), env);
+  assert.equal(other.status, 200);
+  assert.equal((await other.json()).prompts_left, PROMPTS_PER_DAY - 1);
+});
+
+test("yesterday's submissions do not count against today", async () => {
+  const { env, store } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  // Three prompts from the same login, before the start of the UTC day.
+  for (let i = 0; i < PROMPTS_PER_DAY; i += 1) {
+    store.submissions.set(900 + i, {
+      id: 900 + i,
+      kind: "prompt",
+      username: "octocat",
+      entry_id: null,
+      text: A_PROMPT,
+      created_utc: "2020-01-01T00:00:01Z",
+      updated_utc: "2020-01-01T00:00:01Z",
+    });
+  }
+
+  const response = await worker.fetch(postAuth("/prompt", { prompt: A_PROMPT }, token), env);
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).prompts_left, PROMPTS_PER_DAY - 1);
+});
+
+test("an empty prompt or critique is refused in lineage.validate's words", async () => {
+  const { env, store } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  for (const value of ["", "   ", "\n\t ", undefined, null, 7]) {
+    const prompt = await worker.fetch(postAuth("/prompt", { prompt: value }, token), env);
+    assert.equal(prompt.status, 400, `accepted prompt ${JSON.stringify(value)}`);
+    assert.deepEqual(await prompt.json(), { error: "the prompt is empty" });
+
+    const critique = await worker.fetch(
+      postAuth("/critique", { entry_id: 412, critique: value }, token),
+      env,
+    );
+    assert.equal(critique.status, 400, `accepted critique ${JSON.stringify(value)}`);
+    assert.deepEqual(await critique.json(), { error: "the critique is empty" });
+  }
+  assert.equal(store.submissions.size, 0);
+});
+
+test("every code mark is refused, and the error names the mark", async () => {
+  const { env, store } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  // One sentence per mark, short, carrying that mark and no other.
+  const carrying = {
+    "```": "let the lines thin ``` near the edge",
+    "{": "let the lines thin { near the edge",
+    "}": "let the lines thin } near the edge",
+    ";": "let the lines thin ; near the edge",
+    "()": "let the lines thin () near the edge",
+    "=>": "let the lines thin => near the edge",
+    "function ": "let the lines thin function near the edge",
+    "<script": "let the lines thin <script near the edge",
+    "//": "let the lines thin // near the edge",
+    $: "let the lines thin $ near the edge",
+  };
+
+  for (const mark of CODE_MARKS) {
+    const text = carrying[mark];
+    assert.ok(text.includes(mark), `no test text carries ${mark}`);
+
+    const critique = await worker.fetch(
+      postAuth("/critique", { entry_id: 412, critique: text }, token),
+      env,
+    );
+    assert.equal(critique.status, 400, `accepted a critique carrying ${mark}`);
+    assert.deepEqual(await critique.json(), {
+      error: `the critique contains code ('${mark}'); it becomes a prompt, not a patch`,
+    });
+
+    const prompt = await worker.fetch(postAuth("/prompt", { prompt: text }, token), env);
+    assert.equal(prompt.status, 400, `accepted a prompt carrying ${mark}`);
+    assert.deepEqual(await prompt.json(), { error: `the prompt holds code ('${mark}')` });
+  }
+  assert.equal(store.submissions.size, 0);
+});
+
+test("a critique is one sentence, and the count is in the refusal", async () => {
+  const { env, store } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  const two = await worker.fetch(
+    postAuth("/critique", { entry_id: 412, critique: "Thin the lines. Soften the edge." }, token),
+    env,
+  );
+  assert.equal(two.status, 400);
+  assert.deepEqual(await two.json(), {
+    error: "the critique is 2 sentences; one is the contract",
+  });
+
+  // A terminator at the end is still one sentence, as in Python.
+  const one = await worker.fetch(
+    postAuth("/critique", { entry_id: 412, critique: "Thin the lines near the edge." }, token),
+    env,
+  );
+  assert.equal(one.status, 200);
+  assert.equal(store.submissions.size, 1);
+
+  // The one-sentence rule is the critique's. A prompt may describe as much as
+  // it likes inside its characters.
+  const prompt = await worker.fetch(
+    postAuth(
+      "/prompt",
+      { prompt: "Triangles drift toward the cursor. They thin at the edge." },
+      token,
+    ),
+    env,
+  );
+  assert.equal(prompt.status, 200);
+});
+
+test("a critique of forty words is refused; thirty-nine is not", async () => {
+  const { env, store } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  const long = await worker.fetch(
+    postAuth("/critique", { entry_id: 412, critique: words(MAX_CRITIQUE_WORDS) }, token),
+    env,
+  );
+  assert.equal(long.status, 400);
+  assert.deepEqual(await long.json(), {
+    error:
+      `the critique is ${MAX_CRITIQUE_WORDS} words; ` +
+      `under ${MAX_CRITIQUE_WORDS} is the contract`,
+  });
+  assert.equal(store.submissions.size, 0);
+
+  const ok = await worker.fetch(
+    postAuth("/critique", { entry_id: 412, critique: words(MAX_CRITIQUE_WORDS - 1) }, token),
+    env,
+  );
+  assert.equal(ok.status, 200);
+});
+
+test("a prompt is capped at its characters; the boundary is allowed", async () => {
+  const { env, store } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  const over = "a".repeat(MAX_PROMPT_CHARS + 1);
+  const refused = await worker.fetch(postAuth("/prompt", { prompt: over }, token), env);
+  assert.equal(refused.status, 400);
+  assert.deepEqual(await refused.json(), {
+    error:
+      `the prompt is ${MAX_PROMPT_CHARS + 1} characters; ` +
+      `at most ${MAX_PROMPT_CHARS} is the contract`,
+  });
+  assert.equal(store.submissions.size, 0);
+
+  const exact = await worker.fetch(
+    postAuth("/prompt", { prompt: "a".repeat(MAX_PROMPT_CHARS) }, token),
+    env,
+  );
+  assert.equal(exact.status, 200);
+
+  // The cap is the prompt's: a critique is bounded by its words instead, so a
+  // long single word is still fine there.
+  const critique = await worker.fetch(
+    postAuth("/critique", { entry_id: 412, critique: "a".repeat(MAX_PROMPT_CHARS + 1) }, token),
+    env,
+  );
+  assert.equal(critique.status, 200);
+});
+
+test("entry_id must be a positive integer, and that is all this Worker can check", async () => {
+  const { env, store } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  for (const value of [undefined, null, 0, -1, "12", 1.5, "", true, [412]]) {
+    const response = await worker.fetch(
+      postAuth("/critique", { entry_id: value, critique: A_CRITIQUE }, token),
+      env,
+    );
+    assert.equal(response.status, 400, `accepted entry_id ${JSON.stringify(value)}`);
+    assert.deepEqual(await response.json(), { error: "entry_id must be an entry id" });
+  }
+  assert.equal(store.submissions.size, 0);
+
+  // An id no entry has is still accepted here: there is no entries table in
+  // this database and pretending otherwise would be a lie. The node refuses an
+  // unknown parent when it applies the row.
+  const unknown = await worker.fetch(
+    postAuth("/critique", { entry_id: 999999, critique: A_CRITIQUE }, token),
+    env,
+  );
+  assert.equal(unknown.status, 200);
+});
+
+test("/me carries both budgets, and is still 401 signed out", async () => {
+  const { env } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  assert.equal((await worker.fetch(get("/me"), env)).status, 401);
+
+  const fresh = await worker.fetch(get("/me", { bearer: token }), env);
+  assert.equal(fresh.status, 200);
+  assert.deepEqual(await fresh.json(), {
+    username: "octocat",
+    prompts_left: PROMPTS_PER_DAY,
+    critiques_left: CRITIQUES_PER_DAY,
+  });
+
+  await worker.fetch(postAuth("/prompt", { prompt: A_PROMPT }, token), env);
+  await worker.fetch(postAuth("/critique", { entry_id: 412, critique: A_CRITIQUE }, token), env);
+
+  const spent = await worker.fetch(get("/me", { bearer: token }), env);
+  assert.deepEqual(await spent.json(), {
+    username: "octocat",
+    prompts_left: PROMPTS_PER_DAY - 1,
+    critiques_left: CRITIQUES_PER_DAY - 1,
+  });
+});
+
+test("/pull delivers submissions on the same inclusive watermark", async () => {
+  const { env, store } = makeEnv();
+  seedForPull(store);
+  store.submissions.set(31, {
+    id: 31, kind: "prompt", username: "octocat", entry_id: null,
+    text: A_PROMPT,
+    created_utc: "2026-09-14T00:00:11Z", updated_utc: "2026-09-14T00:00:11Z",
+  });
+  store.submissions.set(77, {
+    id: 77, kind: "critique", username: "hubot", entry_id: 412,
+    text: A_CRITIQUE,
+    created_utc: "2026-09-14T00:00:13Z", updated_utc: "2026-09-14T00:00:13Z",
+  });
+
+  // A session is not the node's credential here either, submissions or not.
+  const token = await forgeSession("octocat");
+  assert.equal(
+    (await worker.fetch(get("/pull?since=1970-01-01T00:00:00Z", { bearer: token }), env)).status,
+    401,
+  );
+
+  const all = await worker.fetch(
+    get("/pull?since=1970-01-01T00:00:00Z", { bearer: PULL_TOKEN }),
+    env,
+  );
+  const first = await all.json();
+  assert.equal(first.submissions.length, 2);
+  assert.deepEqual(first.submissions[0], {
+    id: 31, kind: "prompt", username: "octocat", entry_id: null,
+    text: A_PROMPT,
+    created_utc: "2026-09-14T00:00:11Z", updated_utc: "2026-09-14T00:00:11Z",
+  });
+  // A submission carries the watermark past the last vote, like any other row.
+  assert.equal(first.next_since, "2026-09-14T00:00:13Z");
+
+  // Inclusive at both ends: the row sitting on the watermark comes again.
+  const again = await worker.fetch(
+    get(`/pull?since=${first.next_since}`, { bearer: PULL_TOKEN }),
+    env,
+  );
+  const second = await again.json();
+  assert.equal(second.submissions.length, 1);
+  assert.equal(second.submissions[0].id, 77);
+  assert.deepEqual([second.votes, second.likes, second.views], [[], [], []]);
+
+  // Nothing in a pulled submission identifies a person beyond the username.
+  for (const row of first.submissions) {
+    assert.deepEqual(
+      Object.keys(row).filter(
+        (k) => !/^(id|kind|username|entry_id|text|created_utc|updated_utc)$/.test(k),
+      ),
+      [],
+    );
+  }
+});
+
+test("a submission written through the routes comes back out of /pull", async () => {
+  const { env } = makeEnv();
+  const token = await forgeSession("octocat");
+
+  const written = await (
+    await worker.fetch(postAuth("/prompt", { prompt: A_PROMPT }, token), env)
+  ).json();
+
+  const pulled = await (
+    await worker.fetch(get("/pull?since=1970-01-01T00:00:00Z", { bearer: PULL_TOKEN }), env)
+  ).json();
+  assert.equal(pulled.submissions.length, 1);
+  assert.equal(pulled.submissions[0].id, written.id);
+  assert.equal(pulled.submissions[0].created_utc, written.created_utc);
+  assert.equal(pulled.next_since, written.created_utc);
 });

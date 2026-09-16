@@ -7,6 +7,12 @@
  * own schedule through /pull. /pull is the ONLY route the node ever calls; the
  * node opens no port for this.
  *
+ * It also takes submissions: a prompt or a critique a signed-in visitor asked
+ * for. A submission is not a job. It lands in its own table, capped per login
+ * per UTC day, and becomes a job only when the operator releases it on the
+ * node — so this Worker knows nothing about jobs, entries or the pipeline, and
+ * nothing the public types can reach a model by accident.
+ *
  * What it knows about a person: a GitHub username. That is the whole list. The
  * OAuth access token is used inside /callback to read the login and is discarded
  * in the same function; nothing else from the GitHub user document is read, kept
@@ -36,6 +42,19 @@ const VIEW_WINDOW_MS = 60_000;
 const PULL_LIMIT = 500;
 const QUESTIONS = new Set(["brief", "look"]);
 const CHOICES = new Set(["A", "B", "tie"]);
+
+// What one GitHub login may ask for in one UTC day. A vote is idempotent per
+// person, so abusing it is self-limiting; a prompt is roughly a minute of the
+// node's only GPU, so it is not. The cap has to be able to refuse, which the
+// operator's console cannot do after the text has already been submitted.
+// Changing either number is this line and the test that names it.
+export const PROMPTS_PER_DAY = 3;
+export const CRITIQUES_PER_DAY = 5;
+
+// A prompt is a sentence or two, not an essay. The critique has no character
+// cap of its own because it has a word one, which is lineage.validate's.
+export const MAX_PROMPT_CHARS = 240;
+export const MAX_CRITIQUE_WORDS = 40;
 const GITHUB_AUTHORIZE = "https://github.com/login/oauth/authorize";
 const GITHUB_TOKEN = "https://github.com/login/oauth/access_token";
 const GITHUB_USER = "https://api.github.com/user";
@@ -84,6 +103,17 @@ export const SQL = {
   pullViews:
     "SELECT entry_id, count, updated_utc " +
     "FROM views WHERE updated_utc >= ? ORDER BY updated_utc, entry_id LIMIT ?",
+  insertSubmission:
+    "INSERT INTO submissions (kind, username, entry_id, text, created_utc, updated_utc) " +
+    "VALUES (?, ?, ?, ?, ?, ?)",
+  // The day's budget, straight off the rows: no counter to drift, nothing to
+  // reset at midnight, and a row that was never written never counted.
+  countToday:
+    "SELECT COUNT(*) AS n FROM submissions " +
+    "WHERE username = ? AND kind = ? AND created_utc >= ?",
+  pullSubmissions:
+    "SELECT id, kind, username, entry_id, text, created_utc, updated_utc " +
+    "FROM submissions WHERE updated_utc >= ? ORDER BY updated_utc, id LIMIT ?",
 };
 
 /** `SELECT … IN (?, ?, …)` for n entry ids. Exported so the tests build the
@@ -127,6 +157,15 @@ function utcNow(ms = Date.now()) {
 
 function utcPlus(seconds, ms = Date.now()) {
   return utcNow(ms + seconds * 1000);
+}
+
+/** Midnight at the start of the UTC day `ms` falls in. The budget window.
+ *
+ *  UTC and not the visitor's zone, deliberately: the Worker is not told where
+ *  anyone is and is not going to start asking. A day here is the same day for
+ *  everybody, which also makes the count a plain string comparison. */
+function utcDayStart(ms = Date.now()) {
+  return `${new Date(ms).toISOString().slice(0, 10)}T00:00:00Z`;
 }
 
 function parseUtc(stamp) {
@@ -187,6 +226,94 @@ const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
 
 function isEntryId(value) {
   return Number.isInteger(value) && value > 0;
+}
+
+// ---------------------------------------------------------------------------
+// What a stranger is allowed to submit — lineage.validate, in JavaScript
+// ---------------------------------------------------------------------------
+
+/**
+ * The marks a sentence of prompt or critique has no business containing.
+ *
+ * This list is `lineage._CODE_MARKS` (sketchgen/lineage.py) copied by hand and
+ * exported so a reader can hold the two against each other, in the same order,
+ * and see at a glance that they still match. Keep the order.
+ */
+export const CODE_MARKS = [
+  "```",
+  "{",
+  "}",
+  ";",
+  "()",
+  "=>",
+  "function ",
+  "<script",
+  "//",
+  "$",
+];
+
+// Where one sentence ends and the next begins: a terminator, then whitespace.
+// `lineage._SENTENCE_SPLIT_RE`, which is the same expression.
+const SENTENCE_SPLIT_RE = /(?<=[.!?])\s+/;
+
+/**
+ * One line of public text, trimmed, or the sentence that refuses it.
+ *
+ * Returns `{ text }` or `{ error }`. The rules are `lineage.validate`'s and the
+ * sentences are its sentences, word for word, because a visitor who is refused
+ * here and a model that is refused on the node should be told the same thing.
+ * Three copies of this rule exist on purpose — the gallery page refuses before
+ * the round trip, this Worker refuses whatever the page does, and `sync.py`
+ * refuses again on the way into the node — so the wording is the contract
+ * between them and is not ours to improve.
+ *
+ * A prompt and a critique differ in exactly two places. A prompt is capped at
+ * MAX_PROMPT_CHARS, because nothing else bounds it; that sentence has no
+ * Python original, since the Python validator only ever sees a critique. And a
+ * prompt is *not* held to the one-sentence rule: a revision line is one
+ * sentence because it is an instruction to patch a prompt, while a prompt may
+ * describe as much as it likes inside its 240 characters.
+ */
+export function validateText(raw, kind) {
+  const text = String(raw ?? "").split(/\s+/).filter(Boolean).join(" ");
+  if (typeof raw !== "string" || !text) {
+    return { error: `the ${kind} is empty` };
+  }
+  for (const mark of CODE_MARKS) {
+    if (text.includes(mark)) {
+      // Two wordings, because a critique's refusal says what goes wrong: it
+      // stops being a patch and becomes a prompt. A prompt is already one.
+      return {
+        error:
+          kind === "critique"
+            ? `the critique contains code ('${mark}'); it becomes a prompt, not a patch`
+            : `the prompt holds code ('${mark}')`,
+      };
+    }
+  }
+  if (kind === "prompt") {
+    if (text.length > MAX_PROMPT_CHARS) {
+      return {
+        error:
+          `the prompt is ${text.length} characters; ` +
+          `at most ${MAX_PROMPT_CHARS} is the contract`,
+      };
+    }
+    return { text };
+  }
+  const sentences = text.split(SENTENCE_SPLIT_RE).filter(Boolean);
+  if (sentences.length > 1) {
+    return { error: `the critique is ${sentences.length} sentences; one is the contract` };
+  }
+  const words = text.split(" ");
+  if (words.length >= MAX_CRITIQUE_WORDS) {
+    return {
+      error:
+        `the critique is ${words.length} words; ` +
+        `under ${MAX_CRITIQUE_WORDS} is the contract`,
+    };
+  }
+  return { text };
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +561,102 @@ async function routeVote(request, env, username) {
   return json({ ok: true, updated_utc: now }, 200, request, env);
 }
 
+/**
+ * How much of today's budget this login has left for this kind of submission.
+ *
+ * Counted, never remembered: the only state is the rows themselves, so a refused
+ * submission costs nothing, a deleted row gives the day back, and there is no
+ * midnight job. `created_utc` and the day start are both ISO 8601 with a Z at
+ * second resolution, so `>=` on the strings is `>=` on the instants.
+ */
+async function budgetLeft(env, username, kind, perDay) {
+  const row = await env.DB.prepare(SQL.countToday)
+    .bind(username, kind, utcDayStart())
+    .first();
+  return Math.max(0, perDay - Number(row?.n || 0));
+}
+
+/** The new row's id. D1 reports it as `meta.last_row_id`, the rowid SQLite
+ *  assigned, which for this table is its AUTOINCREMENT primary key. */
+async function insertSubmission(env, kind, username, entryId, text, now) {
+  const result = await env.DB.prepare(SQL.insertSubmission)
+    .bind(kind, username, entryId, text, now, now)
+    .run();
+  return result?.meta?.last_row_id ?? null;
+}
+
+/**
+ * A prompt a signed-in visitor wants run. It becomes a row and nothing else.
+ *
+ * This Worker knows nothing about jobs, entries or the pipeline, and that is
+ * the point of the table: a submission is text a person has to release on the
+ * node before any model sees it, so nothing written here can be picked up by
+ * accident. The wording of every refusal is the wire format's (plan §2).
+ */
+async function routePrompt(request, env, username) {
+  const body = await readJson(request);
+  if (!body) return json({ error: "bad json" }, 400, request, env);
+  // Validated before the budget is read: text this Worker would not have stored
+  // anyway should not cost a database round trip, and must not read as a 429.
+  const checked = validateText(body.prompt, "prompt");
+  if (checked.error) return json({ error: checked.error }, 400, request, env);
+
+  const left = await budgetLeft(env, username, "prompt", PROMPTS_PER_DAY);
+  if (left <= 0) {
+    return json(
+      { error: `${PROMPTS_PER_DAY} prompts a day`, prompts_left: 0 },
+      429,
+      request,
+      env,
+    );
+  }
+  const now = utcNow();
+  const id = await insertSubmission(env, "prompt", username, null, checked.text, now);
+  return json(
+    { ok: true, id, created_utc: now, prompts_left: left - 1 },
+    200,
+    request,
+    env,
+  );
+}
+
+/**
+ * A revision line for an entry that already exists. The same row, with a parent.
+ *
+ * `entry_id` is checked only for being a positive integer: this Worker has no
+ * entries table and must not pretend to have one. The node refuses an unknown
+ * parent when it applies the row, which is the only place the question can
+ * honestly be answered.
+ */
+async function routeCritique(request, env, username) {
+  const body = await readJson(request);
+  if (!body) return json({ error: "bad json" }, 400, request, env);
+  const entryId = body.entry_id;
+  if (!isEntryId(entryId)) {
+    return json({ error: "entry_id must be an entry id" }, 400, request, env);
+  }
+  const checked = validateText(body.critique, "critique");
+  if (checked.error) return json({ error: checked.error }, 400, request, env);
+
+  const left = await budgetLeft(env, username, "critique", CRITIQUES_PER_DAY);
+  if (left <= 0) {
+    return json(
+      { error: `${CRITIQUES_PER_DAY} critiques a day`, critiques_left: 0 },
+      429,
+      request,
+      env,
+    );
+  }
+  const now = utcNow();
+  const id = await insertSubmission(env, "critique", username, entryId, checked.text, now);
+  return json(
+    { ok: true, id, created_utc: now, critiques_left: left - 1 },
+    200,
+    request,
+    env,
+  );
+}
+
 async function routeLike(request, env, username) {
   const body = await readJson(request);
   if (!body) return json({ error: "bad json" }, 400, request, env);
@@ -520,16 +743,21 @@ async function routePull(request, env, url) {
   const votes = (await env.DB.prepare(SQL.pullVotes).bind(since, PULL_LIMIT).all())?.results || [];
   const likes = (await env.DB.prepare(SQL.pullLikes).bind(since, PULL_LIMIT).all())?.results || [];
   const views = (await env.DB.prepare(SQL.pullViews).bind(since, PULL_LIMIT).all())?.results || [];
+  // Submissions ride the same watermark as everything else. Nothing ever
+  // updates one, so its `updated_utc` is its `created_utc` and stays put; the
+  // puller does not have to know that and treats all four arrays alike.
+  const submissions =
+    (await env.DB.prepare(SQL.pullSubmissions).bind(since, PULL_LIMIT).all())?.results || [];
 
   // The window is inclusive at both ends: rows are re-delivered rather than
   // risk being skipped when several land in the same second, and sync.py
   // applies every row idempotently. At-least-once, never at-most-once.
   let watermark = since;
-  for (const row of [...votes, ...likes, ...views]) {
+  for (const row of [...votes, ...likes, ...views, ...submissions]) {
     if (row.updated_utc > watermark) watermark = row.updated_utc;
   }
   return json(
-    { since, next_since: watermark, votes, likes, views },
+    { since, next_since: watermark, votes, likes, views, submissions },
     200,
     request,
     env,
@@ -562,9 +790,19 @@ export default {
     if (request.method === "GET" && path === "/logout") return routeLogout(request, env);
 
     if (request.method === "GET" && path === "/me") {
-      return username
-        ? json({ username }, 200, request, env)
-        : json({ error: "not signed in" }, 401, request, env);
+      if (!username) return json({ error: "not signed in" }, 401, request, env);
+      // The budget comes back with the name so the gallery can draw "2 of 3
+      // left today" on the composer without a second call.
+      return json(
+        {
+          username,
+          prompts_left: await budgetLeft(env, username, "prompt", PROMPTS_PER_DAY),
+          critiques_left: await budgetLeft(env, username, "critique", CRITIQUES_PER_DAY),
+        },
+        200,
+        request,
+        env,
+      );
     }
 
     if (request.method === "POST" && path === "/view") {
@@ -578,6 +816,21 @@ export default {
       return path === "/vote"
         ? routeVote(request, env, username)
         : routeLike(request, env, username);
+    }
+
+    // A prompt and a critique are the same thing at this stage — a sentence a
+    // stranger wants run — so they take the same credential as a vote does: a
+    // session, and only a session. env.PULL_TOKEN is the node's and opens
+    // neither, which is why this sits below the session block and /pull sits
+    // above it.
+    if (request.method === "POST" && (path === "/prompt" || path === "/critique")) {
+      const kind = path === "/prompt" ? "prompt" : "critique";
+      if (!username) {
+        return json({ error: `sign in to submit a ${kind}` }, 401, request, env);
+      }
+      return kind === "prompt"
+        ? routePrompt(request, env, username)
+        : routeCritique(request, env, username);
     }
 
     return json({ error: "not found" }, 404, request, env);
