@@ -648,10 +648,15 @@ class TestStatusCard(WebTestCase):
         self.assertNotIn("<script>alert", page)
         self.assertIn("&lt;script&gt;alert", page)
 
-    def test_a_step_with_no_median_draws_no_bar(self):
+    def test_a_step_with_no_median_draws_the_ribbon(self):
+        # Until 2026-09-16 this asserted the track was `hidden`, which drew an
+        # empty grey track anyway: `.bar { display: flex }` is an author rule
+        # and beats the browser's own [hidden]. The track is always there now
+        # and its class says which of the three states it is in.
         self.step()
         page = self.text("/")
-        self.assertIn('data-act="track" hidden', page)
+        self.assertIn('class="bar working" data-act="track"', page)
+        self.assertNotIn("hidden", page.split('data-act="track"')[1][:40])
 
     def test_a_step_past_its_median_keeps_its_track_and_turns_amber(self):
         card = web.activity_card({"activity": {
@@ -662,6 +667,80 @@ class TestStatusCard(WebTestCase):
         self.assertIn('style="width:100.0%"', card)
         self.assertIn('class="over"', card)
         self.assertIn("5m 00s of about 1m 07s", card)
+
+
+class TestBarStates(unittest.TestCase):
+    """The bar says one of three things, and the track is always drawn.
+
+    A fill is a measured step. A ribbon is a step that is running and cannot be
+    measured — fewer than five of it have finished, and some steps will never
+    have five. An empty track is a worker that is not working. The three are
+    decided in Python, once, because the poll repaints the same card.
+    """
+
+    def act(self, **over):
+        card = {"step": "writing", "headline": "Writing the sketch",
+                "detail": "…", "elapsed_s": 24.0, "median_s": None,
+                "state": "running", "recent": []}
+        card.update(over)
+        return card
+
+    def test_measured_fills_and_does_not_stripe(self):
+        act = self.act(elapsed_s=41.0, median_s=67.0)
+        self.assertAlmostEqual(61.19, web.activity_bar_pct(act), places=1)
+        self.assertEqual("", web.activity_bar_class(act))
+
+    def test_running_without_a_median_stripes(self):
+        act = self.act()
+        self.assertIsNone(web.activity_bar_pct(act))
+        self.assertEqual("working", web.activity_bar_class(act))
+
+    def test_a_stalled_step_stripes_in_amber(self):
+        act = self.act(elapsed_s=3000.0, state="stalled")
+        self.assertEqual("working late", web.activity_bar_class(act))
+
+    def test_the_nap_is_not_work_however_long_it_has_run(self):
+        # The worker opens an `idle` row when it sleeps, on purpose, so an open
+        # row exists for as long as the process does. A long nap is not
+        # progress towards anything, and a nap with a median is not either.
+        act = self.act(step="idle", headline="Nothing to do", state="idle",
+                       elapsed_s=200.0, median_s=30.0)
+        self.assertIsNone(web.activity_bar_pct(act))
+        self.assertEqual("", web.activity_bar_class(act))
+        self.assertFalse(web.activity_working(act))
+
+    def test_idle_work_is_work(self):
+        # judging and critiquing land under the `idle` STATE beside the nap,
+        # which is why the bar reads the step and not the state.
+        act = self.act(step="critiquing", headline="Critiquing entry 214",
+                       state="idle")
+        self.assertTrue(web.activity_working(act))
+        self.assertEqual("working", web.activity_bar_class(act))
+
+    def test_paused_gone_and_empty_all_draw_an_empty_track(self):
+        for state in ("paused", "gone", "unknown"):
+            with self.subTest(state=state):
+                act = self.act(state=state, elapsed_s=900.0, median_s=67.0)
+                self.assertIsNone(web.activity_bar_pct(act))
+                self.assertEqual("", web.activity_bar_class(act))
+
+    def test_the_card_never_hides_the_track(self):
+        for act in (self.act(), self.act(state="paused"),
+                    self.act(elapsed_s=41.0, median_s=67.0)):
+            with self.subTest(state=act["state"], median=act["median_s"]):
+                card = web.activity_card({"activity": act})
+                self.assertIn('data-act="track"', card)
+                self.assertNotIn("hidden", card)
+
+    def test_one_job_is_not_one_jobs(self):
+        def foot(session):
+            return web.activity_foot({
+                "worker": {"control": "running"},
+                "funnel": {"generated": {"session": session}},
+            })
+        self.assertIn("1 job this session", foot(1))
+        self.assertIn("2 jobs this session", foot(2))
+        self.assertIn("0 jobs this session", foot(0))
 
 
 class TestTokensGauge(WebTestCase):
