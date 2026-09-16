@@ -409,6 +409,31 @@ python3 bin/sketchgen publish 12 --from /path/to/e12 --by <github-username>
 python3 bin/sketchgen reject  12 --reason "off brief"            # no git at all
 ```
 
+### One publisher at a time
+
+Both the worker and the operator UI publish, and they share one working tree at
+`~/sketchgen/gallery`. Since 2026-09-16 a publish takes an exclusive `flock` on
+that checkout and holds it from the clean-tree check to the last push, so the
+two serialise instead of racing. A publisher that finds the lock held prints
+
+```
+sketchgen: waiting for another publish to finish with /home/ubuntu/sketchgen/gallery
+```
+
+once, waits, and then does its work. That line is normal on a busy node and
+needs nothing from you. After five minutes it gives up with `another publish has
+held ... for more than 300s`, which is not a queue any more: look for a
+publisher that died. The lock is advisory and the kernel drops it when the
+holder exits, including when it is killed, so nothing has to be cleaned up by
+hand.
+
+Before the lock, two overlapping publishes of entry 488 raced and the loser's
+push was refused with `cannot lock ref 'refs/heads/main': is at <x> but expected
+<y>`. That one was harmless -- the loser rolled itself back after the winner had
+finished -- but the same race the other way round has one publish's `git reset
+--hard` landing while the other is still rendering into the tree, and the
+survivor then publishes a half-reset gallery without reporting anything.
+
 Rejecting from the **operator UI** does more than that CLI line: since the
 lineage ledger's packet 2 the Reject button stores the reason on the entry and
 then publishes it to the rejections page, beside the gate's own rejections. The
