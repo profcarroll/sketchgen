@@ -104,7 +104,7 @@ h1 + .sub + .byline { margin-top: 0; }
 .note { color: var(--ink-soft); font-size: 0.85rem; margin: 0.5rem 0 0; }
 .none { color: var(--ink-soft); font-style: italic; }
 
-.panel, .stage, .engagement, .questions, .reveal, .filters {
+.panel, .stage, .engagement, .questions, .reveal, .filters, .compose {
   background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 10px;
@@ -237,6 +237,81 @@ summary.filter-label::before { content: "\25b8\a0"; }
   padding: 0.15rem 0.7rem;
 }
 .search-count { color: var(--ink-soft); font-size: 0.85rem; }
+
+/* The two forms a signed-in visitor gets: the composer, above the grid in the
+ * space the filter bar gave up, and the critique form on an entry page. They
+ * share every control because they ask for the same thing — one sentence, no
+ * code — in two places.
+ *
+ * Every state of each is in the HTML and hidden; gallery.js reveals one of
+ * them once /me has answered. Nothing below sets `display` on a block the
+ * script hides, so `hidden` stays the whole of that decision. */
+.compose-head {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 0.75rem;
+  justify-content: space-between;
+  margin: 0 0 0.6rem;
+}
+.compose-head h2 { margin: 0; }
+.quota { color: var(--ink-soft); font-size: 0.85rem; margin: 0; }
+.quota b { color: var(--ink); font-variant-numeric: tabular-nums; font-weight: 600; }
+.signed-out-line { color: var(--ink-soft); margin: 0; }
+
+textarea {
+  background: var(--ground);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: inherit;
+  display: block;
+  font: inherit;
+  line-height: 1.45;
+  padding: 0.55rem 0.7rem;
+  resize: vertical;
+  width: 100%;
+}
+
+/* The contract, stated while someone types against it: what the label says
+ * before a keystroke, what the validator says after one. */
+.rule { color: var(--ink-soft); font-size: 0.82rem; margin: 0.45rem 0 0; }
+.rule.bad { color: var(--failed-ink); }
+.rule.good { color: var(--ok-ink); }
+label.rule { display: block; margin: 0 0 0.35rem; }
+
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--panel); }
+
+.receipt {
+  background: var(--ok-ground);
+  border-radius: 8px;
+  color: var(--ok-ink);
+  margin: 0;
+  padding: 0.7rem 0.85rem;
+}
+.receipt p { margin: 0; }
+.receipt p + p { font-size: 0.85rem; margin-top: 0.35rem; }
+
+/* The prompt the child would carry, in the shape .sub renders a revision in on
+ * the entry page above: the sentences it inherits, then the one being typed. */
+.preview {
+  background: var(--ground);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--agent);
+  border-radius: 6px;
+  margin: 0.75rem 0 0;
+  padding: 0.6rem 0.75rem;
+}
+.preview .label {
+  color: var(--ink-soft);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.preview p { font-size: 0.9rem; margin: 0.3rem 0 0; }
+.preview .revise { color: var(--ink-soft); }
+.preview .revise .label { font-size: 0.85rem; letter-spacing: 0.02em; text-transform: none; }
+.preview .revise em { color: var(--ink); font-style: italic; }
 
 .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); }
 

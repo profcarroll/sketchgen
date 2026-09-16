@@ -1,11 +1,16 @@
 /* gallery.js — the only script the published gallery loads.
  *
- * Three jobs, all of them read-or-write against the gallery write path
+ * Five jobs, all of them read-or-write against the gallery write path
  * (packet 3.3), whose base URL comes from config.json and from nowhere else:
  *
  *   1. counts   GET  <base>/counts?entries=1,2,3   views and likes per entry
  *   2. like     POST <base>/like               one like, identified by GitHub
  *   3. vote     POST <base>/vote               one answer to one question
+ *   4. prompt   POST <base>/prompt             a sketch a visitor asked for
+ *   5. critique POST <base>/critique           a revision of one that exists
+ *
+ * The last two are submissions and not jobs: they wait in a table until the
+ * operator releases them (plan §1.2), and both forms say so.
  *
  * Both writes need a session, and the gallery is a different origin from the
  * write path, so the session arrives as a token in the /callback redirect's
@@ -115,12 +120,18 @@
     return false;
   }
 
-  function paintSession(username) {
-    var login = document.querySelector("[data-login]");
-    if (login) {
+  /* `me` is the /me payload when there is one: the username the caller has
+   * already read out of it, and the day's remaining budget the composer shows.
+   * Every other caller passes nothing, which paints a signed-out page. */
+  function paintSession(username, me) {
+    // More than one of these now: the like button's, the composer's and the
+    // critique form's all offer the same sign-in and all take the same href.
+    Array.prototype.forEach.call(document.querySelectorAll("[data-login]"), function (login) {
       if (base()) { login.setAttribute("href", base() + "/login"); }
       login.hidden = !!username;
-    }
+    });
+    paintCompose(username, me);
+    paintCritique(username);
     var button = document.querySelector("[data-like]");
     if (button && base()) {
       button.disabled = !username;
@@ -158,7 +169,7 @@
       })
       .then(function (data) {
         var username = data && data.username ? data.username : null;
-        paintSession(username);
+        paintSession(username, data);
         return username;
       })
       .catch(function () { paintSession(null); return null; });
@@ -262,6 +273,282 @@
           loadCounts();
         })
         .catch(function () { button.disabled = false; });
+    });
+  }
+
+  /* ---- asking for a sketch, and asking for a revision ------------------ */
+
+  /* The two forms of plan §5: a prompt on the gallery index, a critique on an
+   * entry page. They are the only places this script sends anything a person
+   * typed, and they hold no more than the like button does — the same bearer
+   * token, the same /me, no credential in the page.
+   *
+   * The generator writes neither block unless config.json names a write path,
+   * and writes every state of the one it does write, hidden. This file reveals
+   * exactly one of them, and only once /me has answered: a form that appears
+   * before the page knows who is looking invites a stranger to type something
+   * it is about to refuse.
+   *
+   * Neither submission is a job. The Worker files it in a table, the node
+   * pulls it down, and it runs when the operator releases it — which is what
+   * the note under each button and the receipt after each one say out loud.
+   */
+
+  function composeBlock() { return document.querySelector("[data-compose]"); }
+  function critiqueBlock() { return document.querySelector("[data-critique]"); }
+
+  /* Whitespace collapsed and trimmed, exactly as lineage.validate does it
+   * before it counts anything: the page must count the same words. */
+  function collapse(value) {
+    return String(value === null || value === undefined ? "" : value)
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  /* "2 of 3 left today" — the denominator is in the HTML because it is the
+   * Worker's cap and not this page's; the numerator arrives from /me, and the
+   * line stays hidden until it has. */
+  function paintQuota(slot, left) {
+    if (!slot) { return; }
+    if (typeof left !== "number") { slot.hidden = true; return; }
+    slot.hidden = false;
+    var value = slot.querySelector("[data-left]");
+    if (value) { value.textContent = String(left); }
+  }
+
+  /* Once a form has been submitted its receipt stands: nothing repaints it
+   * back into an empty box the visitor might fill in twice. */
+  function done(block) { return block.getAttribute("data-done") === "true"; }
+
+  function paintCompose(username, me) {
+    var block = composeBlock();
+    if (!block || !base() || done(block)) { return; }
+    var out = block.querySelector("[data-compose-out]");
+    var form = block.querySelector("[data-compose-in]");
+    var left = me && typeof me.prompts_left === "number" ? me.prompts_left : null;
+    if (out) { out.hidden = !!username; }
+    if (form) { form.hidden = !username; }
+    paintQuota(block.querySelector("[data-compose-quota]"), username ? left : null);
+    var button = block.querySelector("[data-compose-send]");
+    if (button) { button.disabled = left === 0; }
+    block.hidden = false;
+  }
+
+  function paintCritique(username) {
+    var block = critiqueBlock();
+    if (!block || !base() || done(block)) { return; }
+    var out = block.querySelector("[data-critique-out]");
+    var form = block.querySelector("[data-critique-in]");
+    if (out) { out.hidden = !!username; }
+    if (form) { form.hidden = !username; }
+    block.hidden = false;
+  }
+
+  /* One answer, whatever it was: the status, and whatever JSON came with it.
+   * A refusal whose body this page cannot read is still a refusal. */
+  function answered(response) {
+    var status = response.status;
+    return response.json()
+      .catch(function () { return {}; })
+      .then(function (data) { return { status: status, data: data || {} }; });
+  }
+
+  /* lineage.validate(), in the page.
+   *
+   * The same cases in the same order and the same thresholds as
+   * sketchgen/lineage.py: empty, a code mark, more than one sentence, forty
+   * words or more. The sentences are shorter here because this line is read
+   * while someone is typing; the Worker refuses the same text again in
+   * Python's longer words, and sync.py refuses it a third time on the way in.
+   *
+   * CODE_MARKS is lineage._CODE_MARKS, in its order, so the two can be read
+   * side by side. */
+  var CODE_MARKS = ["```", "{", "}", ";", "()", "=>", "function ", "<script", "//", "$"];
+  var MAX_CRITIQUE_WORDS = 40;
+
+  /* Python splits on lineage._SENTENCE_SPLIT_RE — a terminator, then space —
+   * and drops the empties. Its lookbehind is counted out here rather than
+   * written: a regex lookbehind is a syntax error in a browser too old for it,
+   * and a syntax error anywhere in this file takes the whole file down, the
+   * counts and the like button and the sort with it. The text is already
+   * collapsed, so every split point is one space after a terminator. */
+  function sentenceCount(text) {
+    var count = text ? 1 : 0;
+    for (var at = 1; at < text.length; at += 1) {
+      if (text.charAt(at) === " " && ".!?".indexOf(text.charAt(at - 1)) !== -1) {
+        count += 1;
+      }
+    }
+    return count;
+  }
+
+  function critiqueVerdict(raw) {
+    var text = collapse(raw);
+    if (!text) { return { ok: false, text: "", says: "say something" }; }
+    for (var at = 0; at < CODE_MARKS.length; at += 1) {
+      if (text.indexOf(CODE_MARKS[at]) !== -1) {
+        return {
+          ok: false,
+          text: text,
+          says: "holds code (" + CODE_MARKS[at] +
+            ") — a critique becomes a prompt, not a patch"
+        };
+      }
+    }
+    var sentences = sentenceCount(text);
+    if (sentences > 1) {
+      return { ok: false, text: text, says: sentences + " sentences — one is the contract" };
+    }
+    var words = text.split(" ").length;
+    if (words >= MAX_CRITIQUE_WORDS) {
+      return {
+        ok: false,
+        text: text,
+        says: words + " words — under " + MAX_CRITIQUE_WORDS + " is the contract"
+      };
+    }
+    return { ok: true, text: text, says: "one sentence · " + words + " words · no code" };
+  }
+
+  function wireCompose() {
+    var block = composeBlock();
+    if (!block || !base()) { return; }
+    var field = block.querySelector("[data-compose-text]");
+    var button = block.querySelector("[data-compose-send]");
+    var form = block.querySelector("[data-compose-in]");
+    var receipt = block.querySelector("[data-compose-receipt]");
+    var refusal = block.querySelector("[data-compose-refusal]");
+    if (!field || !button) { return; }
+
+    function refuse(says) {
+      if (!refusal) { return; }
+      refusal.textContent = says || "";
+      refusal.hidden = !says;
+    }
+
+    button.addEventListener("click", function () {
+      var text = collapse(field.value);
+      if (!text) { refuse("say something"); return; }
+      refuse("");
+      button.disabled = true;
+      fetch(base() + "/prompt", {
+        method: "POST",
+        credentials: "include",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        // worker.js routePrompt: { prompt } — one sentence, nothing else.
+        body: JSON.stringify({ prompt: text })
+      })
+        .then(function (response) {
+          if (refused(response)) {
+            refuse("sign in with GitHub to submit a prompt");
+            return null;
+          }
+          return answered(response);
+        })
+        .then(function (answer) {
+          if (!answer) { return; }
+          var left = typeof answer.data.prompts_left === "number"
+            ? answer.data.prompts_left
+            : (answer.status === 429 ? 0 : null);
+          paintQuota(block.querySelector("[data-compose-quota]"), left);
+          if (answer.status === 200 && answer.data.ok) {
+            block.setAttribute("data-done", "true");
+            if (form) { form.hidden = true; }
+            if (receipt) { receipt.hidden = false; }
+            return;
+          }
+          // 429 is the day's budget spent and nothing to try again; anything
+          // else is the Worker's own sentence about the text, in the words
+          // lineage.validate would have used.
+          refuse(answer.data.error || "that was not queued; try again");
+          button.disabled = answer.status === 429;
+        })
+        .catch(function () {
+          refuse("could not queue that; try again");
+          button.disabled = false;
+        });
+    });
+  }
+
+  function wireCritique() {
+    var block = critiqueBlock();
+    if (!block || !base()) { return; }
+    var field = block.querySelector("[data-critique-text]");
+    var button = block.querySelector("[data-critique-send]");
+    var rule = block.querySelector("[data-critique-rule]");
+    var echo = block.querySelector("[data-critique-echo]");
+    var form = block.querySelector("[data-critique-in]");
+    var sent = block.querySelector("[data-critique-sent]");
+    var sentEcho = block.querySelector("[data-critique-echo-sent]");
+    if (!field || !button) { return; }
+
+    /* The rules line, and the child's prompt under it, repainted on every
+     * keystroke: the contract is worth reading before the round trip, not
+     * after it. */
+    function check() {
+      var verdict = critiqueVerdict(field.value);
+      if (echo) { echo.textContent = verdict.text || "…"; }
+      if (rule) {
+        rule.className = verdict.ok ? "rule good" : "rule bad";
+        rule.textContent = verdict.says;
+      }
+      // A budget the Worker has already said is spent stays spent: retyping
+      // does not buy another one.
+      button.disabled = !verdict.ok || block.getAttribute("data-spent") === "true";
+      return verdict;
+    }
+
+    field.addEventListener("input", check);
+    check();
+
+    button.addEventListener("click", function () {
+      var verdict = check();
+      if (!verdict.ok) { return; }
+      button.disabled = true;
+      fetch(base() + "/critique", {
+        method: "POST",
+        credentials: "include",
+        headers: authHeaders({ "Content-Type": "application/json" }),
+        // worker.js routeCritique: { entry_id, critique } — the parent and the
+        // sentence; who asked is the session's business, not the body's.
+        body: JSON.stringify({
+          entry_id: Number(block.getAttribute("data-critique")),
+          critique: verdict.text
+        })
+      })
+        .then(function (response) {
+          if (refused(response)) {
+            if (rule) {
+              rule.className = "rule bad";
+              rule.textContent = "sign in with GitHub to ask for a revision";
+            }
+            return null;
+          }
+          return answered(response);
+        })
+        .then(function (answer) {
+          if (!answer) { return; }
+          if (answer.status === 200 && answer.data.ok) {
+            block.setAttribute("data-done", "true");
+            if (sentEcho) { sentEcho.textContent = verdict.text; }
+            if (form) { form.hidden = true; }
+            if (sent) { sent.hidden = false; }
+            return;
+          }
+          if (rule) {
+            rule.className = "rule bad";
+            rule.textContent = answer.data.error || "that was not queued; try again";
+          }
+          if (answer.status === 429) { block.setAttribute("data-spent", "true"); }
+          button.disabled = answer.status === 429;
+        })
+        .catch(function () {
+          if (rule) {
+            rule.className = "rule bad";
+            rule.textContent = "could not queue that; try again";
+          }
+          button.disabled = false;
+        });
     });
   }
 
@@ -1199,6 +1486,9 @@
     loadConfig().then(function () {
       loadCounts();
       wireLike();
+      // Both forms are wired before loadMe answers and revealed only by it.
+      wireCompose();
+      wireCritique();
       wireCompare();
       wireLedger();
       loadMe();
