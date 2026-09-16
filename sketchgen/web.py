@@ -1831,6 +1831,7 @@ def preview_frame(
     *,
     summary: str | None = None,
     report: dict[str, Any] | None = None,
+    tab_link: bool = True,
 ) -> str:
     """The attempt, as a still with a play button. Empty when there is nothing.
 
@@ -1844,6 +1845,12 @@ def preview_frame(
     ``summary`` still wraps the poster in a collapsed ``<details>``; it is now
     tidiness rather than safety, because a folded poster and an open one cost
     the same.
+
+    ``tab_link=False`` drops the "open in a tab" anchor. The decision card says
+    everything about an entry on one meta line and carries the link there; the
+    job page, where a poster stands on its own, keeps it. The cost chip is not
+    optional either way — it is the warning beside the button that starts the
+    run, and the run costs this machine what it cost the gate.
     """
     if not has_preview(app, job_id, attempt_n):
         return ""
@@ -1856,6 +1863,11 @@ def preview_frame(
         if poster else
         '<span class="no-still">no frame on disk</span>'
     )
+    tab = (
+        f' <a href="{esc(url)}" target="_blank" rel="noopener">open in a tab ↗</a>'
+        if tab_link
+        else ""
+    )
     frame = (
         f'<div class="preview-run" data-preview data-src="{esc(url)}" '
         f'data-label="{esc(label)}" data-w="{PREVIEW_W}" data-h="{PREVIEW_H}">'
@@ -1864,8 +1876,7 @@ def preview_frame(
         f'<span class="play-label" data-play-label>run ▸</span></button>'
         f"</div>"
         f'<p class="dim" style="font-size:12px">'
-        f'{cost_chip(report)} '
-        f'<a href="{esc(url)}" target="_blank" rel="noopener">open in a tab ↗</a>'
+        f"{cost_chip(report)}{tab}"
         f"</p>"
     )
     if summary is None:
@@ -2298,7 +2309,14 @@ def _entry_rows(conn: sqlite3.Connection, state: str = "held") -> list[sqlite3.R
 
 
 def _entry_image(app: App, row: sqlite3.Row) -> str:
-    """The strip, but only when it really is inside the jobs directory."""
+    """The strip, but only when it really is inside the jobs directory.
+
+    The fallback image, and only that. A card's picture is the run button's
+    poster, which is this same file (:func:`_poster_url` prefers ``strip.png``),
+    so until 2026-09-15 every held card drew the four-frame strip twice — once
+    under the play button and once again beneath it. The poster won; this is
+    what an entry with no attempt left to run gets instead.
+    """
     raw = row["strip_path"] or row["png_path"]
     if not raw:
         return '<p class="dim">no strip on disk</p>'
@@ -2327,12 +2345,14 @@ def _gate_summary(conn: sqlite3.Connection, job_id: int) -> str:
     return f"attempt {row['n']}: " + (first[0] if first else f"gate exit {row['gate_exit']}")
 
 
-def _held_preview(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
-    """The running sketch for a held entry: its last attempt with an index.html.
+def _runnable_attempt(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> int | None:
+    """Which attempt of an entry the card's run button runs, if any.
 
     The entry's own ``source_dir`` is the attempt the gate passed, so that is
     the one to run; when it is missing or outside the jobs directory the
-    attempts table is walked backwards instead.
+    attempts table is walked backwards instead. None when no attempt has an
+    index.html left on disk, which is the card's cue to fall back to
+    :func:`_entry_image`.
     """
     job_id = int(row["job_id"])
     numbers = [
@@ -2348,10 +2368,9 @@ def _held_preview(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
             wanted = int(name[8:])
             numbers = [wanted] + [n for n in numbers if n != wanted]
     for n in numbers:
-        frame = preview_frame(app, job_id, n, report=_report_for_n(app, job_id, n))
-        if frame:
-            return frame
-    return ""
+        if has_preview(app, job_id, n):
+            return n
+    return None
 
 
 def _report_for_n(app: App, job_id: int, attempt_n: int) -> dict[str, Any] | None:
@@ -2363,16 +2382,28 @@ def _report_for_n(app: App, job_id: int, attempt_n: int) -> dict[str, Any] | Non
         return None
 
 
-def _lineage_note(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
-    lineage = conn.execute(
+def _lineage_row(conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row | None:
+    return conn.execute(
         "SELECT parent_entry_id, generation, critique_by FROM lineage "
         "WHERE child_entry_id = ?",
-        (row["id"],),
+        (entry_id,),
     ).fetchone()
+
+
+def _lineage_note(
+    conn: sqlite3.Connection, row: sqlite3.Row, *, with_generation: bool = True
+) -> str:
+    """Where this entry came from, in words.
+
+    ``with_generation=False`` drops the leading "generation N, ": the card's
+    header already carries the generation beside the state, and this packet is
+    about the Held page saying a thing once. Nothing else changed here.
+    """
+    lineage = _lineage_row(conn, int(row["id"]))
     if lineage is not None:
+        head = f"generation {lineage['generation']}, " if with_generation else ""
         return (
-            f"generation {lineage['generation']}, from entry "
-            f"{lineage['parent_entry_id']}"
+            f"{head}from entry {lineage['parent_entry_id']}"
             + (f", critiqued by {lineage['critique_by']}" if lineage["critique_by"] else "")
         )
     if row["parent_entry_id"]:
@@ -2380,71 +2411,135 @@ def _lineage_note(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
     return "a root prompt, no lineage"
 
 
-def _archive_form(row: sqlite3.Row, back: str) -> str:
-    """The third button on a decision card: neither yes nor no, but not now.
+def _card_face(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    """Everything above the buttons: the number, the sketch, the prompt, the line.
 
-    A held entry nobody will publish and nobody wants to reject, and a kept
-    failure nobody will ever put on the site, otherwise sit on this page for
-    good. Archiving takes them off it. Nothing is deleted — the row, the
-    attempt directories and the strip all stay — and the entry is still
-    readable at /entry/<id>, which the note on the button says.
+    One number, one image, one meta line. The Held page used to say "entry 271"
+    in six places and draw the four-frame strip twice — the poster the run
+    button sits on *is* the strip — so the operator read the same card six
+    times to make one decision. The id is the card's heading and nowhere else
+    in words; the buttons keep it in their ``aria-label`` so a screen reader
+    still hears which entry it is about.
+
+    Shared by the Held card and the read-only /entry/<id> page, which differ
+    only in what is under this.
     """
     entry_id = int(row["id"])
+    job_id = int(row["job_id"])
+    state = str(row["state"])
+    lineage_row = _lineage_row(conn, entry_id)
+    generation = (
+        f'<span class="dim">generation {esc(lineage_row["generation"])}</span>'
+        if lineage_row is not None
+        else ""
+    )
+    # The sketch, running on a click. Publication is a person's decision
+    # (DECIDE[publication-gate]) and this is the part of it a still frame
+    # cannot carry — so the still is the button, and the strip is drawn once.
+    attempt_n = _runnable_attempt(app, conn, row)
+    if attempt_n is None:
+        stage = _entry_image(app, row)
+        tab = ""
+    else:
+        stage = preview_frame(
+            app,
+            job_id,
+            attempt_n,
+            report=_report_for_n(app, job_id, attempt_n),
+            tab_link=False,
+        )
+        url = f"/preview/{job_id}/{attempt_n}/"
+        tab = (
+            f' · <a href="{esc(url)}" target="_blank" rel="noopener">'
+            "open in a tab ↗</a>"
+        )
+    # The root sentence and the newest revision, split the way the gallery's
+    # entry page splits them: a generation-10 prompt is 1,700 characters of
+    # stapled amendments and no operator reads it on a card. Neither half is
+    # clamped — the critique is what the decision turns on.
+    root, revisions = lineage.split_prompt(row["prompt"] or "")
+    revision = (
+        f'<p class="rev"><span class="k">revise:</span> {esc(revisions[-1])}</p>'
+        if revisions
+        else ""
+    )
     return (
-        f'<form method="post" action="/held/{entry_id}/archive">'
-        f'<input type="hidden" name="back" value="{esc(back)}">'
-        f'<button type="submit">Archive entry {entry_id}</button>'
-        '<span class="dim" style="font-size:12px">off this page, nothing '
-        'deleted</span></form>'
+        '<div class="id">'
+        f'<span class="n">{entry_id}</span>'
+        f'<span class="pill {esc(state)}">{esc(state_label(state))}</span>'
+        f"{generation}</div>"
+        f"{stage}"
+        f'<p class="prompt">{esc(root or "—")}</p>'
+        f"{revision}"
+        f'<p class="meta">{esc(_gate_summary(conn, job_id))}'
+        f" · {esc(row['rules_file'] or '—')} · {esc(row['executor'] or '—')}"
+        f' · job <a href="/job/{job_id}">{job_id}</a>'
+        f" · {esc(_lineage_note(conn, row, with_generation=False))}"
+        f"{tab}</p>"
     )
 
 
 def _decision_card(
     app: App, conn: sqlite3.Connection, row: sqlite3.Row, *, kept: bool
 ) -> str:
-    """One entry waiting for a person: the sketch, the strip, the buttons.
+    """One entry waiting for a person: one input, four verbs, one form.
 
-    A held entry can be published or rejected. A kept rejection — the gate
-    refused every attempt and the worker kept it (spec §9) — can only be
-    published, onto the rejections page rather than the grid, because it is
-    a rejection already.
+    A held entry can be published, rejected, critiqued into a child, or
+    archived. A kept rejection — the gate refused every attempt and the worker
+    kept it (spec §9) — has no Reject, because it is a rejection already;
+    publishing it puts it on the gallery's rejections page rather than the grid.
+
+    One form with four ``formaction``s, which is plain HTML5 and needs no
+    script: the routes are the ones that already exist, and the button pressed
+    says which of them reads the text box. The box is the reason when Reject
+    presses it and the child's revision sentence when Critique does; two boxes
+    and two help strings for one decision were what made the old card six cards.
+
+    Archiving deletes nothing — not the row, not the attempt directories, not
+    the strip — and the archived entry is still readable at /entry/<id>. That
+    question has been asked once already, so the hint under the buttons answers
+    it before it is asked again.
     """
+    entry_id = int(row["id"])
     reject = (
         ""
         if kept
         else (
-            f'<form method="post" action="/held/{row["id"]}/reject">'
-            '<input type="text" name="reason" placeholder="reason" '
-            'style="font:inherit;padding:4px 8px;border:1px solid var(--line);'
-            'border-radius:5px;background:var(--bg);color:var(--fg)">'
-            f'<button type="submit" class="danger">Reject entry {row["id"]}</button></form>'
+            f'<button type="submit" class="rej" formaction="/held/{entry_id}/reject" '
+            f'aria-label="Reject entry {entry_id}">× Reject</button>'
         )
     )
+    placeholder = (
+        "one sentence for a child"
+        if kept
+        else "why you are rejecting, or one sentence for a child"
+    )
+    hint = (
+        "Publish puts it on the gallery's rejections page. Critique reads the "
+        "box. Archive takes it off this page; nothing is deleted."
+        if kept
+        else "Reject and Critique read the box. Archive takes it off this "
+        "page; nothing is deleted."
+    )
     return (
-        f'<section class="panel card" id="entry-{row["id"]}">'
-        # One number per card, and it is the entry's: every button here acts
-        # on the entry. The job that made it is provenance, said in words,
-        # because "Entry 48 — job 49" was read as two ids for one thing twice
-        # on 2026-09-14 and the wrong one was typed into the next request.
-        f"<h2>Entry {row['id']}</h2>"
-        f'<p class="dim" style="font-size:12px;margin:-6px 0 8px">made by job '
-        f'<a href="/job/{row["job_id"]}">{row["job_id"]}</a></p>'
-        # The sketch running, then the strip the gate saw. Publication is a
-        # person's decision (DECIDE[publication-gate]) and this is the part
-        # of it a still frame cannot carry.
-        f"{_held_preview(app, conn, row)}"
-        f"{_entry_image(app, row)}"
-        f"<p>{esc(truncate(row['prompt'], 200))}</p>"
-        f"<p class=\"dim\" style=\"font-size:12px\">{esc(_gate_summary(conn, row['job_id']))}"
-        f" · {esc(_lineage_note(conn, row))} · {esc(row['executor'] or '—')}"
-        f" · rules {esc(row['rules_file'] or '—')}</p>"
-        '<div class="actions">'
-        f'<form method="post" action="/held/{row["id"]}/publish">'
-        f'<button type="submit">Publish entry {row["id"]}</button></form>'
+        f'<section class="panel card" id="entry-{entry_id}" '
+        f'aria-label="Entry {entry_id}">'
+        f"{_card_face(app, conn, row)}"
+        f'<form method="post" action="/held/{entry_id}/publish" class="say">'
+        '<input type="hidden" name="back" value="/held">'
+        f'<input type="text" name="text" id="say-{entry_id}" maxlength="400" '
+        f'aria-label="{esc(placeholder)}" placeholder="{esc(placeholder)}">'
+        '<div class="acts">'
+        f'<button type="submit" class="pub" aria-label="Publish entry {entry_id}">'
+        "+ Publish</button>"
         f"{reject}"
-        f"{_archive_form(row, '/held')}"
+        f'<button type="submit" class="cri" formaction="/entry/{entry_id}/spawn" '
+        f'aria-label="Spawn a child of entry {entry_id}">› Critique</button>'
+        f'<button type="submit" class="arc" formaction="/held/{entry_id}/archive" '
+        f'aria-label="Archive entry {entry_id}">− Archive</button>'
         "</div>"
-        f'<div class="actions">{spawn_form(row, "/held")}</div>'
+        f'<p class="hint">{hint}</p>'
+        "</form>"
         "</section>"
     )
 
@@ -2506,19 +2601,12 @@ def entry_page(app: App, conn: sqlite3.Connection, entry_id: int) -> str:
         where = f'On the site: <a href="{esc(GALLERY_URL)}e/{entry_id}/">e/{entry_id}/</a>.'
     else:
         where = "Not on the site: nobody has published it."
+    # The same card as /held — header, poster, prompt, meta — and no form.
     return (
-        f'<section class="panel card" id="entry-{entry_id}">'
-        f"<h2>Entry {entry_id}</h2>"
-        f'<p class="dim" style="font-size:12px;margin:-6px 0 8px">'
-        f'{esc(state_label(state))} · made by job '
-        f'<a href="/job/{row["job_id"]}">{row["job_id"]}</a></p>'
-        f"{_held_preview(app, conn, row)}"
-        f"{_entry_image(app, row)}"
-        f"<p>{esc(truncate(row['prompt'], 400))}</p>"
-        f'<p class="dim" style="font-size:12px">{esc(_gate_summary(conn, row["job_id"]))}'
-        f" · {esc(_lineage_note(conn, row))} · {esc(row['executor'] or '—')}"
-        f" · rules {esc(row['rules_file'] or '—')}</p>"
-        f'<p class="dim" style="font-size:12px">{where}</p>'
+        f'<section class="panel card" id="entry-{entry_id}" '
+        f'aria-label="Entry {entry_id}">'
+        f"{_card_face(app, conn, row)}"
+        f'<p class="meta">{where}</p>'
         "</section>"
     )
 
@@ -2559,6 +2647,23 @@ def publish_entry(app: App, conn: sqlite3.Connection, entry_id: int) -> str:
     except Exception as exc:
         return f"publish failed: {exc}"
     return f"Entry {entry_id} handed to the publisher"
+
+
+def said(form: dict, *legacy: str) -> str:
+    """What the operator typed in the card's one text box.
+
+    The decision card posts a single field called ``text`` to four routes and
+    lets the button say which one reads it. Everything written before that
+    posted ``reason`` to /reject and ``critique`` to /spawn — the job page's
+    spawn form still does, and so do scripts and bookmarks nobody here can see
+    — so each route still answers to its own old name. ``text`` first, the
+    legacy name after, empty when neither carries anything.
+    """
+    for name in ("text", *legacy):
+        value = (form.get(name) or [""])[0].strip()
+        if value:
+            return value
+    return ""
 
 
 def reject_entry(
@@ -2677,8 +2782,16 @@ def spawn_form(row: sqlite3.Row, back: str) -> str:
 
 
 def spawn_child(conn: sqlite3.Connection, entry_id: int, form: dict) -> str:
-    """Hand one critique to lineage.spawn(). Returns the flash message."""
-    critique = (form.get("critique") or [""])[0].strip()
+    """Hand one critique to lineage.spawn(). Returns the flash message.
+
+    ``critique_by`` is optional, and the decision card does not offer it: a
+    sentence typed into that card's box was typed by the person reading it, so
+    the default here — :func:`operator_username` — is already the true answer
+    and a field asking for it again is a field to get wrong. The job page's
+    form still sends one, and the CLI still writes a model id there when a
+    model wrote the critique.
+    """
+    critique = said(form, "critique")
     by = (form.get("critique_by") or [""])[0].strip()
     row = conn.execute(
         "SELECT * FROM entries WHERE id = ?", (entry_id,)
@@ -3189,7 +3302,7 @@ class OpHandler(BaseHTTPRequestHandler):
 
     def post_reject(self, entry_id: str) -> None:
         form = self.form()
-        reason = (form.get("reason") or [""])[0]
+        reason = said(form, "reason")
         conn = self.app.connect()
         try:
             message = reject_entry(self.app, conn, int(entry_id), reason)
