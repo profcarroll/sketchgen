@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 __all__ = [
+    "ACTIVITY_KEEP",
     "DEFAULT_DB_PATH",
     "ENTRY_TRANSITIONS",
     "TRANSITIONS",
@@ -29,9 +30,12 @@ __all__ = [
     "add_attempt",
     "add_lineage",
     "archive_entry",
+    "begin_step",
     "claim_next",
     "connect",
     "create_entry",
+    "current_activity",
+    "end_step",
     "enqueue",
     "entries_to_critique",
     "entry_transition",
@@ -42,6 +46,7 @@ __all__ = [
     "get_meta",
     "init",
     "list_jobs",
+    "recent_activity",
     "record_critique",
     "record_judgment",
     "requeue",
@@ -49,6 +54,7 @@ __all__ = [
     "set_control",
     "set_meta",
     "transition",
+    "update_step",
     "utc_now",
 ]
 
@@ -796,6 +802,148 @@ def entries_to_critique(
         (prompt_version, int(limit)),
     ).fetchall()
     return [int(row["id"]) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Activity — migration 008, what the worker is doing right now
+# ---------------------------------------------------------------------------
+
+#: How many activity rows are kept. A status channel, not a transcript: the
+#: card shows one open step and the three closed ones behind it, and the median
+#: is fitted over the newest fifty of a step, so two hundred rows is several
+#: hours of a busy worker and still nothing to read or vacuum. Older rows are
+#: pruned by :func:`begin_step`, on the process that is already writing.
+ACTIVITY_KEEP = 200
+
+
+def begin_step(
+    conn: sqlite3.Connection,
+    *,
+    step: str,
+    headline: str,
+    detail: str | None = None,
+    job_id: int | None = None,
+    entry_id: int | None = None,
+    model: str | None = None,
+    pid: int | None = None,
+) -> int:
+    """Open one step, closing whatever this pid had open. Returns its row id.
+
+    One row per pid is open at a time, and the close is part of the same call
+    rather than a separate one the caller could forget: the worker's steps abut
+    — the sketch is written, then evaluated, then corrected — and a step that
+    ended without the next one being asked for is not a thing this loop does.
+    The nap is a step too (worker.Worker._nap), so the worker always has a row
+    open while it is alive, and an open row whose pid is gone is how the card
+    says the worker stopped mid-step.
+    """
+    pid = os.getpid() if pid is None else int(pid)
+    now = utc_now()
+    conn.execute(
+        "UPDATE activity SET ended_utc = ? WHERE pid = ? AND ended_utc IS NULL",
+        (now, pid),
+    )
+    cur = conn.execute(
+        "INSERT INTO activity (step, headline, detail, job_id, entry_id, model, "
+        "pid, started_utc, ended_utc) VALUES (?,?,?,?,?,?,?,?,NULL)",
+        (
+            str(step),
+            str(headline),
+            detail,
+            None if job_id is None else int(job_id),
+            None if entry_id is None else int(entry_id),
+            model,
+            pid,
+            now,
+        ),
+    )
+    activity_id = int(cur.lastrowid)
+    conn.execute(
+        "DELETE FROM activity WHERE id NOT IN "
+        "(SELECT id FROM activity ORDER BY id DESC LIMIT ?)",
+        (ACTIVITY_KEEP,),
+    )
+    return activity_id
+
+
+def update_step(
+    conn: sqlite3.Connection,
+    activity_id: int,
+    *,
+    detail: str | None = None,
+    entry_id: int | None = None,
+    model: str | None = None,
+) -> None:
+    """Fill in what a step only learns once it is under way.
+
+    Two steps cannot say everything at their own start: ``claiming`` does not
+    know which job it will get, and the judge picks its pair internally and
+    only names it afterwards, through its log callback. Rather than delay the
+    row — which would leave the card blank for exactly the seconds a person is
+    watching it — the row opens with what is known and is amended here. Fields
+    left None are left alone.
+    """
+    sets: list[str] = []
+    values: list[Any] = []
+    if detail is not None:
+        sets.append("detail = ?")
+        values.append(detail)
+    if entry_id is not None:
+        sets.append("entry_id = ?")
+        values.append(int(entry_id))
+    if model is not None:
+        sets.append("model = ?")
+        values.append(model)
+    if not sets:
+        return
+    values.append(int(activity_id))
+    conn.execute(f"UPDATE activity SET {', '.join(sets)} WHERE id = ?", tuple(values))
+
+
+def end_step(conn: sqlite3.Connection, activity_id: int) -> None:
+    """Close one step without opening another.
+
+    The worker never calls this: its steps abut, and the last row is left open
+    on purpose so that a worker killed mid-evaluation still says what it was
+    doing. It is here for a caller that really does stop — a one-shot run, a
+    test — and does not want the card claiming it is still working.
+    """
+    conn.execute(
+        "UPDATE activity SET ended_utc = ? WHERE id = ? AND ended_utc IS NULL",
+        (utc_now(), int(activity_id)),
+    )
+
+
+def current_activity(conn: sqlite3.Connection) -> sqlite3.Row | None:
+    """The newest step still running, or None.
+
+    A database that predates migration 008 answers None rather than raising,
+    the way :func:`get_meta` treats a missing ``meta`` table and
+    ``worker.idle_summary`` a missing ``judgments``: an older file should
+    render a card that says nothing, not a traceback in the browser.
+    """
+    try:
+        return conn.execute(
+            "SELECT * FROM activity WHERE ended_utc IS NULL ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def recent_activity(conn: sqlite3.Connection, limit: int = 3) -> list[sqlite3.Row]:
+    """The newest finished steps, newest first. The card's trail."""
+    if int(limit) <= 0:
+        return []
+    try:
+        return list(
+            conn.execute(
+                "SELECT * FROM activity WHERE ended_utc IS NOT NULL "
+                "ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        )
+    except sqlite3.OperationalError:
+        return []
 
 
 # ---------------------------------------------------------------------------

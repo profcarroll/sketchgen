@@ -85,6 +85,14 @@ button.danger { color: var(--bad); }
 .pill.pausing, .pill.stopping, .pill.repairing, .pill.gating,
 .pill.planning, .pill.executing, .pill.queued { border-color: var(--warn); color: var(--warn); }
 .pill.paused, .pill.failed, .pill.rejected, .pill.needs-laptop { border-color: var(--bad); color: var(--bad); }
+/* The status card's own four: a running job step, work the worker gives
+   itself, a step that has outlasted every other one of its kind, and a worker
+   that is not there. Idle is the quiet treatment rather than green — an idle
+   worker is not a working one. */
+.pill.ok { border-color: var(--ok); color: var(--ok); }
+.pill.warn { border-color: var(--warn); color: var(--warn); }
+.pill.bad { border-color: var(--bad); color: var(--bad); }
+.pill.quiet { border-color: var(--line); color: var(--dim); }
 main { padding: 16px; max-width: 1100px; margin: 0 auto; }
 h1 { font-size: 19px; margin: 0 0 14px; }
 h2 { font-size: 15px; margin: 0 0 10px; text-transform: uppercase;
@@ -103,6 +111,39 @@ h3 { font-size: 14px; margin: 14px 0 6px; }
 .bar { display: flex; background: var(--bar-bg); border-radius: 3px; height: 9px; overflow: hidden; }
 .bar > span { display: block; flex: none; height: 100%; background: var(--bar); }
 .bar > span.cache { background: var(--dim); }
+/* The process status card: the now line, who is doing it, elapsed against the
+   median of that step, and the three steps just before. The worker is a
+   different process from this one and blocks inside a single HTTP call for a
+   whole step, so there is no heartbeat to animate — the bar is elapsed over
+   the median and it stops at the end of its track and turns amber, because a
+   step that is over its median should look stuck rather than look finished.
+   No median (fewer than five samples of that step) draws no bar at all. */
+.panel.status .head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.panel.status .head h2 { margin: 0; }
+.panel.status .now { font-size: 17px; margin: 10px 0 3px; }
+.panel.status .who { font-size: 12px; color: var(--dim); margin: 0 0 10px;
+                     overflow-wrap: anywhere; }
+.panel.status .prog { display: flex; align-items: center; gap: 10px; }
+.panel.status .prog .bar { flex: 1 1 auto; }
+.panel.status .prog .t { font-size: 12px; color: var(--dim); white-space: nowrap;
+                         font-variant-numeric: tabular-nums; }
+.panel.status .bar > span.over { background: var(--warn); }
+.panel.status .trail ol { list-style: none; margin: 12px 0 0; padding: 0; }
+.panel.status .trail li { display: flex; justify-content: space-between; gap: 10px;
+                          font-size: 12px; color: var(--dim); padding: 3px 0;
+                          border-top: 1px solid var(--line); }
+.panel.status .trail li .h { overflow-wrap: anywhere; }
+.panel.status .trail li .s { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.panel.status .foot { font-size: 12px; color: var(--dim); margin: 12px 0 0; }
+/* The Queue's copy: the same card on one line above the jobs table. It wraps
+   rather than scrolls — at 400px the pill and the headline hold the first
+   line and the detail takes the second. */
+.panel.status.compact { display: flex; flex-wrap: wrap; align-items: baseline;
+                        gap: 6px 10px; }
+.panel.status.compact .now { font-weight: 600; }
+.panel.status.compact .who { flex: 1 1 220px; font-size: 12px; color: var(--dim);
+                             margin: 0; overflow-wrap: anywhere; }
+.panel.status.compact .more { margin-left: auto; white-space: nowrap; font-size: 12px; }
 .cores { display: grid; gap: 4px 10px; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); }
 .core { display: grid; grid-template-columns: 22px 1fr 42px; gap: 6px; align-items: center;
         font-size: 11px; color: var(--dim); font-variant-numeric: tabular-nums; }
@@ -301,6 +342,68 @@ $body
     mark("session-in", (Number(tokens.session_in) || 0).toLocaleString("en-US"));
     mark("session-out", (Number(tokens.session_out) || 0).toLocaleString("en-US"));
   }
+  // The status card. Every value it shows carries data-act, and every one of
+  // them is written with textContent, never innerHTML: a detail line is a
+  // sentence a model wrote about a sketch a student asked for, and the trail
+  // is three more of them. The server has already decided the pill, the
+  // elapsed text and the bar's percentage — one mapping from state to colour,
+  // in Python, where the state itself is decided.
+  function activity(a) {
+    if (!a) return;
+    document.querySelectorAll("[data-act]").forEach(function (el) {
+      var key = el.getAttribute("data-act");
+      if (key === "pill") {
+        el.textContent = a.pill_text || "";
+        el.className = "pill " + (a.pill_class || "quiet");
+      } else if (key === "elapsed") {
+        el.textContent = a.elapsed_text || "—";
+      } else if (key === "track") {
+        el.hidden = a.bar_pct === null || a.bar_pct === undefined;
+      } else if (key === "bar") {
+        var pct = Number(a.bar_pct) || 0;
+        el.style.width = pct.toFixed(1) + "%";
+        el.className = a.median_s && a.elapsed_s > a.median_s ? "over" : "";
+      } else if (key === "recent") {
+        var rows = a.recent || [];
+        el.textContent = "";
+        if (!rows.length) {
+          var empty = document.createElement("li");
+          var none = document.createElement("span");
+          none.className = "h";
+          none.textContent = "nothing before this";
+          empty.appendChild(none);
+          el.appendChild(empty);
+        }
+        rows.slice(0, 3).forEach(function (row) {
+          var li = document.createElement("li");
+          var head = document.createElement("span");
+          head.className = "h";
+          head.textContent = row.headline || "";
+          var secs = document.createElement("span");
+          secs.className = "s";
+          secs.textContent = row.seconds === null || row.seconds === undefined
+            ? "" : dur(row.seconds);
+          li.appendChild(head);
+          li.appendChild(secs);
+          el.appendChild(li);
+        });
+      } else if (key === "foot") {
+        // The foot's three values are the collector's (up since, slot) and
+        // this poll does not call the collector. Left as the page rendered it.
+      } else if (a[key] !== undefined) {
+        el.textContent = a[key] === null ? "" : String(a[key]);
+      }
+    });
+  }
+  // web.py:human_seconds, for the trail's durations only.
+  function dur(seconds) {
+    var s = Math.max(0, Math.round(Number(seconds) || 0));
+    if (s < 60) return s + "s";
+    if (s < 3600) return (s / 60 | 0) + "m " + String(s % 60).padStart(2, "0") + "s";
+    if (s < 86400) return (s / 3600 | 0) + "h " +
+                          String((s % 3600) / 60 | 0).padStart(2, "0") + "m";
+    return (s / 86400 | 0) + "d " + ((s % 86400) / 3600 | 0) + "h";
+  }
   function tick() {
     fetch("/api/control.json", {cache: "no-store"}).then(function (r) {
       return r.json();
@@ -308,6 +411,7 @@ $body
       pill.textContent = d.pill;
       pill.className = "pill " + d.pill_class;
       pill.title = d.title || "";
+      activity(d.activity);
       var nav = d.nav;
       if (!nav) return;
       meter(nav);
