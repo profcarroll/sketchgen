@@ -587,7 +587,9 @@ class EntryPageTests(GalleryTestCase):
         )
         self.assertIn("CC BY 4.0", self.page)
         self.assertIn(f"compare.html?a={self.entry_id}", self.page)
-        self.assertIn("ask the operator", self.page.lower())
+        # where the apology used to be — the page can start a job now, and
+        # still only by asking the operator for one (plan §5.2).
+        self.assertIn("Critique this sketch", self.page)
 
     def test_no_score_is_invented(self):
         self.assertEqual(self.page.count("no pairs yet"), 2)
@@ -1022,14 +1024,33 @@ class IndexTests(GalleryTestCase):
         self.assertIn("profcarroll", self.index)
         self.assertIn('data-count="views"', self.index)
 
-    def test_the_filters_are_plain_links(self):
-        for href in (
-            'href="index.html?rules=control"',
-            'href="index.html?rules=treatment"',
-            'href="index.html?executor=qwen3.5:4b"',
+    def test_the_url_still_filters_with_the_chips_gone(self):
+        """§5.3 took the bar out; ``?rules=`` and ``?executor=`` still work.
+
+        The chips were links and the filtering was never theirs: it is
+        ``applyVisibility()``, which reads the two parameters off the URL and
+        matches them against attributes the generator writes on every card. So
+        this asserts the machinery a shared link needs, not the furniture.
+        """
+        self.assertNotIn('class="filter"', self.index)
+        for attribute in (
+            'data-rules="control"',
+            'data-rules="treatment"',
+            'data-executor="qwen3.5:4b"',
         ):
-            with self.subTest(href=href):
-                self.assertIn(href, self.index)
+            with self.subTest(attribute=attribute):
+                self.assertIn(attribute, self.index)
+        script = (self.dest / "assets" / "gallery.js").read_text(encoding="utf-8")
+        self.assertIn('params.get("rules")', script)
+        self.assertIn('params.get("executor")', script)
+
+    def test_the_filter_links_are_still_built_for_the_revert(self):
+        # _filters() stays in gallery.py, unused, so that putting the bar back
+        # is four lines of template and nothing else (plan §5.3).
+        rows = [row for row in self.conn.execute("SELECT * FROM entries")]
+        links = gallery._filters(rows, "index.html")
+        self.assertIn('href="index.html?rules=control"', links)
+        self.assertIn('href="index.html?executor=qwen3.5:4b"', links)
 
     def test_compare_carries_no_pre_deployment_notes(self):
         # Two sentences written before the write path and the agent judge
@@ -1166,13 +1187,14 @@ class GridOrderTests(GalleryTestCase):
                 # the order the HTML is already in is the one marked current
                 self.assertIn('data-sort="newest" aria-current="true"', page)
 
-    def test_the_filters_are_a_details_that_starts_closed(self):
-        for name, page in (("index", self.index), ("rejections", self.failed)):
-            with self.subTest(page=name):
-                self.assertIn('<details class="filters">', page)
-                self.assertIn('<summary class="filter-label">Filter</summary>', page)
-                self.assertNotIn('<div class="filters">', page)
-                self.assertNotIn("open", page.split("<details")[1].split(">")[0])
+    def test_no_page_has_a_filter_bar_any_more(self):
+        self.render()
+        for page in self.pages():
+            with self.subTest(page=str(page.relative_to(self.dest))):
+                text = page.read_text(encoding="utf-8")
+                self.assertNotIn('details class="filters"', text)
+                self.assertNotIn('class="filter-label"', text)
+                self.assertNotIn('class="filter-links"', text)
 
     def test_the_line_page_is_still_oldest_first(self):
         # the grid reversed; the line pages did not, because a critique has to
@@ -1188,6 +1210,297 @@ class GridOrderTests(GalleryTestCase):
         # the grid reversed and this did not: published oldest first, then the
         # kept rejections, which is the order _public_rows walks
         self.assertEqual([entry["id"] for entry in entries], list(self.ids))
+
+
+def flat(text: str) -> str:
+    """One line, single-spaced: the page's wrapping is not its wording."""
+    return " ".join(text.split())
+
+
+class ComposerTests(GalleryTestCase):
+    """The prompt composer (plan §5.1), in the space the filters gave up.
+
+    Its copy is the mockup's, with one correction the plan makes: a submission
+    is not a job (§1.2), so the receipt names no job number and no username —
+    at submit time neither exists.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.render()
+        self.index = (self.dest / "index.html").read_text(encoding="utf-8")
+        self.failed = (self.dest / "rejections.html").read_text(encoding="utf-8")
+
+    def block(self):
+        return self.index.split('<section class="compose"')[1].split("</section>")[0]
+
+    def test_only_the_gallery_index_takes_a_prompt(self):
+        self.assertIn('<section class="compose" data-compose hidden>', self.index)
+        others = {
+            "rejections.html": self.failed,
+            f"lines/{self.ids[0]}.html": (
+                self.dest / "lines" / f"{self.ids[0]}.html"
+            ).read_text(encoding="utf-8"),
+            "compare.html": (self.dest / "compare.html").read_text(encoding="utf-8"),
+            f"e/{self.ids[0]}/index.html": (
+                self.dest / "e" / str(self.ids[0]) / "index.html"
+            ).read_text(encoding="utf-8"),
+        }
+        for name, page in others.items():
+            with self.subTest(page=name):
+                self.assertNotIn("data-compose", page)
+
+    def test_every_line_of_it_is_the_mockup_s(self):
+        page = flat(self.index)
+        for line in (
+            "<h2>Submit a prompt</h2>",
+            "Sign in with GitHub</a> to submit a prompt. "
+            "Only your GitHub username is shared and published.",
+            ">One sentence describing a sketch. No code.</label>",
+            "<b data-left>—</b> of 3 left today",
+            ">Queue it</button>",
+            '<span class="note">Held for review before it runs</span>',
+        ):
+            with self.subTest(line=line):
+                self.assertIn(flat(line), page)
+
+    def test_the_receipt_promises_a_review_and_names_no_job(self):
+        # §1.2: the Worker answers with a submission id and nothing more, so
+        # the mockup's "Job #418, submitted by profcarroll" cannot be true.
+        page = flat(self.index)
+        self.assertIn("<strong>Queued for review.</strong>", page)
+        self.assertIn(
+            "<p>After review, check back later to see if your sketch was "
+            "successfully created.</p>",
+            page,
+        )
+        self.assertNotIn("Job #", self.index)
+        self.assertNotIn("submitted by profcarroll.", self.index)
+
+    def test_nothing_shows_until_me_has_answered(self):
+        block = self.block()
+        # the section itself, and each of the three states inside it
+        self.assertIn("data-compose hidden", self.index)
+        for hook in ("data-compose-quota", "data-compose-in", "data-compose-receipt"):
+            with self.subTest(hook=hook):
+                self.assertIn(f"{hook} hidden", block)
+        # signed out is the one state that is not hidden: it is what a page
+        # with no session, and a page whose script never ran, should say.
+        self.assertIn('<p class="signed-out-line" data-compose-out>', block)
+
+    def test_the_composer_holds_no_credential(self):
+        block = self.block()
+        for mark in ("Bearer", "token", "Authorization", "sketchgen_session"):
+            with self.subTest(mark=mark):
+                self.assertNotIn(mark, block)
+        # the sign-in link's href is written by gallery.js from config.json;
+        # the page ships a relative link to itself, not the write path
+        self.assertIn('<a class="login" data-login href="index.html">', block)
+        self.assertNotIn(self.config.write_path, block)
+
+    def test_an_undeployed_write_path_renders_no_composer(self):
+        dest = self.tmp / "nowrite"
+        dest.mkdir()
+        gallery.render_index(self.conn, dest, gallery.Config(write_path=""))
+        index = (dest / "index.html").read_text(encoding="utf-8")
+        self.assertNotIn("data-compose", index)
+        self.assertNotIn("Submit a prompt", index)
+
+
+class CritiqueFormTests(GalleryTestCase):
+    """The critique form (plan §5.2), where the apology used to be."""
+
+    def setUp(self):
+        super().setUp()
+        self.render()
+        self.entry_id = self.ids[1]          # generation 2, a child of entry 1
+        self.page = (self.dest / "e" / str(self.entry_id) / "index.html").read_text(
+            encoding="utf-8"
+        )
+
+    def form(self, page=None):
+        text = self.page if page is None else page
+        return text.split('<section class="panel critique-form"')[1].split("</section>")[0]
+
+    def test_the_apology_is_gone(self):
+        for line in (
+            "Spawn a child from a critique",
+            "A static page cannot start a job",
+            "Ask the operator.",
+        ):
+            with self.subTest(line=line):
+                self.assertNotIn(line, self.page)
+
+    def test_every_line_of_it_is_the_mockup_s(self):
+        page = flat(self.page)
+        for line in (
+            "<h2>Critique this sketch</h2>",
+            "Sign in with GitHub</a> to ask for a revision. "
+            "One sentence becomes the next generation's prompt.",
+            "One sentence, under 40 words, no code — the same contract the critic "
+            "model works under. Your sentence is appended to this entry's prompt "
+            "and the child is queued.",
+            ">Say what should change, not how to write it.</label>",
+            '<span class="label">the child\'s prompt</span>',
+            ">Queue the child</button>",
+        ):
+            with self.subTest(line=line):
+                self.assertIn(flat(line), page)
+
+    def test_the_receipt_records_a_critique_and_names_no_job(self):
+        page = flat(self.page)
+        self.assertIn(
+            "<p><strong>Critique recorded.</strong> Queued for review.</p>", page
+        )
+        self.assertIn(
+            "Your username appears on the child entry as the critic, the way the "
+            "critic model's name appears on this one.",
+            page,
+        )
+        self.assertIn('<span class="label">what you asked for</span>', page)
+        self.assertNotIn("Child job #", self.page)
+
+    def test_the_note_counts_the_child_s_generation_not_this_one_s(self):
+        # entry two is generation 2, so a critique of it makes generation 3 —
+        # which is the number the mockup drew, computed rather than written.
+        meta = json.loads(
+            (self.dest / "e" / str(self.entry_id) / "meta.json").read_text()
+        )
+        self.assertEqual(2, meta["lineage"]["generation"])
+        self.assertIn(
+            "generation 3 · a person's critique, so the line does not stall here",
+            flat(self.form()),
+        )
+        # and the root, generation 1, offers generation 2
+        root = (self.dest / "e" / str(self.ids[0]) / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("generation 2 · a person's critique", flat(self.form(root)))
+
+    def test_the_preview_shows_the_prompt_the_child_would_carry(self):
+        form = flat(self.form())
+        self.assertIn(
+            "<p>the same field, but it holds still and earns it</p>", form
+        )
+        self.assertIn(
+            '<p class="revise"><span class="label">Revise:</span> '
+            '<em data-critique-echo>…</em></p>',
+            form,
+        )
+
+    def test_a_prompt_that_already_holds_revisions_shows_all_of_them(self):
+        # A generation-4 parent does not pretend its child inherits one
+        # sentence: every Revise: line already on the prompt is in the preview.
+        self.conn.execute(
+            "UPDATE entries SET prompt = ? WHERE id = ?",
+            ("a field of thin blue lines\nRevise: let them thin at the edge",
+             self.entry_id),
+        )
+        self.conn.commit()
+        self.render()
+        form = flat(
+            self.form(
+                (self.dest / "e" / str(self.entry_id) / "index.html").read_text(
+                    encoding="utf-8"
+                )
+            )
+        )
+        self.assertIn("<p>a field of thin blue lines</p>", form)
+        self.assertIn(
+            '<p class="revise"><span class="label">Revise:</span> '
+            "<em>let them thin at the edge</em></p>",
+            form,
+        )
+
+    def test_nothing_shows_until_me_has_answered(self):
+        self.assertIn('data-critique="%d" hidden' % self.entry_id, self.page)
+        form = self.form()
+        for hook in ("data-critique-in", "data-critique-sent"):
+            with self.subTest(hook=hook):
+                self.assertIn(f"{hook} hidden", form)
+        self.assertIn('<p class="signed-out-line" data-critique-out>', form)
+
+    def test_the_form_holds_no_credential(self):
+        form = self.form()
+        for mark in ("Bearer", "token", "Authorization", "sketchgen_session"):
+            with self.subTest(mark=mark):
+                self.assertNotIn(mark, form)
+        self.assertIn('<a class="login" data-login href="../../index.html">', form)
+        self.assertNotIn(self.config.write_path, form)
+
+    def test_a_rejected_entry_is_offered_no_form(self):
+        # lineage.spawn refuses a rejected parent, so a box on that page would
+        # be an offer the pipeline will not honour.
+        self.conn.execute(
+            "UPDATE entries SET state = 'rejected', reject_reason = ?, "
+            "published_utc = ? WHERE id = ?",
+            ("drifted from the prompt", "2026-09-14T06:00:00Z", self.entry_id),
+        )
+        self.conn.commit()
+        self.render()
+        page = (self.dest / "e" / str(self.entry_id) / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("data-critique", page)
+        self.assertNotIn("Critique this sketch", page)
+        # a kept rejection is spawnable and keeps its form
+        kept = (self.dest / "e" / str(self.ids[2]) / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("Critique this sketch", kept)
+
+    def test_an_undeployed_write_path_renders_no_form(self):
+        dest = self.tmp / "nowrite"
+        dest.mkdir()
+        gallery.render_all(self.conn, dest, gallery.Config(write_path=""))
+        page = (dest / "e" / str(self.entry_id) / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("data-critique", page)
+        self.assertNotIn("Critique this sketch", page)
+
+
+class FormSafetyTests(GalleryTestCase):
+    """The guard's question, asked of the two forms: what did they publish?
+
+    Nothing the forms add may carry an absolute path off this machine, a
+    credential, or a URL that only resolves on the node. The guard itself
+    refuses e-mail addresses and the node's hostname; these are the marks the
+    forms could plausibly have introduced and the guard does not look for.
+    """
+
+    def test_a_render_with_both_forms_still_passes_the_guard(self):
+        self.render()
+        gallery.guard(self.dest)          # the read-only form: raises or nothing
+
+    def test_the_forms_publish_no_path_no_token_and_no_local_url(self):
+        self.render()
+        marks = (
+            str(self.tmp),                # this machine's absolute paths
+            "/home/",
+            "127.0.0.1",
+            "localhost",
+            "sslip.io",
+            "Bearer ",
+            "Authorization",
+            "sketchgen_session",
+        )
+        for page in self.pages():
+            text = page.read_text(encoding="utf-8")
+            for mark in marks:
+                with self.subTest(page=str(page.relative_to(self.dest)), mark=mark):
+                    self.assertNotIn(mark, text)
+
+    def test_an_email_in_a_prompt_is_still_refused(self):
+        # The guard's own rule, re-checked through a page that now has a form
+        # on it: the render is undone and nothing is left behind.
+        self.conn.execute(
+            "UPDATE entries SET prompt = ? WHERE id = ?",
+            ("write to someone@example.com about it", self.ids[0]),
+        )
+        self.conn.commit()
+        with self.assertRaises(gallery.Unsafe):
+            self.render()
 
 
 class CompareRejectionTests(GalleryTestCase):
