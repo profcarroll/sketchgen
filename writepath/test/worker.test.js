@@ -1303,6 +1303,55 @@ test("/me carries both budgets, and is still 401 signed out", async () => {
   });
 });
 
+/** A database that refuses every statement, the way a missing table does. */
+function brokenDB() {
+  return {
+    prepare() {
+      return {
+        bind() {
+          const fail = async () => {
+            throw new Error("D1_ERROR: no such table: submissions");
+          };
+          return { run: fail, all: fail, first: fail };
+        },
+      };
+    },
+  };
+}
+
+test("/me keeps the session when the budget cannot be counted", async () => {
+  // The deploy of 2026-09-16 put the routes live before the table existed, and
+  // this is what it cost: /me threw on the COUNT, the gallery read the non-200
+  // as signed out, and every signed-in visitor was logged out of a site whose
+  // sign-in was working. The name does not depend on the database and must not
+  // be lost with it.
+  const { env } = makeEnv({ DB: brokenDB() });
+  const token = await forgeSession("octocat");
+
+  const response = await worker.fetch(get("/me", { bearer: token }), env);
+  assert.equal(response.status, 200);
+  // Omitted, not null and not zero: zero would disable the composer's button
+  // and claim a spent budget that was never counted.
+  assert.deepEqual(await response.json(), { username: "octocat" });
+
+  assert.equal((await worker.fetch(get("/me"), env)).status, 401);
+});
+
+test("a budget that cannot be counted still refuses a submission", async () => {
+  // The other half of the asymmetry. On /me the count is decoration; here it is
+  // the cap, and a cap that cannot be read must not wave the submission
+  // through. Neither route may answer 200.
+  const { env } = makeEnv({ DB: brokenDB() });
+  const token = await forgeSession("octocat");
+
+  await assert.rejects(() =>
+    worker.fetch(postAuth("/prompt", { prompt: A_PROMPT }, token), env),
+  );
+  await assert.rejects(() =>
+    worker.fetch(postAuth("/critique", { entry_id: 412, critique: A_CRITIQUE }, token), env),
+  );
+});
+
 test("/pull delivers submissions on the same inclusive watermark", async () => {
   const { env, store } = makeEnv();
   seedForPull(store);
