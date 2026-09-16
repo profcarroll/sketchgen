@@ -13,8 +13,9 @@ kept as the record of what was decided and why, not as work outstanding.
 Repositories:
 
 - Pipeline: `profcarroll/sketchgen`, local clone `/home/dave/sketchgen`, on the node at
-  `~/sketchgen/app`. Python 3.12, stdlib only, `pytest tests/`. Templates are `string.Template`
-  files in `sketchgen/templates/`. The operator UI is one `http.server` process on 127.0.0.1:8081
+  `~/sketchgen/app`. Python 3.12, stdlib only, `python3 -m unittest discover -s tests` (there is no
+  pytest here and the suite does not use it). Templates are `string.Template` files in
+  `sketchgen/templates/`. The operator UI is one `http.server` process on 127.0.0.1:8081
   (`systemd/sketchgen-web.service`); the worker is a **different process**
   (`systemd/sketchgen-worker.service`). They share one WAL-mode SQLite file and nothing else.
 - Gallery: `profcarroll/sketchgen-gallery`, generated output only. **Neither packet here touches
@@ -350,7 +351,8 @@ grid stays `minmax(300px, 1fr)`; the mockup is drawn at that width and fits.
 Both packets branch from `main` and touch disjoint regions of `web.py` (packet 5:
 `console_page`, `queue_page`, `/api/control.json`, the layout's script; packet 6: `_decision_card`,
 `held_page`, `entry_page`, the layout's stylesheet). They can be built in parallel and merged in
-either order; whichever lands second rebases on `main` and re-runs `pytest tests/`.
+either order; whichever lands second rebases on `main` and re-runs
+`python3 -m unittest discover -s tests`.
 
 Neither is deployed by its PR. The node updates with `update.sh`, which applies migration 008 and
 restarts the units.
