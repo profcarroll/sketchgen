@@ -16,7 +16,10 @@ What it reads, all of it read-only and none of it needing sudo:
   os.statvfs("/")   disk, plus a walk of the two big tenants (the model blobs
                     and the Playwright browser) so the console can name them
   GET /api/ps       what Ollama has resident, and /api/version
-  the app database  the control row, the attempts, the entries, the jobs
+  the app database  the control row, the attempts, the entries, the jobs, and
+                    the worker's own step-by-step account of itself (the
+                    ``activity`` table, migration 008)
+  /proc/<pid>       whether the worker that wrote the open step is still there
 
 Every one of those is optional. A source that is missing, unreadable or
 unreachable becomes ``null`` in the document; nothing here raises because the
@@ -32,6 +35,15 @@ that call and does not sleep at all. The raw jiffy counters are deliberately not
 in the document — they are not part of the contract — so ``prev`` is used as a
 signal that the cached sample is the caller's, not as the sample itself.
 
+**The process status card is read by one function, deliberately.**
+:func:`activity` is called by :func:`collect` for the document *and* by the
+operator UI's two-second poll for the card, so the page and the poll cannot end
+up saying different things about what the worker is doing. It is also where the
+card's ``state`` is decided — paused, gone, stalled, running, idle, unknown —
+rather than in a template, because that reading takes the control row, a stat
+of ``/proc/<pid>`` and the age of the open step, and none of those belong in
+markup.
+
 Python 3.12, stdlib only. Timestamps are UTC, ISO 8601 with a trailing Z.
 """
 
@@ -40,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import statistics
 import time
 import urllib.error
 import urllib.request
@@ -49,14 +62,19 @@ from pathlib import Path
 from typing import Any
 
 from sketchgen import db
-from sketchgen.worker import DEFAULT_HOST, DEFAULT_JOBS_DIR, node_shape
+from sketchgen.worker import DEFAULT_HOST, DEFAULT_JOBS_DIR, human_gap, node_shape
 
 __all__ = [
+    "ACTIVITY_IDLE_STEPS",
+    "ACTIVITY_MEDIAN_MIN",
+    "ACTIVITY_MEDIAN_SAMPLE",
+    "ACTIVITY_STALLED_S",
     "DEFAULT_HOST",
     "DEFAULT_JOBS_DIR",
     "FUNNEL_NAMES",
     "RATE_PER_HOUR_16_96",
     "RATE_PER_HOUR_4_24",
+    "activity",
     "collect",
     "redact_command",
     "render_text",
@@ -1014,6 +1032,199 @@ def _worker_block(conn: sqlite3.Connection, since: str | None) -> dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
+# The process status card (packet 5)
+# ---------------------------------------------------------------------------
+
+#: How many closed rows of a step the median is fitted over, and how few is too
+#: few to fit one. Fifty is a working day of that step on this node; under five
+#: samples the median moves further between readings than the thing it is
+#: measuring, and a progress bar that lies is worse than no progress bar, so it
+#: is null and the card draws none.
+ACTIVITY_MEDIAN_SAMPLE = 50
+ACTIVITY_MEDIAN_MIN = 5
+
+#: Past this, a step that is still open is not slow, it is stuck. Longer than
+#: the executor's own 1800 s timeout on purpose: the timeout is the step's way
+#: of ending itself, and this is the card's way of saying that it did not.
+ACTIVITY_STALLED_S = 40 * 60.0
+
+#: Steps that are the worker keeping itself busy rather than carrying a job.
+#: The card's pill goes quiet for these: an idle worker is not a working one,
+#: and a green pill over "Nothing to do" has told the operator the wrong thing.
+ACTIVITY_IDLE_STEPS = ("judging", "critiquing", "sweeping", "idle")
+
+#: What to do about a worker that is not there. The card says it in words,
+#: because "gone" on its own reads like a bug in the page.
+ACTIVITY_GONE_FIX = "systemctl --user status sketchgen-worker"
+
+
+def _activity_seconds(row: sqlite3.Row) -> float | None:
+    """How long one closed step took, or None if its stamps do not parse."""
+    start = _utc_z(row["started_utc"])
+    end = _utc_z(row["ended_utc"])
+    if start is None or end is None:
+        return None
+    try:
+        began = datetime.strptime(start, "%Y-%m-%dT%H:%M:%SZ")
+        ended = datetime.strptime(end, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return max(0.0, (ended - began).total_seconds())
+
+
+def _activity_median(conn: sqlite3.Connection, step: str) -> float | None:
+    """The median duration of this step, over the newest closed rows of it.
+
+    No per-step constants anywhere: how long writing a sketch takes is a
+    measurement of this node with these models, and it moves when either
+    changes. The card's bar is elapsed against this, which is the only honest
+    progress a worker that cannot tick mid-step can offer.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT started_utc, ended_utc FROM activity WHERE step = ? "
+            "AND ended_utc IS NOT NULL ORDER BY id DESC LIMIT ?",
+            (str(step), ACTIVITY_MEDIAN_SAMPLE),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    seconds = [value for value in (_activity_seconds(row) for row in rows)
+               if value is not None]
+    if len(seconds) < ACTIVITY_MEDIAN_MIN:
+        return None
+    return _round(statistics.median(seconds), 1)
+
+
+def _pid_alive(pid: int | None) -> bool:
+    """Whether that process still exists. One stat call, on a 200 ms budget."""
+    if not pid:
+        return False
+    return Path(f"/proc/{int(pid)}").exists()
+
+
+def _blank_activity(state: str, headline: str, detail: str | None,
+                    recent: list[dict[str, Any]]) -> dict[str, Any]:
+    """The card with no step under it: every key present, nothing claimed."""
+    return {
+        "step": None,
+        "headline": headline,
+        "detail": detail,
+        "job_id": None,
+        "entry_id": None,
+        "model": None,
+        "pid": None,
+        "started_utc": None,
+        "elapsed_s": None,
+        "median_s": None,
+        "live": False,
+        "state": state,
+        "recent": recent,
+    }
+
+
+def activity(conn: sqlite3.Connection) -> dict[str, Any]:
+    """What the worker is doing right now, as the card shows it.
+
+    The one reader of migration 008's table: :func:`collect` calls it for the
+    Console document and the operator UI's two-second poll calls it directly,
+    so the document and the poll cannot disagree about the sentence on screen.
+    Three small queries and one stat — the poll must not be the reason a page
+    load waits for a collector.
+
+    ``state`` is decided here rather than in the template, because it is a
+    reading of three things a template should not be re-deriving: the control
+    row, whether the recorded pid still exists, and how long the open step has
+    been open. It is exactly one of:
+
+      ``paused``   the operator's switch says so, whatever a row claims
+      ``gone``     the pid that opened the step is not there any more
+      ``stalled``  the pid is there and the step is past ACTIVITY_STALLED_S
+      ``running``  a step that is carrying a job
+      ``idle``     a step that is the worker keeping itself busy
+      ``unknown``  nothing has ever been recorded
+
+    ``paused`` comes first on purpose. A paused worker's last step stays open —
+    it is stopped between steps, not mid-step — and the operator who pressed
+    Pause needs the card to agree with the button they pressed.
+    """
+    try:
+        control = db.get_control(conn)
+    except sqlite3.Error:  # pragma: no cover - the database is the problem
+        control = None
+    paused = control is not None and control.state == "paused"
+
+    recent = []
+    for row in db.recent_activity(conn, 3):
+        recent.append({
+            "headline": row["headline"],
+            "seconds": _round(_activity_seconds(row), 1),
+        })
+
+    row = db.current_activity(conn)
+    if row is None:
+        if paused:
+            return _blank_activity(
+                "paused",
+                "The worker is paused",
+                (control.reason if control else None) or "paused by the operator",
+                recent,
+            )
+        return _blank_activity(
+            "unknown",
+            "Nothing recorded yet",
+            "the worker writes this card as it works; this database has no "
+            "activity in it",
+            recent,
+        )
+
+    step = str(row["step"])
+    pid = int(row["pid"]) if row["pid"] is not None else None
+    live = _pid_alive(pid)
+    elapsed = _round(_seconds_since(row["started_utc"]), 1)
+    headline = str(row["headline"])
+    detail = row["detail"]
+
+    if paused:
+        state = "paused"
+        detail = (control.reason if control else None) or "paused by the operator"
+    elif not live:
+        state = "gone"
+        ago = human_gap(elapsed) if elapsed is not None else "some time"
+        headline = (
+            "Worker not running — the last step was "
+            + step
+            + (f" job {int(row['job_id'])}" if row["job_id"] is not None else "")
+            + f", {ago} ago"
+        )
+        detail = ACTIVITY_GONE_FIX
+    elif elapsed is not None and elapsed > ACTIVITY_STALLED_S:
+        state = "stalled"
+        detail = " · ".join(filter(None, [
+            detail, "longer than any step has taken; check the transcript"
+        ]))
+    elif step in ACTIVITY_IDLE_STEPS:
+        state = "idle"
+    else:
+        state = "running"
+
+    return {
+        "step": step,
+        "headline": headline,
+        "detail": detail,
+        "job_id": int(row["job_id"]) if row["job_id"] is not None else None,
+        "entry_id": int(row["entry_id"]) if row["entry_id"] is not None else None,
+        "model": row["model"],
+        "pid": pid,
+        "started_utc": _utc_z(row["started_utc"]),
+        "elapsed_s": elapsed,
+        "median_s": _activity_median(conn, step),
+        "live": live,
+        "state": state,
+        "recent": recent,
+    }
+
+
+# ---------------------------------------------------------------------------
 # The document
 # ---------------------------------------------------------------------------
 
@@ -1089,6 +1300,7 @@ def collect(
         "node": node,
         "model": model,
         "worker": worker,
+        "activity": activity(conn),
         "odometer": _odometer(conn, since),
         "funnel": _funnel(conn, since),
         "per_sketch": _per_sketch(conn, jobs_path, since),
@@ -1156,8 +1368,18 @@ def render_text(doc: dict[str, Any]) -> str:
         )
     worker = doc["worker"]
     odo = doc["odometer"]
+    act = doc.get("activity") or {}
     lines += [
         "",
+        # The two lines this view exists for over SSH: the sentence, and the
+        # line under it. Everything else here is a number; this is the only
+        # part that says what the machine is doing.
+        f"  now   {act.get('headline') or '—'}"
+        + (f"   [{act.get('state')}"
+           + (f", {act['elapsed_s']:.0f} s" if act.get("elapsed_s") is not None else "")
+           + (f" of about {act['median_s']:.0f} s" if act.get("median_s") else "")
+           + "]" if act.get("state") else ""),
+        f"        {act.get('detail') or ''}",
         f"  worker {worker['control']}"
         + (f" ({worker['reason']})" if worker["reason"] else "")
         + f"; job in flight {worker['job_in_flight']}; session began "
