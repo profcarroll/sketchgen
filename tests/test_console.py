@@ -154,6 +154,42 @@ class ConsoleTestCase(unittest.TestCase):
         return console.collect(self.conn, self.jobs, **kwargs)
 
 
+class TestSubmissions(ConsoleTestCase):
+    """The console's one new number: how many people are waiting for an answer."""
+
+    def add(self, remote_id, kind="prompt", text="a tide of small triangles"):
+        return db.add_submission(
+            self.conn,
+            remote_id=remote_id,
+            kind=kind,
+            username="octocat",
+            entry_id=None,
+            text=text,
+            created_utc="2026-09-16T15:04:22Z",
+        )
+
+    def test_an_empty_table_is_zero_and_not_a_missing_key(self):
+        self.assertEqual(
+            {"pending": 0, "released": 0, "declined": 0},
+            console.submissions(self.conn),
+        )
+        self.assertEqual(0, self.collect()["submissions"]["pending"])
+
+    def test_the_waiting_count_is_what_has_not_been_decided(self):
+        pending = [self.add(n) for n in (1, 2, 3)]
+        db.release_submission(self.conn, pending[0], self.job_id)
+        db.decline_submission(self.conn, pending[1], "off topic")
+        self.assertEqual(
+            {"pending": 1, "released": 1, "declined": 1},
+            console.submissions(self.conn),
+        )
+        self.assertEqual(1, self.collect()["submissions"]["pending"])
+
+    def test_a_database_without_the_table_counts_zero_rather_than_raising(self):
+        self.conn.execute("DROP TABLE submissions")
+        self.assertEqual(0, console.submissions(self.conn)["pending"])
+
+
 class TestContract(ConsoleTestCase):
     def test_live_document_has_the_fixture_s_keys(self):
         sample = json.loads(FIXTURE.read_text(encoding="utf-8"))

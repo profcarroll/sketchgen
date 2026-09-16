@@ -1645,6 +1645,362 @@ class TestSpawn(WebTestCase):
         self.assertIn(f'action="/entry/{self.entry_id}/spawn"', job)
 
 
+class TestSubmissions(WebTestCase):
+    """GET /submissions and its two verbs — packet 8's whole operator surface.
+
+    The page is the decision card with the sentence where the sketch is, and
+    the point of every test here is the same one: nothing a stranger typed
+    reaches the queue until a person presses Release, and what happens when
+    they do is a job like any other — held, and signed with their login.
+    """
+
+    def add(self, remote_id, *, kind="prompt", username="octocat", entry_id=None,
+            text="a tide of small triangles", created_utc="2026-09-16T15:04:22Z"):
+        conn = self.db()
+        try:
+            return db.add_submission(
+                conn, remote_id=remote_id, kind=kind, username=username,
+                entry_id=entry_id, text=text, created_utc=created_utc,
+            )
+        finally:
+            conn.close()
+
+    def entry_in_state(self, state, prompt="a field of circles that drift"):
+        """One entry of this node's own, in the state the test needs."""
+        conn = self.db()
+        try:
+            job_id = db.enqueue(conn, prompt, "student-two", rules_file="control")
+            db.transition(conn, job_id, "executing")
+            db.transition(conn, job_id, "gating")
+            db.transition(conn, job_id, "held")
+            if state == "published":
+                db.transition(conn, job_id, "published")
+            entry_id = db.create_entry(
+                conn, job_id, "held", prompt=prompt,
+                submitted_by="student-two", rules_file="control",
+            )
+            if state != "held":
+                db.entry_transition(conn, entry_id, state,
+                                    **({"reject_reason": "not this one"}
+                                       if state == "rejected" else {}))
+            return entry_id
+        finally:
+            conn.close()
+
+    def submission(self, submission_id):
+        conn = self.db()
+        try:
+            return dict(db.submission(conn, submission_id))
+        finally:
+            conn.close()
+
+    def job(self, job_id):
+        conn = self.db()
+        try:
+            return db.get_job(conn, job_id)
+        finally:
+            conn.close()
+
+    def critiques_of(self, entry_id):
+        conn = self.db()
+        try:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM critiques WHERE entry_id = ? ORDER BY id",
+                    (entry_id,),
+                )
+            ]
+        finally:
+            conn.close()
+
+    # -- the page ----------------------------------------------------------
+
+    def test_the_page_lists_pending_rows_oldest_first(self):
+        old = self.add(101, created_utc="2026-09-16T10:00:00Z", text="the early one")
+        new = self.add(102, created_utc="2026-09-16T12:00:00Z", text="the late one")
+        declined = self.add(103, text="the one nobody wants")
+        conn = self.db()
+        try:
+            db.decline_submission(conn, declined, "off topic")
+        finally:
+            conn.close()
+
+        page = self.text("/submissions")
+        self.assertIn("the early one", page)
+        self.assertIn("the late one", page)
+        self.assertNotIn("the one nobody wants", page)
+        self.assertLess(
+            page.index(f'id="submission-{old}"'),
+            page.index(f'id="submission-{new}"'),
+            "oldest first: whoever typed first waits least",
+        )
+        self.assertIn("@octocat", page)
+        # One form, two formactions, no script: the decision card's own shape.
+        self.assertIn(f'action="/submissions/{old}/release"', page)
+        self.assertIn(f'formaction="/submissions/{old}/decline"', page)
+        self.assertNotIn("<script>", page.split("</main>")[0])
+
+    def test_a_critique_shows_the_entry_it_is_about(self):
+        entry_id = self.entry_in_state("held", "a slow lattice of lines")
+        self.add(110, kind="critique", entry_id=entry_id,
+                 text="let the lines thin as they near the edge")
+        page = self.text("/submissions")
+        self.assertIn("let the lines thin as they near the edge", page)
+        self.assertIn("a slow lattice of lines", page)
+        self.assertIn(f'href="/entry/{entry_id}"', page)
+
+    def test_the_nav_and_the_console_tile_link_here(self):
+        self.assertIn('href="/submissions"', self.text("/queue"))
+        self.assertIn('data-k="submissions.pending"', self.text("/"))
+
+    # -- releasing ---------------------------------------------------------
+
+    def test_release_on_a_prompt_queues_a_random_rules_job_held_and_signed(self):
+        submission_id = self.add(
+            120, username="hubot", text="a tide of small triangles that drifts"
+        )
+        status, location = self.post(f"/submissions/{submission_id}/release", {})
+        self.assertEqual(303, status)
+        self.assertTrue(location.startswith("/submissions?flash="), location)
+
+        row = self.submission(submission_id)
+        self.assertEqual("released", row["state"])
+        self.assertTrue(row["decided_utc"])
+        job = self.job(row["job_id"])
+        self.assertEqual("queued", job.state)
+        self.assertEqual("a tide of small triangles that drifts", job.prompt)
+        self.assertEqual("random", job.rules_file)
+        self.assertEqual("hold", job.publication)
+        self.assertEqual("hubot", job.submitted_by)
+        self.assertIsNone(job.parent_entry_id)
+
+    def test_release_on_a_critique_spawns_the_child_and_records_human_login(self):
+        entry_id = self.entry_in_state("published", "a quiet grid of dots")
+        submission_id = self.add(
+            130, kind="critique", entry_id=entry_id, username="octocat",
+            text="let the dots drift apart as they fall",
+        )
+        status, _ = self.post(f"/submissions/{submission_id}/release", {})
+        self.assertEqual(303, status)
+
+        row = self.submission(submission_id)
+        self.assertEqual("released", row["state"])
+        job = self.job(row["job_id"])
+        self.assertEqual("queued", job.state)
+        self.assertEqual(entry_id, job.parent_entry_id)
+        self.assertEqual("octocat", job.submitted_by)
+        self.assertEqual("octocat", job.critique_by)
+        self.assertEqual("let the dots drift apart as they fall", job.critique)
+        # The parent's rules file, not 'random': a line stays a fair
+        # comparison with itself (decision §1.6).
+        self.assertEqual("control", job.rules_file)
+        self.assertIn("Revise:", job.prompt)
+
+        critiques = self.critiques_of(entry_id)
+        self.assertEqual(1, len(critiques))
+        self.assertEqual("human:octocat", critiques[0]["prompt_version"])
+        self.assertEqual("octocat", critiques[0]["critique_by"])
+        self.assertEqual(row["job_id"], critiques[0]["spawned_job_id"])
+
+    def test_two_people_may_each_critique_one_entry_but_neither_twice(self):
+        entry_id = self.entry_in_state("published", "three circles breathing out")
+        first = self.add(140, kind="critique", entry_id=entry_id,
+                         username="octocat", text="slower, and further apart")
+        second = self.add(141, kind="critique", entry_id=entry_id,
+                          username="hubot", text="hold the third one still")
+        third = self.add(142, kind="critique", entry_id=entry_id,
+                         username="octocat", text="and now in a different colour")
+
+        self.post(f"/submissions/{first}/release", {})
+        self.post(f"/submissions/{second}/release", {})
+        self.assertEqual("released", self.submission(first)["state"])
+        self.assertEqual("released", self.submission(second)["state"])
+        self.assertEqual(
+            {"human:octocat", "human:hubot"},
+            {row["prompt_version"] for row in self.critiques_of(entry_id)},
+        )
+
+        # The same person, the same entry, a second time: refused, and the row
+        # is left for the operator to decline.
+        _, location = self.post(f"/submissions/{third}/release", {})
+        self.assertIn("refused", urllib.parse.unquote(location))
+        self.assertEqual("pending", self.submission(third)["state"])
+        self.assertEqual(2, len(self.critiques_of(entry_id)))
+
+    def test_a_rejected_parent_declines_the_row_rather_than_raising(self):
+        entry_id = self.entry_in_state("rejected", "a sketch nobody kept")
+        submission_id = self.add(150, kind="critique", entry_id=entry_id,
+                                 text="try it again with fewer lines")
+        before = len(self.jobs())
+        status, location = self.post(f"/submissions/{submission_id}/release", {})
+        self.assertEqual(303, status)
+        row = self.submission(submission_id)
+        self.assertEqual("declined", row["state"])
+        self.assertIn("rejected", row["decline_reason"])
+        self.assertIsNone(row["job_id"])
+        self.assertEqual(before, len(self.jobs()), "nothing was queued")
+        self.assertIn("declined", urllib.parse.unquote(location))
+
+    def test_a_released_row_cannot_be_released_twice(self):
+        submission_id = self.add(160, text="only once, please")
+        self.post(f"/submissions/{submission_id}/release", {})
+        job_id = self.submission(submission_id)["job_id"]
+        before = len(self.jobs())
+
+        _, location = self.post(f"/submissions/{submission_id}/release", {})
+        self.assertIn("already released", urllib.parse.unquote(location))
+        self.assertEqual(before, len(self.jobs()), "no second job")
+        self.assertEqual(job_id, self.submission(submission_id)["job_id"])
+
+    # -- declining ---------------------------------------------------------
+
+    def test_decline_writes_the_reason_keeps_the_text_and_queues_nothing(self):
+        submission_id = self.add(170, text="something the operator will not run")
+        before = len(self.jobs())
+        status, location = self.post(
+            f"/submissions/{submission_id}/decline", {"text": "not this week"}
+        )
+        self.assertEqual(303, status)
+        row = self.submission(submission_id)
+        self.assertEqual("declined", row["state"])
+        self.assertEqual("not this week", row["decline_reason"])
+        self.assertEqual("something the operator will not run", row["text"])
+        self.assertIsNone(row["job_id"])
+        self.assertEqual(before, len(self.jobs()))
+        self.assertIn("not this week", urllib.parse.unquote(location))
+
+    def test_a_decline_with_an_empty_box_still_says_who_did_it(self):
+        submission_id = self.add(171, text="no reason given for this one")
+        self.post(f"/submissions/{submission_id}/decline", {"text": "  "})
+        self.assertEqual(
+            "declined by operator", self.submission(submission_id)["decline_reason"]
+        )
+
+    def test_a_submission_that_is_not_there_changes_nothing(self):
+        _, location = self.post("/submissions/99999/release", {})
+        self.assertIn("there is no submission", urllib.parse.unquote(location))
+        _, location = self.post("/submissions/99999/decline", {"text": "no"})
+        self.assertIn("there is no submission", urllib.parse.unquote(location))
+
+    def jobs(self):
+        conn = self.db()
+        try:
+            return db.list_jobs(conn)
+        finally:
+            conn.close()
+
+
+class TestSubmissionsCLI(unittest.TestCase):
+    """`sketchgen submissions` — the same three verbs without the tunnel.
+
+    A subprocess against a temp database, because what is under test is the
+    exit codes as a person over SSH would see them: 0 released, 3 refused, and
+    1 for the one outcome that is neither.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="sketchgen-cli-")
+        self.addCleanup(self._tmp.cleanup)
+        self.db_path = Path(self._tmp.name) / "sketchgen.db"
+        db.init(self.db_path)
+        conn = db.connect(self.db_path)
+        try:
+            self.prompt_id = db.add_submission(
+                conn, remote_id=1, kind="prompt", username="octocat",
+                entry_id=None, text="a tide of small triangles",
+                created_utc="2026-09-16T15:04:22Z",
+            )
+            self.other_id = db.add_submission(
+                conn, remote_id=2, kind="prompt", username="hubot",
+                entry_id=None, text="a grid that loses its corners",
+                created_utc="2026-09-16T15:05:00Z",
+            )
+        finally:
+            conn.close()
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "bin" / "sketchgen"), "submissions",
+             *args, "--db", str(self.db_path)],
+            capture_output=True, text=True, timeout=60,
+        )
+
+    def row(self, submission_id):
+        conn = db.connect(self.db_path)
+        try:
+            return dict(db.submission(conn, submission_id))
+        finally:
+            conn.close()
+
+    def test_bare_submissions_lists_what_is_waiting(self):
+        result = self.run_cli()
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("a tide of small triangles", result.stdout)
+        self.assertIn("@octocat", result.stdout)
+        self.assertIn("2 waiting", result.stdout)
+
+    def test_release_queues_the_job_and_decline_keeps_the_row(self):
+        released = self.run_cli("release", "--id", str(self.prompt_id), "--json")
+        self.assertEqual(0, released.returncode, released.stderr)
+        document = json.loads(released.stdout)
+        self.assertEqual("released", document["outcome"])
+        conn = db.connect(self.db_path)
+        try:
+            job = db.get_job(conn, document["job_id"])
+        finally:
+            conn.close()
+        self.assertEqual("random", job.rules_file)
+        self.assertEqual("hold", job.publication)
+        self.assertEqual("octocat", job.submitted_by)
+
+        declined = self.run_cli("decline", "--id", str(self.other_id),
+                                "--reason", "not this week")
+        self.assertEqual(0, declined.returncode, declined.stderr)
+        row = self.row(self.other_id)
+        self.assertEqual("declined", row["state"])
+        self.assertEqual("not this week", row["decline_reason"])
+        self.assertEqual("a grid that loses its corners", row["text"])
+
+        self.assertIn("nothing waiting", self.run_cli("list").stdout)
+
+    def test_a_decided_row_and_a_missing_one_are_refusals(self):
+        self.run_cli("release", "--id", str(self.prompt_id))
+        again = self.run_cli("release", "--id", str(self.prompt_id))
+        self.assertEqual(3, again.returncode)
+        self.assertIn("already released", again.stderr)
+        self.assertEqual(3, self.run_cli("release", "--id", "9999").returncode)
+        self.assertEqual(3, self.run_cli("decline", "--id", "9999").returncode)
+
+    def test_a_rejected_parent_exits_one_and_declines_the_row(self):
+        conn = db.connect(self.db_path)
+        try:
+            job_id = db.enqueue(conn, "a sketch nobody kept", "student-two")
+            db.transition(conn, job_id, "executing")
+            db.transition(conn, job_id, "gating")
+            db.transition(conn, job_id, "held")
+            entry_id = db.create_entry(conn, job_id, "held",
+                                       prompt="a sketch nobody kept")
+            db.entry_transition(conn, entry_id, "rejected",
+                                reject_reason="not this one")
+            submission_id = db.add_submission(
+                conn, remote_id=3, kind="critique", username="octocat",
+                entry_id=entry_id, text="try it again with fewer lines",
+                created_utc="2026-09-16T15:06:00Z",
+            )
+        finally:
+            conn.close()
+        result = self.run_cli("release", "--id", str(submission_id))
+        self.assertEqual(1, result.returncode, result.stdout)
+        self.assertIn("declined", result.stderr)
+        self.assertEqual("declined", self.row(submission_id)["state"])
+
+    def test_help_works(self):
+        result = self.run_cli("--help")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("release", result.stdout)
+
+
 class TestStaticFiles(WebTestCase):
     def test_a_gate_png_is_served_as_a_png(self):
         status, content_type, body = self.get(
