@@ -35,11 +35,26 @@ how the tests run. The validator is deliberately strict — one sentence, under
 forty words, no code — because the text becomes the next brief's revision line
 and a paragraph of review would be a paragraph of prompt.
 
+**The critic looks at the sketch.** Until critic-v3 it saw only words: the
+prompt, the brief, the gate's assertions, and the executor's own statement about
+what it built. The statement is unverified self-description, and on 2026-09-14 it
+was false twice in one line — entry 20 claimed interlocking planes of colour and
+is a blue blob on black; its child, job 33, claimed a gradient behind a head and
+neck and is a red rectangle. The critic revised the statement instead of the
+sketch. So :func:`critique` now sends ``entries.strip_path`` — the gate's
+four-frame strip — base64 in ``/api/generate``'s ``images`` field, the way
+:func:`sketchgen.judge._strip_bytes` does for the local judge, and **refuses**
+rather than critiquing blind when there is no strip to send. Every
+:class:`Critique` carries the path and the sha256 of exactly the bytes that went
+out, so a sentence is tied to the pixels that produced it.
+
 Python 3.12, stdlib only. Every timestamp is UTC, ISO 8601, with a Z.
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import re
 import sqlite3
@@ -121,20 +136,43 @@ class CritiqueRefused(Exception):
 
 
 class CritiqueFailed(Exception):
-    """The model answered and the answer is unusable. ``raw`` is kept."""
+    """The model answered and the answer is unusable. ``raw`` is kept.
 
-    def __init__(self, message: str, raw: str = "") -> None:
+    ``strip_path`` and ``strip_sha256`` are filled in by :func:`critique` when
+    the failure happened after the strip went out, so the row the worker keeps
+    for a rejected critique is tied to the same pixels a good one would be.
+    They are empty when nothing was ever shown to a model.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        raw: str = "",
+        strip_path: str = "",
+        strip_sha256: str = "",
+    ) -> None:
         super().__init__(message)
         self.raw = raw
+        self.strip_path = strip_path
+        self.strip_sha256 = strip_sha256
 
 
 @dataclass
 class Critique:
-    """One sentence, and the provenance a verdict needs to be readable later."""
+    """One sentence, and the provenance a verdict needs to be readable later.
+
+    ``strip_path`` is the frame strip the critic was shown and ``strip_sha256``
+    is the sha256 of exactly the bytes that were sent. Together they are what
+    :func:`sketchgen.pairs.artefact_hash` is for a verdict: re-run the sketch,
+    regenerate the strip, and the hash no longer matches, so an old critique is
+    visibly about a picture that no longer exists.
+    """
 
     text: str
     model: str
     prompt_version: str
+    strip_path: str
+    strip_sha256: str
     tokens: dict[str, int] = field(default_factory=dict)
     raw: str = ""
 
@@ -158,6 +196,38 @@ def _get(row: Any, key: str, default: Any = None) -> Any:
 
 def _entry(conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+
+
+def _strip_bytes(row: Any) -> tuple[bytes, str]:
+    """The entry's four-frame strip, or a refusal. The critic must SEE.
+
+    The same rule, the same three failure modes and deliberately the same
+    wording as :func:`sketchgen.judge._strip_bytes`, which enforces it for the
+    local judge (spec §5: the model reviewing a sketch has to look at it, not
+    read about it). It is a sibling here rather than a shared helper because
+    ``judge.py`` imports ``worker.py``, which imports this module; hoisting one
+    function into either of them would close that import loop.
+
+    There is no blind fallback on purpose. A critique written without the
+    picture is what critic-v2 was, and what it produced was a revision of the
+    executor's statement rather than of the sketch.
+    """
+    label = _get(row, "id", "?")
+    path = str(_get(row, "strip_path", "") or "").strip()
+    if not path:
+        raise CritiqueRefused(
+            f"entry {label} has no strip.png on record; the critic has to look "
+            "at the sketch, so there is nothing to ask it"
+        )
+    try:
+        data = Path(path).read_bytes()
+    except OSError as exc:
+        raise CritiqueRefused(
+            f"cannot read the strip for entry {label} at {path}: {exc}"
+        ) from exc
+    if not data:
+        raise CritiqueRefused(f"the strip for entry {label} at {path} is empty")
+    return data, path
 
 
 def _lineage_row(conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row | None:
@@ -480,12 +550,17 @@ def critique_prompt(
     brief: str | None,
     path: str | Path | None = None,
 ) -> str:
-    """Fill ``prompts/critic.md`` for one entry.
+    """Fill ``prompts/critic.md`` for one entry — the words half of the request.
 
     The critic sees the prompt, the brief, the executor's own statement and the
     assertions the gate ran. It does not see who submitted it, what any human
     thought of it, or which model made it: spec §5 blinds the agent, and a
     critic that becomes the next prompt is an agent judge with a pen.
+
+    The picture is not in here. :func:`critique` attaches the frame strip as an
+    image beside this text, and critic-v3's first section tells the model that
+    the image is the only evidence of what the sketch shows and that it beats
+    the statement wherever the two disagree.
     """
     text = _read_prompt_file(path)
     text = _PROMPT_VERSION_RE.sub("", text, count=1).lstrip("\n")
@@ -566,6 +641,17 @@ def critique(
 ) -> Critique:
     """One sentence of critique for one entry. With ``stub``, call nothing.
 
+    The entry's frame strip goes with the words, base64, in ``/api/generate``'s
+    ``images`` field — the same field the local judge fills over ``/api/chat``,
+    and the reason the call can stay on ``/api/generate``: ollama accepts
+    ``images`` beside ``prompt`` there, and nothing in this call needs a
+    multi-turn conversation. An entry with no readable strip is
+    :class:`CritiqueRefused` and never a blind critique (see :func:`_strip_bytes`).
+
+    The strip is read before the ``stub`` branch, so a replayed run refuses on
+    the same evidence a real one would: the stub replaces the model, not the
+    requirement to have looked.
+
     ``"think": false`` goes only to the qwen tags, as in planner.py: ollama
     refuses an option a model does not declare, and ``gemma4:e4b`` — the critic,
     as it is the local judge in spec §5 — has no thinking mode to turn off.
@@ -573,6 +659,8 @@ def critique(
     row = _entry(conn, int(entry_id))
     if row is None:
         raise CritiqueRefused(f"there is no entry {entry_id}")
+    strip, strip_path = _strip_bytes(row)
+    strip_sha256 = hashlib.sha256(strip).hexdigest()
     version = prompt_version(prompt_path)
     rendered = critique_prompt(row, row["statement"], row["brief"], prompt_path)
     tokens: dict[str, int] = {}
@@ -587,6 +675,7 @@ def critique(
         payload: dict = {
             "model": model,
             "prompt": rendered,
+            "images": [base64.b64encode(strip).decode("ascii")],
             "stream": False,
             "options": {"num_ctx": num_ctx, "seed": seed},
         }
@@ -596,17 +685,32 @@ def critique(
         raw = body.get("response")
         if not isinstance(raw, str):
             raise CritiqueFailed(
-                "the model host returned no 'response' field", json.dumps(body, indent=2)
+                "the model host returned no 'response' field",
+                json.dumps(body, indent=2),
+                strip_path,
+                strip_sha256,
             )
         tokens = {
             "prompt": int(body.get("prompt_eval_count") or 0),
             "response": int(body.get("eval_count") or 0),
         }
 
+    try:
+        text = validate(raw)
+    except CritiqueFailed as exc:
+        # The words failed, but the picture was still the evidence. The worker
+        # keeps a rejected critique as a row, and that row should say which
+        # pixels it is a rejection of.
+        exc.strip_path = strip_path
+        exc.strip_sha256 = strip_sha256
+        raise
+
     return Critique(
-        text=validate(raw),
+        text=text,
         model=model,
         prompt_version=version,
+        strip_path=strip_path,
+        strip_sha256=strip_sha256,
         tokens=tokens,
         raw=raw,
     )

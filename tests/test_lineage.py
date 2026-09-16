@@ -10,13 +10,18 @@ two-sentence one that must not — and they are checked before anything asks a
 model for a third.
 """
 
+import base64
+import hashlib
 import json
 import os
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -32,6 +37,33 @@ CLI = REPO_ROOT / "bin" / "sketchgen"
 # ---------------------------------------------------------------------------
 # Stubs, kept to the minimum this packet needs
 # ---------------------------------------------------------------------------
+
+
+def png_bytes(mark: bytes = b"\x11\x22\x33") -> bytes:
+    """A tiny but genuinely well-formed PNG, 1x1, with ``mark`` as its pixel.
+
+    Nothing in these tests decodes it — what is asserted is that the bytes on
+    disk are the bytes that reach the model — but the critic is being handed a
+    picture, so the fixture is a picture. ``mark`` varies it per entry so two
+    entries do not share a sha256 by accident.
+    """
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return (
+            struct.pack(">I", len(data))
+            + body
+            + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+    pixel = zlib.compress(b"\x00" + mark[:3].ljust(3, b"\x00"))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", pixel)
+        + chunk(b"IEND", b"")
+    )
 
 
 def stub_executor(out_root):
@@ -72,6 +104,7 @@ class LineageTestCase(unittest.TestCase):
         self.root_dir = Path(self._tmp.name)
         self.path = str(self.root_dir / "test.db")
         self.jobs = self.root_dir / "jobs"
+        self.strips = self.root_dir / "strips"
         db.init(self.path)
         self.conn = db.connect(self.path)
         self.addCleanup(self.conn.close)
@@ -81,9 +114,16 @@ class LineageTestCase(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------
 
-    def publish(self, prompt, by="astudent", state="published", **opts):
+    def publish(self, prompt, by="astudent", state="published", strip="png", **opts):
         """A job walked to a terminal state with its entry row, as the worker
-        leaves it. Returns the entry id."""
+        leaves it. Returns the entry id.
+
+        ``strip`` is what the gate left behind: ``"png"`` for a real strip file,
+        ``"empty"`` for a zero-byte one, ``"missing"`` for a path pointing at
+        nothing, and ``None`` for no ``strip_path`` column at all. Since
+        critic-v3 the critic refuses everything but the first, so the three
+        broken shapes each have a test.
+        """
         job_id = db.enqueue(self.conn, prompt, by, rules_file="treatment", **opts)
         db.transition(self.conn, job_id, "executing")
         db.transition(self.conn, job_id, "gating")
@@ -91,6 +131,15 @@ class LineageTestCase(unittest.TestCase):
         if state == "published":
             db.transition(self.conn, job_id, "published")
         job = db.get_job(self.conn, job_id)
+        strip_path = None
+        if strip is not None:
+            path = self.strips / f"job-{job_id}" / "strip.png"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if strip == "png":
+                path.write_bytes(png_bytes(bytes([job_id % 251, 7, 9])))
+            elif strip == "empty":
+                path.write_bytes(b"")
+            strip_path = str(path)
         entry_id = db.create_entry(
             self.conn,
             job_id,
@@ -102,10 +151,25 @@ class LineageTestCase(unittest.TestCase):
             rules_file="treatment",
             planner="gemma4:e4b",
             parent_entry_id=job.parent_entry_id,
+            strip_path=strip_path,
             submitted_by=by,
         )
         lineage.record_child(self.conn, entry_id, job)
         return entry_id
+
+    def strip_of(self, entry_id):
+        """The bytes on disk for one entry's strip."""
+        row = self.conn.execute(
+            "SELECT strip_path FROM entries WHERE id = ?", (entry_id,)
+        ).fetchone()
+        return Path(row["strip_path"]).read_bytes()
+
+    def counts(self):
+        """(critiques, jobs) — what a refusal must leave untouched."""
+        return (
+            self.conn.execute("SELECT COUNT(*) AS c FROM critiques").fetchone()["c"],
+            self.conn.execute("SELECT COUNT(*) AS c FROM jobs").fetchone()["c"],
+        )
 
     def entry_for(self, job_id, state="published"):
         """Finish a spawned job the way the worker would, and return the entry."""
@@ -115,12 +179,16 @@ class LineageTestCase(unittest.TestCase):
         db.transition(self.conn, job_id, "held")
         if state == "published":
             db.transition(self.conn, job_id, "published")
+        strip_path = self.strips / f"job-{job_id}" / "strip.png"
+        strip_path.parent.mkdir(parents=True, exist_ok=True)
+        strip_path.write_bytes(png_bytes(bytes([job_id % 251, 13, 29])))
         entry_id = db.create_entry(
             self.conn,
             job_id,
             state=state,
             prompt=job.prompt,
             parent_entry_id=job.parent_entry_id,
+            strip_path=str(strip_path),
             submitted_by=job.submitted_by,
         )
         lineage.record_child(self.conn, entry_id, job)
@@ -494,8 +562,8 @@ class TestTheLinePage(LineageTestCase):
 
 
 class TestCritique(LineageTestCase):
-    def test_prompts_critic_md_is_version_1_and_leaves_no_placeholders(self):
-        self.assertEqual("critic-v2", lineage.prompt_version())
+    def test_prompts_critic_md_is_v3_and_leaves_no_placeholders(self):
+        self.assertEqual("critic-v3", lineage.prompt_version())
         row = self.conn.execute(
             "SELECT * FROM entries WHERE id = ?", (self.root_entry,)
         ).fetchone()
@@ -507,6 +575,29 @@ class TestCritique(LineageTestCase):
         self.assertNotIn("prompt_version:", rendered)
         self.assertIn("sixty circles drifting", rendered)
         self.assertIn("motion(idle)", rendered)
+
+    def test_the_rendered_prompt_tells_the_critic_the_image_beats_the_words(self):
+        """critic-v3's whole point: the statement is a claim, the strip is not.
+
+        Entry 20 said 'interlocking planes of colour' and is a blue blob; its
+        child said 'blue-to-purple gradient' and is a red rectangle. A critic
+        that cannot be told which of the two to believe revises the sentence.
+        """
+        row = self.conn.execute(
+            "SELECT * FROM entries WHERE id = ?", (self.root_entry,)
+        ).fetchone()
+        rendered = lineage.critique_prompt(row, row["statement"], row["brief"])
+        self.assertIn("WHAT THE SKETCH ACTUALLY SHOWS", rendered)
+        self.assertIn("four frames", rendered)
+        self.assertIn("the image wins", rendered)
+        # the new section comes before the words it is telling the critic to
+        # distrust, or it is advice arriving after the fact
+        self.assertLess(
+            rendered.index("WHAT THE SKETCH ACTUALLY SHOWS"),
+            rendered.index("THE PROMPT IT WAS MADE FROM"),
+        )
+        # and the contract the version bump does not touch
+        self.assertIn("One sentence. Fewer than forty words.", rendered)
 
     def test_the_prompt_never_shows_the_judge_who_made_it_or_who_liked_it(self):
         row = self.conn.execute(
@@ -529,7 +620,7 @@ class TestCritique(LineageTestCase):
             result.text,
         )
         self.assertEqual("gemma4:e4b", result.model)
-        self.assertEqual("critic-v2", result.prompt_version)
+        self.assertEqual("critic-v3", result.prompt_version)
 
     def test_a_saved_two_sentence_output_is_refused(self):
         with self.assertRaises(lineage.CritiqueFailed) as caught:
@@ -624,7 +715,7 @@ class TestCli(LineageTestCase):
         )
         self.assertEqual(0, done.returncode, done.stderr)
         document = json.loads(done.stdout)
-        self.assertEqual("critic-v2", document["prompt_version"])
+        self.assertEqual("critic-v3", document["prompt_version"])
         self.assertTrue(document["critique"].startswith("the same field"))
         self.assertTrue(
             (out / f"entry-{self.root_entry}-critique.json").is_file()
