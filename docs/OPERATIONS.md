@@ -91,6 +91,13 @@ worker does one bounded round of idle work before it sleeps:
    child yet, and queues the child each critique asks for;
 3. then sleeps.
 
+The critic is shown the entry's four-frame strip, the same picture the judge
+looks at, and **refuses** a published entry that has no readable strip on record
+rather than critiquing it blind. A refusal writes nothing and consumes nothing,
+so that entry comes back round on the next idle cycle; if you see the same
+`critique of entry N refused` line every cycle, the strip is missing or
+unreadable and no amount of waiting will fix it.
+
 This runs **inside the worker's own loop, not on a second timer**, and that is the
 whole of the design: there is one inference slot, so one process is allowed to use
 it. A second unit would need a second fence, and two fences racing each other is
@@ -129,6 +136,36 @@ An entry is critiqued **once per version of `prompts/critic.md`**, and the row i
 rejected for breaking the one-sentence rule, which is kept with its reason rather
 than retried. Editing that prompt bumps its `prompt_version`, and those entries
 may be critiqued again under the new one.
+
+### A new critic prompt version is a burst of work
+
+Read that last sentence as an operator rather than as a reader. `critiques` is
+UNIQUE on `(entry_id, prompt_version)`, so the bookkeeping that stops an entry
+being critiqued twice only stops it *under the version it was critiqued under*.
+The first idle round after a prompt-version bump therefore starts again from the
+oldest published entry and works through **every** one of them — one per idle
+cycle, each spawning one child job, each child a real sketch the executor has to
+build. Nothing is wrong when you see that; it is what the bump is for. The
+comparison MEASURE[critic-quality] wants is the same parents critiqued blind and
+then sighted, and it only exists if the second pass actually runs.
+
+It is still a burst, and there are two ways to hold it back:
+
+- **`SKETCHGEN_IDLE_CRITIQUE=0`** in the unit's environment — the worker keeps
+  draining the queue and keeps judging pairs, and critiques nothing:
+
+  ```
+  systemctl --user edit sketchgen-worker.service   # Environment=SKETCHGEN_IDLE_CRITIQUE=0
+  systemctl --user restart sketchgen-worker.service
+  ```
+
+- **pause from the console header** — the control row, which stops the worker
+  after the attempt in flight and so stops the idle round with it. Resume from
+  the same place when you want the pass to run.
+
+Raise the limit back (or resume) when you want it, and the pass picks up where
+it left off: the rows already in `critiques` under the new version are what it
+counts as done.
 
 ## When a job goes wrong
 

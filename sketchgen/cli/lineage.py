@@ -10,7 +10,11 @@ something we will not do at all (3: no database, no such entry, an unreadable
 prompt file or stub).
 
 ``lineage critique`` is the only command in this file that can reach a model,
-and only when it is given no ``--stub``.
+and only when it is given no ``--stub``. Since critic-v3 it sends the entry's
+frame strip with the words and refuses (3) an entry it cannot see; it writes the
+sentence, the strip path and the strip's sha256 to ``--out``, and with
+``--record`` it also writes the row in `critiques` that the worker's idle round
+writes for itself.
 """
 
 from __future__ import annotations
@@ -143,6 +147,30 @@ def cmd_critique(args: argparse.Namespace) -> int:
         if raw_path is not None:
             print(f"raw response kept at {raw_path}", file=sys.stderr)
         return EXIT_FAIL
+    else:
+        recorded = None
+        if args.record:
+            try:
+                recorded = db.record_critique(
+                    conn,
+                    args.entry,
+                    critique=result.text,
+                    critique_by=result.model,
+                    prompt_version=result.prompt_version,
+                    spawned_job_id=None,
+                    rejected_reason=None,
+                    strip_path=result.strip_path,
+                    strip_sha256=result.strip_sha256,
+                )
+            except sqlite3.IntegrityError:
+                # Migration 006 is UNIQUE on (entry_id, prompt_version): this
+                # entry already has a critique under this version of the prompt.
+                # The sentence is still written to --out; only the row is not.
+                print(
+                    f"note: entry {args.entry} already has a critique under "
+                    f"{result.prompt_version}; nothing recorded",
+                    file=sys.stderr,
+                )
     finally:
         conn.close()
 
@@ -152,8 +180,11 @@ def cmd_critique(args: argparse.Namespace) -> int:
         "critique_by": result.model,
         "model": result.model,
         "prompt_version": result.prompt_version,
+        "strip_path": result.strip_path,
+        "strip_sha256": result.strip_sha256,
         "tokens": result.tokens,
         "stub": str(args.stub) if args.stub else None,
+        "recorded": recorded,
         "created_utc": db.utc_now(),
     }
     path = out / f"entry-{args.entry}-critique.json"
@@ -170,6 +201,9 @@ def cmd_critique(args: argparse.Namespace) -> int:
     else:
         print(result.text)
         print(f"({result.model}, {result.prompt_version}) -> {path}")
+        print(f"saw {result.strip_path} (sha256 {result.strip_sha256[:12]}…)")
+        if recorded is not None:
+            print(f"recorded as critique {recorded}")
     return EXIT_OK
 
 
@@ -252,8 +286,11 @@ def register(top: argparse._SubParsersAction) -> None:
         help="ask a local model for the one sentence that becomes the next prompt",
         description=(
             "One sentence, under forty words, no code. Anything else exits 1 "
-            "with the raw response saved under --out. With --stub it replays a "
-            "saved response and calls no model at all."
+            "with the raw response saved under --out. The entry's frame strip "
+            "goes to the model with the words; an entry with no readable strip "
+            "is refused (3) rather than critiqued blind. With --stub it replays "
+            "a saved response and calls no model at all — but it still needs a "
+            "strip on record."
         ),
     )
     critique.add_argument("--entry", type=int, required=True, metavar="ID")
@@ -265,6 +302,12 @@ def register(top: argparse._SubParsersAction) -> None:
                           help="replay a saved response instead of calling a model")
     critique.add_argument("--host", default=lineage.DEFAULT_HOST, metavar="URL",
                           help=f"ollama host (default: {lineage.DEFAULT_HOST})")
+    critique.add_argument(
+        "--record", action="store_true",
+        help="also write the row in `critiques`, with the strip the critic saw "
+             "and its sha256 (the worker's idle round does this for itself); "
+             "an entry already critiqued under this prompt version is left alone",
+    )
     critique.add_argument("--json", action="store_true", help="machine-readable output")
     _add_db_option(critique)
     critique.set_defaults(func=cmd_critique, _parser=critique)
