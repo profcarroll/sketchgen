@@ -816,7 +816,7 @@ whose gate does not run cannot make another entry:
 ```bash
 ssh sld-cloud-new '. ~/sketchgen/.venv/bin/activate && ~/sketchgen/app/gate/accept.sh'
 ssh sld-cloud-new '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen db status'
-ssh -f -N -L 8081:127.0.0.1:8081 sld-cloud-new && open http://localhost:8081/held
+SKETCHGEN_REMOTE_HOST=sld-cloud-new bin/sketchgen-tunnel.sh up && open http://localhost:8081/held
 ssh sld-cloud-new '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen backup snapshot --to ~/sketchgen/backups'
 bin/pull-backup.sh sld-cloud-new --no-jobs
 ```
@@ -846,8 +846,38 @@ SSH tunnel:
 
 ```bash
 systemctl --user enable --now sketchgen-web.service      # on the node
-ssh -f -N -L 8081:127.0.0.1:8081 sld-cloud                # on the laptop
+bin/sketchgen-tunnel.sh up                                # on the laptop
 ```
+
+`bin/sketchgen-tunnel.sh` is `up`, `status`, `heal`, `down` and `url`, and `up` is
+idempotent: if the port already answers it does nothing. Reach for `heal` when the
+console stops loading — it tears the forward down and builds it again.
+
+Raise the tunnel by hand and you inherit a trap worth knowing about, because the
+obvious command is the one that sets it:
+
+```bash
+ssh -f -N -L 8081:127.0.0.1:8081 sld-cloud                # don't
+```
+
+`-f` backgrounds ssh *before* the bind error is visible, and without
+`ExitOnForwardFailure=yes` a forward that fails to bind does not end the session — it
+leaves a connected ssh holding **no listener**, which never retries the bind, and
+`ssh -f` still exits 0. Run it twice and the second one is already that stub; run it
+again after the first dies and every survivor is one. What you see is a console that
+does not load and a healthy-looking `ps` full of tunnels. Tell the two apart by socket
+count — a real forward has three (the connection, the `127.0.0.1` listener and the
+`::1` listener), a stub has one:
+
+```bash
+ls -l /proc/<pid>/fd | grep -c socket
+```
+
+The script closes that hole: it always passes `ExitOnForwardFailure=yes`, reaps
+listener-less strays before starting, and decides whether the tunnel is up by asking
+the port for HTTP rather than by finding a process. Defaults are `sld-cloud` and
+8081; `SKETCHGEN_REMOTE_HOST`, `SKETCHGEN_LOCAL_PORT`, `SKETCHGEN_REMOTE_BIND`,
+`SKETCHGEN_REMOTE_PORT` and `SKETCHGEN_HEALTH_PATH` override them.
 
 Then open http://localhost:8081/ — the Console; Queue, New job, Job detail (live
 transcript) and Held are in its top bar, with the worker's Pause / Stop now / Resume

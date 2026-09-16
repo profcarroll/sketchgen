@@ -176,6 +176,7 @@ writepath/                  Cloudflare Worker for the gallery's write side
   schema.sql                D1 tables
 
 bin/pull-backup.sh          pull the node's snapshots and jobs/ to this machine
+bin/sketchgen-tunnel.sh     the operator UI's SSH tunnel: up, status, heal, down
 requirements.txt            the venv's one pin: playwright==1.62.0
 
 tests/                      17 files, stdlib unittest
