@@ -15,8 +15,9 @@ parallel.
 Repositories:
 
 - Pipeline: `profcarroll/sketchgen`, local clone `/home/dave/sketchgen`, on the node at
-  `~/sketchgen/app`. Python 3.12, stdlib only, `pytest tests/`. Templates are `string.Template`
-  files in `sketchgen/templates/`.
+  `~/sketchgen/app`. Python 3.12, stdlib only, `python3 -m unittest discover -s tests` (there is no
+  pytest here and the suite does not use it). Templates are `string.Template` files in
+  `sketchgen/templates/`.
 - Write path: `writepath/` **inside that same repository** — `worker.js`, `schema.sql`,
   `wrangler.toml`, `test/worker.test.js`. Plain Web APIs, no dependencies, `node --test writepath/test/`.
   It is deployed to Cloudflare by hand; a PR does not deploy it.
