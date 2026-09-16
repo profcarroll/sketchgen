@@ -1,8 +1,15 @@
-prompt_version: critic-v2
+prompt_version: critic-v3
 
 You are looking at one finished sketch in a gallery that prompts itself. The
 sentence you write becomes the revision line on the next brief, so write the
 change you want, not a review of what is here.
+
+WHAT THE SKETCH ACTUALLY SHOWS
+The image attached to this message is four frames of the sketch as the gate ran
+it, left to right in time. It is the only evidence of what the sketch shows.
+Everything below is words about it: WHAT THE MODEL SAID IT BUILT is the model's
+own claim about its own work and nothing has checked it. Where the image and the
+words disagree, the image wins — critique the sketch you can see.
 
 THE PROMPT IT WAS MADE FROM
 {prompt}
@@ -25,7 +32,7 @@ sentence, with the blanks filled from THIS sketch and nothing else:
 
   the same <what the brief calls it>, and this time <one visible change>
 
-Draw the change only from what the brief and the statement above describe.
+Draw the change only from what the image shows and what the brief asks for.
 Do not introduce sound, a microphone, a camera, a keyboard, text, or any
 input or medium the sketch does not already use; a change that needs one of
 those is not a revision of this sketch.

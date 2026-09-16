@@ -734,16 +734,23 @@ def record_critique(
     prompt_version: str,
     spawned_job_id: int | None = None,
     rejected_reason: str | None = None,
+    strip_path: str | None = None,
+    strip_sha256: str | None = None,
 ) -> int:
     """Record one critique of one entry, whether or not it spawned anything.
 
     One row per (entry, prompt_version): the UNIQUE constraint in migration 006
     is what stops the worker critiquing the same entry on every idle round, so a
     second call for the same pair raises ``sqlite3.IntegrityError`` by design.
+
+    ``strip_path`` and ``strip_sha256`` (migration 007) are the frame strip the
+    critic was shown and the sha256 of exactly those bytes. Both are NULL for
+    every row written under critic-v2, which was blind.
     """
     cur = conn.execute(
         "INSERT INTO critiques (entry_id, critique, critique_by, prompt_version, "
-        "spawned_job_id, rejected_reason, created_utc) VALUES (?,?,?,?,?,?,?)",
+        "spawned_job_id, rejected_reason, strip_path, strip_sha256, created_utc) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
         (
             int(entry_id),
             critique,
@@ -751,6 +758,8 @@ def record_critique(
             prompt_version,
             spawned_job_id,
             rejected_reason,
+            strip_path or None,
+            strip_sha256 or None,
             utc_now(),
         ),
     )
