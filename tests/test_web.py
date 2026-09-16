@@ -15,6 +15,7 @@ import http.client
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -350,15 +351,18 @@ class TestPages(WebTestCase):
 
     def test_every_number_says_which_kind_it_is(self):
         # "Entry 48 — job 49" was read as one thing with two ids, twice, on
-        # 2026-09-14. Now the card carries the entry number alone, the job is
-        # named in words, every button says which entry it acts on, the queue
-        # has an entry column, and the job page names its entry.
+        # 2026-09-14. The card carries the entry number alone as its heading,
+        # the job is named as a job on the meta line, every button still says
+        # which entry it acts on — in its aria-label since packet 6, because
+        # the id in four button labels was the same number said four more
+        # times — the queue has an entry column, and the job page names its
+        # entry.
         held = self.text("/held")
-        self.assertIn(f'<h2>Entry {self.entry_id}</h2>', held)
-        self.assertIn(f'made by job <a href="/job/{self.held_id}">{self.held_id}</a>', held)
-        self.assertIn(f"Publish entry {self.entry_id}</button>", held)
-        self.assertIn(f"Reject entry {self.entry_id}</button>", held)
-        self.assertIn(f"Spawn a child of entry {self.entry_id}</button>", held)
+        self.assertIn(f'<span class="n">{self.entry_id}</span>', held)
+        self.assertIn(f'job <a href="/job/{self.held_id}">{self.held_id}</a>', held)
+        self.assertIn(f'aria-label="Publish entry {self.entry_id}"', held)
+        self.assertIn(f'aria-label="Reject entry {self.entry_id}"', held)
+        self.assertIn(f'aria-label="Spawn a child of entry {self.entry_id}"', held)
         self.assertNotIn("— job", held)
         queue = self.text("/queue")
         self.assertIn('<th class="n">job</th><th class="n">entry</th>', queue)
@@ -1159,6 +1163,275 @@ class TestArchiveAndReject(WebTestCase):
         self.assertGreaterEqual(funnel["archived"]["total"], 1)
 
 
+class TestDecisionCard(WebTestCase):
+    """Packet 6: one number, one image, one input, four verbs.
+
+    Entry 271's card said "271" six times and the word "entry" eight times,
+    drew the gate's four-frame strip twice — the poster the run button sits on
+    *is* that file — and offered two text boxes with a help string under each.
+    One decision, said once. Each test here is one of those repetitions gone.
+    """
+
+    def card_entry(self, state="held", prompt="a cityscape at dusk", entry_id=9271):
+        """An entry with a runnable attempt, renumbered to an id of its own.
+
+        The seeded fixture's entry is 1 and its job is 2, and "1" is also the
+        attempt number and half the numbers on the page, so counting how often
+        a card says its own id needs an id that means nothing else there.
+        """
+        conn = self.db()
+        try:
+            job_id = db.enqueue(conn, prompt, "student-two", rules_file="treatment")
+            if state == "held":
+                db.transition(conn, job_id, "executing", executor="qwen3-coder:30b")
+                db.transition(conn, job_id, "gating")
+                db.transition(conn, job_id, "held")
+            else:
+                conn.execute(
+                    "UPDATE jobs SET state = 'failed' WHERE id = ?", (job_id,)
+                )
+            attempt = self.jobs_dir / str(job_id) / "attempt-1"
+            gate = attempt / ".gate"
+            gate.mkdir(parents=True)
+            (gate / "report.json").write_text(
+                json.dumps(report_json(attempt)), encoding="utf-8"
+            )
+            (gate / "strip.png").write_bytes(PNG_BYTES)
+            (attempt / "index.html").write_text(SKETCH_INDEX, encoding="utf-8")
+            (attempt / "sketch.js").write_text(SKETCH_JS, encoding="utf-8")
+            db.add_attempt(
+                conn, job_id, 1,
+                model="qwen3-coder:30b", rules_file="treatment",
+                source_dir=str(attempt), gate_exit=0,
+                gate_report_path=str(gate / "report.json"),
+            )
+            made = db.create_entry(
+                conn, job_id, state, prompt=prompt,
+                executor="qwen3-coder:30b", rules_file="treatment", attempts=1,
+                source_dir=str(attempt), strip_path=str(gate / "strip.png"),
+                submitted_by="student-two",
+            )
+            conn.execute("UPDATE entries SET id = ? WHERE id = ?", (entry_id, made))
+            conn.commit()
+        finally:
+            conn.close()
+
+        def clean():
+            # Children first: a spawned child job points at this entry, and the
+            # foreign keys are on.
+            conn = self.db()
+            try:
+                conn.execute(
+                    "DELETE FROM jobs WHERE parent_entry_id = ?", (entry_id,)
+                )
+                conn.execute(
+                    "DELETE FROM lineage WHERE parent_entry_id = ? "
+                    "OR child_entry_id = ?",
+                    (entry_id, entry_id),
+                )
+                conn.execute("DELETE FROM attempts WHERE job_id = ?", (job_id,))
+                conn.execute("DELETE FROM entries WHERE id = ?", (entry_id,))
+                conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+                conn.commit()
+            finally:
+                conn.close()
+            shutil.rmtree(self.jobs_dir / str(job_id), ignore_errors=True)
+
+        self.addCleanup(clean)
+        return job_id, entry_id
+
+    def card(self, page, entry_id):
+        """Inside this entry's <section>, and nothing else on the page.
+
+        From the end of the opening tag, so that stripping the tags out of
+        what comes back leaves the words a person actually reads.
+        """
+        needle = f'id="entry-{entry_id}"'
+        self.assertIn(needle, page)
+        inside = page.split(needle, 1)[1].split(">", 1)[1]
+        return inside.split("</section>", 1)[0]
+
+    def row(self, entry_id):
+        conn = self.db()
+        try:
+            return conn.execute(
+                "SELECT * FROM entries WHERE id = ?", (entry_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+
+    # -- what the card shows -----------------------------------------------
+
+    def test_the_strip_is_drawn_once_as_the_run_buttons_poster(self):
+        # The one that started the packet: _poster_url prefers strip.png, so
+        # the poster and the picture underneath it were the same four frames.
+        _, entry_id = self.card_entry()
+        card = self.card(self.text("/held"), entry_id)
+        self.assertEqual(1, card.count("data-preview"))
+        self.assertEqual(1, card.count("<img"))
+        self.assertIn("/.gate/strip.png", card)
+        self.assertNotIn("<iframe", card)
+
+    def test_an_entry_with_nothing_to_run_still_shows_its_strip(self):
+        # _entry_image is the fallback now, not a second picture.
+        job_id, entry_id = self.card_entry()
+        (self.jobs_dir / str(job_id) / "attempt-1" / "index.html").unlink()
+        card = self.card(self.text("/held"), entry_id)
+        self.assertNotIn("data-preview", card)
+        self.assertEqual(1, card.count("<img"))
+        self.assertIn("strip.png", card)
+
+    def test_the_entry_id_is_said_once_and_otherwise_only_to_a_screen_reader(self):
+        _, entry_id = self.card_entry()
+        card = self.card(self.text("/held"), entry_id)
+        visible = re.sub(r"<[^>]+>", " ", card)
+        self.assertEqual(1, len(re.findall(rf"\b{entry_id}\b", visible)), visible)
+        # and the word itself is gone from the card's face: it is a card about
+        # an entry, on a page of them, which nothing has to say out loud
+        self.assertNotIn("entry", visible.lower())
+        # the buttons still name it where it matters
+        for label in ("Publish", "Reject", "Archive"):
+            self.assertIn(f'aria-label="{label} entry {entry_id}"', card)
+        self.assertIn(f'aria-label="Spawn a child of entry {entry_id}"', card)
+
+    def test_the_prompt_is_the_root_sentence_and_the_newest_revision(self):
+        from sketchgen import lineage
+
+        prompt = lineage.compose_prompt(
+            lineage.compose_prompt("a cityscape at dusk", "add a moon"),
+            "try a colder palette after dusk",
+        )
+        _, entry_id = self.card_entry(prompt=prompt)
+        card = self.card(self.text("/held"), entry_id)
+        self.assertIn('<p class="prompt">a cityscape at dusk</p>', card)
+        self.assertIn(
+            '<span class="k">revise:</span> try a colder palette after dusk', card
+        )
+        # the earlier revisions are the ledger's job, not this card's
+        self.assertNotIn("add a moon", card)
+
+    def test_the_meta_line_says_the_rest_of_it_once(self):
+        _, entry_id = self.card_entry()
+        card = self.card(self.text("/held"), entry_id)
+        meta = card.split('<p class="meta">', 1)[1].split("</p>", 1)[0]
+        self.assertIn("gate passed on attempt 1", meta)
+        self.assertIn("treatment", meta)
+        self.assertIn("qwen3-coder:30b", meta)
+        self.assertIn("a root prompt, no lineage", meta)
+        self.assertIn("open in a tab", meta)
+        # and the poster does not repeat the link it carries
+        self.assertEqual(1, card.count("open in a tab"))
+        # what the run costs stays beside the button that starts it
+        self.assertIn("chip cost", card)
+
+    def test_the_generation_is_said_in_the_header_and_not_again_below(self):
+        parent = self.card_entry(entry_id=9270)[1]
+        _, entry_id = self.card_entry(entry_id=9271)
+        conn = self.db()
+        try:
+            db.add_lineage(
+                conn, entry_id, parent, generation=4,
+                critique_by="gemma4:e4b", critique="a colder palette",
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        self.addCleanup(self._drop_lineage, entry_id)
+        card = self.card(self.text("/held"), entry_id)
+        self.assertEqual(1, card.count("generation 4"))
+        self.assertIn(f"from entry {parent}, critiqued by gemma4:e4b", card)
+
+    def _drop_lineage(self, entry_id):
+        conn = self.db()
+        conn.execute("DELETE FROM lineage WHERE child_entry_id = ?", (entry_id,))
+        conn.commit()
+        conn.close()
+
+    # -- the four verbs ----------------------------------------------------
+
+    def test_one_form_one_box_four_verbs(self):
+        _, entry_id = self.card_entry()
+        card = self.card(self.text("/held"), entry_id)
+        self.assertEqual(1, card.count("<form"))
+        self.assertEqual(1, card.count('type="text"'))
+        self.assertEqual(1, card.count('name="text"'))
+        self.assertIn(f'action="/held/{entry_id}/publish"', card)
+        for css, action in (
+            ("rej", f"/held/{entry_id}/reject"),
+            ("cri", f"/entry/{entry_id}/spawn"),
+            ("arc", f"/held/{entry_id}/archive"),
+        ):
+            self.assertIn(f'class="{css}" formaction="{action}"', card)
+        # critique_by left the page: a sentence typed here is the operator's
+        self.assertNotIn("critique_by", card)
+        # one help string, under all four
+        self.assertEqual(1, card.count('class="hint"'))
+
+    def test_a_kept_failure_card_has_no_reject(self):
+        _, entry_id = self.card_entry(
+            state="failed-kept", prompt="one the gate refused"
+        )
+        card = self.card(self.text("/held"), entry_id)
+        self.assertNotIn("/reject", card)
+        self.assertNotIn('class="rej"', card)
+        self.assertIn(f'action="/held/{entry_id}/publish"', card)
+        self.assertIn(f'formaction="/entry/{entry_id}/spawn"', card)
+        self.assertIn(f'formaction="/held/{entry_id}/archive"', card)
+        # and the hint says where publishing puts it
+        self.assertIn("rejections page", card)
+
+    def test_reject_reads_the_box_and_still_reads_the_old_field(self):
+        _, new = self.card_entry(entry_id=9281)
+        self.post(f"/held/{new}/reject", {"text": "off brief", "back": "/held"})
+        self.assertEqual("off brief", self.row(new)["reject_reason"])
+        # Anything posting the old name — the tests above, a bookmark, a
+        # script — still works, which is why the box could be renamed at all.
+        _, old = self.card_entry(entry_id=9282)
+        self.post(f"/held/{old}/reject", {"reason": "the old field", "back": "/held"})
+        self.assertEqual("the old field", self.row(old)["reject_reason"])
+
+    def test_a_critique_typed_on_the_card_is_the_operators(self):
+        _, entry_id = self.card_entry()
+        expected = web.operator_username(self.row(entry_id))
+        status, location = self.post(
+            f"/entry/{entry_id}/spawn",
+            {"text": "try a colder palette after dusk", "back": "/held"},
+        )
+        self.assertEqual(303, status)
+        self.assertIn("Queued", location)
+        conn = self.db()
+        try:
+            child = conn.execute(
+                "SELECT * FROM jobs WHERE parent_entry_id = ?", (entry_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(child)
+        self.assertEqual("try a colder palette after dusk", child["critique"])
+        # no critique_by was posted, and the card has no field for one
+        self.assertEqual(expected, child["critique_by"])
+
+    # -- the same card, read-only ------------------------------------------
+
+    def test_the_entry_page_is_the_same_card_with_no_form(self):
+        _, entry_id = self.card_entry()
+        card = self.card(self.text(f"/entry/{entry_id}"), entry_id)
+        self.assertEqual(1, card.count("data-preview"))
+        self.assertEqual(1, card.count("<img"))
+        self.assertIn('<p class="prompt">a cityscape at dusk</p>', card)
+        self.assertIn('<p class="meta">', card)
+        self.assertNotIn("<form", card)
+        self.assertIn("Waiting for a decision", card)
+
+    def test_an_archived_entry_still_renders_at_entry_id(self):
+        _, entry_id = self.card_entry()
+        self.post(f"/held/{entry_id}/archive", {"back": "/held"})
+        card = self.card(self.text(f"/entry/{entry_id}"), entry_id)
+        self.assertIn('<span class="pill archived">archived</span>', card)
+        self.assertIn("Nothing was deleted", card)
+        self.assertNotIn("<form", card)
+
+
 class TestSpawn(WebTestCase):
     """POST /entry/<id>/spawn — packet 5.3's one write to the operator UI."""
 
@@ -1415,7 +1688,8 @@ class TestPreview(WebTestCase):
     def test_the_held_card_offers_the_sketch_without_running_it(self):
         page = self.text("/held")
         self.assertIn(f'data-src="/preview/{self.held_id}/1/"', page)
-        # the strip the gate saw is still there, below it
+        # the strip the gate saw is the poster the play button sits on, and
+        # since packet 6 that is the only place it is drawn
         self.assertIn("strip.png", page)
 
     def test_the_held_page_renders_no_iframe_at_all(self):
