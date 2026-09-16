@@ -5,3 +5,6 @@ __pycache__/
 .gate/
 *.pyc
 writepath/.wrangler/
+
+# Claude Code agent worktrees (harness scratch, not project files)
+.claude/worktrees/
