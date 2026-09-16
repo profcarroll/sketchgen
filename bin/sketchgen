@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sketchgen import __version__  # noqa: E402
+from sketchgen import console  # noqa: E402
 from sketchgen import db  # noqa: E402
 from sketchgen import executor  # noqa: E402
 from sketchgen import lineage  # noqa: E402
@@ -135,6 +136,19 @@ def cmd_db_status(args: argparse.Namespace) -> int:
         print("jobs by state:")
         for state, count in db.job_counts(conn):
             print(f"  {state:<16} {count:>8}")
+        # What the worker is doing, in the one view that is available over SSH
+        # with no tunnel to the operator UI. The card and this print the same
+        # sentence because they read the same function.
+        act = console.activity(conn)
+        state = act.get("state") or "unknown"
+        elapsed = act.get("elapsed_s")
+        print(
+            f"now: {act.get('headline') or '—'}  [{state}"
+            + (f", {worker.human_gap(elapsed)}" if elapsed is not None else "")
+            + "]"
+        )
+        if act.get("detail"):
+            print(f"  {act['detail']}")
         idle = worker.idle_summary(conn)
         print("idle work:")
         for label, key in (

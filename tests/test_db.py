@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from sketchgen import db  # noqa: E402
 
 EXPECTED_TABLES = {
+    "activity",
     "attempts",
     "control",
     "critiques",
@@ -432,6 +433,84 @@ class TestRequeue(DbTestCase):
         with self.assertRaises(db.IllegalTransition):
             db.requeue(self.conn, other)
         self.assertEqual("held", db.get_job(self.conn, other).state)
+
+
+class TestActivity(DbTestCase):
+    """Migration 008: the row the worker writes and the operator UI reads."""
+
+    def test_a_new_step_closes_the_one_this_pid_had_open(self):
+        first = db.begin_step(self.conn, step="writing",
+                              headline="Writing the sketch")
+        second = db.begin_step(self.conn, step="evaluating",
+                               headline="Evaluating the sketch in a browser")
+        rows = {
+            int(row["id"]): row
+            for row in self.conn.execute("SELECT * FROM activity")
+        }
+        self.assertIsNotNone(rows[first]["ended_utc"])
+        self.assertIsNone(rows[second]["ended_utc"])
+
+    def test_another_pids_open_step_is_left_alone(self):
+        # Two workers is not a thing this system has, but a worker that was
+        # killed is: its row stays open, because it is the evidence of what
+        # that process was doing when it stopped.
+        stale = db.begin_step(self.conn, step="writing", headline="Writing",
+                              pid=999999)
+        db.begin_step(self.conn, step="planning", headline="Planning")
+        row = self.conn.execute(
+            "SELECT ended_utc FROM activity WHERE id = ?", (stale,)
+        ).fetchone()
+        self.assertIsNone(row["ended_utc"])
+
+    def test_current_activity_is_the_open_one_and_recent_is_the_closed_ones(self):
+        db.begin_step(self.conn, step="claiming", headline="Picking up the next job")
+        db.begin_step(self.conn, step="planning",
+                      headline="Turning the prompt into a brief")
+        db.begin_step(self.conn, step="writing", headline="Writing the sketch",
+                      model="qwen3-coder:30b")
+        current = db.current_activity(self.conn)
+        self.assertEqual("writing", current["step"])
+        self.assertEqual("qwen3-coder:30b", current["model"])
+        trail = db.recent_activity(self.conn, 3)
+        self.assertEqual(
+            ["Turning the prompt into a brief", "Picking up the next job"],
+            [row["headline"] for row in trail],
+        )
+
+    def test_update_step_fills_in_what_the_step_learned_late(self):
+        activity_id = db.begin_step(self.conn, step="judging",
+                                    headline="Comparing two sketches")
+        db.update_step(self.conn, activity_id,
+                       detail="gemma4:e4b · entry 231 against entry 88")
+        row = db.current_activity(self.conn)
+        self.assertEqual("gemma4:e4b · entry 231 against entry 88", row["detail"])
+        # a call with nothing in it writes nothing rather than blanking the row
+        db.update_step(self.conn, activity_id)
+        self.assertEqual(row["detail"], db.current_activity(self.conn)["detail"])
+
+    def test_end_step_closes_without_opening_another(self):
+        activity_id = db.begin_step(self.conn, step="idle",
+                                    headline="Nothing to do")
+        db.end_step(self.conn, activity_id)
+        self.assertIsNone(db.current_activity(self.conn))
+        self.assertEqual(["Nothing to do"],
+                         [row["headline"] for row in db.recent_activity(self.conn)])
+
+    def test_the_table_is_pruned_to_activity_keep(self):
+        for n in range(db.ACTIVITY_KEEP + 25):
+            db.begin_step(self.conn, step="idle", headline=f"step {n}")
+        count = self.conn.execute("SELECT COUNT(*) FROM activity").fetchone()[0]
+        self.assertEqual(db.ACTIVITY_KEEP, count)
+        # the newest survive, not the oldest
+        self.assertEqual(f"step {db.ACTIVITY_KEEP + 24}",
+                         db.current_activity(self.conn)["headline"])
+
+    def test_a_database_without_the_table_answers_rather_than_raising(self):
+        # An older file — one that predates migration 008 — should render a
+        # card that says nothing, not a traceback in the browser.
+        self.conn.execute("DROP TABLE activity")
+        self.assertIsNone(db.current_activity(self.conn))
+        self.assertEqual([], db.recent_activity(self.conn))
 
 
 if __name__ == "__main__":

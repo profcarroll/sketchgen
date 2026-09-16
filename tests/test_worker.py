@@ -11,6 +11,7 @@ the gate actually produces rather than against a convenient fiction.
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -273,6 +274,16 @@ class WorkerTestCase(unittest.TestCase):
 
     def attempts(self, job_id):
         return db.list_attempts(self.conn, job_id)
+
+    def steps(self):
+        """Every activity row this worker wrote, oldest first, by step name."""
+        return [
+            row["step"]
+            for row in self.conn.execute("SELECT step FROM activity ORDER BY id")
+        ]
+
+    def activity_rows(self):
+        return self.conn.execute("SELECT * FROM activity ORDER BY id").fetchall()
 
     def entries(self, job_id):
         return self.conn.execute(
@@ -1174,6 +1185,145 @@ class TestSweep(WorkerTestCase):
         self.assertIsNone(worker.minutes_between("yesterday", db.utc_now()))
         self.assertEqual(60.0, worker.minutes_between("2026-09-14T00:00:00Z",
                                                       "2026-09-14T01:00:00Z"))
+
+
+class TestStatusCard(IdleTestCase):
+    """Packet 5: the steps the worker records for the operator's card.
+
+    The card is the only way "what is the worker doing right now" reaches the
+    web process — a different process, sharing one database and nothing else —
+    so these tests are about the row, not about the log line beside it.
+    """
+
+    def test_one_job_records_its_steps_in_order(self):
+        job_id = db.enqueue(self.conn, "sixty drifting circles", "octocat")
+        self.assertEqual(0, self.make_worker().run_once())
+        self.assertEqual(
+            ["claiming", "planning", "writing", "evaluating", "submitting"],
+            self.steps(),
+        )
+        rows = self.activity_rows()
+        # the claiming row names the job it got, once it has it
+        self.assertIn(f"job {job_id}", rows[0]["detail"])
+        self.assertIn("by octocat", rows[0]["detail"])
+        # the sentence is in plain language; the job state machine is not
+        writing = rows[2]
+        self.assertEqual("Writing the sketch", writing["headline"])
+        self.assertEqual(job_id, writing["job_id"])
+        self.assertIn("attempt 1 of 3", writing["detail"])
+        # two vocabularies on purpose: the card says writing, the database says
+        # executing, and neither is renamed for the other
+        self.assertNotIn("executing", self.steps())
+        # the last step of a finished job stays open; nothing closes it but the
+        # next step, and the nap is the next step
+        self.assertIsNone(rows[-1]["ended_utc"])
+        self.assertEqual("Submitting the sketch for review", rows[-1]["headline"])
+
+    def test_a_failed_gate_records_the_feedback_and_the_correction(self):
+        self.enqueue()
+        run = self.make_worker(gate_fn=StubGate([1, 0]))
+        self.assertEqual(0, run.run_once())
+        steps = self.steps()
+        self.assertEqual(
+            ["claiming", "writing", "evaluating", "feedback", "correcting",
+             "writing", "evaluating", "submitting"],
+            steps,
+        )
+        correcting = [row for row in self.activity_rows()
+                      if row["step"] == "correcting"][0]
+        self.assertEqual("Correcting the sketch from the feedback",
+                         correcting["headline"])
+        self.assertIn("attempt 2 of 3 next", correcting["detail"])
+        second = [row for row in self.activity_rows() if row["step"] == "writing"][1]
+        self.assertIn("correcting from the last evaluation", second["detail"])
+
+    def test_an_idle_round_records_judging_critiquing_and_the_nap(self):
+        _, entry_id = self.publish()
+        self.publish(prompt="a second field")
+        run = self.make_worker(judge_fn=StubJudge(judged=1),
+                               critic_fn=StubCritic(), idle_judge=1,
+                               idle_critique=1)
+        self.assertEqual(0, run.run_once())
+        run._nap(0.0)  # what run_forever does next, with no sleep to wait for
+        self.assertEqual(
+            ["claiming", "judging", "critiquing", "spawning", "idle"], self.steps()
+        )
+        rows = {row["step"]: row for row in self.activity_rows()}
+        # the judge names its pair only after it has judged it
+        self.assertIn("entry 1 against entry 2", rows["judging"]["detail"])
+        self.assertEqual(f"Critiquing entry {entry_id}", rows["critiquing"]["headline"])
+        self.assertIn("next wake in 0 s", rows["idle"]["detail"])
+        # the nap is the step that is still open, so a living worker always has
+        # one: an open row with a dead pid is how the card says it stopped
+        self.assertIsNone(rows["idle"]["ended_utc"])
+
+    def test_the_nap_carries_what_the_idle_round_found(self):
+        run = self.make_worker(idle_judge=0, idle_critique=0)
+        self.assertEqual(0, run.run_once())
+        # The step is opened before the sleeping starts, so a worker on its way
+        # out records the nap it was about to take — and this test does not
+        # have to wait three minutes and forty seconds to read it.
+        run._terminating = True
+        run._nap(220.0)
+        row = db.current_activity(self.conn)
+        self.assertEqual("idle", row["step"])
+        self.assertIn("queue empty", row["detail"])
+        self.assertIn("judging is switched off", row["detail"])
+        self.assertIn("next wake in 3 min 40 s", row["detail"])
+
+    def test_a_sweep_that_re_queues_nothing_says_nothing(self):
+        # The sweep runs on every pass. A step per pass would push whatever the
+        # worker is really doing off the card.
+        self.make_worker().run_once()
+        self.assertNotIn("sweeping", self.steps())
+
+    def test_a_sweep_that_re_queues_something_is_a_step(self):
+        job_id = self.enqueue()
+        db.transition(self.conn, job_id, "executing")
+        self.conn.execute(
+            "UPDATE jobs SET updated_utc = ? WHERE id = ?",
+            ("2026-09-14T00:00:00Z", job_id),
+        )
+        run = self.make_worker()
+        run.sweep_stuck(now="2026-09-14T09:00:00Z")
+        row = db.current_activity(self.conn)
+        self.assertEqual("sweeping", row["step"])
+        self.assertEqual("1 job left running by a worker that stopped",
+                         row["detail"])
+
+    def test_a_card_that_cannot_be_written_does_not_cost_the_job(self):
+        # The same bargain the idle round makes: the display of the work is
+        # never worth the work.
+        job_id = self.enqueue()
+        log = io.StringIO()
+        run = self.make_worker(log_stream=log)
+
+        def refuse(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        with mock.patch.object(db, "begin_step", refuse):
+            self.assertEqual(0, run.run_once())
+        self.assertEqual("held", db.get_job(self.conn, job_id).state)
+        self.assertEqual([], self.steps())
+        self.assertIn("status: the card could not record", log.getvalue())
+
+
+class TestHumanGap(unittest.TestCase):
+    """The card's own duration voice: read inside a sentence, not in a cell."""
+
+    def test_the_shapes_the_card_uses(self):
+        for seconds, text in (
+            (0, "0 s"),
+            (40, "40 s"),
+            (220, "3 min 40 s"),
+            (840, "14 min"),
+            (3600, "1 h"),
+            (15120, "4 h 12 min"),
+            (90000, "1 d 1 h"),
+            (None, "—"),
+        ):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(text, worker.human_gap(seconds))
 
 
 class TestEvidence(unittest.TestCase):

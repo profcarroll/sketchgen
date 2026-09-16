@@ -99,6 +99,31 @@ job 6. Two rules came out of it:
     worker that is killed mid-job, or a bug nobody predicted, costs a delay now
     instead of a job.
 
+**What it is doing, where another process can read it (packet 5).** The
+operator UI is ``sketchgen-web.service`` and this is ``sketchgen-worker.service``:
+two processes, one WAL-mode database, nothing else in common. Everything above
+is said with :meth:`Worker.log` into ``jobs/<id>/job.log``, which the web server
+cannot find until it knows which job to look for, and the idle round writes to
+no job log at all — so the Console could say ``executing`` and not one word
+about what that meant, and an idle worker looked exactly like a stopped one.
+:meth:`Worker._say` writes one row per step into ``activity`` (migration 008) at
+the boundaries this loop already has, in the operator's vocabulary rather than
+the state machine's: *writing*, *evaluating*, *correcting*, while ``jobs.state``
+goes on saying ``executing``, ``gating``, ``repairing``. Two vocabularies on
+purpose.
+
+Three consequences worth writing down. There is **no thread and no second
+timer**: this process blocks inside one non-streaming HTTP call for a whole step
+(about 67 s for a sketch), so it cannot tick a heartbeat mid-step, and a thread
+to do it with would be a second thing holding the one inference slot's process
+open — the same argument that put the idle round inside this loop. Liveness is
+therefore the recorded pid plus the step's start, and progress is elapsed
+against the median of that step. **The nap is a step**, so a living worker
+always has one row open and an open row whose pid is gone means the worker
+stopped rather than that nobody has written lately. And **the card never costs a
+job**: every write is wrapped, and a step that could not be recorded is a step
+that still happened.
+
 Python 3.12, stdlib only. Timestamps are UTC, ISO 8601 with a trailing Z.
 """
 
@@ -151,6 +176,7 @@ __all__ = [
     "default_probe",
     "evidence_with_preflight",
     "fence",
+    "human_gap",
     "idle_summary",
     "is_stop_now",
     "minutes_between",
@@ -161,6 +187,7 @@ __all__ = [
     "stub_executor",
     "stub_judge",
     "stub_planner",
+    "trim_detail",
 ]
 
 EXIT_OK = 0
@@ -251,6 +278,18 @@ CHECK_NOTE_KEYWORDS: dict[str, tuple[str, ...]] = {
 RUNTIME_NOTE_KEYWORDS = ("framecount", "audiocontext")
 
 MAX_CONSOLE_LINES = 10
+
+#: The gate's five fixed checks, said the way a person would say them, for the
+#: ``evaluating`` step's detail line. The gate keeps its own names everywhere it
+#: already has them — ``console_clean``, ``frame_advancing``, ``sound_lib_ok``
+#: are what report.json and the evidence say, and nothing renames them. This is
+#: the one place the operator is told what the browser is about to look at, and
+#: it is the card's vocabulary, not the report's (docs: packet 5 §3).
+GATE_CHECKS_PLAIN = ("console", "motion", "frame budget", "sound")
+
+#: How long a detail line may be before it is cut. A repair reason is the gate's
+#: first line and can be a paragraph; the card is one line under a headline.
+DETAIL_MAX_CHARS = 120
 
 
 class StopNow(Exception):
@@ -606,6 +645,39 @@ def minutes_between(earlier: str | None, later: str | None) -> float | None:
     return (end - start).total_seconds() / 60.0
 
 
+def human_gap(seconds: float | None) -> str:
+    """A span of time in the status card's voice: ``40 s``, ``3 min 40 s``,
+    ``14 min``, ``4 h 12 min``.
+
+    Not :func:`sketchgen.web.human_seconds`, which writes ``3m 40s`` for a
+    table cell and has to stay narrow. This one is read inside a sentence —
+    "queued 14 min ago", "next wake in 3 min 40 s" — so it is spaced and
+    spelled out, and it drops the seconds once the minutes are the news.
+    """
+    if seconds is None:
+        return "—"
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total} s"
+    if total < 3600:
+        minutes, rest = divmod(total, 60)
+        if minutes < 10 and rest:
+            return f"{minutes} min {rest} s"
+        return f"{minutes} min"
+    hours, rest = divmod(total, 3600)
+    minutes = rest // 60
+    if hours < 24:
+        return f"{hours} h {minutes} min" if minutes else f"{hours} h"
+    days, hours = divmod(hours, 24)
+    return f"{days} d {hours} h" if hours else f"{days} d"
+
+
+def trim_detail(text: str | None, limit: int = DETAIL_MAX_CHARS) -> str:
+    """One line of somebody else's prose, flattened and cut to fit the card."""
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
 def node_shape() -> str:
     """The machine this entry was made on, as one string for the gallery.
 
@@ -946,6 +1018,12 @@ class Worker:
         self._owned: set[int] = set()
         self._swept = False
         self._terminating = False
+        #: The activity row this process has open, for the steps that learn
+        #: something after they begin (see :meth:`_say_more`).
+        self._activity_id: int | None = None
+        #: What the last idle round found, carried to the nap that follows it so
+        #: that "Nothing to do" can say what there was nothing of.
+        self._idle_note: str | None = None
 
     # -- logging ---------------------------------------------------------
 
@@ -969,6 +1047,74 @@ class Worker:
         self._log_path = directory / "job.log"
         return directory
 
+    # -- the status card (packet 5) --------------------------------------
+
+    def _say(
+        self,
+        step: str,
+        headline: str,
+        detail: str | None = None,
+        *,
+        job_id: int | None = None,
+        entry_id: int | None = None,
+        model: str | None = None,
+    ) -> None:
+        """Open one step of the process status card, and log the same sentence.
+
+        The web UI is a different process that shares nothing with this one but
+        the database, so this is the only way "what is the worker doing right
+        now" travels: ``job.log`` is a file the server cannot find until it
+        knows which job to look for, and idle work has no job log at all. The
+        row is the card; the log line keeps the transcript complete, so a
+        person reading ``job.log`` sees every boundary the card shows.
+
+        **It never raises.** A card that cannot be written is not a reason to
+        lose a job — the same bargain :meth:`_idle_round` already makes for the
+        judge and the critic. The step still happens; only the display of it is
+        lost, and the failure is logged where the transcript will keep it.
+        """
+        self.log(f"{step}: {headline}" + (f" — {detail}" if detail else ""))
+        try:
+            self._activity_id = db.begin_step(
+                self.conn,
+                step=step,
+                headline=headline,
+                detail=detail,
+                job_id=job_id,
+                entry_id=entry_id,
+                model=model,
+            )
+        except sqlite3.Error as exc:
+            self._activity_id = None
+            self.log(f"status: the card could not record {step}: {exc}")
+
+    def _say_more(
+        self,
+        detail: str | None = None,
+        *,
+        entry_id: int | None = None,
+        model: str | None = None,
+    ) -> None:
+        """Amend the open step. Never raises, for :meth:`_say`'s reason.
+
+        Two steps only learn their subject after they have started: ``claiming``
+        does not know the job id until ``claim_next`` has answered, and the
+        judge picks its pair inside ``judge.run_local`` and reports it through
+        the log callback afterwards.
+        """
+        if self._activity_id is None:
+            return
+        try:
+            db.update_step(
+                self.conn,
+                self._activity_id,
+                detail=detail,
+                entry_id=entry_id,
+                model=model,
+            )
+        except sqlite3.Error as exc:
+            self.log(f"status: the card could not be amended: {exc}")
+
     # -- control ---------------------------------------------------------
 
     def _control(self) -> db.Control | None:
@@ -990,6 +1136,10 @@ class Worker:
         """One pass: at most one job. 0 ok / 1 failed / 3 refused by the fence."""
         self._log_path = None
         self._planner_prompt_version = None
+        # The nap after this pass says what this pass found, and this pass has
+        # not found it yet; a note left over from the last idle round would be
+        # a sentence about a queue that has since moved.
+        self._idle_note = None
         control = self._control()
         if control is not None and control.state == "paused":
             self.log(f"control: paused ({control.reason or 'no reason given'}); "
@@ -1025,12 +1175,19 @@ class Worker:
             else "fence: the inference slot is free"
         )
 
+        self._say("claiming", "Picking up the next job")
         job = db.claim_next(self.conn)
         if job is None:
             self.log("queue: nothing queued")
             self._idle_round()
             return EXIT_OK
 
+        waited = minutes_between(job.created_utc, db.utc_now())
+        self._say_more(
+            f"job {job.id}"
+            + (f" · queued {human_gap(waited * 60.0)} ago" if waited is not None else "")
+            + (f" · by {job.submitted_by}" if job.submitted_by else "")
+        )
         directory = self._open_job_log(job.id)
         self.log(f"job {job.id}: claimed, state {job.state}, by {job.submitted_by}, "
                  f"work directory {directory}")
@@ -1140,6 +1297,17 @@ class Worker:
                 continue
             swept.append(job_id)
             self.log(said)
+        if swept:
+            # Only when something was actually re-queued. The sweep runs on
+            # every pass and on every idle round, and a step that opened each
+            # time would push whatever the worker is really doing off the card
+            # and fill the trail with rows that mean "nothing was wrong".
+            self._say(
+                "sweeping",
+                "Re-queuing jobs nobody came back for",
+                f"{len(swept)} job{'' if len(swept) == 1 else 's'} left running "
+                "by a worker that stopped",
+            )
         return swept
 
     # -- idle work (packet 5.4) ------------------------------------------
@@ -1155,6 +1323,16 @@ class Worker:
             head, _, tail = message.partition(":")
             detail = f" ({tail.strip()})" if tail.strip() else ""
             self.log(f"idle: {head.strip()} as {self.judge_model}{detail}")
+            # The judge picks its pair internally and names it only here, once
+            # it has judged it. One `judging` step may cover several pairs; the
+            # card's detail says what it last did, which is what the operator
+            # is looking at when they look.
+            words = head.split()
+            if len(words) >= 4 and words[1].isdigit() and words[3].isdigit():
+                self._say_more(
+                    f"{self.judge_model} · entry {words[1]} against entry "
+                    f"{words[3]} · closer to the brief, rather look at"
+                )
         else:
             self.log(f"idle: {message}")
 
@@ -1189,6 +1367,9 @@ class Worker:
             if self.idle_critique <= 0 else "nothing to critique",
         ]
         self.log("idle: " + "; ".join(parts))
+        # The nap that follows is the step; this is the half of its sentence
+        # only the round knows. See :meth:`_nap`.
+        self._idle_note = "queue empty · " + ", ".join(parts)
 
     def _idle_judge(self) -> int:
         """Judge up to ``idle_judge`` pairs with the local judge (packet 5.2).
@@ -1198,6 +1379,13 @@ class Worker:
         second probe could only refuse the worker its own resident model, or
         undo the test-mode observing probe the CLI injected.
         """
+        self._say(
+            "judging",
+            "Comparing two sketches",
+            f"{self.judge_model} · looking for a pair · closer to the brief, "
+            "rather look at",
+            model=self.judge_model,
+        )
         try:
             counts = self.judge_fn(
                 self.conn,
@@ -1268,6 +1456,16 @@ class Worker:
         if row is None:  # pragma: no cover - it was there a moment ago
             return False
 
+        parent_generation = self._generation_of(entry_id)
+        self._say(
+            "critiquing",
+            f"Critiquing entry {entry_id}",
+            f"{self.critic_model} · one sentence that becomes a child prompt"
+            + (f" · generation {parent_generation}" if parent_generation is not None
+               else ""),
+            entry_id=int(entry_id),
+            model=self.critic_model,
+        )
         try:
             critique = self.critic_fn(
                 self.conn, int(entry_id), model=self.critic_model, host=self.host
@@ -1326,7 +1524,25 @@ class Worker:
                 f"idle: critiqued entry {entry_id} -> job {job_id} "
                 f"(generation {generation})"
             )
+            self._say(
+                "spawning",
+                "Starting a child sketch",
+                f"job {job_id} from entry {entry_id} · generation {generation}",
+                job_id=int(job_id),
+                entry_id=int(entry_id),
+            )
         return True
+
+    def _generation_of(self, entry_id: int) -> int | None:
+        """The entry's place in its line, or None when it cannot be read.
+
+        A number for a sentence on a card is never worth an exception in the
+        idle round, so the lookup that raises leaves the segment out instead.
+        """
+        try:
+            return lineage.generation_of(self.conn, int(entry_id))
+        except Exception:  # noqa: BLE001 - the card is not worth a job
+            return None
 
     # -- the job ---------------------------------------------------------
 
@@ -1375,7 +1591,22 @@ class Worker:
         return True
 
     def _nap(self, seconds: float) -> None:
-        """Sleep, in slices, so a SIGTERM while idle ends the loop promptly."""
+        """Sleep, in slices, so a SIGTERM while idle ends the loop promptly.
+
+        The nap is a step on the status card, and it is the step that makes the
+        card trustworthy: with it, a living worker always has one row open, so
+        an open row with a dead pid means the worker stopped rather than that
+        nobody has written since. Its detail carries the sleep length, which is
+        where "next wake in 3 min 40 s" comes from, and the note the idle round
+        left behind, which is where "nothing to judge, nothing to critique"
+        does.
+        """
+        note, self._idle_note = self._idle_note, None
+        self._say(
+            "idle",
+            "Nothing to do",
+            " · ".join(filter(None, [note, f"next wake in {human_gap(seconds)}"])),
+        )
         deadline = time.monotonic() + seconds
         while not self._terminating:
             left = deadline - time.monotonic()
@@ -1452,6 +1683,16 @@ class Worker:
             png_path=artefacts.get("png"),
         )
         self.log(f"job {job_id}: entry {entry_id} created, state {state}")
+        self._say(
+            "submitting",
+            "Submitting the sketch for review",
+            f"entry {entry_id}, "
+            + ("waiting for a person" if state == "held"
+               else "a failure kept for the record")
+            + f" · job {job_id}",
+            job_id=job_id,
+            entry_id=entry_id,
+        )
         # Packet 5.3. A spawned job has carried its critique since
         # lineage.spawn() queued it, because the `lineage` table keys on the
         # child ENTRY and the entry is only now a thing that exists. This is
@@ -1505,6 +1746,13 @@ class Worker:
                      "(DECIDE[credential-model] B: no paid key on the node)")
             return None
 
+        self._say(
+            "planning",
+            "Turning the prompt into a brief",
+            f"{self.planner_model} · job {job.id}",
+            job_id=job.id,
+            model=self.planner_model,
+        )
         plan = None
         reason = "the planner said nothing"
         last_raw = ""
@@ -1589,7 +1837,7 @@ class Worker:
             self._pause_after_attempt(job.id)
         return EXIT_OK
 
-    def _preflight_lines(self, job_id: int, attempt_dir: Path) -> list[str]:
+    def _preflight_lines(self, job_id: int, n: int, attempt_dir: Path) -> list[str]:
         """The pre-flight scan over one attempt directory, as evidence lines.
 
         Never raises into the job: a scan that fails is logged and dropped, the
@@ -1597,6 +1845,12 @@ class Worker:
         failure that has already happened, and no explanation is worth losing
         the evidence the gate did produce.
         """
+        self._say(
+            "feedback",
+            "Working out what went wrong",
+            f"job {job_id}, attempt {n} · reading the sketch beside the evaluation",
+            job_id=job_id,
+        )
         try:
             lines = preflight.evidence_lines(preflight.scan_dir(attempt_dir))
         except Exception as exc:  # noqa: BLE001 - deliberately everything
@@ -1626,6 +1880,15 @@ class Worker:
         self.log(f"job {job.id}: attempt {n}/{job.max_attempts} executing into "
                  f"{attempt_dir}"
                  + (" with the previous attempt's evidence" if evidence else ""))
+        self._say(
+            "writing",
+            "Writing the sketch",
+            f"{self.executor_model} · job {job.id}, attempt {n} of "
+            f"{job.max_attempts}"
+            + (" · correcting from the last evaluation" if evidence else ""),
+            job_id=job.id,
+            model=self.executor_model,
+        )
         try:
             execution = self.executor_fn(
                 brief=brief,
@@ -1683,6 +1946,13 @@ class Worker:
             # straight from executing to repairing; the attempt row carries a
             # null gate_exit and says why.
             db.transition(self.conn, job.id, "repairing")
+            self._say(
+                "correcting",
+                "Correcting the sketch from the feedback",
+                f"job {job.id} · {trim_detail(failure)} · attempt {n + 1} of "
+                f"{job.max_attempts} next",
+                job_id=job.id,
+            )
             db.transition(self.conn, job.id, "executing")
             return failure
 
@@ -1690,6 +1960,15 @@ class Worker:
         gate_out = attempt_dir / ".gate"
         asked = " ".join(f"--assert {word}" for word in assertions) or "(no assertions)"
         self.log(f"job {job.id}: attempt {n} gating {attempt_dir} {asked}")
+        looking_at = ", ".join(GATE_CHECKS_PLAIN)
+        if assertions:
+            looking_at += ", and " + ", ".join(assertions)
+        self._say(
+            "evaluating",
+            "Evaluating the sketch in a browser",
+            f"chromium · job {job.id}, attempt {n} · {looking_at}",
+            job_id=job.id,
+        )
         try:
             outcome = self.gate_fn(
                 source_dir=str(attempt_dir),
@@ -1717,7 +1996,7 @@ class Worker:
         new_evidence = gate_evidence
         if gate_evidence is not None:
             new_evidence = evidence_with_preflight(
-                gate_evidence, self._preflight_lines(job.id, attempt_dir)
+                gate_evidence, self._preflight_lines(job.id, n, attempt_dir)
             )
         db.add_attempt(
             self.conn,
@@ -1758,6 +2037,13 @@ class Worker:
             return None
 
         db.transition(self.conn, job.id, "repairing")
+        self._say(
+            "correcting",
+            "Correcting the sketch from the feedback",
+            f"job {job.id} · {trim_detail(first_line)} · attempt {n + 1} of "
+            f"{job.max_attempts} next",
+            job_id=job.id,
+        )
         db.transition(self.conn, job.id, "executing")
         self.log(f"job {job.id}: repairing — {first_line}")
         return new_evidence
