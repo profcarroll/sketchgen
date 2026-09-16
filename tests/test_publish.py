@@ -16,6 +16,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -443,6 +445,81 @@ class PublishIndexTests(PublishTestCase):
         self.assertIn("index render failed", why)
         self.assertEqual(head, self.head(self.gallery))
         self.assertEqual("", git(self.gallery, "status", "--porcelain").stdout.strip())
+
+
+class LockTests(PublishTestCase):
+    """One publisher at a time per checkout (the entry 488 race, 2026-09-16)."""
+
+    def test_the_lock_file_is_in_the_git_dir_and_never_in_the_work_tree(self):
+        """A lock file in the work tree would be staged and published."""
+        lock_path = publish._lock_file(self.gallery)
+        self.assertIsNotNone(lock_path)
+        self.assertEqual(".git", lock_path.parent.name)
+        with publish._checkout_lock(self.gallery):
+            pass
+        self.assertTrue(lock_path.exists())
+        # the publisher stages everything in the work tree; this must not be in it
+        self.assertEqual("", git(self.gallery, "status", "--porcelain").stdout.strip())
+
+    def test_a_second_holder_gives_up_rather_than_waiting_for_ever(self):
+        with publish._checkout_lock(self.gallery):
+            with self.assertRaises(publish.PublishFailed) as caught:
+                with publish._checkout_lock(self.gallery, timeout=0.3):
+                    self.fail("the second holder should not have got the lock")
+        self.assertIn("another publish", str(caught.exception))
+
+    def test_the_lock_is_released_when_the_block_exits(self):
+        with publish._checkout_lock(self.gallery, timeout=0.3):
+            pass
+        with publish._checkout_lock(self.gallery, timeout=0.3):
+            pass  # would raise if the first had not released
+
+    def test_the_lock_is_released_when_the_block_raises(self):
+        with self.assertRaises(ValueError):
+            with publish._checkout_lock(self.gallery, timeout=0.3):
+                raise ValueError("boom")
+        with publish._checkout_lock(self.gallery, timeout=0.3):
+            pass
+
+    def test_a_directory_that_is_not_a_repository_is_not_locked(self):
+        """Not a repo: no lock, and gallery_checkout gives the real refusal."""
+        plain = self.tmp / "not-a-repo"
+        plain.mkdir()
+        self.assertIsNone(publish._lock_file(plain))
+        with publish._checkout_lock(plain, timeout=0.3):
+            pass  # a no-op, not an error
+        self.assertIsNone(publish._lock_file(self.tmp / "does-not-exist"))
+
+    def test_a_publish_waits_for_the_holder_instead_of_racing_it(self):
+        """The whole point: the second publisher blocks, then does its work.
+
+        Without the lock both would render and push against the same tree,
+        which is how entry 488's push was refused for a ref that had moved.
+        """
+        held_for = 0.5
+        released_at = []
+
+        def hold():
+            with publish._checkout_lock(self.gallery):
+                time.sleep(held_for)
+                released_at.append(time.monotonic())
+
+        holder = threading.Thread(target=hold)
+        holder.start()
+        self.addCleanup(holder.join)
+        time.sleep(0.1)  # let the thread take the lock first
+
+        started = time.monotonic()
+        result = publish.publish(
+            self.conn, self.entry_id, gallery_dir=self.gallery, key=None
+        )
+        elapsed = time.monotonic() - started
+        holder.join()
+
+        self.assertIsInstance(result, publish.Published)
+        self.assertTrue(released_at, "the holder never released the lock")
+        # it cannot have started its git work before the holder let go
+        self.assertGreater(elapsed, held_for - 0.2)
 
 
 class ScanTests(unittest.TestCase):
