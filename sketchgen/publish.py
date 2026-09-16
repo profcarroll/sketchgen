@@ -29,6 +29,8 @@ UTC, ISO 8601, with a Z.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import os
 import re
 import shutil
@@ -36,6 +38,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -163,6 +166,93 @@ def _default_branch(gallery_dir: Path) -> str | None:
     if current in ("main", "master"):
         return current
     return None
+
+
+#: How long a publisher waits for another one to finish with the checkout
+#: before it gives up. A publish is a render, two commits and two pushes over
+#: the network; a minute or two is a slow one, and anything past this is not a
+#: queue any more, it is a process that died holding the lock.
+LOCK_TIMEOUT = 300.0
+
+#: The lock file, kept in the repository's git directory and NOT in the work
+#: tree. Everything in the work tree is generated output that the publisher
+#: stages with `git add -A`, so a lock file there would be committed and
+#: published to the gallery.
+LOCK_NAME = "sketchgen-publish.lock"
+
+
+def _lock_file(gallery_dir: str | os.PathLike[str]) -> Path | None:
+    """Where this checkout's publish lock lives, or None if it is not a repo.
+
+    None means the caller should carry on without a lock: there is nothing to
+    serialise, and the checks in :func:`gallery_checkout` are about to refuse
+    this directory anyway with a better message than a lock error would give.
+    """
+    path = Path(os.path.expanduser(str(gallery_dir)))
+    if not path.is_dir():
+        return None
+    git_dir = _git_out(path, "rev-parse", "--absolute-git-dir")
+    return Path(git_dir) / LOCK_NAME if git_dir else None
+
+
+@contextlib.contextmanager
+def _checkout_lock(gallery_dir: str | os.PathLike[str], timeout: float | None = None):
+    """Hold an exclusive lock on one gallery checkout for the whole publish.
+
+    Two publishers share one working tree on the node -- the worker's and the
+    operator UI's -- and nothing used to keep them apart. On 2026-09-16 two
+    overlapping publishes of entry 488 raced: the second had negotiated its
+    push against the ref the first then moved, and GitHub refused it with
+    "cannot lock ref 'refs/heads/main': is at <x> but expected <y>".
+
+    That one was benign, because the loser reset after the winner had
+    finished. The dangerous ordering is the other one: :func:`_undo` runs
+    ``git reset --hard`` on the shared tree, so a publish that fails its push
+    can pull the tree out from under a publish that is still rendering into
+    it, and the survivor then commits and pushes a half-reset gallery. Nothing
+    would report that; the pages would just be wrong.
+
+    So the lock covers everything from the clean-tree check to the last push,
+    the clean-tree check included -- checking that a tree is clean and then
+    letting someone else dirty it is the same race one step earlier. It is an
+    advisory ``flock`` on a file in the git directory, which the kernel drops
+    if the holder dies, so a killed publisher does not wedge the node.
+    """
+    # Read at call time, not bound as a default, so a test can shorten it.
+    timeout = LOCK_TIMEOUT if timeout is None else timeout
+    lock_path = _lock_file(gallery_dir)
+    if lock_path is None:
+        yield
+        return
+    try:
+        handle = open(lock_path, "w")  # noqa: SIM115
+    except OSError as exc:
+        raise PublishFailed(f"cannot open the publish lock at {lock_path}: {exc}") from exc
+    deadline = time.monotonic() + timeout
+    waited = False
+    try:
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise PublishFailed(
+                        f"another publish has held {lock_path} for more than "
+                        f"{timeout:.0f}s; if nothing is publishing, a process died "
+                        "holding it and the lock clears when it is gone"
+                    ) from None
+                if not waited:
+                    print(
+                        "sketchgen: waiting for another publish to finish with "
+                        f"{Path(os.path.expanduser(str(gallery_dir)))}",
+                        file=sys.stderr,
+                    )
+                    waited = True
+                time.sleep(0.25)
+        yield
+    finally:
+        handle.close()  # closing drops the flock
 
 
 def gallery_checkout(gallery_dir: str | os.PathLike[str]) -> tuple[Path, str]:
@@ -373,119 +463,120 @@ def publish(
         )
     executor_model = _executor_model(entry, model)
     published_by = by or _os_user()
-    checkout, branch = gallery_checkout(gallery_dir)
-    target = remote or _git_out(checkout, "remote", "get-url", "origin")
-    if not target:
-        raise PublishRefused(
-            f"{checkout} has no 'origin' remote and no --remote was given"
-        )
-
-    temporary: str | None = None
-    if from_dir is not None:
-        source = Path(os.path.expanduser(str(from_dir)))
-        if not source.is_dir():
-            raise PublishRefused(f"no source directory at {source}")
-    else:
-        temporary = tempfile.mkdtemp(prefix="sketchgen-publish-")
-        source = Path(temporary)
-        try:
-            source = _render_with_generator(conn, entry_id, source)
-        except Exception:
-            shutil.rmtree(temporary, ignore_errors=True)
-            raise
-
-    try:
-        files = _source_files(source)
-        if not files:
-            raise PublishRefused(f"{source} is empty; there is nothing to publish")
-        scan_for_personal_data(source)
-        message = _message(entry, executor_model, published_by)
-        env, masked = _push_env(key, target)
-        push_display = f"{masked}git push {target} HEAD:refs/heads/{branch}"
-        dest = checkout / "e" / str(entry_id)
-
-        if dry_run:
-            return Plan(
-                entry_id=entry_id,
-                state=entry["state"],
-                source_dir=str(source),
-                files=files,
-                dest=str(dest),
-                message=message,
-                push_command=push_display,
-                url=entry_url(entry_id, url_base),
-            )
-
-        before = _git_out(checkout, "rev-parse", "HEAD")
-        if dest.exists():
-            shutil.rmtree(dest)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copytree(source, dest)
-
-        added = _git(checkout, "add", "--", f"e/{entry_id}")
-        if added.returncode != 0:
-            raise PublishFailed(f"git add failed: {added.stderr.strip()}")
-        if _git(checkout, "diff", "--cached", "--quiet").returncode == 0:
+    with _checkout_lock(gallery_dir):
+        checkout, branch = gallery_checkout(gallery_dir)
+        target = remote or _git_out(checkout, "remote", "get-url", "origin")
+        if not target:
             raise PublishRefused(
-                f"nothing to commit: e/{entry_id} is already in the gallery "
-                "with these exact bytes"
+                f"{checkout} has no 'origin' remote and no --remote was given"
             )
-        committed = subprocess.run(
-            ["git", "commit", "-F", "-"],
-            cwd=str(checkout),
-            input=message,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if committed.returncode != 0:
-            raise PublishFailed(f"git commit failed: {committed.stderr.strip()}")
-        sha = _git_out(checkout, "rev-parse", "HEAD")
-        if not sha:
-            raise PublishFailed("git rev-parse HEAD failed after the commit")
 
-        pushed = _git(
-            checkout, "push", target, f"HEAD:refs/heads/{branch}", env=env
-        )
-        if pushed.returncode != 0:
-            _undo(checkout, before)
-            raise PublishFailed(pushed.stderr.strip() or "git push failed")
+        temporary: str | None = None
+        if from_dir is not None:
+            source = Path(os.path.expanduser(str(from_dir)))
+            if not source.is_dir():
+                raise PublishRefused(f"no source directory at {source}")
+        else:
+            temporary = tempfile.mkdtemp(prefix="sketchgen-publish-")
+            source = Path(temporary)
+            try:
+                source = _render_with_generator(conn, entry_id, source)
+            except Exception:
+                shutil.rmtree(temporary, ignore_errors=True)
+                raise
 
-        now = db.utc_now()
-        # Only a held entry becomes 'published'. A rejection — the gate's
-        # 'failed-kept' or the operator's 'rejected' — keeps its state, which
-        # is what puts it on the rejections page rather than the grid, and
-        # gains the timestamp and commit like any other.
-        new_state = "published" if entry["state"] == "held" else entry["state"]
-        conn.execute(
-            "UPDATE entries SET state = ?, published_utc = ?, "
-            "publish_commit = ? WHERE id = ?",
-            (new_state, now, sha, entry_id),
-        )
-        # The job's row follows its entry, so the queue stops saying "held"
-        # about work that is public. A job already past held is left alone.
-        if new_state == "published" and entry["job_id"] is not None:
-            job = db.get_job(conn, entry["job_id"])
-            if job is not None and job.state == "held":
-                db.transition(conn, job.id, "published")
-        conn.commit()
-        # The entry is public. Now the grid, the failures page, compare and the
-        # line pages must know about it: re-render the index and push it as a
-        # second commit. This never fails the publish; the entry is already up.
-        index_sha, index_note = _publish_index(conn, checkout, branch, target, env, entry_id)
-        return Published(
-            entry_id=entry_id,
-            commit=sha,
-            branch=branch,
-            url=entry_url(entry_id, url_base),
-            published_utc=now,
-            files=files,
-            index_commit=index_sha,
-            index_note=index_note,
-        )
-    finally:
-        if temporary:
-            shutil.rmtree(temporary, ignore_errors=True)
+        try:
+            files = _source_files(source)
+            if not files:
+                raise PublishRefused(f"{source} is empty; there is nothing to publish")
+            scan_for_personal_data(source)
+            message = _message(entry, executor_model, published_by)
+            env, masked = _push_env(key, target)
+            push_display = f"{masked}git push {target} HEAD:refs/heads/{branch}"
+            dest = checkout / "e" / str(entry_id)
+
+            if dry_run:
+                return Plan(
+                    entry_id=entry_id,
+                    state=entry["state"],
+                    source_dir=str(source),
+                    files=files,
+                    dest=str(dest),
+                    message=message,
+                    push_command=push_display,
+                    url=entry_url(entry_id, url_base),
+                )
+
+            before = _git_out(checkout, "rev-parse", "HEAD")
+            if dest.exists():
+                shutil.rmtree(dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(source, dest)
+
+            added = _git(checkout, "add", "--", f"e/{entry_id}")
+            if added.returncode != 0:
+                raise PublishFailed(f"git add failed: {added.stderr.strip()}")
+            if _git(checkout, "diff", "--cached", "--quiet").returncode == 0:
+                raise PublishRefused(
+                    f"nothing to commit: e/{entry_id} is already in the gallery "
+                    "with these exact bytes"
+                )
+            committed = subprocess.run(
+                ["git", "commit", "-F", "-"],
+                cwd=str(checkout),
+                input=message,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if committed.returncode != 0:
+                raise PublishFailed(f"git commit failed: {committed.stderr.strip()}")
+            sha = _git_out(checkout, "rev-parse", "HEAD")
+            if not sha:
+                raise PublishFailed("git rev-parse HEAD failed after the commit")
+
+            pushed = _git(
+                checkout, "push", target, f"HEAD:refs/heads/{branch}", env=env
+            )
+            if pushed.returncode != 0:
+                _undo(checkout, before)
+                raise PublishFailed(pushed.stderr.strip() or "git push failed")
+
+            now = db.utc_now()
+            # Only a held entry becomes 'published'. A rejection — the gate's
+            # 'failed-kept' or the operator's 'rejected' — keeps its state, which
+            # is what puts it on the rejections page rather than the grid, and
+            # gains the timestamp and commit like any other.
+            new_state = "published" if entry["state"] == "held" else entry["state"]
+            conn.execute(
+                "UPDATE entries SET state = ?, published_utc = ?, "
+                "publish_commit = ? WHERE id = ?",
+                (new_state, now, sha, entry_id),
+            )
+            # The job's row follows its entry, so the queue stops saying "held"
+            # about work that is public. A job already past held is left alone.
+            if new_state == "published" and entry["job_id"] is not None:
+                job = db.get_job(conn, entry["job_id"])
+                if job is not None and job.state == "held":
+                    db.transition(conn, job.id, "published")
+            conn.commit()
+            # The entry is public. Now the grid, the failures page, compare and the
+            # line pages must know about it: re-render the index and push it as a
+            # second commit. This never fails the publish; the entry is already up.
+            index_sha, index_note = _publish_index(conn, checkout, branch, target, env, entry_id)
+            return Published(
+                entry_id=entry_id,
+                commit=sha,
+                branch=branch,
+                url=entry_url(entry_id, url_base),
+                published_utc=now,
+                files=files,
+                index_commit=index_sha,
+                index_note=index_note,
+            )
+        finally:
+            if temporary:
+                shutil.rmtree(temporary, ignore_errors=True)
 
 
 def publish_index(
@@ -504,57 +595,58 @@ def publish_index(
     For template or asset changes: no entry's state changes. Returns
     (sha, None) on success or (None, why); refuses on a dirty checkout.
     """
-    checkout, branch = gallery_checkout(gallery_dir)
-    target = remote or _git_out(checkout, "remote", "get-url", "origin")
-    if not target:
-        raise PublishRefused(f"{checkout} has no 'origin' remote and no --remote was given")
-    env, _ = _push_env(key, target)
-    try:
-        from . import gallery  # noqa: PLC0415
-    except ImportError as exc:
-        raise PublishRefused("generator not present") from exc
-    before = _git_out(checkout, "rev-parse", "HEAD")
-    config = gallery.Config.load(checkout)
-    if write_path is not None:
-        config = gallery.Config(
-            write_path=write_path.rstrip("/"),
-            gallery_url=config.gallery_url,
-            repository=config.repository,
+    with _checkout_lock(gallery_dir):
+        checkout, branch = gallery_checkout(gallery_dir)
+        target = remote or _git_out(checkout, "remote", "get-url", "origin")
+        if not target:
+            raise PublishRefused(f"{checkout} has no 'origin' remote and no --remote was given")
+        env, _ = _push_env(key, target)
+        try:
+            from . import gallery  # noqa: PLC0415
+        except ImportError as exc:
+            raise PublishRefused("generator not present") from exc
+        before = _git_out(checkout, "rev-parse", "HEAD")
+        config = gallery.Config.load(checkout)
+        if write_path is not None:
+            config = gallery.Config(
+                write_path=write_path.rstrip("/"),
+                gallery_url=config.gallery_url,
+                repository=config.repository,
+            )
+        # Only what a person has published: a kept rejection without a
+        # published_utc is still waiting for that decision (spec §9), and a
+        # re-render is not the place it gets made.
+        rows = conn.execute(
+            "SELECT id FROM entries WHERE state IN ('published', 'failed-kept', "
+            "'rejected') AND published_utc IS NOT NULL ORDER BY id"
+        ).fetchall()
+        for row in rows:
+            gallery.render_entry(conn, row["id"], checkout, config)
+        gallery.render_index(conn, checkout, config)
+        _git(checkout, "rm", "-q", "--ignore-unmatch", "--", "failed.html")  # renamed to rejections.html
+        # Everything in the checkout is generated output (the generator also writes
+        # files INDEX_PATHS does not list, pairs.json for one), so stage it all.
+        added = _git(checkout, "add", "-A", "--", ".")
+        if added.returncode != 0:
+            return None, f"git add failed: {added.stderr.strip()}"
+        if _git(checkout, "diff", "--cached", "--quiet").returncode == 0:
+            return None, "site unchanged"
+        committed = subprocess.run(
+            ["git", "commit", "-F", "-"],
+            cwd=str(checkout),
+            input="gallery: re-render every page\n",
+            capture_output=True,
+            text=True,
+            check=False,
         )
-    # Only what a person has published: a kept rejection without a
-    # published_utc is still waiting for that decision (spec §9), and a
-    # re-render is not the place it gets made.
-    rows = conn.execute(
-        "SELECT id FROM entries WHERE state IN ('published', 'failed-kept', "
-        "'rejected') AND published_utc IS NOT NULL ORDER BY id"
-    ).fetchall()
-    for row in rows:
-        gallery.render_entry(conn, row["id"], checkout, config)
-    gallery.render_index(conn, checkout, config)
-    _git(checkout, "rm", "-q", "--ignore-unmatch", "--", "failed.html")  # renamed to rejections.html
-    # Everything in the checkout is generated output (the generator also writes
-    # files INDEX_PATHS does not list, pairs.json for one), so stage it all.
-    added = _git(checkout, "add", "-A", "--", ".")
-    if added.returncode != 0:
-        return None, f"git add failed: {added.stderr.strip()}"
-    if _git(checkout, "diff", "--cached", "--quiet").returncode == 0:
-        return None, "site unchanged"
-    committed = subprocess.run(
-        ["git", "commit", "-F", "-"],
-        cwd=str(checkout),
-        input="gallery: re-render every page\n",
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if committed.returncode != 0:
-        return None, f"commit failed: {committed.stderr.strip()}"
-    sha = _git_out(checkout, "rev-parse", "HEAD")
-    pushed = _git(checkout, "push", target, f"HEAD:refs/heads/{branch}", env=env)
-    if pushed.returncode != 0:
-        _undo(checkout, before)
-        return None, f"push failed: {pushed.stderr.strip() or 'git push failed'}"
-    return sha, None
+        if committed.returncode != 0:
+            return None, f"commit failed: {committed.stderr.strip()}"
+        sha = _git_out(checkout, "rev-parse", "HEAD")
+        pushed = _git(checkout, "push", target, f"HEAD:refs/heads/{branch}", env=env)
+        if pushed.returncode != 0:
+            _undo(checkout, before)
+            return None, f"push failed: {pushed.stderr.strip() or 'git push failed'}"
+        return sha, None
 
 
 INDEX_PATHS = ("index.html", "rejections.html", "compare.html", "lines", "assets", "config.json")
