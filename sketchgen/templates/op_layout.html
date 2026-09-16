@@ -111,6 +111,29 @@ h3 { font-size: 14px; margin: 14px 0 6px; }
 .bar { display: flex; background: var(--bar-bg); border-radius: 3px; height: 9px; overflow: hidden; }
 .bar > span { display: block; flex: none; height: 100%; background: var(--bar); }
 .bar > span.cache { background: var(--dim); }
+/* The status card's bar says one of three things, and the track is always
+   drawn so that saying a different one moves nothing below it. A fill is a
+   measured step. A moving ribbon is a step that is running and cannot be
+   measured — fewer than five of it have finished on this node, and some steps
+   (claiming is instant, sweeping happens twice a week) will never have five.
+   An empty track is a worker that is napping, paused or gone. One stripe
+   period per 900 ms: slow enough not to nag on a screen that is left open all
+   day, fast enough to read as motion at nine pixels tall. */
+.bar.working {
+  background-image: repeating-linear-gradient(-45deg,
+    color-mix(in srgb, var(--accent) 50%, transparent) 0 6px,
+    transparent 6px 12px);
+  background-size: 17px 100%;                 /* 12px × √2: one stripe period */
+  animation: ribbon 900ms linear infinite;
+}
+.bar.working.late {
+  background-image: repeating-linear-gradient(-45deg,
+    color-mix(in srgb, var(--warn) 55%, transparent) 0 6px,
+    transparent 6px 12px);
+}
+@keyframes ribbon { to { background-position: 17px 0; } }
+/* Still stripes still read as "not the empty track", which is the whole job. */
+@media (prefers-reduced-motion: reduce) { .bar.working { animation: none; } }
 /* The process status card: the now line, who is doing it, elapsed against the
    median of that step, and the three steps just before. The worker is a
    different process from this one and blocks inside a single HTTP call for a
@@ -404,7 +427,8 @@ $body
       } else if (key === "elapsed") {
         el.textContent = a.elapsed_text || "—";
       } else if (key === "track") {
-        el.hidden = a.bar_pct === null || a.bar_pct === undefined;
+        // The track is always there; its class says which of the three it is.
+        el.className = "bar" + (a.bar_class ? " " + a.bar_class : "");
       } else if (key === "bar") {
         var pct = Number(a.bar_pct) || 0;
         el.style.width = pct.toFixed(1) + "%";

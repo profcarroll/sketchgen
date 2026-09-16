@@ -1171,6 +1171,18 @@ ACTIVITY_PILLS: dict[str, tuple[str, str]] = {
     "unknown": ("unknown", "quiet"),
 }
 
+#: Steps that are not work. There is exactly one, and it is the nap: the worker
+#: opens an ``idle`` row when it goes to sleep so that an open row exists for as
+#: long as the process does. The bar reads this, not the state, because
+#: console.activity() puts judging and critiquing under the ``idle`` state too,
+#: and those two are work — long, model-shaped work, with medians of their own.
+ACTIVITY_RESTING_STEPS = frozenset({"idle"})
+
+#: Card states where nothing is running whatever the newest row says: a paused
+#: worker, one whose pid is gone (its last step stays open on purpose), and a
+#: database with no rows in it.
+ACTIVITY_RESTING_STATES = frozenset({"paused", "gone", "unknown"})
+
 #: What the card shows when the document has no activity block at all: an old
 #: cached document, or a console module that predates packet 5. The same shape
 #: console.activity() answers for an empty table, so nothing downstream has to
@@ -1213,17 +1225,61 @@ def activity_elapsed(act: dict[str, Any]) -> str:
     return human_seconds(elapsed)
 
 
+def activity_working(act: dict[str, Any]) -> bool:
+    """Is the worker doing something, as opposed to merely being alive?
+
+    "There is an open row" is not the same question. The worker opens an
+    ``idle`` row when it naps, deliberately, because an open row for as long as
+    the process lives is what makes the "worker not running" card readable —
+    which means the nap is a row like any other and the bar has to know it is
+    not work. Neither is a paused worker, a dead one, or a database with
+    nothing in it.
+    """
+    if str(act.get("state") or "unknown") in ACTIVITY_RESTING_STATES:
+        return False
+    return str(act.get("step") or "") not in ACTIVITY_RESTING_STEPS
+
+
 def activity_bar_pct(act: dict[str, Any]) -> float | None:
-    """Elapsed as a percentage of the median, capped, or None for no bar.
+    """Elapsed as a percentage of the median, capped, or None for no fill.
 
     Capped rather than overflowing: a step that is past its median keeps a full
     track and turns amber, so a stuck step looks stuck instead of looking like
     a progress bar somebody drew too long.
+
+    None also when nothing is running: a nap that has lasted longer than the
+    median nap is not progress towards anything.
     """
+    if not activity_working(act):
+        return None
     elapsed, median = act.get("elapsed_s"), act.get("median_s")
     if elapsed is None or not median:
         return None
     return min(100.0, max(0.0, float(elapsed) / float(median) * 100.0))
+
+
+def activity_bar_class(act: dict[str, Any]) -> str:
+    """The track's own class, which is how the bar says which of three it is.
+
+    The track is always drawn. Until 2026-09-16 it was hidden when there was no
+    median, which drew an empty grey track anyway — ``.bar { display: flex }``
+    is an author rule and beats the browser's own ``[hidden]`` — and said
+    nothing when it was working, which is most of the time on a step the node
+    has run fewer than five of. So:
+
+    * **measured** — a median exists: no class, the fill inside says it.
+    * **working** — running and unmeasurable: ``working``, a moving ribbon.
+      Some steps are never measurable (``claiming`` is instant, ``sweeping``
+      may happen twice a week), so this is the answer rather than a stopgap.
+    * **idle** — nothing running: no class and no fill, an empty track.
+
+    ``working late`` is the ribbon in amber, for a step past
+    :data:`console.ACTIVITY_STALLED_S`, so "this is taking too long" stays
+    legible in the unmeasured case too.
+    """
+    if not activity_working(act) or activity_bar_pct(act) is not None:
+        return ""
+    return "working late" if str(act.get("state")) == "stalled" else "working"
 
 
 def activity_foot(doc: dict[str, Any]) -> str:
@@ -1237,6 +1293,8 @@ def activity_foot(doc: dict[str, Any]) -> str:
     collector, and up-since and slot are the collector's to know.
     """
     control = _dig(doc, "worker.control", "?")
+    # One job is not "1 jobs". The worker says it this way too (sweep_stuck).
+    jobs = _dig(doc, "funnel.generated.session", 0)
     started = _parse_utc(_dig(doc, "worker.started_utc"))
     up = (
         human_seconds((datetime.now(timezone.utc) - started).total_seconds())
@@ -1247,7 +1305,7 @@ def activity_foot(doc: dict[str, Any]) -> str:
         str(control),
         f"up {up}",
         f"slot {_dig(doc, 'model.slot.state', '—')}",
-        f"{_dig(doc, 'funnel.generated.session', 0)} jobs this session",
+        f"{jobs} job{'' if jobs == 1 else 's'} this session",
     ]
     return " · ".join(parts)
 
@@ -1294,8 +1352,9 @@ def activity_card(doc: dict[str, Any], *, compact: bool = False) -> str:
     over = pct is not None and float(act.get("elapsed_s") or 0) > float(
         act.get("median_s") or 0
     )
+    ribbon = activity_bar_class(act)
     track = (
-        f'<div class="bar" data-act="track"{"" if pct is not None else " hidden"}>'
+        f'<div class="bar{" " + ribbon if ribbon else ""}" data-act="track">'
         f'<span data-act="bar" class="{"over" if over else ""}" '
         f'style="width:{_width(pct if pct is not None else 0):.1f}%"></span></div>'
     )
@@ -3190,7 +3249,8 @@ class OpHandler(BaseHTTPRequestHandler):
                 "activity": dict(now, pill_text=activity_pill(now)[0],
                                  pill_class=activity_pill(now)[1],
                                  elapsed_text=activity_elapsed(now),
-                                 bar_pct=activity_bar_pct(now)),
+                                 bar_pct=activity_bar_pct(now),
+                                 bar_class=activity_bar_class(now)),
             }
         )
 
