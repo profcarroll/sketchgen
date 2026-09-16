@@ -23,7 +23,8 @@ Repositories:
   It is deployed to Cloudflare by hand; a PR does not deploy it.
 - Gallery: `profcarroll/sketchgen-gallery`, generated output only. Packet 9 changes the
   **generator** (`sketchgen/gallery.py`, `sketchgen/templates/`, `sketchgen/assets/`); the gallery
-  repository receives the result on the next `sketchgen publish`. Do not hand-edit it.
+  repository receives the result on the next re-render — `render-index` for everything that is not
+  an entry directory, `render-all` when `entry.html` changed (§6). Do not hand-edit it.
 
 Conventions: small PRs, one packet per branch, commit messages in the repo's existing voice (see
 `git log`). Every packet lands with tests. No new dependency, in either language.
@@ -367,17 +368,64 @@ Delete the `<details class="filters">` block from `grid.html`. Nothing else:
 Packets 7, 8 and 9 branch from `main` and touch disjoint files; §2 is the contract between them, so
 they can be built in parallel and merged in any order.
 
-Deployment is not a PR and is the instructor's, in this order:
+Deployment is not a PR and is the instructor's, in this order. Step 1 is a **gate**, not the first
+item on a list: do not run step 2 until its verification has printed `submissions`.
 
-1. `wrangler d1 execute sketchgen-writepath --remote --file=./writepath/schema.sql` — the new table.
-2. `wrangler deploy` — the two routes. No new secret, no new binding.
-3. `update.sh` on the node — migration 010 and the restarted units. **Pull the gallery checkout
-   first if any PR was merged from outside the node**, and remember that a deploy which pulls a new
-   `update.sh` runs the old copy.
-4. `sketchgen publish` — the gallery, with the forms in it.
+1. The new table:
 
-Nothing between steps 1 and 4 is broken for a visitor: the forms do not exist until step 4, and the
-routes answer before anything calls them.
+       cd writepath && wrangler d1 execute sketchgen-writepath --remote --file=./schema.sql
+
+   `--file` uploads through the D1 `/import` endpoint, which fails with
+   `Authentication error [code: 10000]` on a `wrangler login` OAuth token even when that token
+   has `d1 (write)`. The query endpoint is unaffected, so the fallback is the same DDL inline via
+   `--command`. `schema.sql` is `IF NOT EXISTS` throughout and safe to rerun either way.
+
+2. **Verify, before deploying anything:**
+
+       wrangler d1 execute sketchgen-writepath --remote --command \
+           "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+
+   `submissions` must be in that list. If it is not, stop here.
+
+3. `wrangler deploy` — the two routes. No new secret, no new binding.
+
+4. `update.sh` on the node — migration 010, the restarted units, and a `render-index`. **Pull the
+   gallery checkout first if any PR was merged from outside the node**, and remember that a deploy
+   which pulls a new `update.sh` runs the old copy.
+
+5. The entry pages, which step 4 does **not** touch — see below:
+
+       ~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen render-all \
+           --gallery-dir ~/sketchgen/gallery --db ~/sketchgen/sketchgen.db
+       git -C ~/sketchgen/gallery add -A
+       git -C ~/sketchgen/gallery commit -m "re-render: the critique form reaches every entry page"
+       GIT_SSH_COMMAND='ssh -i ~/.ssh/sketchgen-gallery' git -C ~/sketchgen/gallery push
+
+`update.sh` runs `render-index`, which is *everything that is not an entry directory*: the grid,
+the rejections page, compare, the line pages, the assets and `config.json`. Packet 9 changes
+`entry.html` as well as `grid.html`, and **no amount of `update.sh` will re-render an entry page**.
+`render-all` is the command that does, and it writes files only — the commit and the push are by
+hand. `sketchgen publish` is not this: it publishes one held entry by id.
+
+### Why step 1 is a gate
+
+An earlier draft of this section claimed that nothing between the first and last step is broken for
+a visitor, on the reasoning that the forms do not exist until the end and the routes answer before
+anything calls them. **That reasoning is wrong, and it cost an outage on 2026-09-16.**
+
+Two of the routes this work touches were already being called before any form existed:
+
+- `/pull` is called by the node every five minutes, and `routePull` reads `submissions`
+  unconditionally. Deploying over a missing table stopped the sync dead — and took votes, likes and
+  views down with it, none of which are part of this feature.
+- `/me` is called by the gallery on every page load, and it now counts the day's budget. A failed
+  `COUNT` answered 500, and `gallery.js` reads any non-200 from `/me` as signed out, so every
+  signed-in visitor was logged out of a site whose sign-in was working. It presents as a broken
+  OAuth flow and is nothing of the kind.
+
+Deploying code before its schema does not stage a new feature behind a door nobody has opened yet.
+It breaks the routes that were already working. The gate is the fix; `/me` degrading rather than
+failing is the belt to its braces.
 
 ## 7. What this does not do
 
