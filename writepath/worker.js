@@ -576,6 +576,27 @@ async function budgetLeft(env, username, kind, perDay) {
   return Math.max(0, perDay - Number(row?.n || 0));
 }
 
+/**
+ * The same count, or `null` when the database cannot answer.
+ *
+ * Only `/me` uses this. There the budget is decoration — a line that reads
+ * "2 of 3 left today" — and losing it must not cost the visitor their session:
+ * the page reads a non-200 from `/me` as signed out, so a failed COUNT once
+ * logged every signed-in visitor out of a gallery whose sign-in was working.
+ *
+ * `/prompt` and `/critique` deliberately do NOT use it. There the count is the
+ * enforcement, and a budget that cannot be read has to refuse rather than wave
+ * the submission through: the failure that costs a quota line is not the
+ * failure that costs the cap.
+ */
+async function budgetLeftOrNull(env, username, kind, perDay) {
+  try {
+    return await budgetLeft(env, username, kind, perDay);
+  } catch {
+    return null;
+  }
+}
+
 /** The new row's id. D1 reports it as `meta.last_row_id`, the rowid SQLite
  *  assigned, which for this table is its AUTOINCREMENT primary key. */
 async function insertSubmission(env, kind, username, entryId, text, now) {
@@ -792,17 +813,17 @@ export default {
     if (request.method === "GET" && path === "/me") {
       if (!username) return json({ error: "not signed in" }, 401, request, env);
       // The budget comes back with the name so the gallery can draw "2 of 3
-      // left today" on the composer without a second call.
-      return json(
-        {
-          username,
-          prompts_left: await budgetLeft(env, username, "prompt", PROMPTS_PER_DAY),
-          critiques_left: await budgetLeft(env, username, "critique", CRITIQUES_PER_DAY),
-        },
-        200,
-        request,
-        env,
-      );
+      // left today" on the composer without a second call. It is omitted, not
+      // faked, when it cannot be counted: gallery.js paints the quota only for
+      // a number (paintQuota) and leaves the button enabled for anything else,
+      // so a missing budget costs the line and nothing more. The name is what
+      // this route is for, and it is answerable without the database.
+      const body = { username };
+      const prompts = await budgetLeftOrNull(env, username, "prompt", PROMPTS_PER_DAY);
+      const critiques = await budgetLeftOrNull(env, username, "critique", CRITIQUES_PER_DAY);
+      if (prompts !== null) body.prompts_left = prompts;
+      if (critiques !== null) body.critiques_left = critiques;
+      return json(body, 200, request, env);
     }
 
     if (request.method === "POST" && path === "/view") {
