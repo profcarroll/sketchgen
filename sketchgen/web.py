@@ -544,6 +544,7 @@ NAV = (
     ("/queue", "Queue"),
     ("/new", "New job"),
     ("/held", "Held"),
+    ("/submissions", "Submissions"),
 )
 
 
@@ -1591,9 +1592,26 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None) -> s
         )
         per_sketch_rows.append(f"<tr><td>{esc(label)}</td>{cells}</tr>")
 
+    # The public's queue, as one number with a link on it. The anchor carries
+    # the data-k, not the tile, so the two-second poll patches the count and
+    # leaves the link it is written on alone.
+    waiting = (
+        '<a href="/submissions" data-k="submissions.pending" data-fmt="int">'
+        f'{esc(_fmt(_dig(doc, "submissions.pending"), "int"))}</a>'
+    )
+    submissions_tile = _tile(
+        "waiting",
+        waiting,
+        field(doc, "submissions.released", "int")
+        + " released, "
+        + field(doc, "submissions.declined", "int")
+        + " declined",
+    )
+
     return render(
         "op_console",
         token_spark=console_spark(tokens),
+        submissions=submissions_tile,
         shape=esc(_dig(doc, "node.shape", "shape unknown")),
         cores_n=field(doc, "node.cores", "int"),
         source=esc(doc.get("source", "sample")),
@@ -3041,6 +3059,254 @@ def spawn_child(conn: sqlite3.Connection, entry_id: int, form: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Submissions — the public's queue, and the person in front of it (packet 8)
+#
+# A submission is not a job (plan §1.2). It is a sentence a signed-in visitor
+# typed on the gallery, pulled down by sync.py into its own table, and it
+# becomes a job here and nowhere else — when the operator presses Release. The
+# job state machine is untouched by all of this on purpose: an unreleased
+# submission is not in `jobs`, so there is no state the worker could claim it
+# from however this page is used or misused.
+# ---------------------------------------------------------------------------
+
+#: How many pending submissions the page draws at once. The same order the
+#: table's index is in, and a cap for the same reason /queue has one: a page
+#: that renders two hundred strips is not a page anybody reviews.
+SUBMISSIONS_PAGE_LIMIT = 50
+
+
+#: What one of the two verbs below did, for a caller that has to act on it
+#: rather than print it. The page shows the sentence and nothing else; the CLI
+#: turns this into an exit code, and a word is what it should be reading —
+#: sniffing the sentence for "refused" would make the wording load-bearing.
+RELEASED, DECLINED, REFUSED = "released", "declined", "refused"
+
+
+def human_prompt_version(username: str) -> str:
+    """What a released human critique is recorded under (decision §1.4).
+
+    ``human:<login>`` in ``critiques.prompt_version``, which is the whole of the
+    collision fix: migration 006's UNIQUE ``(entry_id, prompt_version)`` then
+    admits one critique per *person* per entry, while the critic model's rows
+    keep the one-per-version rule that is right for a model. Nothing else reads
+    this string as a version — ``db.entries_to_critique`` matches the model's
+    current one and so never sees a human row, and ``gallery._critic_chip``
+    draws a person from ``critique_by``.
+    """
+    return f"human:{username}"
+
+
+def _submission_parent(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    """The entry a critique is about: its strip and its prompt, above the sentence.
+
+    A critique is a sentence about a picture, and the operator is being asked
+    whether to spend a run on it. Reading it without the parent in front of you
+    is reading half of it, so the parent's strip and its prompt sit above the
+    ask on the card. A prompt has no parent and gets nothing here.
+    """
+    entry_id = row["entry_id"]
+    if row["kind"] != "critique" or entry_id is None:
+        return ""
+    parent = db.get_entry(conn, int(entry_id))
+    if parent is None:  # pragma: no cover - sync.py refuses an unknown parent
+        return f'<p class="meta">entry {esc(entry_id)} is not on this node</p>'
+    root, revisions = lineage.split_prompt(parent["prompt"] or "")
+    revision = (
+        f'<p class="rev"><span class="k">revise:</span> {esc(revisions[-1])}</p>'
+        if revisions
+        else ""
+    )
+    state = str(parent["state"])
+    return (
+        f'<p class="meta">of entry <a href="/entry/{int(entry_id)}">{int(entry_id)}</a>'
+        f' · <span class="pill {esc(state)}">{esc(state_label(state))}</span></p>'
+        f"{_entry_image(app, parent)}"
+        f'<p class="prompt">{esc(root or "—")}</p>'
+        f"{revision}"
+    )
+
+
+def _submission_card(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    """One submission waiting for a person: one input, two verbs, one form.
+
+    Built from the decision card packet 6 established and deliberately the same
+    shape: the id is the heading and is nowhere else in words, the one text box
+    is read by whichever button presses it, and there is no JavaScript on the
+    page at all — two ``formaction``s are plain HTML5 and the routes already
+    exist. The difference is that the sentence is the subject here rather than
+    the sketch, so it is the largest thing on the card.
+    """
+    submission_id = int(row["id"])
+    kind = str(row["kind"])
+    username = str(row["username"])
+    return (
+        f'<section class="panel card" id="submission-{submission_id}" '
+        f'aria-label="Submission {submission_id}">'
+        '<div class="id">'
+        f'<span class="n">{submission_id}</span>'
+        f'<span class="pill queued">{esc(kind)}</span>'
+        f'<span class="chip person">@{esc(username)}</span>'
+        f'<span class="dim">{esc(row["created_utc"])}</span>'
+        "</div>"
+        f"{_submission_parent(app, conn, row)}"
+        f'<p class="ask">{esc(row["text"])}</p>'
+        f'<form method="post" action="/submissions/{submission_id}/release" class="say">'
+        '<input type="hidden" name="back" value="/submissions">'
+        f'<input type="text" name="text" id="say-submission-{submission_id}" '
+        'maxlength="400" aria-label="why you are declining, or nothing" '
+        'placeholder="why you are declining, or nothing">'
+        '<div class="acts">'
+        f'<button type="submit" class="pub" '
+        f'aria-label="Release submission {submission_id}">+ Release</button>'
+        f'<button type="submit" class="rej" '
+        f'formaction="/submissions/{submission_id}/decline" '
+        f'aria-label="Decline submission {submission_id}">× Decline</button>'
+        "</div>"
+        '<p class="hint">Release queues it as a job, held for review like every '
+        "other. Decline reads the box; the row stays as the record of what was "
+        "asked.</p>"
+        "</form>"
+        "</section>"
+    )
+
+
+def submissions_page(app: App, conn: sqlite3.Connection) -> str:
+    rows = db.pending_submissions(conn, SUBMISSIONS_PAGE_LIMIT)
+    cards = [_submission_card(app, conn, row) for row in rows]
+    if not cards:
+        cards.append(
+            '<section class="panel"><p class="dim">nothing is waiting. '
+            "A row reaches this page when <code>sketchgen sync</code> pulls a "
+            "prompt or a critique somebody submitted on the gallery.</p></section>"
+        )
+    return render("op_submissions", count=len(rows), cards="\n".join(cards))
+
+
+def release_submission(
+    conn: sqlite3.Connection, submission_id: int
+) -> tuple[str, int | None, str]:
+    """Turn one submission into a job. Returns ``(outcome, job_id, message)``.
+
+    A prompt is enqueued with ``rules_file='random'`` (decision §1.6, so public
+    work cannot skew the treatment/control split) and ``publication='hold'``,
+    signed with the visitor's own login. A critique goes through
+    :func:`sketchgen.lineage.spawn` with every default it already has —
+    including the depth limit, which needs no exception here because a line at
+    the limit is held and marked ``needs='review'``, which is what a public
+    submission gets anyway (decision §1.5) — and is then recorded in
+    ``critiques`` under :func:`human_prompt_version`.
+
+    ``spawn()`` answering None means the parent was rejected in the time
+    between the submission and this review. That is not an error and not
+    something to raise at the operator: the row is declined with that as the
+    reason, which is the true account of what happened to it.
+
+    ``outcome`` is :data:`RELEASED`, :data:`DECLINED` or :data:`REFUSED`, so a
+    caller can tell those three apart without reading the sentence; ``job_id``
+    is None for the two that queued nothing.
+    """
+    row = db.submission(conn, submission_id)
+    if row is None:
+        return REFUSED, None, f"there is no submission {submission_id}"
+    state = str(row["state"])
+    if state != "pending":
+        return REFUSED, None, (
+            f"refused: submission {submission_id} is already {state} — "
+            "nothing changed"
+        )
+    username = str(row["username"])
+    text = str(row["text"])
+    if row["kind"] == "prompt":
+        job_id = db.enqueue(
+            conn,
+            text,
+            submitted_by=username,
+            rules_file="random",
+            publication="hold",
+        )
+        db.release_submission(conn, submission_id, job_id)
+        return RELEASED, job_id, (
+            f"Submission {submission_id} released as job #{job_id} — "
+            f"queued for {username}, held for review"
+        )
+
+    entry_id = int(row["entry_id"])
+    version = human_prompt_version(username)
+    # One critique per person per entry, asked before anything is queued: the
+    # UNIQUE constraint would refuse the row after spawn() had already made the
+    # job, and a child whose critique is not on record is a line with a hole in
+    # it. The submission stays pending, so it can still be declined.
+    if db.get_critique(conn, entry_id, version) is not None:
+        return REFUSED, None, (
+            f"refused: {username} already has a critique of entry {entry_id} — "
+            "one per person per entry, and nothing changed"
+        )
+    try:
+        job_id = lineage.spawn(
+            conn,
+            parent_entry_id=entry_id,
+            critique=text,
+            critique_by=username,
+            submitted_by=username,
+        )
+    except ValueError as exc:
+        return REFUSED, None, f"refused: {exc}"
+    except sqlite3.Error as exc:  # pragma: no cover - defensive
+        return REFUSED, None, f"spawn failed: {exc}"
+    if job_id is None:
+        reason = (
+            f"the parent, entry {entry_id}, was rejected before this was reviewed"
+        )
+        db.decline_submission(conn, submission_id, reason)
+        return DECLINED, None, f"Submission {submission_id} declined — {reason}"
+    db.record_critique(
+        conn,
+        entry_id,
+        critique=text,
+        critique_by=username,
+        prompt_version=version,
+        spawned_job_id=job_id,
+    )
+    db.release_submission(conn, submission_id, job_id)
+    generation = lineage.generation_of(conn, entry_id) + 1
+    job = db.get_job(conn, job_id)
+    tail = (
+        f" — generation {generation} is at the depth limit "
+        f"({lineage.DEFAULT_MAX_DEPTH}), so it is held and needs a person "
+        "before it goes any further"
+        if job is not None and job.needs == "review"
+        else f" — generation {generation} of entry {entry_id}"
+    )
+    return RELEASED, job_id, (
+        f"Submission {submission_id} released as job #{job_id}, "
+        f"critique by {username}{tail}"
+    )
+
+
+def decline_submission(
+    conn: sqlite3.Connection, submission_id: int, reason: str
+) -> tuple[str, str]:
+    """A person said no. Returns ``(outcome, message)``.
+
+    Nothing is deleted: the sentence stays in the table with the reason beside
+    it, because a declined submission is the record of what somebody asked for
+    (plan §7). No job is created and no critique is recorded.
+    """
+    row = db.submission(conn, submission_id)
+    if row is None:
+        return REFUSED, f"there is no submission {submission_id}"
+    state = str(row["state"])
+    if state != "pending":
+        return REFUSED, (
+            f"refused: submission {submission_id} is already {state} — "
+            "nothing changed"
+        )
+    reason = reason.strip() or "declined by operator"
+    db.decline_submission(conn, submission_id, reason)
+    return DECLINED, f"Submission {submission_id} declined — {reason}"
+
+
+# ---------------------------------------------------------------------------
 # The server
 # ---------------------------------------------------------------------------
 
@@ -3062,6 +3328,17 @@ ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     ("POST", re.compile(r"^/held/(?P<entry_id>\d+)/archive$"), "post_archive"),
     ("GET", re.compile(r"^/entry/(?P<entry_id>\d+)$"), "page_entry"),
     ("POST", re.compile(r"^/entry/(?P<entry_id>\d+)/spawn$"), "post_spawn"),
+    ("GET", re.compile(r"^/submissions$"), "page_submissions"),
+    (
+        "POST",
+        re.compile(r"^/submissions/(?P<submission_id>\d+)/release$"),
+        "post_submission_release",
+    ),
+    (
+        "POST",
+        re.compile(r"^/submissions/(?P<submission_id>\d+)/decline$"),
+        "post_submission_decline",
+    ),
     ("POST", re.compile(r"^/control$"), "post_control"),
     ("GET", re.compile(r"^/preview/(?P<job_id>\d+)/(?P<n>\d+)$"), "preview_slash"),
     (
@@ -3584,6 +3861,46 @@ class OpHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
         self.redirect(back, message)
+
+    def page_submissions(self) -> None:
+        conn = self.app.connect()
+        try:
+            control = db.get_control(conn)
+            body = submissions_page(self.app, conn)
+            marks = nav_summary(conn)
+        finally:
+            conn.close()
+        self.html(
+            layout(
+                title="Submissions",
+                here="/submissions",
+                body=body,
+                control=control,
+                back="/submissions",
+                flash=self.flash(),
+                nav_marks=marks,
+            )
+        )
+
+    def post_submission_release(self, submission_id: str) -> None:
+        self.form()
+        conn = self.app.connect()
+        try:
+            _, _, message = release_submission(conn, int(submission_id))
+        finally:
+            conn.close()
+        self.redirect("/submissions", message)
+
+    def post_submission_decline(self, submission_id: str) -> None:
+        form = self.form()
+        conn = self.app.connect()
+        try:
+            _, message = decline_submission(
+                conn, int(submission_id), said(form, "reason")
+            )
+        finally:
+            conn.close()
+        self.redirect("/submissions", message)
 
     def post_control(self) -> None:
         form = self.form()

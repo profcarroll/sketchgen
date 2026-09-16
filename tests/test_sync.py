@@ -357,6 +357,130 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class SubmissionsTest(unittest.TestCase):
+    """The fourth array: what a signed-in visitor asked for (plan §2, §4.3).
+
+    Applied straight through :func:`sync.apply_changes` rather than over the
+    canned server, because what is under test is the refusals — a payload whose
+    rows the node must drop is not a payload the Worker would ever send, and
+    building it here is the only way to see the node refuse it.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = Path(self.tmp.name) / "sketchgen.db"
+        db.init(self.db_path)
+        self.conn = db.connect(self.db_path)
+        self.addCleanup(self.conn.close)
+        for prompt in ("a field of circles", "a quiet grid"):
+            job_id = db.enqueue(self.conn, prompt, "profcarroll")
+            db.create_entry(self.conn, job_id, state="published",
+                            submitted_by="profcarroll")
+
+    def payload(self, *submissions, next_since="2026-09-16T15:04:22Z"):
+        return {"next_since": next_since, "submissions": list(submissions)}
+
+    def submission(self, **fields):
+        row = {
+            "id": 31,
+            "kind": "prompt",
+            "username": "octocat",
+            "entry_id": None,
+            "text": "a tide of small triangles that drifts toward the cursor",
+            "created_utc": "2026-09-16T15:04:22Z",
+            "updated_utc": "2026-09-16T15:04:22Z",
+        }
+        row.update(fields)
+        return row
+
+    def rows(self):
+        return [
+            dict(row)
+            for row in self.conn.execute("SELECT * FROM submissions ORDER BY id")
+        ]
+
+    def test_a_payload_with_submissions_writes_them_pending(self):
+        counts = sync.apply_changes(
+            self.conn,
+            self.payload(
+                self.submission(),
+                self.submission(id=77, kind="critique", entry_id=1,
+                                text="let the lines thin as they near the edge"),
+            ),
+        )
+        self.assertEqual(2, counts["submissions"])
+        self.assertEqual(0, counts["skipped"])
+        rows = self.rows()
+        self.assertEqual([31, 77], [row["remote_id"] for row in rows])
+        self.assertEqual(["pending", "pending"], [row["state"] for row in rows])
+        self.assertEqual([None, 1], [row["entry_id"] for row in rows])
+        self.assertEqual(["octocat", "octocat"], [row["username"] for row in rows])
+        # Nothing was queued: a submission is not a job, and only a person
+        # releasing one puts a row in `jobs`.
+        self.assertEqual(2, len(db.list_jobs(self.conn)), "the two seeded jobs")
+
+    def test_the_same_payload_applied_twice_is_a_no_op(self):
+        payload = self.payload(
+            self.submission(),
+            self.submission(id=77, kind="critique", entry_id=2, text="slower"),
+        )
+        sync.apply_changes(self.conn, payload)
+        after_first = self.rows()
+        sync.apply_changes(self.conn, payload)
+        self.assertEqual(after_first, self.rows())
+
+    def test_a_bad_login_a_bad_kind_an_empty_text_and_a_stranger_are_skipped(self):
+        counts = sync.apply_changes(
+            self.conn,
+            self.payload(
+                self.submission(id=1, username="not a login"),
+                self.submission(id=2, kind="rant"),
+                self.submission(id=3, text="   "),
+                self.submission(id=4, kind="critique", entry_id=99,
+                                text="about an entry this node never published"),
+                self.submission(id=5, kind="critique", entry_id=None,
+                                text="a critique of nothing at all"),
+                self.submission(id=6, created_utc=None, updated_utc=None),
+                self.submission(id=None),
+                "not even a row",
+            ),
+        )
+        self.assertEqual(0, counts["submissions"])
+        self.assertEqual(8, counts["skipped"])
+        self.assertEqual([], self.rows())
+
+    def test_a_prompt_carries_no_parent_however_the_row_arrives(self):
+        # The kind decides. A prompt naming an entry would otherwise write a
+        # parent nothing reads and the review page would draw a strip above a
+        # sentence that is not about it.
+        sync.apply_changes(self.conn, self.payload(self.submission(entry_id=1)))
+        self.assertEqual([None], [row["entry_id"] for row in self.rows()])
+
+    def test_the_watermark_advances_past_a_submission_only_payload(self):
+        self.assertEqual(sync.EPOCH, sync.get_since(self.conn))
+        sync.apply_changes(
+            self.conn,
+            self.payload(self.submission(), next_since="2026-09-16T15:04:22Z"),
+        )
+        self.assertEqual("2026-09-16T15:04:22Z", sync.get_since(self.conn))
+
+    def test_a_submission_stores_a_login_and_nothing_else_about_a_person(self):
+        sync.apply_changes(
+            self.conn,
+            self.payload(
+                self.submission(
+                    email="octocat@users.noreply.github.invalid",
+                    name="The Octocat",
+                    avatar_url="https://avatars.example.invalid/u/1",
+                )
+            ),
+        )
+        stored = json.dumps(self.rows())
+        for leak in ("@users.noreply", "The Octocat", "avatars.example"):
+            self.assertNotIn(leak, stored)
+
+
 class UserAgentTests(unittest.TestCase):
     def test_sync_sends_a_named_user_agent(self):
         # Cloudflare answers 403 (error 1010) to Python-urllib's default agent.

@@ -420,6 +420,7 @@ def _sync_report(result: dict, as_json: bool) -> None:
     print(
         f"{result['pulled_utc']}  votes {result['votes']}  likes {result['likes']}  "
         f"unlikes {result['unlikes']}  views {result['views']}  "
+        f"submissions {result['submissions']}  "
         f"skipped {result['skipped']}  watermark {result['next_since']}"
     )
 
