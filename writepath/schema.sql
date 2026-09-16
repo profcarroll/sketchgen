@@ -68,3 +68,27 @@ CREATE TABLE IF NOT EXISTS oauth_state (
     state       TEXT PRIMARY KEY,
     created_utc TEXT NOT NULL
 );
+
+-- One row per thing a signed-in visitor asked for, prompt or critique. Written
+-- once and never updated; `updated_utc` mirrors `created_utc` so a submission
+-- rides the same inclusive /pull watermark as a vote.
+--
+-- A submission is not a job. It is text in this table until the operator
+-- releases it on the node, which is what guarantees nothing the public types
+-- can reach a model by accident.
+--
+-- The day's budget is counted straight off this table — COUNT(*) by username,
+-- kind and the start of the UTC day — so there is no counter to drift and no
+-- second table to keep in step. That is what submissions_budget_idx serves.
+CREATE TABLE IF NOT EXISTS submissions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT    NOT NULL CHECK (kind IN ('prompt', 'critique')),
+    username    TEXT    NOT NULL,           -- GitHub login, nothing else
+    entry_id    INTEGER,                    -- the parent, for a critique; NULL for a prompt
+    text        TEXT    NOT NULL,
+    created_utc TEXT    NOT NULL,
+    updated_utc TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS submissions_updated_idx ON submissions (updated_utc);
+CREATE INDEX IF NOT EXISTS submissions_budget_idx  ON submissions (username, kind, created_utc);
