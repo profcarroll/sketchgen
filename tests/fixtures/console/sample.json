@@ -109,6 +109,7 @@
     "archived": {"now": 0, "session": 1, "per_day": 1.0, "total": 2},
     "children": {"now": 1, "session": 5, "per_day": 8.5, "total": 17}
   },
+  "submissions": {"pending": 2, "released": 5, "declined": 1},
   "per_sketch": {
     "last": {
       "attempts_to_pass": 1.0,

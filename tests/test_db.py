@@ -27,6 +27,7 @@ EXPECTED_TABLES = {
     "lineage",
     "meta",
     "schema_version",
+    "submissions",
     "sync_state",
 }
 
@@ -544,6 +545,152 @@ class TestActivity(DbTestCase):
         self.conn.execute("DROP TABLE activity")
         self.assertIsNone(db.current_activity(self.conn))
         self.assertEqual([], db.recent_activity(self.conn))
+
+
+class TestSubmissions(DbTestCase):
+    """Migration 010: what the public asked for, before a person released it."""
+
+    def setUp(self):
+        super().setUp()
+        self.job_id = self.enqueue("a quiet grid")
+        self.entry_id = db.create_entry(
+            self.conn, self.job_id, "held", prompt="a quiet grid"
+        )
+
+    def add(self, remote_id=31, kind="prompt", username="octocat", entry_id=None,
+            text="a tide of small triangles", created_utc="2026-09-16T15:04:22Z"):
+        return db.add_submission(
+            self.conn,
+            remote_id=remote_id,
+            kind=kind,
+            username=username,
+            entry_id=entry_id,
+            text=text,
+            created_utc=created_utc,
+        )
+
+    def rows(self):
+        return list(self.conn.execute("SELECT * FROM submissions ORDER BY id"))
+
+    def test_a_submission_lands_pending_with_both_stamps(self):
+        submission_id = self.add()
+        row = db.submission(self.conn, submission_id)
+        self.assertEqual("pending", row["state"])
+        self.assertEqual(31, row["remote_id"])
+        self.assertEqual("octocat", row["username"])
+        self.assertEqual("a tide of small triangles", row["text"])
+        self.assertEqual("2026-09-16T15:04:22Z", row["created_utc"])
+        self.assertTrue(row["pulled_utc"], "the node stamps when it first saw it")
+        self.assertIsNone(row["job_id"])
+        self.assertIsNone(row["decided_utc"])
+
+    def test_the_same_remote_id_twice_writes_one_row_and_answers_none(self):
+        first = self.add()
+        second = self.add(text="the boundary second, delivered again")
+        self.assertIsNotNone(first)
+        self.assertIsNone(second, "at-least-once delivery must not queue it twice")
+        rows = self.rows()
+        self.assertEqual(1, len(rows))
+        self.assertEqual("a tide of small triangles", rows[0]["text"])
+
+    def test_a_repeat_does_not_resurrect_a_declined_row(self):
+        submission_id = self.add()
+        db.decline_submission(self.conn, submission_id, "not this week")
+        self.assertIsNone(self.add())
+        row = db.submission(self.conn, submission_id)
+        self.assertEqual("declined", row["state"])
+        self.assertEqual("not this week", row["decline_reason"])
+
+    def test_releasing_records_the_job_and_the_moment(self):
+        submission_id = self.add()
+        db.release_submission(self.conn, submission_id, self.job_id)
+        row = db.submission(self.conn, submission_id)
+        self.assertEqual("released", row["state"])
+        self.assertEqual(self.job_id, row["job_id"])
+        self.assertTrue(row["decided_utc"])
+
+    def test_a_released_row_cannot_be_released_again(self):
+        submission_id = self.add()
+        db.release_submission(self.conn, submission_id, self.job_id)
+        other = self.enqueue("a second job")
+        db.release_submission(self.conn, submission_id, other)
+        self.assertEqual(self.job_id, db.submission(self.conn, submission_id)["job_id"])
+
+    def test_declining_keeps_the_text_and_refuses_a_later_release(self):
+        submission_id = self.add()
+        db.decline_submission(self.conn, submission_id, "off topic")
+        row = db.submission(self.conn, submission_id)
+        self.assertEqual("declined", row["state"])
+        self.assertEqual("a tide of small triangles", row["text"])
+        db.release_submission(self.conn, submission_id, self.job_id)
+        self.assertEqual("declined", db.submission(self.conn, submission_id)["state"])
+
+    def test_pending_submissions_is_oldest_first_and_skips_what_was_decided(self):
+        old = self.add(remote_id=1, created_utc="2026-09-16T10:00:00Z", text="first")
+        mid = self.add(remote_id=2, created_utc="2026-09-16T11:00:00Z", text="second")
+        new = self.add(remote_id=3, created_utc="2026-09-16T12:00:00Z", text="third")
+        self.assertEqual(
+            [old, mid, new],
+            [row["id"] for row in db.pending_submissions(self.conn)],
+        )
+        db.decline_submission(self.conn, mid, "no")
+        db.release_submission(self.conn, new, self.job_id)
+        self.assertEqual(
+            [old], [row["id"] for row in db.pending_submissions(self.conn)]
+        )
+        self.assertEqual([], db.pending_submissions(self.conn, 0))
+
+    def test_a_critique_names_its_parent_entry(self):
+        submission_id = self.add(
+            kind="critique", entry_id=self.entry_id, text="thin the lines at the edge"
+        )
+        row = db.submission(self.conn, submission_id)
+        self.assertEqual("critique", row["kind"])
+        self.assertEqual(self.entry_id, row["entry_id"])
+
+    def test_the_schema_refuses_a_kind_and_a_state_it_does_not_know(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.add(kind="rant")
+        submission_id = self.add(remote_id=99)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute(
+                "UPDATE submissions SET state = 'approved' WHERE id = ?",
+                (submission_id,),
+            )
+
+    def test_counts_are_by_state_with_zeros_and_no_table_is_zeros_too(self):
+        self.assertEqual(
+            {"pending": 0, "released": 0, "declined": 0},
+            db.submission_counts(self.conn),
+        )
+        self.add(remote_id=1)
+        released = self.add(remote_id=2)
+        declined = self.add(remote_id=3)
+        db.release_submission(self.conn, released, self.job_id)
+        db.decline_submission(self.conn, declined, "no")
+        self.assertEqual(
+            {"pending": 1, "released": 1, "declined": 1},
+            db.submission_counts(self.conn),
+        )
+        # An older file — one that predates migration 010 — answers zeros
+        # rather than stopping the console's page.
+        self.conn.execute("DROP TABLE submissions")
+        self.assertEqual(
+            {"pending": 0, "released": 0, "declined": 0},
+            db.submission_counts(self.conn),
+        )
+
+    def test_the_job_state_machine_is_untouched_by_this_table(self):
+        # Decision §1.2, asserted rather than trusted: a submission is not a
+        # job, so nothing here may have grown a job state to hold one.
+        self.assertEqual(
+            {
+                "queued", "planning", "executing", "gating", "repairing",
+                "needs-laptop", "held", "published", "rejected", "failed",
+            },
+            set(db.TRANSITIONS),
+        )
+        self.assertNotIn("submissions", str(db.TRANSITIONS))
 
 
 if __name__ == "__main__":

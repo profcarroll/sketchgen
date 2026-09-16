@@ -29,12 +29,14 @@ __all__ = [
     "Job",
     "add_attempt",
     "add_lineage",
+    "add_submission",
     "archive_entry",
     "begin_step",
     "claim_next",
     "connect",
     "create_entry",
     "current_activity",
+    "decline_submission",
     "end_step",
     "enqueue",
     "entries_to_critique",
@@ -46,13 +48,17 @@ __all__ = [
     "get_meta",
     "init",
     "list_jobs",
+    "pending_submissions",
     "recent_activity",
     "record_critique",
     "record_judgment",
+    "release_submission",
     "requeue",
     "schema_version",
     "set_control",
     "set_meta",
+    "submission",
+    "submission_counts",
     "transition",
     "update_step",
     "utc_now",
@@ -821,6 +827,138 @@ def entries_to_critique(
         (prompt_version, int(limit)),
     ).fetchall()
     return [int(row["id"]) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Submissions — migration 010, what the public asked for
+# ---------------------------------------------------------------------------
+
+#: The states of this table's own machine, in the order the console counts
+#: them. It is not the job machine and it shares nothing with it on purpose:
+#: an unreleased submission is not a job, so ``claim_next`` cannot reach it
+#: however this row is spelled, and the job state machine above is untouched by
+#: this whole packet.
+SUBMISSION_STATES = ("pending", "released", "declined")
+
+
+def add_submission(
+    conn: sqlite3.Connection,
+    *,
+    remote_id: int,
+    kind: str,
+    username: str,
+    entry_id: int | None,
+    text: str,
+    created_utc: str,
+) -> int | None:
+    """Record one row pulled from the write path. Returns its id, or None.
+
+    None means the row was already here and nothing was written. ``/pull`` is
+    at-least-once — the inclusive watermark hands the boundary second back on
+    the next pull — so this is called twice with the same ``remote_id`` as a
+    matter of course, and the second call must not queue the prompt a second
+    time or lift a row the operator has already declined. The UNIQUE index on
+    ``remote_id`` is what recognises it and ``DO NOTHING`` is what makes the
+    repeat free.
+
+    Everything this writes has been checked by its caller (sync.py): the login
+    is a GitHub login, the kind is one of two, the parent exists. The row lands
+    ``pending``, which is the only state a person can move it out of.
+    """
+    cur = conn.execute(
+        "INSERT INTO submissions (remote_id, kind, username, entry_id, text, "
+        "state, created_utc, pulled_utc) VALUES (?,?,?,?,?,'pending',?,?) "
+        "ON CONFLICT (remote_id) DO NOTHING",
+        (
+            int(remote_id),
+            kind,
+            username,
+            None if entry_id is None else int(entry_id),
+            text,
+            created_utc,
+            utc_now(),
+        ),
+    )
+    # rowcount is 0 when the conflict clause swallowed the insert; lastrowid
+    # after that is whatever this connection inserted last, so it is read only
+    # when a row really was written.
+    return int(cur.lastrowid) if cur.rowcount else None
+
+
+def pending_submissions(conn: sqlite3.Connection, limit: int = 50) -> list[sqlite3.Row]:
+    """Submissions waiting for a person, oldest first.
+
+    Oldest first because the queue is a queue: somebody typed the first of
+    these before they typed the last, and a review page that shows the newest
+    at the top quietly starves the person who was early.
+    """
+    if int(limit) <= 0:
+        return []
+    return list(
+        conn.execute(
+            "SELECT * FROM submissions WHERE state = 'pending' "
+            "ORDER BY created_utc, id LIMIT ?",
+            (int(limit),),
+        ).fetchall()
+    )
+
+
+def submission(conn: sqlite3.Connection, submission_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM submissions WHERE id = ?", (int(submission_id),)
+    ).fetchone()
+
+
+def release_submission(
+    conn: sqlite3.Connection, submission_id: int, job_id: int
+) -> None:
+    """Record that a person released this submission as ``job_id``.
+
+    Only from ``pending``: the ``state`` in the WHERE clause is why a row that
+    has already been released cannot be released again by a second click on a
+    page left open, or by a CLI running beside the browser. The caller checks
+    the state first so that no job is created for a row this would refuse; this
+    is the line under that, in the same statement as the write.
+    """
+    conn.execute(
+        "UPDATE submissions SET state = 'released', job_id = ?, decided_utc = ? "
+        "WHERE id = ? AND state = 'pending'",
+        (int(job_id), utc_now(), int(submission_id)),
+    )
+
+
+def decline_submission(
+    conn: sqlite3.Connection, submission_id: int, reason: str
+) -> None:
+    """A person said no. The row stays, with the reason, as the record.
+
+    Nothing is deleted and the text is not touched: what was asked for is the
+    thing worth keeping, and this project does not moderate by forgetting
+    (plan §7).
+    """
+    conn.execute(
+        "UPDATE submissions SET state = 'declined', decline_reason = ?, "
+        "decided_utc = ? WHERE id = ? AND state = 'pending'",
+        (reason, utc_now(), int(submission_id)),
+    )
+
+
+def submission_counts(conn: sqlite3.Connection) -> dict[str, int]:
+    """How many submissions are in each state, zeros included.
+
+    A database that predates migration 010 answers zeros rather than raising,
+    the way :func:`get_meta` treats a missing ``meta`` table: the console's tile
+    should say nothing on an older file, not stop the whole page.
+    """
+    empty = {state: 0 for state in SUBMISSION_STATES}
+    try:
+        rows = conn.execute(
+            "SELECT state, COUNT(*) AS c FROM submissions GROUP BY state"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return empty
+    found = {str(row["state"]): int(row["c"]) for row in rows}
+    return {state: found.get(state, 0) for state in SUBMISSION_STATES}
 
 
 # ---------------------------------------------------------------------------

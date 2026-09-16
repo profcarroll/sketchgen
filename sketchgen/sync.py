@@ -1,10 +1,15 @@
 """Pull the gallery write path into the app database.
 
 The gallery is a static site and cannot write; the node must not listen (spec
-§4). So human votes, likes and view counts land in a small hosted Worker
-(``writepath/worker.js``) and this module pulls them down over HTTPS on the
-node's own schedule. ``GET /pull`` is the only route the node ever calls, and
-this is the only module that calls it.
+§4). So human votes, likes, view counts and submissions land in a small hosted
+Worker (``writepath/worker.js``) and this module pulls them down over HTTPS on
+the node's own schedule. ``GET /pull`` is the only route the node ever calls,
+and this is the only module that calls it.
+
+A submission — a prompt or a critique a signed-in visitor asked for — is the
+one kind of row here that a person must still act on. It lands in
+``submissions`` and nowhere near ``jobs``; releasing it is the operator's, on
+/submissions (plan §4.4).
 
 What crosses the wire about a person is a GitHub username. Nothing here reads,
 accepts or stores anything else: rows carrying an unusable login are counted as
@@ -38,6 +43,7 @@ __all__ = [
     "JUDGE_KIND",
     "PROMPT_VERSION",
     "SINCE_KEY",
+    "SUBMISSION_KINDS",
     "SyncFailed",
     "SyncRefused",
     "apply_changes",
@@ -70,6 +76,12 @@ UTC_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 QUESTIONS = frozenset({"brief", "look"})
 CHOICES = frozenset({"A", "B", "tie"})
+
+#: The two things a visitor can ask for. Anything else is a row from a Worker
+#: this node does not understand, and it is skipped rather than stored: the
+#: CHECK constraint in migration 010 would refuse it anyway, and a pull that
+#: raises stops the rows behind it from landing.
+SUBMISSION_KINDS = frozenset({"prompt", "critique"})
 
 
 class SyncRefused(Exception):
@@ -229,9 +241,16 @@ def apply_changes(
 
     Rows naming an entry this node has never published, or carrying anything
     that is not a GitHub login, are skipped and counted rather than written.
-    Returns counts: votes, likes, unlikes, views, skipped.
+    Returns counts: votes, likes, unlikes, views, submissions, skipped.
     """
-    counts = {"votes": 0, "likes": 0, "unlikes": 0, "views": 0, "skipped": 0}
+    counts = {
+        "votes": 0,
+        "likes": 0,
+        "unlikes": 0,
+        "views": 0,
+        "submissions": 0,
+        "skipped": 0,
+    }
     conn.execute("BEGIN IMMEDIATE")
     try:
         entries = _known_entries(conn)
@@ -295,6 +314,51 @@ def apply_changes(
                 continue
             conn.execute(_UPSERT_VIEWS, (entry_id, total))
             counts["views"] += 1
+
+        for row in payload.get("submissions") or []:
+            if not isinstance(row, dict):
+                counts["skipped"] += 1
+                continue
+            # The write path's own id. `_entry_id` asks only "a positive
+            # integer", which is what that id is too.
+            remote_id = _entry_id(row.get("id"))
+            username = _login(row.get("username"))
+            created = _stamp(row.get("created_utc")) or _stamp(row.get("updated_utc"))
+            kind = row.get("kind")
+            # Collapsed here and stored collapsed: the sentence becomes a prompt
+            # or a revision line, and both of those are one line by the time
+            # lineage composes them.
+            text = " ".join(str(row.get("text") or "").split())
+            parent = _entry_id(row.get("entry_id"))
+            if (
+                remote_id is None
+                or username is None
+                or created is None
+                or kind not in SUBMISSION_KINDS
+                or not text
+            ):
+                counts["skipped"] += 1
+                continue
+            # The Worker has no entries table and can only check that the
+            # parent id is a positive integer (plan §3.2). This node has the
+            # table, so a critique of an entry it has never published is
+            # dropped here rather than held for an operator who could do
+            # nothing with it.
+            if kind == "critique" and (parent is None or parent not in entries):
+                counts["skipped"] += 1
+                continue
+            db.add_submission(
+                conn,
+                remote_id=remote_id,
+                kind=kind,
+                username=username,
+                # The kind decides, not the payload: a prompt has no parent,
+                # whatever else arrived in the row.
+                entry_id=parent if kind == "critique" else None,
+                text=text,
+                created_utc=created,
+            )
+            counts["submissions"] += 1
 
         watermark = payload.get("next_since")
         if isinstance(watermark, str) and UTC_RE.match(watermark):

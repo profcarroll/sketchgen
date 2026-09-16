@@ -300,6 +300,15 @@ form.stack textarea { min-height: 6em; }
 .acts .cri { color: var(--accent); }
 .acts .arc { color: var(--dim); }
 .card .hint { margin: 8px 0 0; font-size: 12px; color: var(--dim); }
+/* The submissions card is the decision card with the sentence where the sketch
+   is. What the operator is deciding about is a line of text somebody typed, so
+   that line is the largest thing on the card and the person who typed it is a
+   chip beside the number rather than a line of provenance underneath. A
+   critique's parent keeps the card's existing shapes above it — .prompt and
+   .rev — so the two cards read as one design. */
+.card .ask { margin: 12px 0 0; font-size: 17px; line-height: 1.35;
+             overflow-wrap: anywhere; }
+.chip.person { padding: 1px 9px; font-size: 12px; color: var(--dim); }
 /* Entry states the queue's pills never show: the gate's own rejection, and
    the shelf. Same vocabulary as the site's chips. */
 .pill.failed-kept { border-color: var(--bad); color: var(--bad); }
