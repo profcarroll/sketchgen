@@ -79,6 +79,7 @@ __all__ = [
     "redact_command",
     "render_text",
     "resident_entry",
+    "submissions",
 ]
 
 # --- cost ------------------------------------------------------------------
@@ -889,6 +890,22 @@ def _funnel(conn: sqlite3.Connection, since: str | None) -> dict[str, Any]:
     return funnel
 
 
+def submissions(conn: sqlite3.Connection) -> dict[str, int]:
+    """What the public has asked for, by the submissions table's own state.
+
+    The console shows the ``pending`` half of this as one tile, because that
+    number is the only one on the page a person is expected to do something
+    about: a submission waits until the operator releases or declines it, and
+    nothing else on this document waits for a human at all. The other two
+    states ride along so the tile's subtitle can say what has already been
+    decided.
+
+    Zeros on a database that predates migration 010 — see
+    :func:`sketchgen.db.submission_counts`, which does not raise for it.
+    """
+    return db.submission_counts(conn)
+
+
 def _sketch_lines(row: sqlite3.Row, jobs_dir: Path) -> int | None:
     """Lines in an attempt's sketch.js, by its recorded source_dir or the
     directory the worker would have written it into."""
@@ -1303,6 +1320,7 @@ def collect(
         "activity": activity(conn),
         "odometer": _odometer(conn, since),
         "funnel": _funnel(conn, since),
+        "submissions": submissions(conn),
         "per_sketch": _per_sketch(conn, jobs_path, since),
     }
     document["collector_ms"] = round((time.monotonic() - started) * 1000.0, 1)
