@@ -1282,6 +1282,93 @@ def _subtitle(revisions: list[str], meta: dict[str, Any]) -> str:
     )
 
 
+#: The critique form, where the apology used to be (plan §5.2).
+#:
+#: Every state in the HTML and hidden, as the composer keeps them, and the
+#: entry's own id on the section because that is the one thing the POST needs
+#: that the script cannot read off the page's address. The rules line under the
+#: textarea is written by ``gallery.js`` as the visitor types; empty here,
+#: because a rule the page states before anyone has typed is not a finding.
+CRITIQUE_FORM = """<section class="panel critique-form" data-critique="{entry_id}" hidden>
+    <h2>Critique this sketch</h2>
+    <p class="signed-out-line" data-critique-out>
+      <a class="login" data-login href="../../index.html">Sign in with GitHub</a> to ask for a
+      revision. One sentence becomes the next generation's prompt.
+    </p>
+    <div data-critique-in hidden>
+      <p class="note">One sentence, under 40 words, no code — the same contract the critic
+      model works under. Your sentence is appended to this entry's prompt and the child is
+      queued.</p>
+      <label class="rule" for="critique-text">Say what should change, not how to write it.</label>
+      <textarea id="critique-text" rows="2" data-critique-text></textarea>
+      <p class="rule" data-critique-rule></p>
+      <div class="preview">
+        <span class="label">the child's prompt</span>
+        {child_prompt}
+        <p class="revise"><span class="label">Revise:</span> <em data-critique-echo>…</em></p>
+      </div>
+      <p class="actions">
+        <button type="button" class="primary" data-critique-send>Queue the child</button>
+        <span class="note">generation {generation} · a person's critique, so the line does \
+not stall here</span>
+      </p>
+    </div>
+    <div data-critique-sent hidden>
+      <div class="receipt">
+        <p><strong>Critique recorded.</strong> Queued for review.</p>
+        <p>Your username appears on the child entry as the critic, the way the critic model's
+        name appears on this one.</p>
+      </div>
+      <div class="preview">
+        <span class="label">what you asked for</span>
+        <p class="revise"><em data-critique-echo-sent>…</em></p>
+      </div>
+    </div>
+  </section>"""
+
+
+def _child_prompt(title: str, revisions: list[str]) -> str:
+    """The prompt this entry's child would carry, as far as the page knows it.
+
+    The root sentence, then every revision already stapled to it, in the shape
+    :func:`_subtitle` renders one of them in — so the live line the script adds
+    underneath is the same kind of line as the ones above it, and a
+    generation-4 parent does not pretend its child inherits one sentence.
+    """
+    lines = [f"<p>{_esc(title)}</p>"]
+    for revision in revisions:
+        lines.append(
+            '<p class="revise"><span class="label">Revise:</span> '
+            f"<em>{_esc(revision)}</em></p>"
+        )
+    return "\n        ".join(lines)
+
+
+def _critique_form(
+    row: sqlite3.Row,
+    meta: dict[str, Any],
+    title: str,
+    revisions: list[str],
+    config: Config,
+) -> str:
+    """The form, or nothing at all: a rejected parent gets no box.
+
+    ``lineage.spawn`` refuses a rejected entry, so a form on that page would be
+    an offer the pipeline will not honour. With no write path in
+    ``config.json`` there is nothing to submit to and the panel is not written
+    either — the entry page then simply has one panel fewer.
+    """
+    if not config.write_path or row["state"] not in lineage.SPAWNABLE:
+        return ""
+    return CRITIQUE_FORM.format(
+        entry_id=int(row["id"]),
+        child_prompt=_child_prompt(title, revisions),
+        # The child's generation, not this entry's: a critique released now
+        # becomes the next one down (plan §1.5 leaves the depth rule alone).
+        generation=int(meta["lineage"]["generation"]) + 1,
+    )
+
+
 #: Over either of these the stage waits for a click instead of starting itself.
 #: The second is the gate's own frame budget (gate/README.md: a virtual frame
 #: costing more than 100 ms is a sketch the machine cannot keep up with); the
@@ -1923,6 +2010,7 @@ def _write_entry(
         # entry sits on both questions at once, the boxes keep the numbers.
         compass=_compass(scores, entry_id),
         compare_href=f"../../compare.html?a={entry_id}",
+        critique=_critique_form(row, meta, title, revisions, config),
         source_rows=_source_rows(meta),
         provenance_rows=_provenance_rows(meta),
         lineage=_lineage_panel(meta, has_line, _ledger_index(conn)),
@@ -2036,7 +2124,62 @@ def _card(
     )
 
 
+#: The prompt composer, in the space the filter disclosure gave up (plan §5.1).
+#:
+#: Every state it can be in is in the HTML and hidden; ``gallery.js`` reveals
+#: one of them once ``/me`` has answered. Nothing here is a credential and
+#: nothing here is a number the page could be wrong about: the budget's first
+#: figure is filled in from ``/me`` and the second is the cap the Worker
+#: enforces (decision 7), written out because the sentence needs a denominator.
+COMPOSER = """<section class="compose" data-compose hidden>
+    <div class="compose-head">
+      <h2>Submit a prompt</h2>
+      <p class="quota" data-compose-quota hidden><b data-left>—</b> of 3 left today</p>
+    </div>
+    <p class="signed-out-line" data-compose-out>
+      <a class="login" data-login href="index.html">Sign in with GitHub</a> to submit a prompt.
+      Only your GitHub username is shared and published.
+    </p>
+    <div data-compose-in hidden>
+      <label class="rule" for="compose-text">One sentence describing a sketch. No code.</label>
+      <textarea id="compose-text" rows="2" data-compose-text placeholder="a tide of small \
+triangles that drifts toward whichever corner the cursor last rested in"></textarea>
+      <p class="rule bad" data-compose-refusal hidden></p>
+      <p class="actions">
+        <button type="button" class="primary" data-compose-send>Queue it</button>
+        <span class="note">Held for review before it runs</span>
+      </p>
+    </div>
+    <div class="receipt" data-compose-receipt hidden>
+      <p><strong>Queued for review.</strong></p>
+      <p>After review, check back later to see if your sketch was successfully created.</p>
+    </div>
+  </section>"""
+
+
+def _composer(config: Config, page: str) -> str:
+    """The composer on the gallery index, and the empty string everywhere else.
+
+    The rejections page and the line pages take no submissions: a prompt is
+    asked for once, from the one page that is about the gallery as a whole.
+    With no write path in ``config.json`` there is no service to submit to, so
+    the block is not written at all — the same rule the like button follows.
+    """
+    if page != "index.html" or not config.write_path:
+        return ""
+    return COMPOSER
+
+
 def _filters(rows: list[sqlite3.Row], page: str) -> str:
+    """The filter chips, which no page renders any more (plan §5.3).
+
+    The bar was the only real estate the composer wanted and nobody used it, so
+    ``grid.html`` dropped the ``<details class="filters">`` block. This stays,
+    and so does the ``filters=`` argument below, because putting the bar back is
+    then four lines of template and nothing else. ``?rules=`` and ``?executor=``
+    keep filtering the grid either way: that is ``applyVisibility()``, which
+    reads the URL and not these links.
+    """
     rules = sorted({str(r["rules_file"]) for r in rows if r["rules_file"]})
     executors = sorted({str(r["executor"]) for r in rows if r["executor"]})
     links = [f'<a class="filter" href="{page}">all</a>']
@@ -2076,6 +2219,7 @@ def _grid_page(
     intro: str,
     page: str,
     failed: bool,
+    composer: str = "",
 ) -> str:
     card = _template("card.html")
     scores = _all_scores(conn)
@@ -2093,7 +2237,10 @@ def _grid_page(
         # With no JavaScript the search box is a form that submits to the page
         # it is already on, which reloads it showing everything: harmless.
         page=_esc(page),
+        # Unused by the template since §5.3 took the bar out, and passed all
+        # the same so that putting it back is a change to one file.
         filters=_filters(rows, page),
+        composer=composer,
         cards=cards,
     )
 
@@ -2282,6 +2429,7 @@ def render_index(
                 intro="",
                 page="index.html",
                 failed=False,
+                composer=_composer(config, "index.html"),
             ),
         )
         written.write_text(
