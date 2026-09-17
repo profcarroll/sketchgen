@@ -8,6 +8,15 @@ when the push has succeeded does the database row become ``published`` and
 record the commit the site now serves. A publish that fails leaves the checkout
 and the database exactly as it found them.
 
+:func:`publish_many` publishes several entries in one go — one commit each,
+then a single push and a single index pass for all of them. It is the same
+work in the same order, not a second implementation of it: the shared steps
+live in ``_stage_and_commit`` and ``_stamp_row``, and :func:`publish` is a
+batch of one. The rule above is what the batch is careful about, so it holds
+per entry: a row becomes ``published`` only after the push that carried its
+commit has succeeded, and a push that fails leaves every entry in the batch
+exactly as it found them.
+
 Two rules this module enforces rather than trusts:
 
   - **A person decides.** DECIDE[publication-gate] is *hold for a person*
@@ -39,6 +48,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -49,6 +59,7 @@ __all__ = [
     "DEFAULT_KEY_PATH",
     "DEFAULT_URL_BASE",
     "PUBLISHABLE",
+    "ManyResult",
     "PublishFailed",
     "PublishRefused",
     "Plan",
@@ -56,6 +67,7 @@ __all__ = [
     "entry_url",
     "gallery_checkout",
     "publish",
+    "publish_many",
     "reject",
     "scan_for_personal_data",
 ]
@@ -126,6 +138,29 @@ class Published:
     index_note: str | None = None     # why there is no index commit, when there is none
 
 
+@dataclass
+class ManyResult:
+    """What one batch of publications did, entry by entry.
+
+    A batch is not all-or-nothing, because the three ways it can go wrong are
+    not the same thing. ``refused`` is an entry the publisher would not touch
+    (wrong state, the personal-data scan, the generator, or bytes already in
+    the gallery); it was dropped before its commit and the rest of the batch
+    carried on. ``failed`` is the one push that carried every commit going
+    wrong under all of them at once: those entries are still held, their
+    commits are gone, and nothing about them is public. ``published`` is in the
+    order the commits were made, and the index is the batch's, not any one
+    entry's — hence the two fields here rather than on each
+    :class:`Published`.
+    """
+
+    published: list[Published]
+    refused: dict[int, str] = field(default_factory=dict)
+    failed: dict[int, str] = field(default_factory=dict)
+    index_commit: str | None = None
+    index_note: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # git, as a subprocess
 # ---------------------------------------------------------------------------
@@ -172,6 +207,16 @@ def _default_branch(gallery_dir: Path) -> str | None:
 #: before it gives up. A publish is a render, two commits and two pushes over
 #: the network; a minute or two is a slow one, and anything past this is not a
 #: queue any more, it is a process that died holding the lock.
+#:
+#: :func:`publish_many` holds the same lock for a whole batch, and a batch of
+#: forty is a render and forty commits — longer than any single publish ever
+#: was, and it can pass five minutes. This stays at five minutes anyway. A
+#: worker or CLI publisher that waits that long and then reads "another
+#: publish has held ... for more than 300s" has been told something true and
+#: acted on: it can try again when the batch is done. Raising the timeout to
+#: cover the worst batch would only make the other refusal — the process that
+#: died holding the lock — take that much longer to arrive, and that is the
+#: one a person has to go and fix.
 LOCK_TIMEOUT = 300.0
 
 #: The lock file, kept in the repository's git directory and NOT in the work
@@ -440,6 +485,139 @@ def _push_env(key: str | None, remote: str) -> tuple[dict[str, str] | None, str]
 
 
 # ---------------------------------------------------------------------------
+# One entry's worth of work, so that one publish and a batch do it the same way
+# ---------------------------------------------------------------------------
+#
+# These four are the body of :func:`publish` between the lock and the push,
+# lifted out whole rather than copied. :func:`publish` is now a batch of one
+# and :func:`publish_many` is the same steps in a loop; there is no second
+# implementation of the commit, the scan or the stamp to keep in step with
+# this one.
+
+
+def _prepare_source(
+    conn: sqlite3.Connection,
+    entry_id: int,
+    checkout: Path,
+    from_dir: str | os.PathLike[str] | None = None,
+) -> tuple[Path, str | None]:
+    """Where this entry's files are, and the temp directory to delete after.
+
+    Either the caller passed a directory with ``--from``, in which case there
+    is nothing to clean up, or the generator renders into a fresh staging
+    directory whose path is returned as the second element so the caller's
+    ``finally`` can remove it. A generator that refuses takes its staging
+    directory with it, because there is no caller left to clean up for.
+    """
+    if from_dir is not None:
+        source = Path(os.path.expanduser(str(from_dir)))
+        if not source.is_dir():
+            raise PublishRefused(f"no source directory at {source}")
+        return source, None
+    temporary = tempfile.mkdtemp(prefix="sketchgen-publish-")
+    try:
+        source = _render_with_generator(conn, entry_id, Path(temporary), checkout)
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return source, temporary
+
+
+def _files_to_publish(source: Path, entry_id: int) -> list[str]:
+    """The files about to be committed, once they have passed the guard.
+
+    Kept apart from :func:`_stage_and_commit` because ``--dry-run`` needs the
+    list and the scan without the commit: a dry run that did not scan would
+    report a publish that the real one is going to refuse.
+    """
+    files = _source_files(source)
+    if not files:
+        raise PublishRefused(f"{source} is empty; there is nothing to publish")
+    scan_for_personal_data(source)
+    return files
+
+
+def _stage_and_commit(
+    entry_id: int,
+    checkout: Path,
+    source: Path,
+    message: str,
+    *,
+    files: list[str] | None = None,
+) -> tuple[str, list[str]]:
+    """Copy the entry into ``e/<entry_id>/``, stage it, commit it, return the sha.
+
+    Nothing here pushes and nothing here touches the database, so a refusal or
+    a failure leaves only the checkout to put back — which the caller does,
+    because only the caller knows which commit to put it back to.
+
+    ``files`` is the list :func:`_files_to_publish` already produced, when the
+    caller has one; without it the guard runs here instead, so no path reaches
+    a commit unscanned.
+    """
+    if files is None:
+        files = _files_to_publish(source, entry_id)
+    dest = checkout / "e" / str(entry_id)
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, dest)
+
+    added = _git(checkout, "add", "--", f"e/{entry_id}")
+    if added.returncode != 0:
+        raise PublishFailed(f"git add failed: {added.stderr.strip()}")
+    if _git(checkout, "diff", "--cached", "--quiet").returncode == 0:
+        raise PublishRefused(
+            f"nothing to commit: e/{entry_id} is already in the gallery "
+            "with these exact bytes"
+        )
+    committed = subprocess.run(
+        ["git", "commit", "-F", "-"],
+        cwd=str(checkout),
+        input=message,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if committed.returncode != 0:
+        raise PublishFailed(f"git commit failed: {committed.stderr.strip()}")
+    sha = _git_out(checkout, "rev-parse", "HEAD")
+    if not sha:
+        raise PublishFailed("git rev-parse HEAD failed after the commit")
+    return sha, files
+
+
+def _stamp_row(
+    conn: sqlite3.Connection, entry: sqlite3.Row, sha: str, now: str
+) -> str:
+    """Write the push's result onto the entry's row and say what state it is in.
+
+    Only a held entry becomes 'published'. A rejection — the gate's
+    'failed-kept' or the operator's 'rejected' — keeps its state, which is
+    what puts it on the rejections page rather than the grid, and gains the
+    timestamp and commit like any other.
+    """
+    new_state = "published" if entry["state"] == "held" else entry["state"]
+    conn.execute(
+        "UPDATE entries SET state = ?, published_utc = ?, "
+        "publish_commit = ? WHERE id = ?",
+        (new_state, now, sha, entry["id"]),
+    )
+    return new_state
+
+
+def _follow_job(conn: sqlite3.Connection, entry: sqlite3.Row, new_state: str) -> None:
+    """Move the originating job with its entry, so the queue stops saying "held".
+
+    A job already past held is left alone.
+    """
+    if new_state == "published" and entry["job_id"] is not None:
+        job = db.get_job(conn, entry["job_id"])
+        if job is not None and job.state == "held":
+            db.transition(conn, job.id, "published")
+
+
+# ---------------------------------------------------------------------------
 # publish and reject
 # ---------------------------------------------------------------------------
 
@@ -481,25 +659,10 @@ def publish(
                 f"{checkout} has no 'origin' remote and no --remote was given"
             )
 
-        temporary: str | None = None
-        if from_dir is not None:
-            source = Path(os.path.expanduser(str(from_dir)))
-            if not source.is_dir():
-                raise PublishRefused(f"no source directory at {source}")
-        else:
-            temporary = tempfile.mkdtemp(prefix="sketchgen-publish-")
-            source = Path(temporary)
-            try:
-                source = _render_with_generator(conn, entry_id, source, checkout)
-            except Exception:
-                shutil.rmtree(temporary, ignore_errors=True)
-                raise
+        source, temporary = _prepare_source(conn, entry_id, checkout, from_dir)
 
         try:
-            files = _source_files(source)
-            if not files:
-                raise PublishRefused(f"{source} is empty; there is nothing to publish")
-            scan_for_personal_data(source)
+            files = _files_to_publish(source, entry_id)
             message = _message(entry, executor_model, published_by)
             env, masked = _push_env(key, target)
             push_display = f"{masked}git push {target} HEAD:refs/heads/{branch}"
@@ -518,32 +681,9 @@ def publish(
                 )
 
             before = _git_out(checkout, "rev-parse", "HEAD")
-            if dest.exists():
-                shutil.rmtree(dest)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(source, dest)
-
-            added = _git(checkout, "add", "--", f"e/{entry_id}")
-            if added.returncode != 0:
-                raise PublishFailed(f"git add failed: {added.stderr.strip()}")
-            if _git(checkout, "diff", "--cached", "--quiet").returncode == 0:
-                raise PublishRefused(
-                    f"nothing to commit: e/{entry_id} is already in the gallery "
-                    "with these exact bytes"
-                )
-            committed = subprocess.run(
-                ["git", "commit", "-F", "-"],
-                cwd=str(checkout),
-                input=message,
-                capture_output=True,
-                text=True,
-                check=False,
+            sha, files = _stage_and_commit(
+                entry_id, checkout, source, message, files=files
             )
-            if committed.returncode != 0:
-                raise PublishFailed(f"git commit failed: {committed.stderr.strip()}")
-            sha = _git_out(checkout, "rev-parse", "HEAD")
-            if not sha:
-                raise PublishFailed("git rev-parse HEAD failed after the commit")
 
             pushed = _git(
                 checkout, "push", target, f"HEAD:refs/heads/{branch}", env=env
@@ -553,22 +693,8 @@ def publish(
                 raise PublishFailed(pushed.stderr.strip() or "git push failed")
 
             now = db.utc_now()
-            # Only a held entry becomes 'published'. A rejection — the gate's
-            # 'failed-kept' or the operator's 'rejected' — keeps its state, which
-            # is what puts it on the rejections page rather than the grid, and
-            # gains the timestamp and commit like any other.
-            new_state = "published" if entry["state"] == "held" else entry["state"]
-            conn.execute(
-                "UPDATE entries SET state = ?, published_utc = ?, "
-                "publish_commit = ? WHERE id = ?",
-                (new_state, now, sha, entry_id),
-            )
-            # The job's row follows its entry, so the queue stops saying "held"
-            # about work that is public. A job already past held is left alone.
-            if new_state == "published" and entry["job_id"] is not None:
-                job = db.get_job(conn, entry["job_id"])
-                if job is not None and job.state == "held":
-                    db.transition(conn, job.id, "published")
+            new_state = _stamp_row(conn, entry, sha, now)
+            _follow_job(conn, entry, new_state)
             conn.commit()
             # The entry is public. Now the grid, the failures page, compare and the
             # line pages must know about it: re-render the index and push it as a
@@ -590,6 +716,165 @@ def publish(
         finally:
             if temporary:
                 shutil.rmtree(temporary, ignore_errors=True)
+
+
+def publish_many(
+    conn: sqlite3.Connection,
+    entry_ids: Sequence[int],
+    *,
+    gallery_dir: str | os.PathLike[str] = DEFAULT_GALLERY_DIR,
+    key: str | None = DEFAULT_KEY_PATH,
+    remote: str | None = None,
+    by: str | None = None,
+    model: str | None = None,
+    url_base: str = DEFAULT_URL_BASE,
+    on_step: Callable[[str, int | None, str], None] | None = None,
+) -> ManyResult:
+    """Publish several entries as one transaction: n commits, one push, one index.
+
+    Eight publishes one at a time are eight renders, sixteen commits and
+    sixteen pushes, and the operator waits through every one of them. This is
+    the same work with the waiting taken out: each entry is still rendered,
+    scanned and committed on its own, but there is a single push for all of
+    those commits and a single index pass afterwards.
+
+    The invariant from this module's first paragraph holds exactly, and that
+    is what decides the order below: a row becomes ``published`` only after
+    the push that carried its commit has succeeded. So no row is touched until
+    the push returns, and if the push fails then :func:`_undo` puts the
+    checkout back where the batch found it, every committed entry is reported
+    in ``failed``, and all of them are still held — there is nothing to roll
+    back in the database because nothing was written to it.
+
+    An entry the publisher will not take (wrong state, the personal-data scan,
+    the generator, bytes already in the gallery) is dropped before its commit
+    and lands in ``refused``; the checkout goes back to the last commit so the
+    next entry starts from a clean tree, and the batch goes on. There is no
+    ``--from`` and no ``dry_run`` here: a batch is the operator UI's path and
+    the generator is the only source of its bytes. Use :func:`publish` for
+    either of those.
+
+    ``on_step(phase, entry_id, sentence)`` is called before each unit of work
+    — ``commit`` once per entry, then ``push``, then ``index`` — so a caller
+    can count real steps rather than guess at a duration. It is only ever a
+    report: an exception from it is the caller's own and is not caught here.
+    """
+    ids = list(entry_ids)
+    result = ManyResult(published=[])
+    if not ids:
+        # Nothing to do, and taking the checkout lock to discover that would
+        # make an empty press queue behind a real batch for no reason.
+        return result
+
+    def step(phase: str, entry_id: int | None, sentence: str) -> None:
+        if on_step is not None:
+            on_step(phase, entry_id, sentence)
+
+    published_by = by or _os_user()
+    with _checkout_lock(gallery_dir):
+        # A refusal here is the whole batch's: nothing has happened yet, and
+        # the caller reports it against every entry it was asked for.
+        checkout, branch = gallery_checkout(gallery_dir)
+        target = remote or _git_out(checkout, "remote", "get-url", "origin")
+        if not target:
+            raise PublishRefused(
+                f"{checkout} has no 'origin' remote and no --remote was given"
+            )
+        env, _ = _push_env(key, target)
+
+        before = _git_out(checkout, "rev-parse", "HEAD")
+        # Each entry's own commit, so the gallery's log still reads one entry
+        # per line however many were published together.
+        committed: list[tuple[sqlite3.Row, str, list[str]]] = []
+        at = before  # the commit a refusal rewinds the checkout to
+        for entry_id in ids:
+            step(
+                "commit",
+                entry_id,
+                f"Entry {entry_id} — rendering, scanning, committing e/{entry_id}/",
+            )
+            temporary: str | None = None
+            try:
+                entry = _entry(conn, entry_id)
+                if entry["state"] not in PUBLISHABLE:
+                    raise PublishRefused(
+                        f"entry {entry_id} is {entry['state']}; only "
+                        f"{' or '.join(sorted(PUBLISHABLE))} can be published"
+                    )
+                message = _message(entry, _executor_model(entry, model), published_by)
+                source, temporary = _prepare_source(conn, entry_id, checkout)
+                sha, files = _stage_and_commit(entry_id, checkout, source, message)
+            except PublishRefused as exc:
+                result.refused[entry_id] = str(exc)
+                _undo(checkout, at)
+                continue
+            except PublishFailed as exc:
+                # git itself would not do it — a broken index, a full disk.
+                # Not this entry's fault and not the batch's, but the rest of
+                # the batch is still publishable, so report it like a refusal
+                # and carry on from a clean tree.
+                result.failed[entry_id] = str(exc)
+                _undo(checkout, at)
+                continue
+            finally:
+                if temporary:
+                    shutil.rmtree(temporary, ignore_errors=True)
+            committed.append((entry, sha, files))
+            at = sha
+
+        if not committed:
+            return result  # no commits, so no push and no index either
+
+        step("push", None, f"Pushing {len(committed)} commits to the gallery")
+        pushed = _git(checkout, "push", target, f"HEAD:refs/heads/{branch}", env=env)
+        if pushed.returncode != 0:
+            why = pushed.stderr.strip() or "git push failed"
+            _undo(checkout, before)
+            for entry, _sha, _files in committed:
+                result.failed[entry["id"]] = why
+            return result
+
+        # The push has succeeded, so now the rows may say so. One transaction
+        # for all of them: the batch was one push and it is one fact.
+        now = db.utc_now()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            states = [
+                (entry, _stamp_row(conn, entry, sha, now)) for entry, sha, _ in committed
+            ]
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("COMMIT")
+        # The jobs follow outside it, because db.transition opens a
+        # transaction of its own to check the move is legal, and it is right
+        # that it does: an illegal job transition must not take the entry
+        # stamps down with it, and the stamps are the part that must not be
+        # lost once the commits are public.
+        for entry, new_state in states:
+            _follow_job(conn, entry, new_state)
+
+        for entry, sha, files in committed:
+            result.published.append(
+                Published(
+                    entry_id=entry["id"],
+                    commit=sha,
+                    branch=branch,
+                    url=entry_url(entry["id"], url_base),
+                    published_utc=now,
+                    files=files,
+                )
+            )
+
+        # Every entry of the batch goes through the generator again — the same
+        # "later truth" pass a single publish does, for the same reason: the
+        # bytes committed above were rendered before the push and so before
+        # the row knew its own commit. Then the index, once, for all of them.
+        step("index", None, "Re-rendering the index and pushing it")
+        result.index_commit, result.index_note = _publish_index(
+            conn, checkout, branch, target, env, [entry["id"] for entry, _, _ in committed]
+        )
+        return result
 
 
 def publish_index(
@@ -671,18 +956,25 @@ def _publish_index(
     branch: str,
     target: str,
     env: dict[str, str] | None,
-    entry_id: int,
+    entries: int | Iterable[int],
     *,
     regenerate: bool = True,
 ) -> tuple[str | None, str | None]:
-    """Re-render the entry and the gallery index, commit and push them.
+    """Re-render the entries and the gallery index, commit and push them.
 
-    The entry page goes in again because the copy committed a moment ago was
-    rendered BEFORE the push: its Provenance said the entry had no published
+    The entry pages go in again because the copies committed a moment ago were
+    rendered BEFORE the push: their Provenance said the entry had no published
     date and no publish commit, and its own lineage ledger called it "not
     published", because ``published_utc`` was still null when those bytes were
-    made. The row carries both stamps by the time this runs, so the same render
+    made. The rows carry both stamps by the time this runs, so the same render
     against the same database now writes them down. Same generator, later truth.
+
+    ``entries`` is one entry id or several: a batch's whole push gets one index
+    pass, because the index is a single rendering of the database as it now
+    stands and re-rendering it once per entry would only be the same file
+    written n times. One id is spelt "entry 431" in the commit and several
+    "entries 431, 432, 435", so the gallery's log says which push this index
+    belongs to.
 
     ``regenerate`` is false when the caller passed ``--from``: those are a
     person's own bytes and this is not the place to overwrite them with the
@@ -691,8 +983,14 @@ def _publish_index(
     commit, not of every render afterwards.)
 
     Returns (sha, None) on success, (None, why) otherwise. A failure here is
-    reported, never raised: the entry itself is already published.
+    reported, never raised: the entries themselves are already published.
     """
+    entry_ids = [entries] if isinstance(entries, int) else list(entries)
+    label = (
+        f"entry {entry_ids[0]}"
+        if len(entry_ids) == 1
+        else "entries " + ", ".join(str(i) for i in entry_ids)
+    )
     try:
         from . import gallery  # noqa: PLC0415
     except ImportError:
@@ -703,11 +1001,12 @@ def _publish_index(
     render_entry = getattr(gallery, "render_entry", None) if regenerate else None
     before = _git_out(checkout, "rev-parse", "HEAD")
     if render_entry is not None:
-        try:
-            render_entry(conn, entry_id, checkout)
-        except Exception as exc:  # the generator's own refusal, reported
-            _undo(checkout, before)
-            return None, f"entry re-render failed: {exc}"
+        for entry_id in entry_ids:
+            try:
+                render_entry(conn, entry_id, checkout)
+            except Exception as exc:  # the generator's own refusal, reported
+                _undo(checkout, before)
+                return None, f"entry re-render failed: {exc}"
     try:
         render_index(conn, checkout)
     except Exception as exc:  # the generator's own refusal, reported
@@ -726,7 +1025,7 @@ def _publish_index(
     committed = subprocess.run(
         ["git", "commit", "-F", "-"],
         cwd=str(checkout),
-        input=f"gallery index after entry {entry_id}\n",
+        input=f"gallery index after {label}\n",
         capture_output=True,
         text=True,
         check=False,
@@ -745,7 +1044,7 @@ def _publish_index(
         second = subprocess.run(
             ["git", "commit", "-F", "-"],
             cwd=str(checkout),
-            input=f"gallery index after entry {entry_id}, second pass\n\n{leftover}\n",
+            input=f"gallery index after {label}, second pass\n\n{leftover}\n",
             capture_output=True,
             text=True,
             check=False,
