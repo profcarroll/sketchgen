@@ -90,6 +90,43 @@ DEFAULT_INDEX_HTML = """<!DOCTYPE html>
 </html>
 """
 
+#: The p5.sound API, character for character as gate/sketch_gate.py's SOUND_RE
+#: (its line 133) and as the four names prompts/rules/treatment.md warns about.
+#: Copied rather than imported because the gate is a standalone script with its
+#: own copy on the node; if one list moves the other must, and a test says so.
+SOUND_RE = re.compile(r"p5\.AudioIn|p5\.FFT|p5\.Oscillator|loadSound")
+
+#: The p5 script line in DEFAULT_INDEX_HTML, and the addon that goes under it.
+_P5_TAG = ('    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/'
+           '1.11.3/p5.min.js"></script>\n')
+_P5_SOUND_TAG = ('    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/'
+                 '1.11.3/addons/p5.sound.min.js"></script>\n')
+
+
+def index_html_for(js: str) -> tuple[str, str]:
+    """The index.html for a sketch whose model emitted no ``html`` block.
+
+    p5.sound is a separate library. A sketch that calls ``p5.AudioIn`` without it
+    loaded does not fail loudly: ``sound_lib_ok`` goes false, the microphone
+    never opens, and ``responds(audio)`` reads as "the canvas did not react to
+    the tone" — which is true, and is not the sketch's fault.
+
+    prompts/rules/treatment.md warns about exactly this, in its loudest section,
+    under the heading "The library trap". Of the 27 treatment-arm sketches that
+    reached for p5.sound, 25 did not get it, and every run that ever satisfied
+    responds(audio) came from a sketch that never touched the library. A prose
+    warning has been tried and it does not work, so the addon is loaded for a
+    sketch that plainly needs it.
+
+    The model can still write its own ``html`` block and this never runs. Only
+    the fallback got smarter about what the sketch it is wrapping actually asked
+    for.
+    """
+    if not SOUND_RE.search(js):
+        return DEFAULT_INDEX_HTML, "default"
+    return DEFAULT_INDEX_HTML.replace(_P5_TAG, _P5_TAG + _P5_SOUND_TAG), "default+p5.sound"
+
+
 # ---------------------------------------------------------------------------
 # The assertion vocabulary
 # ---------------------------------------------------------------------------
@@ -485,8 +522,7 @@ def run(
             html = parsed.html if parsed.html.endswith("\n") else parsed.html + "\n"
             index_source = "model"
         else:
-            html = DEFAULT_INDEX_HTML
-            index_source = "default"
+            html, index_source = index_html_for(js)
         (out / "index.html").write_text(html, encoding="utf-8")
         files.append("index.html")
         if parsed.statement is not None:

@@ -144,6 +144,13 @@ iframe.sketch {
 .chip.rejected { background: var(--failed-ground); color: var(--failed-ink); }
 .chip.failed, .chip.rejected { letter-spacing: 0; text-transform: none; }
 p.chip.rejected { text-transform: none; letter-spacing: 0; border-radius: 8px; padding: 0.5rem 0.75rem; }
+/* Off-plan is NOT a rejection and must not wear the rejection ground. The
+ * sketch ran: it threw nothing, it did not freeze, it stayed inside the frame
+ * budget. It differs from a brief another model wrote, which is a description
+ * of the work and not a verdict on it, so it takes the neutral chip ground the
+ * page uses for facts. */
+.chip.offplan { background: var(--chip); color: var(--ink-soft); }
+p.chip.offplan { text-transform: none; letter-spacing: 0; border-radius: 8px; padding: 0.5rem 0.75rem; }
 .chip.agree { background: var(--ok-ground); color: var(--ok-ink); }
 /* A critic chip names who asked for the revision: a model in the agent
  * colour, a person in the ok colour, the same two colours the scores use. */

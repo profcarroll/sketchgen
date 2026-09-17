@@ -433,6 +433,7 @@ class GalleryTestCase(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="sketchgen-gallery-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.conn, self.ids = build_db(self.tmp)
+        self.db_path = self.tmp / "sketchgen.db"
         self.addCleanup(self.conn.close)
         self.dest = self.tmp / "site"
         self.dest.mkdir()
@@ -1305,6 +1306,45 @@ class ComposerTests(GalleryTestCase):
         index = (dest / "index.html").read_text(encoding="utf-8")
         self.assertNotIn("data-compose", index)
         self.assertNotIn("Submit a prompt", index)
+
+
+class OffPlanTests(GalleryTestCase):
+    """A sketch that runs and diverged is described, not condemned."""
+
+    def page_for(self, **fields):
+        job = db.enqueue(self.conn, "a jigsaw puzzle game", "profcarroll")
+        self.conn.execute("UPDATE jobs SET state = 'failed' WHERE id = ?", (job,))
+        entry = db.create_entry(
+            self.conn, job, state="failed-kept", prompt="a jigsaw puzzle game",
+            executor="qwen3-coder:30b", published_utc=db.utc_now(), **fields
+        )
+        self.conn.commit()
+        gallery.render_entry(self.conn, entry, self.dest, self.config)
+        return (self.dest / "e" / str(entry) / "index.html").read_text(encoding="utf-8")
+
+    def test_an_off_plan_entry_is_not_called_a_rejection(self):
+        page = self.page_for(offplan_json=json.dumps(["motion(idle)"]))
+        self.assertNotIn("REJECTED BY THE GATE", page)
+        self.assertIn("OFF-PLAN", page)
+        self.assertIn("this sketch runs", page)
+        self.assertIn("motion(idle)", page)
+        # and it must not borrow the rejection colour
+        self.assertIn('class="chip offplan"', page)
+
+    def test_several_missed_assertions_read_as_a_sentence(self):
+        page = self.page_for(
+            offplan_json=json.dumps(["motion(idle)", "responds(click)", "responds(drag)"])
+        )
+        self.assertIn("motion(idle), responds(click) and responds(drag)", page)
+
+    def test_a_real_gate_failure_is_still_called_one(self):
+        page = self.page_for()
+        self.assertIn("REJECTED BY THE GATE", page)
+        self.assertNotIn("OFF-PLAN", page)
+
+    def test_a_row_written_before_the_column_existed_is_not_off_plan(self):
+        # _offplan reads a column older rows do not carry; it must not raise.
+        self.assertEqual([], gallery._offplan({"id": 1}))
 
 
 class CritiqueFormTests(GalleryTestCase):
@@ -2498,6 +2538,90 @@ class HeavyStageTests(GalleryTestCase):
         self.reported(self.ids[0], total_s=12.0, ms_per_frame=100.0)
         page = self.page_of(self.ids[0])
         self.assertIn('<iframe class="sketch" src="sketch/"', page)
+class RepointKeptTests(GalleryTestCase):
+    """The one-time repair: a kept failure shows its best attempt, not its last."""
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(CLI), "repoint-kept", "--db", str(self.db_path), *args],
+            capture_output=True, text=True, check=False, env=dict(os.environ),
+        )
+
+    def kept(self, reports):
+        """A kept failure whose entry points at its LAST attempt, as they all do."""
+        job = db.enqueue(self.conn, "jigsaw puzzle game", "profcarroll")
+        self.conn.execute("UPDATE jobs SET state = 'failed' WHERE id = ?", (job,))
+        last = None
+        for n, report in enumerate(reports, 1):
+            out = self.tmp / f"j{job}-attempt-{n}"
+            (out / ".gate").mkdir(parents=True, exist_ok=True)
+            report = dict(report, artefacts={"strip": str(out / ".gate/strip.png"),
+                                             "png": str(out / ".gate/gate.png")})
+            (out / ".gate" / "report.json").write_text(json.dumps(report), encoding="utf-8")
+            db.add_attempt(
+                self.conn, job, n, started_utc=db.utc_now(), finished_utc=db.utc_now(),
+                model="qwen3-coder:30b", rules_file="treatment",
+                prompt_version="executor-v2", source_dir=str(out), gate_exit=1,
+                gate_report_path=str(out / ".gate" / "report.json"),
+                evidence="x", statement=f"statement {n}",
+            )
+            last = out
+        entry = db.create_entry(
+            self.conn, job, state="failed-kept", prompt="jigsaw puzzle game",
+            source_dir=str(last), statement=f"statement {len(reports)}",
+        )
+        self.conn.commit()
+        return entry
+
+    CLEAN = {"checks": {"console_clean": True, "frame_advancing": True},
+             "assertions": {"responds(drag)": {"pass": False, "detail": "0 changed"}}}
+    BROKEN = {"checks": {"console_clean": False, "frame_advancing": False},
+              "assertions": {"responds(drag)": {"pass": False, "detail": "none"}}}
+
+    def row(self, entry_id):
+        return self.conn.execute(
+            "SELECT * FROM entries WHERE id = ?", (entry_id,)
+        ).fetchone()
+
+    def test_it_repoints_at_the_best_attempt_and_records_the_divergence(self):
+        entry = self.kept([self.CLEAN, self.BROKEN])
+        result = self.run_cli()
+        self.assertEqual(0, result.returncode, result.stderr)
+        row = self.row(entry)
+        self.assertTrue(row["source_dir"].endswith("attempt-1"), row["source_dir"])
+        self.assertEqual("statement 1", row["statement"])
+        self.assertEqual(["responds(drag)"], json.loads(row["offplan_json"]))
+        # the state is left alone without --reclassify
+        self.assertEqual("failed-kept", row["state"])
+
+    def test_dry_run_writes_nothing(self):
+        entry = self.kept([self.CLEAN, self.BROKEN])
+        before = dict(self.row(entry))
+        result = self.run_cli("--dry-run")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertRegex(result.stdout, r"attempt-2 -> \S*attempt-1")
+        self.assertEqual(before["source_dir"], self.row(entry)["source_dir"])
+        self.assertIsNone(self.row(entry)["offplan_json"])
+
+    def test_reclassify_moves_only_the_ones_that_run(self):
+        runs = self.kept([self.CLEAN, self.BROKEN])
+        broken = self.kept([self.BROKEN, self.BROKEN])
+        result = self.run_cli("--reclassify")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("held", self.row(runs)["state"])
+        self.assertEqual("failed-kept", self.row(broken)["state"])
+        # and a sketch that never ran is never called off-plan
+        self.assertIsNone(self.row(broken)["offplan_json"])
+
+    def test_running_it_twice_changes_nothing_the_second_time(self):
+        entry = self.kept([self.CLEAN, self.BROKEN])
+        self.run_cli()
+        after_first = dict(self.row(entry))
+        result = self.run_cli()
+        self.assertIn("same attempt", result.stdout)
+        self.assertEqual(after_first["source_dir"], self.row(entry)["source_dir"])
+
+
 class PublishRejectedTests(GalleryTestCase):
     """§5.4: the one-time backfill of the rejections that were only a state flip."""
 
