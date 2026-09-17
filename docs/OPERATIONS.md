@@ -409,6 +409,41 @@ python3 bin/sketchgen publish 12 --from /path/to/e12 --by <github-username>
 python3 bin/sketchgen reject  12 --reason "off brief"            # no git at all
 ```
 
+### The Held page is one press
+
+Since 2026-09-17 the four verbs on each card — `+ Publish`, `× Reject`,
+`› Critique`, `− Archive` — **mark** rather than act. Pressing one fills it with
+its own colour and makes no request; pressing another moves the fill; pressing
+the filled one clears it. Publish, Reject and Archive are one choice per card.
+Critique stacks with Publish or Archive, or stands alone — a child is queued and
+the entry stays held — but it cannot join Reject, because both read the card's
+one box and one sentence cannot be a reason and a revision at once. A kept
+rejection still has no Reject. Nothing is typed twice: the box is the reason when
+Reject reads it and the child's revision sentence when Critique does, and an
+empty box is allowed for Reject (it becomes `rejected by operator`) and refused
+for Critique — that card reads *needs a sentence* and **Process** stays dimmed
+until it is typed or unmarked.
+
+Curate the whole pile, then press **Process** once, in the second row of the
+sticky header. The tally beside it says what the press will do, which is why
+there is no confirm dialog. One batch runs it in the only order that is legal:
+critiques while their parents are still held, then archives, then every
+rejection and publication committed one at a time and carried out in **one push**
+with **one index re-render**. Eight publishes used to be sixteen pushes; they are
+two. While it runs, every toggle, every box and Process itself are disabled —
+on every open tab, because "busy" is on the server — and the tray shows the now
+line, a bar counted in real steps, the five phases, and each card's own state.
+
+When it ends the result stays in the tray until you dismiss it:
+`6 done · 1 refused in 48s`, refusals first with their reasons. Cards that went
+through are gone on the reload. Refused and failed ones are still there, **still
+marked**, with the reason on the card, so fixing one and pressing again is the
+whole of the retry. `POST /held/<id>/publish`, `/reject` and `/archive` still
+exist for scripts and for `/entry/<id>` habits, and they refuse with
+`a batch is running — nothing changed; it will finish first` while one is in
+flight. Deploy with the tray empty: `update.sh` restarts `sketchgen-web`, and a
+batch in flight when it does is abandoned where it stands.
+
 ### One publisher at a time
 
 Both the worker and the operator UI publish, and they share one working tree at
@@ -435,18 +470,18 @@ finished -- but the same race the other way round has one publish's `git reset
 survivor then publishes a half-reset gallery without reporting anything.
 
 Rejecting from the **operator UI** does more than that CLI line: since the
-lineage ledger's packet 2 the Reject button stores the reason on the entry and
-then publishes it to the rejections page, beside the gate's own rejections. The
-CLI `reject` above is still the state flip on its own, for a rejection that
-should not go out at all. Neither one deletes or moves a single file, and nor
-does Archive below: the entry row, its attempt directories under `jobs/` and its
-strip all stay exactly where they are.
+lineage ledger's packet 2 a rejection stores the reason on the entry and then
+publishes it to the rejections page, beside the gate's own rejections — in a
+batch it travels with that batch's one push. The CLI `reject` above is still the
+state flip on its own, for a rejection that should not go out at all. Neither one
+deletes or moves a single file, and nor does Archive below: the entry row, its
+attempt directories under `jobs/` and its strip all stay exactly where they are.
 
-The third button on the Held page is **Archive**. It takes a held entry, or a
-kept failure nobody published, off the Held page and the kept list and does
-nothing else — no publish, no push, no deletion. An archived entry is in no
-list at all; it is still readable by id at `/entry/<id>` in the operator UI, and
-the console's funnel counts it.
+The fourth verb on a Held card is **Archive**. It takes a held entry, or a kept
+failure nobody published, off the Held page and the kept list and does nothing
+else — no publish, no push, no deletion. An archived entry is in no list at all;
+it is still readable by id at `/entry/<id>` in the operator UI, and the console's
+funnel counts it.
 
 The entry must be `held`, `failed-kept` or `rejected`, and the gallery checkout (`--gallery-dir`,
 default `$SKETCHGEN_GALLERY` or `~/sketchgen/gallery`) must be a clean git work tree
@@ -1066,7 +1101,9 @@ one is failures **since the worker last started** (the worker stamps
 `meta.worker_started_utc` when it comes up), not the all-time total, which would only
 ever grow — so a red zero means this session has been clean, and restarting the worker
 clears it. **Held** has an amber superscript, the number waiting for you to publish or
-reject, with the kept rejections below them named on hover. **Gallery** has a dim
+reject, with the kept rejections below them named on hover; that page's own second
+header row is the batch tray, and its `Process` button is the only request on it.
+**Gallery** has a dim
 superscript: everything that is public, published entries and kept rejections
 together. All of them are rendered by the server on every page load and repainted by the
 same two-second poll that keeps the worker pill honest.
