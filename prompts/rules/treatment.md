@@ -35,6 +35,53 @@ cannot see.
 - Keep `sketch.js` under ~150 lines unless asked. Comment the *why* of a
   technique, not the syntax.
 
+## The frame budget — a brief is a picture, not a particle count
+
+A sketch here runs unattended, in a headless browser with no GPU, on the same
+machine as the model, and later in a viewer's browser tab. Most sketches draw a
+frame in a few milliseconds. One that takes seconds per frame does not "run
+slowly": the gate never finishes, the machine runs out of memory, and the
+viewer's tab crashes. The budget is fixed and does not grow with the adjectives
+in the brief. "Thousands of glowing particles", "volumetric", "highly detailed",
+"overwhelming scale" describe what the viewer should *feel*; they are not
+instructions to allocate thousands of objects. Fill the canvas with the effect,
+not the count.
+
+Per frame, stay inside all of these:
+
+- **At most ~2,000 shape calls in 2D, ~300 in WEBGL.** `sphere()`, `box()`,
+  `torus()` and friends are each a full mesh with lighting; a particle is a
+  point, an `ellipse()`, or one `vertex()` inside a single
+  `beginShape(POINTS)` … `endShape()`. Hundreds of `push()`/`translate()`/
+  `sphere()`/`pop()` blocks per frame is the single most common way a 3D
+  sketch here dies.
+- **No all-pairs loops.** A nested `for i … for j` over the same array is
+  N²: 2,000 particles is two million distance checks per frame, 5,000 is
+  twelve million. Connect neighbours through a grid or spatial hash, compare
+  squared distances, and cap the total connections drawn per frame
+  (a few hundred is plenty). If you cannot bound it, do not draw it.
+- **Batch lines and points.** In WEBGL every `line()` and `point()` call
+  is its own draw with its own buffers. Put them in one
+  `beginShape(LINES)` / `beginShape(POINTS)` … `endShape()` per frame. For a
+  static complex shape, build it once in `setup()` (`buildGeometry()`) and draw
+  the result.
+- **No full-canvas passes inside loops.** `filter()`, `loadPixels()`,
+  `get()`, `image()` of a canvas-sized buffer, `createGraphics()` — at most
+  once per frame, never per object, and `createGraphics()`/`loadImage()`
+  belong in `setup()`, not `draw()`.
+- **Allocate in `setup()`, not `draw()`.** Do not create arrays, vectors,
+  colours or graphics buffers per particle per frame; reuse them.
+- **Keep the count fixed.** Any array that grows every frame must also
+  shrink every frame (a hard cap and `splice`/`shift`), or the sketch leaks
+  until the tab dies.
+- **Detail is a cost.** Default `sphere()` detail (24×16) is fine for a
+  few; for many, lower it (`sphere(r, 6, 4)`) or use points.
+
+A safe reading of "thousands of particles" in WEBGL: ~1,000–2,000 positions in
+one point cloud, a spatial hash for neighbours, a few hundred connecting
+segments in one `LINES` shape, `frameRate(30)`. That fills the screen and the
+viewer sees a field; the machine sees one draw call.
+
 ## What not to do
 
 - Do not write setup or installation instructions into source files. The project
