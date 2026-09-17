@@ -643,6 +643,234 @@ class LockTests(PublishTestCase):
         self.assertGreater(elapsed, held_for - 0.2)
 
 
+@unittest.skipUnless(
+    GENERATOR_PRESENT, "a batch has no --from; the generator is its only source"
+)
+class PublishManyTests(PublishTestCase):
+    """Several entries, one push, one index (the Held page's Process button).
+
+    There is no ``--from`` here, so every entry comes out of the generator, and
+    the fixture's prompt is what ends up on the page — which is how the
+    personal-data test below trips the scan on one entry and not the others.
+    """
+
+    def make_entry(self, prompt, state="held", job_state="held"):
+        """Another publishable entry, with a job of its own behind it."""
+        job = db.enqueue(self.conn, prompt, "profcarroll")
+        self.conn.execute("UPDATE jobs SET state = ? WHERE id = ?", (job_state, job))
+        self.conn.commit()
+        return db.create_entry(
+            self.conn,
+            job,
+            state=state,
+            prompt=prompt,
+            executor=EXECUTOR,
+            submitted_by="profcarroll",
+        )
+
+    def count_pushes(self):
+        """Wrap ``_git`` and collect every push it is asked to make."""
+        pushes = []
+        original = publish._git
+
+        def counting(cwd, *args, **kwargs):
+            if args and args[0] == "push":
+                pushes.append(args)
+            return original(cwd, *args, **kwargs)
+
+        publish._git = counting
+        self.addCleanup(setattr, publish, "_git", original)
+        return pushes
+
+    def publish_batch(self, ids, **extra):
+        options = dict(
+            gallery_dir=self.gallery,
+            remote=str(self.bare),
+            key=None,
+            by="profcarroll",
+        )
+        options.update(extra)
+        return publish.publish_many(self.conn, ids, **options)
+
+    def state_of(self, entry_id):
+        return self.conn.execute(
+            "SELECT * FROM entries WHERE id = ?", (entry_id,)
+        ).fetchone()
+
+    def subjects_since(self, before):
+        out = git(self.gallery, "log", "--pretty=%s", f"{before}..HEAD").stdout
+        return [line for line in out.splitlines() if line.strip()]
+
+    # -- the whole point: n commits, one push, one index --------------------
+
+    def test_a_batch_is_three_commits_one_push_and_one_index(self):
+        second = self.make_entry("a lattice that breathes when the mouse is still")
+        third = self.make_entry("three colours arguing about the horizon")
+        ids = [self.entry_id, second, third]
+        before = self.head(self.gallery)
+        pushes = self.count_pushes()
+
+        result = self.publish_batch(ids)
+
+        self.assertEqual({}, result.refused)
+        self.assertEqual({}, result.failed)
+        self.assertEqual(ids, [p.entry_id for p in result.published])
+        self.assertIsNone(result.index_note, result.index_note)
+        self.assertIsNotNone(result.index_commit)
+
+        # One commit per entry, and one index commit naming all three of them.
+        subjects = self.subjects_since(before)
+        entry_commits = [s for s in subjects if s.startswith("entry ")]
+        self.assertEqual(3, len(entry_commits), subjects)
+        self.assertEqual(
+            1,
+            subjects.count(f"gallery index after entries {ids[0]}, {ids[1]}, {ids[2]}"),
+            subjects,
+        )
+
+        # Two pushes for the lot: the entries' and the index's. Eight publishes
+        # one at a time would have been sixteen.
+        self.assertEqual(2, len(pushes), pushes)
+
+        # The remote has every one of those commits, not just the local branch.
+        self.assertEqual(self.head(self.bare), self.head(self.gallery))
+        listing = git(self.bare, "ls-tree", "-r", "--name-only", "HEAD").stdout
+        for entry_id in ids:
+            self.assertIn(f"e/{entry_id}/index.html", listing)
+        self.assertIn("index.html", listing)
+
+        # Every row published, each stamped with its own commit.
+        commits = []
+        for entry_id in ids:
+            row = self.state_of(entry_id)
+            self.assertEqual("published", row["state"])
+            self.assertTrue(row["published_utc"].endswith("Z"), row["published_utc"])
+            commits.append(row["publish_commit"])
+        self.assertEqual(3, len(set(commits)), commits)
+        self.assertEqual([p.commit for p in result.published], commits)
+        self.assertEqual("", git(self.gallery, "status", "--porcelain").stdout.strip())
+
+    # -- one entry's refusal is not the batch's -----------------------------
+
+    def test_a_refused_entry_drops_out_and_the_rest_go_on(self):
+        """The middle entry's prompt carries an address, so its render does."""
+        caught = self.make_entry("a portrait of someone@example.com in motion")
+        third = self.make_entry("three colours arguing about the horizon")
+        ids = [self.entry_id, caught, third]
+
+        result = self.publish_batch(ids)
+
+        self.assertEqual([caught], list(result.refused))
+        self.assertIn("email-shaped", result.refused[caught])
+        self.assertEqual({}, result.failed)
+        self.assertEqual([self.entry_id, third], [p.entry_id for p in result.published])
+
+        self.assertEqual("held", self.state_of(caught)["state"])
+        self.assertIsNone(self.state_of(caught)["publish_commit"])
+        for entry_id in (self.entry_id, third):
+            self.assertEqual("published", self.state_of(entry_id)["state"])
+
+        listing = git(self.bare, "ls-tree", "-r", "--name-only", "HEAD").stdout
+        self.assertNotIn(f"e/{caught}/", listing)
+        self.assertIn(f"e/{third}/index.html", listing)
+
+        # The dropped entry left nothing behind for the next one to trip on.
+        self.assertFalse((self.gallery / "e" / str(caught)).exists())
+        self.assertEqual("", git(self.gallery, "status", "--porcelain").stdout.strip())
+
+    # -- the push is the whole batch's -------------------------------------
+
+    def test_a_failed_push_takes_the_whole_batch_back(self):
+        second = self.make_entry("a lattice that breathes when the mouse is still")
+        ids = [self.entry_id, second]
+        before = self.head(self.gallery)
+
+        result = self.publish_batch(ids, remote=str(self.tmp / "gone.git"))
+
+        self.assertEqual([], result.published)
+        self.assertEqual(sorted(ids), sorted(result.failed))
+        for entry_id in ids:
+            self.assertTrue(result.failed[entry_id])
+            row = self.state_of(entry_id)
+            self.assertEqual("held", row["state"])
+            self.assertIsNone(row["publish_commit"])
+            self.assertIsNone(row["published_utc"])
+        self.assertEqual(before, self.head(self.gallery))
+        self.assertEqual("", git(self.gallery, "status", "--porcelain").stdout.strip())
+
+    # -- a rejection is a result, and keeps its state ----------------------
+
+    def test_a_rejection_in_the_batch_keeps_its_state_and_gains_the_stamps(self):
+        self.conn.execute(
+            "UPDATE entries SET state = 'rejected', reject_reason = 'off brief' "
+            "WHERE id = ?",
+            (self.entry_id,),
+        )
+        self.conn.commit()
+        kept = self.make_entry(
+            "a sketch the gate failed", state="failed-kept", job_state="failed"
+        )
+        held = self.make_entry("three colours arguing about the horizon")
+
+        result = self.publish_batch([self.entry_id, kept, held])
+
+        self.assertEqual({}, result.refused)
+        self.assertEqual({}, result.failed)
+        self.assertEqual(3, len(result.published))
+        self.assertEqual("rejected", self.state_of(self.entry_id)["state"])
+        self.assertEqual("failed-kept", self.state_of(kept)["state"])
+        self.assertEqual("published", self.state_of(held)["state"])
+        for entry_id in (self.entry_id, kept, held):
+            row = self.state_of(entry_id)
+            self.assertIsNotNone(row["publish_commit"])
+            self.assertTrue(row["published_utc"].endswith("Z"), row["published_utc"])
+
+    # -- the progress the tray counts --------------------------------------
+
+    def test_on_step_reports_every_commit_then_the_push_then_the_index(self):
+        second = self.make_entry("a lattice that breathes when the mouse is still")
+        seen = []
+
+        result = self.publish_batch(
+            [self.entry_id, second],
+            on_step=lambda phase, entry_id, sentence: seen.append(
+                (phase, entry_id, sentence)
+            ),
+        )
+
+        self.assertEqual(2, len(result.published))
+        self.assertEqual(
+            ["commit", "commit", "push", "index"], [s[0] for s in seen]
+        )
+        self.assertEqual([self.entry_id, second, None, None], [s[1] for s in seen])
+        self.assertEqual(
+            f"Entry {self.entry_id} — rendering, scanning, committing "
+            f"e/{self.entry_id}/",
+            seen[0][2],
+        )
+        self.assertEqual("Pushing 2 commits to the gallery", seen[2][2])
+        self.assertEqual("Re-rendering the index and pushing it", seen[3][2])
+
+    # -- nothing marked, nothing done --------------------------------------
+
+    def test_an_empty_batch_does_nothing_and_never_takes_the_lock(self):
+        """An empty press must not queue behind a real batch to learn it is empty."""
+        pushes = self.count_pushes()
+        # So a regression that does take the lock fails in a moment rather
+        # than waiting out the real five minutes.
+        self.addCleanup(setattr, publish, "LOCK_TIMEOUT", publish.LOCK_TIMEOUT)
+        publish.LOCK_TIMEOUT = 0.3
+        with publish._checkout_lock(self.gallery):
+            result = self.publish_batch([])
+        self.assertIsInstance(result, publish.ManyResult)
+        self.assertEqual([], result.published)
+        self.assertEqual({}, result.refused)
+        self.assertEqual({}, result.failed)
+        self.assertIsNone(result.index_commit)
+        self.assertIsNone(result.index_note)
+        self.assertEqual([], pushes)
+
+
 class ScanTests(unittest.TestCase):
     def test_binary_files_are_not_scanned_for_addresses(self):
         import tempfile, pathlib
