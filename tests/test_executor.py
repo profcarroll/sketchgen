@@ -133,7 +133,7 @@ class TestCleanResponse(ExecutorTestCase):
         raw = (self.out / "response.txt").read_text(encoding="utf-8")
         self.assertEqual(raw, (FIXTURES / "clean.txt").read_text(encoding="utf-8"))
         record = json.loads((self.out / "result.json").read_text(encoding="utf-8"))
-        self.assertEqual(record["prompt_version"], "executor-v1")
+        self.assertEqual(record["prompt_version"], "executor-v2")
         self.assertEqual(record["blocks"], ["js", "statement"])
         self.assertEqual(record["seed"], executor.DEFAULT_SEED)
         self.assertEqual(record["num_ctx"], executor.DEFAULT_NUM_CTX)
@@ -272,7 +272,7 @@ class TestPrompt(unittest.TestCase):
     """The template is versioned, the code reads the version, and it is filled."""
 
     def test_version_line_is_read_from_the_template(self):
-        self.assertEqual(executor.prompt_version(), "executor-v1")
+        self.assertEqual(executor.prompt_version(), "executor-v2")
 
     def test_rendered_prompt_carries_rules_brief_assertions_and_seed(self):
         rules = executor.resolve_rules("treatment").read_text(encoding="utf-8")
