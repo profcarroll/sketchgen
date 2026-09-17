@@ -24,11 +24,16 @@ body {
         "Helvetica Neue", Arial, sans-serif;
 }
 a { color: var(--accent); }
+/* The header is two rows on the Held page and one everywhere else, and both of
+   them have to stay on screen: the tray's Process button is what card 40 is
+   marked for, and scrolling back up to find it is the whole reason the tray is
+   in the header at all. So the sticky box is this wrapper rather than
+   header.top, and a page with no subheader sticks exactly as it did. */
+.sticky { position: sticky; top: 0; z-index: 5; }
 header.top {
   display: flex; flex-wrap: wrap; gap: 12px; align-items: center;
   justify-content: space-between; padding: 10px 16px;
   border-bottom: 1px solid var(--line); background: var(--panel);
-  position: sticky; top: 0; z-index: 5;
 }
 header.top nav { display: flex; gap: 14px; flex-wrap: wrap; align-items: baseline; }
 header.top nav a { text-decoration: none; padding: 2px 0; }
@@ -93,6 +98,57 @@ button.danger { color: var(--bad); }
 .pill.warn { border-color: var(--warn); color: var(--warn); }
 .pill.bad { border-color: var(--bad); color: var(--bad); }
 .pill.quiet { border-color: var(--line); color: var(--dim); }
+/* The batch tray: the second row of the sticky header, on /held and nowhere
+   else. It is one <form>, and every toggle and box on every card below joins it
+   by form="held-batch", so the cards stay siblings in the grid and the page has
+   exactly one request in it — this button. What the tally says the press will
+   do is what the press does, which is why there is no confirm dialog. */
+.tray { background: var(--panel); border-bottom: 1px solid var(--line); padding: 8px 16px; }
+.tray-in { max-width: 1100px; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; }
+.tray-row { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+.tray h1 { font-size: 16px; margin: 0; }
+.tray h1 .dim { font-size: 12px; font-weight: 400; }
+.tally { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; flex: 1 1 200px; }
+.tally .t {
+  font-size: 12px; font-variant-numeric: tabular-nums; padding: 1px 9px;
+  border-radius: 999px; border: 1px solid currentColor; white-space: nowrap;
+}
+.tally .t.pub { color: var(--ok); }
+.tally .t.rej { color: var(--bad); }
+.tally .t.cri { color: var(--accent); }
+.tally .t.arc { color: var(--dim); }
+/* A marked Critique with an empty box: dashed, amber, and Process is dead
+   until it is typed or unmarked. One sentence cannot be a reason and a
+   revision at once, so this is the one mark the page will not let through. */
+.tally .t.need { color: var(--warn); border-style: dashed; }
+.tally .none { font-size: 12px; color: var(--dim); }
+.tray-btns { display: flex; gap: 6px; margin-left: auto; }
+button.process {
+  font-weight: 600; background: var(--accent); border-color: var(--accent);
+  color: var(--panel); padding: 5px 16px; font-variant-numeric: tabular-nums;
+}
+button.process:hover:not(:disabled) { filter: brightness(1.08); }
+/* Counted in real steps — one per critique, one per archive, one per entry
+   committed, one for the push, one for the index — and never in elapsed time:
+   there is no median here for a batch to be measured against. */
+.tray .bar { flex: 1 1 160px; }
+.tray .bar > span { transition: width .3s ease; }
+.tray .bar.done > span { background: var(--ok); }
+@media (prefers-reduced-motion: reduce) { .tray .bar > span { transition: none; } }
+.tray .prog-t { font-size: 12px; color: var(--dim); white-space: nowrap;
+                font-variant-numeric: tabular-nums; }
+.tray .now { font-size: 14px; font-weight: 600; flex: 1 1 260px; overflow-wrap: anywhere; }
+.phases { display: flex; flex-wrap: wrap; gap: 4px 14px; list-style: none; margin: 0;
+          padding: 0; font-size: 12px; color: var(--dim); font-variant-numeric: tabular-nums; }
+.phases li.on { color: var(--fg); font-weight: 600; }
+.phases li.fin { color: var(--ok); }
+.phases li.fin::before { content: "\2713 "; }
+.phases li.on::before { content: "\203a "; color: var(--accent); }
+.results { list-style: none; margin: 0; padding: 0; font-size: 12px; }
+.results li { padding: 3px 0; border-top: 1px solid var(--line); display: flex; gap: 8px;
+              align-items: baseline; overflow-wrap: anywhere; }
+.results .n { font-weight: 700; font-variant-numeric: tabular-nums; min-width: 2.4em; }
+.results .bad { color: var(--bad); }
 main { padding: 16px; max-width: 1100px; margin: 0 auto; }
 h1 { font-size: 19px; margin: 0 0 14px; }
 h2 { font-size: 15px; margin: 0 0 10px; text-transform: uppercase;
@@ -291,7 +347,8 @@ form.stack textarea { min-height: 6em; }
 }
 /* Four verbs, one colour each, in the order a decision is usually made. They
    wrap before they shrink: a button whose label is cut in half is a button
-   pressed by mistake. */
+   pressed by mistake. On /submissions they are still buttons and still act on
+   the press; on /held they are the toggles below, which only mark. */
 .acts { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0; }
 .acts button { flex: 1 1 auto; }
 .acts button:hover:not(:disabled) { border-color: currentColor; }
@@ -299,7 +356,54 @@ form.stack textarea { min-height: 6em; }
 .acts .rej { color: var(--bad); }
 .acts .cri { color: var(--accent); }
 .acts .arc { color: var(--dim); }
+/* The same four verbs on /held, where they mark instead of acting: outline at
+   rest, filled with their own colour when on. The radio or checkbox covers the
+   whole label and is invisible but focusable — the fill is input:checked + span
+   and the focus ring is input:focus-visible + span, so the control a keyboard
+   lands on is the control a pointer presses, and neither needs a script. */
+.tog { flex: 1 1 auto; position: relative; display: flex; }
+.tog input { position: absolute; opacity: 0; inset: 0; width: 100%; height: 100%;
+             margin: 0; cursor: pointer; }
+.tog span { flex: 1; text-align: center; padding: 4px 10px; border: 1px solid var(--line);
+            border-radius: 5px; background: var(--panel); white-space: nowrap; }
+.tog:hover span { border-color: currentColor; }
+.tog.pub { color: var(--ok); }
+.tog.rej { color: var(--bad); }
+.tog.cri { color: var(--accent); }
+.tog.arc { color: var(--dim); }
+.tog.pub input:checked + span { background: var(--ok); border-color: var(--ok);
+                                color: var(--panel); font-weight: 600; }
+.tog.rej input:checked + span { background: var(--bad); border-color: var(--bad);
+                                color: var(--panel); font-weight: 600; }
+.tog.cri input:checked + span { background: var(--accent); border-color: var(--accent);
+                                color: var(--panel); font-weight: 600; }
+.tog.arc input:checked + span { background: var(--dim); border-color: var(--dim);
+                                color: var(--panel); font-weight: 600; }
+.tog input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: 2px; }
+.tog input:disabled { cursor: default; }
+.tog input:disabled + span { opacity: .4; }
 .card .hint { margin: 8px 0 0; font-size: 12px; color: var(--dim); }
+/* The hint says what Process will do to this one card, in one sentence, and
+   turns amber for a mark the page will refuse and red for a reason it came
+   back with. The min-height is so that sentence changing length moves nothing
+   below it. */
+.card .decide-hint { min-height: 2.9em; }
+.card .hint.warn { color: var(--warn); }
+.card .hint.bad { color: var(--bad); }
+.card .say input.need { border-color: var(--warn); }
+/* A decision card is as tall as its row, and the controls sit on the floor of
+   it, so the four verbs line up across a row whose prompts are different
+   lengths. Marked: the card's own border says so, at any scroll position. */
+.card.decide { display: flex; flex-direction: column; position: relative; }
+.card.decide .say { margin: auto 0 0; padding-top: 12px; }
+.card.marked { border-color: var(--fg); }
+.card.is-working { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.card.is-done { opacity: .45; }
+/* What the batch is doing to this entry, while it is doing it. It belongs
+   beside the entry's own state pill and it is drawn by the card rather than by
+   _card_face, which /entry/<id> shares and which has no batch to report. */
+.card .pill.st { position: absolute; top: 14px; right: 14px; }
+.card.has-state .id { padding-right: 96px; }
 /* The submissions card is the decision card with the sentence where the sketch
    is. What the operator is deciding about is a line of text somebody typed, so
    that line is the largest thing on the card and the person who typed it is a
@@ -316,6 +420,7 @@ form.stack textarea { min-height: 6em; }
 </style>
 </head>
 <body>
+<div class="sticky">
 <header class="top">
   <nav><span class="brand">sketchgen</span>$nav</nav>
   <div class="control">
@@ -330,6 +435,8 @@ form.stack textarea { min-height: 6em; }
     </form>
   </div>
 </header>
+$subheader
+</div>
 $flash
 <main>
 $body
