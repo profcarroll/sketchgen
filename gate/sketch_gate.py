@@ -615,6 +615,73 @@ class BrowserLog:
         return path
 
 
+#: At most this many distinct failed resources are reported. A sketch looping a
+#: broken fetch can produce thousands; the first few say the same thing.
+MAX_RESOURCE_FAILURES = 8
+
+
+class ResourceLog:
+    """Every resource the sketch asked for and did not get.
+
+    The sketch's own files come off disk through the page.route() handler on
+    SKETCH_ORIGIN and cannot fail. Anything else is the sketch reaching outside
+    itself -- a CDN library, a font, an image -- and when one of those does not
+    arrive the canvas is often simply blank with nothing in the console to say
+    why: a failed image is not a page error, so console_clean stays true and the
+    run looks healthy right up until every assertion reads zero pixels changed.
+
+    Entry 429, a jigsaw puzzle, loaded https://picsum.photos/400/400 in
+    preload() across eight attempts. Every run took eleven seconds and drew
+    nothing, and the evidence the model was handed said only that no pixels had
+    changed -- which reads as "your click handler is broken" when the truth was
+    that the sketch never started. It spent those attempts rewriting handlers
+    that already worked.
+
+    This is not a check and never a verdict. Reaching outside the sketch is
+    allowed, and a sketch that works out it can do so has worked something out.
+    This is only the sentence that tells it what happened when the thing it
+    reached for did not arrive.
+    """
+
+    def __init__(self):
+        self.failures = []
+        self._seen = set()
+
+    def attach(self, page):
+        page.on("requestfailed", self._on_failed)
+        page.on("response", self._on_response)
+
+    def _outside(self, url):
+        return not str(url or "").startswith(SKETCH_ORIGIN)
+
+    def _add(self, url, kind, why):
+        if url in self._seen or len(self.failures) >= MAX_RESOURCE_FAILURES:
+            return
+        self._seen.add(url)
+        self.failures.append({"url": url, "type": kind, "why": why})
+
+    def _on_failed(self, request):
+        try:
+            url, kind, why = request.url, request.resource_type, request.failure
+        except Exception:
+            return
+        if self._outside(url):
+            self._add(url, kind, str(why or "the request failed"))
+
+    def _on_response(self, response):
+        try:
+            url, status = response.url, response.status
+            kind = response.request.resource_type
+        except Exception:
+            return
+        if status >= 400 and self._outside(url):
+            self._add(url, kind, "HTTP %d" % status)
+
+    def notes(self):
+        return ["the sketch asked for %s (%s) and did not get it: %s"
+                % (f["url"], f["type"], f["why"]) for f in self.failures]
+
+
 class Recorder:
     """Collects console messages and page errors with UTC timestamps."""
 
@@ -956,6 +1023,7 @@ def main(argv=None):
     }
     assertions = {}
     rec = Recorder()
+    res = ResourceLog()
     timings = {"launch_s": None, "load_s": None, "total_s": None,
                "ms_per_frame": None, "idle_step_s": None}
     budget = Budget(a.frame_budget_ms, a.budget_s, t_start)
@@ -983,6 +1051,7 @@ def main(argv=None):
                 refuse("could not launch chromium (%s)" % e)
             timings["launch_s"] = round(launch_s, 3)
             rec.attach(page)
+            res.attach(page)
 
             try:
                 load_s = load_sketch(page, timeout_ms)
@@ -1160,6 +1229,10 @@ def main(argv=None):
 
     timings["total_s"] = round(time.time() - t_start, 3)
 
+    # Before the verdict, because a resource that did not arrive is very often
+    # the reason for the verdict, and it is never itself a reason to fail.
+    notes.extend(res.notes())
+
     # is_looping is deliberately absent from FAILABLE_CHECKS: a sketch that
     # calls noLoop() declares itself static and the gate believes it.
     failed = any(checks[k] is False for k in FAILABLE_CHECKS) \
@@ -1189,6 +1262,7 @@ def main(argv=None):
         "checks": checks,
         "assertions": assertions,
         "notes": notes,
+        "resources": res.failures,
         "console": rec.entries,
         "artefacts": artefacts,
         "exit": code,

@@ -942,7 +942,7 @@ class TestForms(WebTestCase):
         self.assertEqual(job.submitted_by, "student-three")
         self.assertEqual(job.rules_file, "random")
         self.assertEqual(job.max_attempts, 2)
-        self.assertEqual(sorted(job.assertions), ["motion(idle)", "responds(click)",
+        self.assertEqual(sorted(job.assertions), ["no_motion", "responds(click)",
                                                   "size(600,400)"])
 
     def test_post_new_refuses_a_bad_username_without_writing(self):
