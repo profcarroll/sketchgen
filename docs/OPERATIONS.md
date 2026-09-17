@@ -625,18 +625,41 @@ says "same attempt" for every entry.
 
 `publish-index` is what puts the repaired pages on the site.
 
-#### The 39, and `--reclassify`
+#### The 30, and the door back
 
 A job now ends in `held` rather than `failed` when some attempt passed every QA
 check and only missed assertions: the sketch runs, it just is not what the
-planner predicted, and that is a judgement for a person. 39 of the first 65
-failed jobs were like that and are still recorded as failures.
+planner predicted, and that is a judgement for a person. The kept failures
+recorded under the old rule have no such path, and 30 of the 45 are in that
+position.
 
-`repoint-kept --reclassify` moves those into `held` so the existing record
-matches the rule now in force. It is **off by default and deliberately so**: it
-puts roughly 39 entries into the review queue, which is a decision to take on
-purpose rather than a side effect of a re-render. Everything that genuinely
-failed a QA check stays `failed-kept` either way.
+`repoint-kept` had a `--reclassify` flag that moved them. **It is gone.** It
+wrote the state with a raw UPDATE, and `failed-kept -> held` is not a transition
+`ENTRY_TRANSITIONS` allows; 18 of those 30 are published, and `held` is not a
+public state, so it would have taken 18 entries off the site. That is the
+deletion this project does not do.
+
+The 12 that nobody has published can be reopened, and that is worth doing for a
+reason the flag never articulated: **publishing reads the state to decide the
+page.** A `held` entry becomes `published` and joins the grid; a `failed-kept`
+one keeps its state and joins the rejections page. So an off-plan sketch
+recorded under the old rule can otherwise only ever be published as a failure,
+however good it is.
+
+```
+~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen reopen-offplan --all --dry-run
+~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen reopen-offplan --all
+```
+
+It goes through `db.entry_transition`, so the state machine decides, not the
+command. Naming an ineligible id refuses rather than skipping it. The 18 already
+on the site stay exactly where they are — the record stands, and their pages now
+say what they diverged on instead of calling them rejections, which is the whole
+repair those 18 need.
+
+The job row is left `failed` on purpose: it is terminal, and a sixth terminal job
+state meaning "its entry got a second look" would mean touching every count and
+funnel in the console to say nothing new.
 
 ## Backups: the nightly snapshot and the pull
 

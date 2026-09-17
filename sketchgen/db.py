@@ -133,10 +133,20 @@ CONTROL_STATES = frozenset({"running", "pausing", "paused"})
 #: rejection that vanishes is not a record of a decision.
 ENTRY_TRANSITIONS: dict[str, frozenset[str]] = {
     "held": frozenset({"published", "rejected", "archived"}),
-    # A kept failure can only be archived, and only while nobody has published
-    # it: once it is on the rejections page it is part of the public record and
-    # taking it down again would be the deletion this project does not do.
-    "failed-kept": frozenset({"archived"}),
+    # A kept failure can be archived, or reopened for a person to judge, and
+    # either one only while nobody has published it: once it is on the
+    # rejections page it is part of the public record and taking it down again
+    # would be the deletion this project does not do. Both conditions are
+    # enforced in entry_transition, which is the only place that can see
+    # published_utc.
+    #
+    # `held` is here because the gate stopped being the only judge of a sketch:
+    # a job that never failed a QA check and only missed an assertion a model
+    # wrote is now created held, for a person. The kept failures recorded under
+    # the old rule have no such path, and 12 of them were never published — this
+    # is the door back for exactly those, and it is shut for the 18 that are
+    # already public.
+    "failed-kept": frozenset({"archived", "held"}),
     # terminal
     "published": frozenset(),
     "rejected": frozenset(),
@@ -622,12 +632,17 @@ def entry_transition(
         current = str(row["state"])
         if new_state not in ENTRY_TRANSITIONS.get(current, frozenset()):
             raise IllegalTransition(f"{current} -> {new_state} (entry {entry_id})")
-        # The one guard the table above cannot express: a kept failure may be
-        # archived only while nobody has published it (§5.1).
-        if current == "failed-kept" and new_state == "archived" and row["published_utc"]:
+        # The one guard the table above cannot express: a kept failure may leave
+        # that state only while nobody has published it (§5.1). Archiving a
+        # public entry would hide it; reopening one to `held` would take it off
+        # the site altogether, because `held` is not a public state. Same rule,
+        # same reason, both spellings.
+        if current == "failed-kept" and new_state in ("archived", "held") \
+                and row["published_utc"]:
+            verb = "archived" if new_state == "archived" else "reopened"
             raise IllegalTransition(
                 f"entry {entry_id} is a kept failure that is already on the site "
-                f"(published {row['published_utc']}); it cannot be archived"
+                f"(published {row['published_utc']}); it cannot be {verb}"
             )
         columns = ["state = ?"]
         values: list[Any] = [new_state]
