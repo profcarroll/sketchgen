@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sketchgen import executor  # noqa: E402
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "executor"
 
 # The statement in clean.txt, exactly as written there, em dash and all.
@@ -90,6 +91,37 @@ class TestCleanResponse(ExecutorTestCase):
         self.assertEqual(html, executor.DEFAULT_INDEX_HTML)
         self.assertIn("p5.js/1.11.3/p5.min.js", html)
         self.assertNotIn("p5.sound", html)
+
+    def test_the_fallback_index_loads_p5_sound_when_the_sketch_needs_it(self):
+        """The library trap, closed.
+
+        prompts/rules/treatment.md warns about this in its loudest section and
+        25 of the 27 treatment-arm sketches that reached for p5.sound did not
+        get it. Every gate run that ever satisfied responds(audio) came from a
+        sketch that never touched the library.
+        """
+        for source in ("let mic = new p5.AudioIn();",
+                       "let fft = new p5.FFT();",
+                       "let osc = new p5.Oscillator();",
+                       "song = loadSound('x.mp3');"):
+            with self.subTest(source=source):
+                html, how = executor.index_html_for(source)
+                self.assertEqual("default+p5.sound", how)
+                self.assertIn("addons/p5.sound.min.js", html)
+                # the addon goes UNDER p5 itself, which has to load first
+                self.assertLess(html.index("p5.min.js"), html.index("p5.sound.min.js"))
+
+    def test_a_sketch_with_no_sound_gets_the_index_byte_for_byte(self):
+        # DEFAULT_INDEX_HTML is the gate's own fixtures/good-motion index; a
+        # sketch that never mentions sound must still get exactly those bytes.
+        html, how = executor.index_html_for("function setup(){ createCanvas(9, 9); }")
+        self.assertEqual("default", how)
+        self.assertEqual(executor.DEFAULT_INDEX_HTML, html)
+
+    def test_the_sound_names_are_the_gate_s_own(self):
+        """If one list moves the other must; the gate is the authority."""
+        gate = (REPO_ROOT / "gate" / "sketch_gate.py").read_text(encoding="utf-8")
+        self.assertIn(executor.SOUND_RE.pattern, gate)
 
     def test_statement_is_stored_verbatim(self):
         self.replay("clean.txt")

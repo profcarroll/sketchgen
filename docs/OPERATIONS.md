@@ -594,6 +594,44 @@ curl -s https://profcarroll.github.io/sketchgen-gallery/e/531/ | grep -c critiqu
 
 One, not zero.
 
+### Operator step, once: point every kept failure at its best attempt
+
+An entry has always taken its files from the attempt that **ended** the job.
+Across the first 65 failed jobs that was the worst attempt 78% of the time, and
+all 44 kept failures on the site are showing it. Entry 429 publishes a blank
+canvas from a tenth attempt whose image never arrived; its second attempt drew a
+working puzzle from an image it built itself.
+
+Deploy, then run it once on the node:
+
+```
+~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen repoint-kept --dry-run
+~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen repoint-kept
+~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen publish-index
+```
+
+`--dry-run` reads the database and writes nothing; it prints one line per entry
+saying which attempt it would move to and what that attempt missed. The real run
+updates `source_dir`, `strip_path`, `png_path`, the statement and the executor,
+and records the divergence in `offplan_json`. **It touches no file in any attempt
+directory** and changes no state. Running it twice is a no-op — the second run
+says "same attempt" for every entry.
+
+`publish-index` is what puts the repaired pages on the site.
+
+#### The 39, and `--reclassify`
+
+A job now ends in `held` rather than `failed` when some attempt passed every QA
+check and only missed assertions: the sketch runs, it just is not what the
+planner predicted, and that is a judgement for a person. 39 of the first 65
+failed jobs were like that and are still recorded as failures.
+
+`repoint-kept --reclassify` moves those into `held` so the existing record
+matches the rule now in force. It is **off by default and deliberately so**: it
+puts roughly 39 entries into the review queue, which is a decision to take on
+purpose rather than a side effect of a re-render. Everything that genuinely
+failed a QA check stays `failed-kept` either way.
+
 ## Backups: the nightly snapshot and the pull
 
 The database and the attempt archive are the only parts of this system with no

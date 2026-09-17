@@ -124,6 +124,15 @@ class ValidatorTests(unittest.TestCase):
         self.assertEqual([item["reason"] for item in rejected],
                          ["duplicate of an earlier line"])
 
+    def test_the_prompt_demands_an_explicit_liveness_word(self):
+        """Job 317: a Swiss-style typographic POSTER whose only assertion was
+        motion(idle) — the sole requirement on a poster was that it never stop
+        moving. The validator's default is a backstop; the planner has read the
+        brief and must say which it is."""
+        text = planner.PROMPT_PATH.read_text(encoding="utf-8")
+        self.assertIn("EXACTLY ONE of motion(idle) or", text)
+        self.assertIn("poster", text.lower())
+
     def test_a_plan_that_answers_input_is_still_by_default(self):
         """Entry 429: a jigsaw puzzle asked to move on its own.
 

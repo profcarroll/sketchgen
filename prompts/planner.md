@@ -31,7 +31,11 @@ word you invent is thrown away by the validator, so choose from this list only:
   no_motion         the canvas is deliberately still
 
 Rules:
-  - no_motion and motion(idle) are mutually exclusive. Choose at most one.
+  - Every plan says which it is: write EXACTLY ONE of motion(idle) or
+    no_motion, always. They are mutually exclusive and one of them is
+    mandatory. You have read the brief; do not leave this to a default. A
+    poster, a logo, a diagram and a still life are no_motion — asking a poster
+    to keep moving is asking for a sketch nobody wrote.
   - A sketch that is defined by what input does to it is STILL until it is
     touched. A puzzle, a board game, a drawing tool, a form: these are
     responds(click) and no_motion, not motion(idle). Write motion(idle)
