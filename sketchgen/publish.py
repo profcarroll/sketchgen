@@ -341,11 +341,21 @@ def scan_for_personal_data(source: Path) -> None:
             )
 
 
-def _render_with_generator(conn: sqlite3.Connection, entry_id: int, dest: Path) -> Path:
+def _render_with_generator(
+    conn: sqlite3.Connection, entry_id: int, dest: Path, checkout: Path
+) -> Path:
     """Ask packet 3.1's generator for the entry's files, or refuse.
 
     This module never invents an entry's files: either the caller passes a
     directory with --from, or the generator produces one.
+
+    ``dest`` is a staging directory, not the checkout: the personal-data scan
+    runs on these bytes before any of them reach the repository. The generator
+    reads its config out of the directory it is writing into, and an empty
+    staging directory has no config.json, so the config is loaded from the
+    ``checkout`` this entry is about to be committed to and passed in. Without
+    it every first-published page came out with ``write_path`` empty — no
+    critique form, because there was nowhere to send a critique.
     """
     try:
         from . import gallery  # noqa: PLC0415 - optional, lands in packet 3.1
@@ -357,7 +367,7 @@ def _render_with_generator(conn: sqlite3.Connection, entry_id: int, dest: Path) 
     try:
         # The generator takes the gallery ROOT and writes dest/e/<id>/, which it
         # returns; that returned directory is the entry, and it is what we copy.
-        out = render(conn, entry_id, dest, publishing=True)
+        out = render(conn, entry_id, dest, gallery.Config.load(checkout), publishing=True)
     except Exception as exc:  # the generator's own refusals, reported, not raised
         raise PublishRefused(f"generator refused entry {entry_id}: {exc}") from exc
     return Path(out) if out else dest / "e" / str(entry_id)
@@ -480,7 +490,7 @@ def publish(
             temporary = tempfile.mkdtemp(prefix="sketchgen-publish-")
             source = Path(temporary)
             try:
-                source = _render_with_generator(conn, entry_id, source)
+                source = _render_with_generator(conn, entry_id, source, checkout)
             except Exception:
                 shutil.rmtree(temporary, ignore_errors=True)
                 raise
@@ -563,7 +573,10 @@ def publish(
             # The entry is public. Now the grid, the failures page, compare and the
             # line pages must know about it: re-render the index and push it as a
             # second commit. This never fails the publish; the entry is already up.
-            index_sha, index_note = _publish_index(conn, checkout, branch, target, env, entry_id)
+            index_sha, index_note = _publish_index(
+                conn, checkout, branch, target, env, entry_id,
+                regenerate=from_dir is None,
+            )
             return Published(
                 entry_id=entry_id,
                 commit=sha,
@@ -659,8 +672,23 @@ def _publish_index(
     target: str,
     env: dict[str, str] | None,
     entry_id: int,
+    *,
+    regenerate: bool = True,
 ) -> tuple[str | None, str | None]:
-    """Re-render the gallery index into the checkout, commit and push it.
+    """Re-render the entry and the gallery index, commit and push them.
+
+    The entry page goes in again because the copy committed a moment ago was
+    rendered BEFORE the push: its Provenance said the entry had no published
+    date and no publish commit, and its own lineage ledger called it "not
+    published", because ``published_utc`` was still null when those bytes were
+    made. The row carries both stamps by the time this runs, so the same render
+    against the same database now writes them down. Same generator, later truth.
+
+    ``regenerate`` is false when the caller passed ``--from``: those are a
+    person's own bytes and this is not the place to overwrite them with the
+    generator's. (A later ``publish-index`` still will — the generator is the
+    source of truth for a published page, and ``--from`` is an override of one
+    commit, not of every render afterwards.)
 
     Returns (sha, None) on success, (None, why) otherwise. A failure here is
     reported, never raised: the entry itself is already published.
@@ -672,7 +700,14 @@ def _publish_index(
     render_index = getattr(gallery, "render_index", None)
     if render_index is None:
         return None, "generator has no render_index; index not re-rendered"
+    render_entry = getattr(gallery, "render_entry", None) if regenerate else None
     before = _git_out(checkout, "rev-parse", "HEAD")
+    if render_entry is not None:
+        try:
+            render_entry(conn, entry_id, checkout)
+        except Exception as exc:  # the generator's own refusal, reported
+            _undo(checkout, before)
+            return None, f"entry re-render failed: {exc}"
     try:
         render_index(conn, checkout)
     except Exception as exc:  # the generator's own refusal, reported

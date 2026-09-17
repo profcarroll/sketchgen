@@ -341,6 +341,98 @@ class GuardTests(PublishTestCase):
         self.assertFalse((self.tmp / "nothing.db").exists())
 
 
+@unittest.skipUnless(
+    GENERATOR_PRESENT, "this path is the generator's; without it publishing refuses"
+)
+class GeneratorStagingTests(PublishTestCase):
+    """Publishing without --from: the generator renders into a staging directory.
+
+    The staging directory is a fresh mkdtemp, so the generator cannot read the
+    gallery's config out of the directory it is writing into the way it does
+    everywhere else. The publisher hands it the checkout's config instead.
+    Without that, write_path came out empty and every first-published page went
+    to the site with no critique form — entry 531, 2026-09-16.
+    """
+
+    CONFIG = (
+        '{\n'
+        '  "gallery_url": "https://example.github.io/sketchgen-gallery/",\n'
+        '  "repository": "https://github.com/example/sketchgen-gallery",\n'
+        '  "write_path": "https://writepath.example"\n'
+        '}\n'
+    )
+
+    def setUp(self):
+        super().setUp()
+        (self.gallery / "config.json").write_text(self.CONFIG, encoding="utf-8")
+        git(self.gallery, "add", "config.json")
+        git(self.gallery, "commit", "-m", "the checkout's config")
+
+    def publish_generated(self, *extra):
+        return run_cli(
+            "publish", str(self.entry_id), "--db", str(self.db_path),
+            "--gallery-dir", str(self.gallery), *extra,
+        )
+
+    def test_the_first_published_page_carries_the_critique_form(self):
+        result = self.publish_generated("--by", "profcarroll")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        page = (self.gallery / "e" / str(self.entry_id) / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('<section class="panel critique-form"', page)
+        self.assertIn(f'data-critique="{self.entry_id}"', page)
+
+    def test_the_published_page_carries_the_stamps_the_push_left(self):
+        # The page is rendered before the push, so the copy that lands in the
+        # entry commit has no published date, no publish commit, and a lineage
+        # ledger that calls the entry on the page "not published". The index
+        # pass re-renders it once the row has both stamps.
+        import json as _json
+
+        result = self.publish_generated("--by", "profcarroll")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        entry_dir = self.gallery / "e" / str(self.entry_id)
+        page = (entry_dir / "index.html").read_text(encoding="utf-8")
+        row = self.entry_row()
+        self.assertIsNotNone(row["publish_commit"])
+        self.assertIn(row["publish_commit"], page)
+        self.assertIn(row["published_utc"], page)
+        # the entry's own ledger row no longer contradicts its state chip
+        self.assertIn('<span class="chip published">published</span>', page)
+        self.assertNotIn('<span class="chip unpublished">not published</span>', page)
+        meta = _json.loads((entry_dir / "meta.json").read_text(encoding="utf-8"))
+        self.assertEqual(row["publish_commit"], meta["publish_commit"])
+        self.assertEqual(row["published_utc"], meta["published_utc"])
+
+    def test_the_re_render_leaves_the_checkout_clean(self):
+        result = self.publish_generated("--by", "profcarroll")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual("", git(self.gallery, "status", "--porcelain").stdout.strip())
+        self.assertEqual(self.head(self.gallery), self.head(self.bare))
+
+    def test_the_generator_is_handed_the_checkout_s_write_path(self):
+        from sketchgen import gallery
+
+        seen = []
+        original = gallery.render_entry
+
+        def remember(conn, entry_id, dest, config=None, **kwargs):
+            seen.append(config)
+            return original(conn, entry_id, dest, config, **kwargs)
+
+        gallery.render_entry = remember
+        try:
+            publish.publish(
+                self.conn, self.entry_id, gallery_dir=self.gallery,
+                remote=str(self.bare), by="profcarroll", key=None,
+            )
+        finally:
+            gallery.render_entry = original
+        self.assertTrue(seen, "the generator was never called")
+        self.assertEqual("https://writepath.example", seen[0].write_path)
+
+
 class RejectTests(PublishTestCase):
     def test_reject_moves_held_to_rejected_and_touches_no_git(self):
         before = self.head(self.gallery)
@@ -392,6 +484,35 @@ class PublishIndexTests(PublishTestCase):
         self.assertIsNone(sha2)
         self.assertEqual(why2, "site unchanged")
 
+
+    def test_publish_index_repairs_a_page_published_without_the_write_path(self):
+        """The retroactive fix: 36 published entries, 518 through 563.
+
+        They went to the site rendered against a config with no write_path, so
+        every one of them has no critique form. Nothing re-rendered an entry
+        page after its own publish commit, so nothing ever put one back. This
+        is the command that does — the same one update.sh now runs on every
+        deploy, by way of render-all. (A rejected entry has no form either,
+        and should not: lineage.spawn refuses a rejected parent.)
+        """
+        from sketchgen import publish as publication
+
+        result = self.publish_cli("--by", "profcarroll")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        page_path = self.gallery / "e" / str(self.entry_id) / "index.html"
+        self.assertNotIn("critique-form", page_path.read_text(encoding="utf-8"))
+
+        sha, why = publication.publish_index(
+            self.conn, self.gallery, remote=str(self.bare),
+            write_path="https://writepath.example",
+        )
+        self.assertIsNone(why, why)
+        self.assertEqual(self.head(self.bare), sha)
+        page = page_path.read_text(encoding="utf-8")
+        self.assertIn('<section class="panel critique-form"', page)
+        self.assertIn(f'data-critique="{self.entry_id}"', page)
+        # and the stamps the push left, which the first render could not know
+        self.assertIn(self.entry_row()["publish_commit"], page)
 
     def test_publish_index_leaves_an_unpublished_rejection_alone(self):
         # A gate rejection the worker kept is a person's to publish (spec §9).
