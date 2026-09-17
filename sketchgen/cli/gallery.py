@@ -319,8 +319,8 @@ def cmd_repoint_kept(args: argparse.Namespace) -> int:
     """Point every kept failure at its best attempt instead of its last.
 
     An entry has always taken its files from the attempt that ENDED the job.
-    Across the first 65 failed jobs that was the worst attempt 78% of the time,
-    and all 44 kept failures on the site are showing it — entry 429 publishes a
+    Usually that is also the best one and this changes nothing for it; on the 45
+    kept entries it moves 7. Entry 429 is why those 7 matter: it publishes a
     blank canvas from a tenth attempt whose image never arrived, while its
     second drew a working puzzle from an image it built itself.
 
@@ -489,8 +489,9 @@ def register(top: argparse._SubParsersAction) -> None:
         help="point every kept failure at its best attempt instead of its last",
         description=(
             "A kept failure has always shown the attempt that ended the job, "
-            "which across the first 65 failed jobs was the worst one 78% of the "
-            "time. This points each one at its best attempt instead — the same "
+            "which is usually but not always its best one: on the first 45 it "
+            "moves 7, entry 429 among them. This points each one at its best "
+            "attempt instead — the same "
             "ranking the worker now uses: runs at all, then how much of the plan "
             "it managed, then recency — and records which assertions that "
             "attempt missed. It touches no file in any attempt directory. "

@@ -1738,11 +1738,14 @@ class Worker:
         QA check false), then how much of the plan it managed, then recency as
         the tiebreak.
 
-        The entry used to take attempts[-1] unconditionally. Across the first 65
-        failed jobs the last attempt was the worst one 78% of the time, and all
-        44 kept failures on the site are showing it: entry 429 publishes a blank
-        canvas because its tenth attempt fetched an image that never arrived,
-        while its second drew a working puzzle from an image it made itself.
+        The entry used to take attempts[-1] unconditionally. Across the first 66
+        failed jobs the last attempt was not the best one 9 times (14%), and on
+        the 45 kept entries the repair moves 7 of them. A minority — but entry
+        429 is in it, and is the reason the ranking is worth having: it publishes
+        a blank canvas because its tenth attempt fetched an image that never
+        arrived, while its second drew a working puzzle from an image it made
+        itself. The rest of the kept entries were already showing their best
+        attempt and this leaves them exactly where they are.
 
         A job whose gate run passed is unaffected. That attempt is QA-clean with
         every assertion satisfied, which is the maximum, and the recency tiebreak
