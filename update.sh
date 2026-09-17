@@ -11,7 +11,7 @@
 #   2. Re-installs the unit files into ~/.config/systemd/user and reloads
 #   2b. Applies any pending database migration (db init)
 #   3. Pulls the gallery checkout (~/sketchgen/gallery)
-#   4. Re-renders the gallery index from the database (new templates → new HTML)
+#   4. Re-renders the gallery from the database — the index AND every entry page
 #   5. Pushes the re-rendered gallery to GitHub
 #   6. Restarts sketchgen-web so the operator UI picks up any code changes
 #
@@ -69,21 +69,30 @@ cd "$GALLERY" || die "cannot cd to $GALLERY"
 git pull origin main || die "git pull failed in $GALLERY"
 green "gallery checkout up to date"
 
-# --- 4. Re-render the gallery index ------------------------------------------
-step "Re-rendering gallery index from database"
+# --- 4. Re-render the whole gallery ------------------------------------------
+# Every entry page, not only the index. An entry page is written once, by the
+# publisher, at the moment that entry goes up, and until now nothing re-rendered
+# it afterwards: a template change, a new panel or a fixed generator reached
+# index.html on this step and never reached the hundreds of pages that ARE the
+# gallery. That is how entries 501-531 went to the site with no critique form.
+# render-all is render-index plus one render per public entry, from the same
+# database and the same config.json, so a page that is already current comes out
+# byte-identical and step 5 sees nothing to commit for it. It takes a few
+# minutes over five hundred entries — the price of the pages never drifting from
+# the code again.
+step "Re-rendering gallery from database (index and every entry)"
 cd "$APP"
-"$VENV" bin/sketchgen render-index \
+written=$("$VENV" bin/sketchgen render-all \
     --db "$DB" \
-    --gallery-dir "$GALLERY" \
-    || die "render-index failed"
-green "gallery index re-rendered"
+    --gallery-dir "$GALLERY" | wc -l) || die "render-all failed"
+green "gallery re-rendered ($written files)"
 
 # --- 5. Commit and push the re-rendered gallery -------------------------------
 step "Committing and pushing gallery"
 cd "$GALLERY"
 if [ -n "$(git status --porcelain)" ]; then
     git add -A .
-    git commit -m "gallery: re-render index after code update"
+    git commit -m "gallery: re-render every page after code update"
     git push origin HEAD:refs/heads/main || die "gallery push failed"
     green "gallery pushed"
 else
