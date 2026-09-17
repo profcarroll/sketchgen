@@ -552,6 +552,7 @@ _ENTRY_FIELDS = (
     "executor_prompt_version",
     "rules_file",
     "assertions_json",
+    "offplan_json",
     "attempts",
     "prompt_tokens",
     "completion_tokens",

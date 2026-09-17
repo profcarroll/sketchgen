@@ -1,0 +1,24 @@
+-- 011_offplan.sql — the sketch ran; it just isn't what the plan said.
+--
+-- The gate does two jobs. One is quality assurance: don't throw, don't freeze,
+-- don't spend more than the frame budget. The other is checking the sketch
+-- against a brief a MODEL wrote. Until now both could end a job the same way,
+-- and 39 of the first 65 failed jobs had an attempt that passed every QA check
+-- and was thrown away for missing an assertion — a plan a machine invented.
+--
+-- Those now land in `held`, where a person decides, the same queue a clean pass
+-- lands in. `offplan_json` is what separates the two once they are there: the
+-- assertions the kept attempt missed, as a JSON array — and only ever when
+-- that attempt was QA-clean. A sketch that threw missed its assertions too,
+-- of course it did, there was nothing on the canvas to assert about; calling
+-- that a divergence would put "this sketch runs" on the page of one that
+-- does not. So NULL means one of two honest things: it matched the plan, or
+-- it never ran well enough for the question to mean anything. NULL therefore means what it has always meant — this entry passed the
+-- gate outright — and no existing row changes meaning by being backfilled,
+-- because none is.
+--
+-- It is derivable from the kept attempt's report.json. It is stored anyway so
+-- that the operator's Held page and the gallery can say WHICH assertion a
+-- sketch diverged on without reading a file per entry to find out.
+
+ALTER TABLE entries ADD COLUMN offplan_json TEXT;

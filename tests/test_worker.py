@@ -11,6 +11,7 @@ the gate actually produces rather than against a convenient fiction.
 import io
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -21,6 +22,8 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 from sketchgen import db  # noqa: E402
 from sketchgen import lineage  # noqa: E402
@@ -603,6 +606,77 @@ class TestEntries(WorkerTestCase):
         self.assertEqual("failed-kept", rows[0]["state"])
         self.assertEqual(2, rows[0]["attempts"])
         self.assertEqual(self.attempts(job_id)[-1].statement, rows[0]["statement"])
+
+    def test_a_job_that_only_missed_the_plan_goes_to_a_person(self):
+        """39 of the first 65 failed jobs had an attempt like this one.
+
+        Nothing that protects a visitor went wrong — no throw, no freeze, inside
+        the frame budget. It simply is not what the planner predicted, and the
+        planner is a model. That is a judgement for a person, so it lands in the
+        same queue a clean pass lands in.
+        """
+        offplan = make_report(
+            "/tmp/x",
+            assertions={"responds(drag)": {"pass": False, "detail": "0 of 9 changed"}},
+            exit_code=1,
+        )
+        job_id = self.enqueue(max_attempts=2)
+        self.make_worker(
+            gate_fn=StubGate([1, 1], reports=[offplan, offplan])
+        ).run_once()
+
+        row = self.entries(job_id)[0]
+        self.assertEqual("held", row["state"])
+        self.assertEqual(["responds(drag)"], json.loads(row["offplan_json"]))
+        self.assertEqual("held", db.get_job(self.conn, job_id).state)
+
+    def test_a_job_that_broke_the_browser_is_still_a_failure(self):
+        """QA keeps its teeth. A sketch that throws is not off-plan, it is broken."""
+        job_id = self.enqueue(max_attempts=2)
+        self.make_worker(gate_fn=StubGate([1, 1])).run_once()   # frame_advancing false
+        row = self.entries(job_id)[0]
+        self.assertEqual("failed-kept", row["state"])
+        self.assertIsNone(row["offplan_json"])
+        self.assertEqual("failed", db.get_job(self.conn, job_id).state)
+
+    def test_the_entry_keeps_the_best_attempt_not_the_last(self):
+        """Entry 429 publishes a blank tenth attempt; its second drew a puzzle.
+
+        Across the first 65 failed jobs the last attempt was the worst one 78%
+        of the time, and all 44 kept failures on the site are showing it.
+        """
+        good = make_report(
+            "/tmp/x",
+            assertions={"motion(idle)": {"pass": True, "detail": "ok"}},
+            exit_code=1,
+        )
+        broken = make_report(
+            "/tmp/x",
+            checks={"console_clean": False},
+            assertions={"motion(idle)": {"pass": False, "detail": "0 of 9 changed"}},
+            exit_code=1,
+        )
+        job_id = self.enqueue(max_attempts=3)
+        self.make_worker(
+            gate_fn=StubGate([1, 1, 1], reports=[broken, good, broken])
+        ).run_once()
+
+        row = self.entries(job_id)[0]
+        self.assertTrue(row["source_dir"].endswith("attempt-2"), row["source_dir"])
+        self.assertEqual(3, row["attempts"])      # the record still counts all three
+        self.assertEqual(self.attempts(job_id)[1].statement, row["statement"])
+        # attempt 2 ran clean and satisfied its one assertion, so it is a pass
+        # in everything but name and goes to a person, with nothing missed.
+        self.assertEqual("held", row["state"])
+        self.assertIsNone(row["offplan_json"])
+
+    def test_a_passing_job_still_keeps_its_passing_attempt(self):
+        """The ranking must not disturb the ordinary case."""
+        job_id = self.enqueue(max_attempts=3)
+        self.make_worker(gate_fn=StubGate([1, 0])).run_once()
+        row = self.entries(job_id)[0]
+        self.assertEqual("held", row["state"])
+        self.assertTrue(row["source_dir"].endswith("attempt-2"), row["source_dir"])
 
     def test_the_planner_prompt_version_lands_on_the_entry(self):
         job_id = db.enqueue(self.conn, "sixty drifting circles", "octocat")
@@ -1368,6 +1442,48 @@ class TestHumanGap(unittest.TestCase):
         ):
             with self.subTest(seconds=seconds):
                 self.assertEqual(text, worker.human_gap(seconds))
+
+
+class TestQaSplit(unittest.TestCase):
+    """QA is what may fail a job; the plan is what a person judges."""
+
+    def test_qa_clean_is_false_when_a_failable_check_failed(self):
+        for name in worker.QA_CHECKS:
+            with self.subTest(check=name):
+                self.assertFalse(worker.qa_clean(make_report("/tmp/x", checks={name: False})))
+
+    def test_an_advisory_check_does_not_make_a_sketch_unclean(self):
+        # noLoop() is a declaration, not a defect. A puzzle that redraws on
+        # input has not failed quality assurance by being still.
+        self.assertTrue(worker.qa_clean(make_report("/tmp/x", checks={"is_looping": False})))
+
+    def test_a_missing_report_is_never_assumed_clean(self):
+        for report in (None, {}):
+            with self.subTest(report=report):
+                self.assertFalse(worker.qa_clean(report))
+
+    def test_qa_checks_are_exactly_the_gate_s_failable_ones(self):
+        """The gate decides what may fail a run; this module only reads it.
+
+        QA_CHECKS is a copy, because the gate is a standalone script with its
+        own copy on the node and cannot be imported. If the gate's list moves
+        and this one does not, sketches start being failed for things the gate
+        forgave, or forgiven for things it did not — so the two are compared
+        here rather than trusted to stay in step.
+        """
+        source = (REPO_ROOT / "gate" / "sketch_gate.py").read_text(encoding="utf-8")
+        body = source.split("FAILABLE_CHECKS = (", 1)[1].split(")", 1)[0]
+        gate_checks = set(re.findall(r'"([a-z_]+)"', body))
+        self.assertEqual(gate_checks, set(worker.QA_CHECKS))
+
+    def test_missed_assertions_lists_only_the_ones_that_failed(self):
+        report = make_report("/tmp/x", assertions={
+            "motion(idle)": {"pass": False, "detail": ""},
+            "responds(click)": {"pass": True, "detail": ""},
+            "responds(drag)": {"pass": False, "detail": ""},
+        })
+        self.assertEqual(["motion(idle)", "responds(drag)"],
+                         worker.missed_assertions(report))
 
 
 class TestEvidence(unittest.TestCase):

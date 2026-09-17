@@ -1,4 +1,5 @@
-"""`sketchgen render`, `render-index`, `render-all` and `publish-rejected`.
+"""`sketchgen render`, `render-index`, `render-all`, `publish-rejected` and
+`repoint-kept`.
 
 Packet 3.1. Registered by bin/sketchgen through sketchgen/cli/__init__.py, so
 this file is the only one the packet adds to the CLI surface.
@@ -14,6 +15,7 @@ for a person, spec §9).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sqlite3
 import sys
@@ -22,6 +24,7 @@ from pathlib import Path
 from sketchgen import db
 from sketchgen import gallery
 from sketchgen import publish as publication
+from sketchgen import worker
 
 EXIT_OK = 0
 EXIT_FAIL = 1
@@ -269,6 +272,124 @@ def cmd_publish_rejected(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+# ---------------------------------------------------------------------------
+# repoint-kept — the one-time repair of what a kept failure shows
+# ---------------------------------------------------------------------------
+
+
+def _best_of(conn: sqlite3.Connection, job_id: int):
+    """The attempt a kept entry should be showing, and what it missed.
+
+    Same ranking as worker._best_attempt and for the same reason: runs at all,
+    then how much of the plan it managed, then recency. Returns
+    ``(attempt_row, report, missed)`` or ``(None, {}, [])``.
+    """
+    rows = list(conn.execute(
+        "SELECT * FROM attempts WHERE job_id = ? ORDER BY n", (job_id,)
+    ))
+    if not rows:
+        return None, {}, []
+
+    def report_of(row):
+        path = row["gate_report_path"]
+        if not path or not Path(path).is_file():
+            return {}
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def rank(row):
+        report = report_of(row)
+        assertions = report.get("assertions") or {}
+        passed = sum(1 for v in assertions.values() if (v or {}).get("pass"))
+        return (1 if worker.qa_clean(report) else 0, passed, int(row["n"]))
+
+    best = max(rows, key=rank)
+    report = report_of(best)
+    # Only a sketch that ran can be off-plan, the same rule worker._create_entry
+    # applies: one that threw missed its assertions too, and recording that as a
+    # divergence would put "this sketch runs" on the page of one that does not.
+    if not worker.qa_clean(report):
+        return best, report, []
+    return best, report, worker.missed_assertions(report)
+
+
+def cmd_repoint_kept(args: argparse.Namespace) -> int:
+    """Point every kept failure at its best attempt instead of its last.
+
+    An entry has always taken its files from the attempt that ENDED the job.
+    Across the first 65 failed jobs that was the worst attempt 78% of the time,
+    and all 44 kept failures on the site are showing it — entry 429 publishes a
+    blank canvas from a tenth attempt whose image never arrived, while its
+    second drew a working puzzle from an image it built itself.
+
+    This rewrites nothing but which attempt an entry points at: ``source_dir``,
+    ``strip_path``, ``png_path``, the statement and the executor that wrote it,
+    plus ``offplan_json`` so the pages can tell a working divergence from a
+    failure. No file in any attempt directory is touched and no state changes —
+    unless ``--reclassify`` is given, which additionally moves the entries that
+    never failed a QA check into ``held``, where the new rule would have put
+    them, for a person to judge.
+    """
+    database = Path(args.db).expanduser()
+    if not database.is_file():
+        print(f"refused: no database at {database}", file=sys.stderr)
+        return EXIT_REFUSED
+    conn = db.connect(database)
+    moved = repointed = 0
+    try:
+        rows = list(conn.execute(
+            "SELECT * FROM entries WHERE state = 'failed-kept' ORDER BY id"
+        ))
+        if not rows:
+            print("nothing to repoint: no kept failure is recorded")
+            return EXIT_OK
+        for row in rows:
+            entry_id = int(row["id"])
+            best, report, missed = _best_of(conn, int(row["job_id"]))
+            if best is None:
+                print(f"entry {entry_id}: no attempts recorded, left alone")
+                continue
+            current = str(row["source_dir"] or "")
+            target = str(best["source_dir"] or "")
+            clean = worker.qa_clean(report)
+            change = "same attempt" if current == target else (
+                f"{Path(current).name or '—'} -> {Path(target).name}")
+            state = row["state"]
+            if args.reclassify and clean:
+                state = "held"
+            print(f"entry {entry_id}: {change}"
+                  f" · {'runs clean' if clean else 'no clean attempt'}"
+                  f" · missed {', '.join(missed) or 'nothing'}"
+                  + (f" · {row['state']} -> held" if state != row["state"] else ""))
+            if args.dry_run:
+                continue
+            artefacts = report.get("artefacts") or {}
+            conn.execute(
+                "UPDATE entries SET source_dir = ?, strip_path = ?, png_path = ?, "
+                "statement = ?, executor = ?, executor_prompt_version = ?, "
+                "offplan_json = ?, state = ? WHERE id = ?",
+                (target or None, artefacts.get("strip"), artefacts.get("png"),
+                 best["statement"], best["model"], best["prompt_version"],
+                 json.dumps(missed) if missed else None, state, entry_id),
+            )
+            if current != target:
+                repointed += 1
+            if state != row["state"]:
+                moved += 1
+        if args.dry_run:
+            print(f"{len(rows)} kept entries would be examined; nothing written")
+            return EXIT_OK
+        conn.commit()
+        print(f"{len(rows)} kept entries examined, {repointed} repointed"
+              + (f", {moved} moved to held" if moved else ""))
+    finally:
+        conn.close()
+    print("now re-render and push: sketchgen publish-index")
+    return EXIT_OK
+
+
 def register(top: argparse._SubParsersAction) -> None:
     render = top.add_parser(
         "render",
@@ -362,3 +483,32 @@ def register(top: argparse._SubParsersAction) -> None:
         help="the GitHub username for the commit's Published-By: trailer",
     )
     backfill.set_defaults(func=cmd_publish_rejected, _parser=backfill)
+
+    repoint = top.add_parser(
+        "repoint-kept",
+        help="point every kept failure at its best attempt instead of its last",
+        description=(
+            "A kept failure has always shown the attempt that ended the job, "
+            "which across the first 65 failed jobs was the worst one 78% of the "
+            "time. This points each one at its best attempt instead — the same "
+            "ranking the worker now uses: runs at all, then how much of the plan "
+            "it managed, then recency — and records which assertions that "
+            "attempt missed. It touches no file in any attempt directory. "
+            "--reclassify additionally moves the entries that never failed a QA "
+            "check into 'held', where the current rule would have put them. "
+            "--dry-run reads the database and writes nothing."
+        ),
+    )
+    repoint.add_argument(
+        "--dry-run", dest="dry_run", action="store_true",
+        help="print what would change and write nothing",
+    )
+    repoint.add_argument(
+        "--reclassify", action="store_true",
+        help="also move kept failures that never failed a QA check into held",
+    )
+    repoint.add_argument(
+        "--db", default=db.DEFAULT_DB_PATH, metavar="P",
+        help="database file (default: $SKETCHGEN_DB, else ~/sketchgen/sketchgen.db)",
+    )
+    repoint.set_defaults(func=cmd_repoint_kept, _parser=repoint)
