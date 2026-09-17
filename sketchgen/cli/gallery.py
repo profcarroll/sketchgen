@@ -327,17 +327,20 @@ def cmd_repoint_kept(args: argparse.Namespace) -> int:
     This rewrites nothing but which attempt an entry points at: ``source_dir``,
     ``strip_path``, ``png_path``, the statement and the executor that wrote it,
     plus ``offplan_json`` so the pages can tell a working divergence from a
-    failure. No file in any attempt directory is touched and no state changes —
-    unless ``--reclassify`` is given, which additionally moves the entries that
-    never failed a QA check into ``held``, where the new rule would have put
-    them, for a person to judge.
+    failure. No file in any attempt directory is touched and **no state
+    changes**. It had a ``--reclassify`` flag that moved the QA-clean ones into
+    ``held``; it did so with a raw UPDATE, and ENTRY_TRANSITIONS does not allow
+    failed-kept -> held at all — for a published entry that would have taken it
+    off the public record, which is the deletion this project does not do. See
+    ``reopen-offplan`` for the version that goes through the state machine and
+    can only touch a kept failure nobody has published.
     """
     database = Path(args.db).expanduser()
     if not database.is_file():
         print(f"refused: no database at {database}", file=sys.stderr)
         return EXIT_REFUSED
     conn = db.connect(database)
-    moved = repointed = 0
+    repointed = 0
     try:
         rows = list(conn.execute(
             "SELECT * FROM entries WHERE state = 'failed-kept' ORDER BY id"
@@ -356,37 +359,119 @@ def cmd_repoint_kept(args: argparse.Namespace) -> int:
             clean = worker.qa_clean(report)
             change = "same attempt" if current == target else (
                 f"{Path(current).name or '—'} -> {Path(target).name}")
-            state = row["state"]
-            if args.reclassify and clean:
-                state = "held"
             print(f"entry {entry_id}: {change}"
                   f" · {'runs clean' if clean else 'no clean attempt'}"
-                  f" · missed {', '.join(missed) or 'nothing'}"
-                  + (f" · {row['state']} -> held" if state != row["state"] else ""))
+                  f" · missed {', '.join(missed) or 'nothing'}")
             if args.dry_run:
                 continue
             artefacts = report.get("artefacts") or {}
             conn.execute(
                 "UPDATE entries SET source_dir = ?, strip_path = ?, png_path = ?, "
                 "statement = ?, executor = ?, executor_prompt_version = ?, "
-                "offplan_json = ?, state = ? WHERE id = ?",
+                "offplan_json = ? WHERE id = ?",
                 (target or None, artefacts.get("strip"), artefacts.get("png"),
                  best["statement"], best["model"], best["prompt_version"],
-                 json.dumps(missed) if missed else None, state, entry_id),
+                 json.dumps(missed) if missed else None, entry_id),
             )
             if current != target:
                 repointed += 1
-            if state != row["state"]:
-                moved += 1
         if args.dry_run:
             print(f"{len(rows)} kept entries would be examined; nothing written")
             return EXIT_OK
         conn.commit()
-        print(f"{len(rows)} kept entries examined, {repointed} repointed"
-              + (f", {moved} moved to held" if moved else ""))
+        print(f"{len(rows)} kept entries examined, {repointed} repointed")
     finally:
         conn.close()
     print("now re-render and push: sketchgen publish-index")
+    return EXIT_OK
+
+
+# ---------------------------------------------------------------------------
+# reopen-offplan — the door back for a kept failure that was never a failure
+# ---------------------------------------------------------------------------
+
+
+def cmd_reopen_offplan(args: argparse.Namespace) -> int:
+    """Move a kept failure that RAN back into held, for a person to judge.
+
+    Publishing decides which page an entry lands on, and it decides it from the
+    state: a ``held`` entry becomes ``published`` and joins the grid, while a
+    ``failed-kept`` one keeps its state and joins the rejections page
+    (publish.py, "keeps its state, which is what puts it on the rejections page
+    rather than the grid"). So an off-plan sketch recorded under the old rule
+    can currently only ever be published as a failure, however good it is. This
+    is the door back.
+
+    Narrow on purpose:
+
+    * ``failed-kept`` only, and only where ``offplan_json`` says it ran clean
+      and merely diverged from the plan. A sketch that threw is still a failure.
+    * ``published_utc IS NULL`` only. A kept failure already on the site is part
+      of the public record; ``held`` is not a public state, so reopening one
+      would take it off the gallery, and that is the deletion this project does
+      not do. :func:`db.entry_transition` refuses it anyway — this only declines
+      to ask.
+
+    The move goes through ``entry_transition``, so the state machine is the
+    thing that decides, not this command. The earlier ``repoint-kept
+    --reclassify`` wrote the state with a raw UPDATE and would have taken 18
+    published entries off the site; it is gone.
+
+    The job row is left alone. It is ``failed`` and terminal, and a sixth
+    terminal job state to mean "its entry got a second look" would mean touching
+    every count and funnel in the console to say nothing new (db.py says the
+    same thing about archiving).
+    """
+    ids = sorted(set(args.entry_id)) if args.entry_id else None
+    if ids is None and not args.all:
+        print("refused: say which — `--all`, or one or more entry ids",
+              file=sys.stderr)
+        return EXIT_REFUSED
+    database = Path(args.db).expanduser()
+    if not database.is_file():
+        print(f"refused: no database at {database}", file=sys.stderr)
+        return EXIT_REFUSED
+    conn = db.connect(database)
+    moved = 0
+    try:
+        rows = list(conn.execute(
+            "SELECT * FROM entries WHERE state = 'failed-kept' "
+            "AND published_utc IS NULL AND offplan_json IS NOT NULL ORDER BY id"
+        ))
+        if ids is not None:
+            wanted = set(ids)
+            found = {int(r["id"]) for r in rows}
+            missing = sorted(wanted - found)
+            if missing:
+                print("refused: not an unpublished off-plan kept failure: "
+                      + ", ".join(str(i) for i in missing), file=sys.stderr)
+                return EXIT_REFUSED
+            rows = [r for r in rows if int(r["id"]) in wanted]
+        if not rows:
+            print("nothing to reopen: no unpublished kept failure ran clean")
+            return EXIT_OK
+        for row in rows:
+            entry_id = int(row["id"])
+            try:
+                missed = ", ".join(json.loads(row["offplan_json"] or "[]"))
+            except (TypeError, ValueError):
+                missed = "?"
+            print(f"entry {entry_id}: failed-kept -> held · ran clean · missed {missed}")
+            if args.dry_run:
+                continue
+            try:
+                db.entry_transition(conn, entry_id, "held")
+            except db.IllegalTransition as exc:
+                print(f"refused at entry {entry_id}: {exc}", file=sys.stderr)
+                return EXIT_REFUSED
+            moved += 1
+        if args.dry_run:
+            print(f"{len(rows)} would be reopened; nothing written")
+            return EXIT_OK
+        conn.commit()
+        print(f"{moved} reopened; they are on the Held page for a person to judge")
+    finally:
+        conn.close()
     return EXIT_OK
 
 
@@ -494,9 +579,8 @@ def register(top: argparse._SubParsersAction) -> None:
             "attempt instead — the same "
             "ranking the worker now uses: runs at all, then how much of the plan "
             "it managed, then recency — and records which assertions that "
-            "attempt missed. It touches no file in any attempt directory. "
-            "--reclassify additionally moves the entries that never failed a QA "
-            "check into 'held', where the current rule would have put them. "
+            "attempt missed. It touches no file in any attempt directory and "
+            "changes no entry's state — see reopen-offplan for that. "
             "--dry-run reads the database and writes nothing."
         ),
     )
@@ -505,11 +589,34 @@ def register(top: argparse._SubParsersAction) -> None:
         help="print what would change and write nothing",
     )
     repoint.add_argument(
-        "--reclassify", action="store_true",
-        help="also move kept failures that never failed a QA check into held",
-    )
-    repoint.add_argument(
         "--db", default=db.DEFAULT_DB_PATH, metavar="P",
         help="database file (default: $SKETCHGEN_DB, else ~/sketchgen/sketchgen.db)",
     )
     repoint.set_defaults(func=cmd_repoint_kept, _parser=repoint)
+
+    reopen = top.add_parser(
+        "reopen-offplan",
+        help="move an unpublished kept failure that RAN back into held",
+        description=(
+            "Publishing reads the state to decide the page: a held entry joins "
+            "the grid, a failed-kept one joins the rejections page. So a sketch "
+            "that ran clean and only diverged from the plan can currently only "
+            "ever be published as a failure. This moves it back to held, for a "
+            "person to judge, through the entry state machine. Only kept "
+            "failures whose offplan_json says they ran, and only ones nobody "
+            "has published: an entry already on the site stays on it."
+        ),
+    )
+    reopen.add_argument(
+        "entry_id", type=int, nargs="*", metavar="ID",
+        help="the entries to reopen; omit and pass --all for every one eligible",
+    )
+    reopen.add_argument("--all", action="store_true",
+                        help="every unpublished kept failure that ran clean")
+    reopen.add_argument("--dry-run", dest="dry_run", action="store_true",
+                        help="print what would move and write nothing")
+    reopen.add_argument(
+        "--db", default=db.DEFAULT_DB_PATH, metavar="P",
+        help="database file (default: $SKETCHGEN_DB, else ~/sketchgen/sketchgen.db)",
+    )
+    reopen.set_defaults(func=cmd_reopen_offplan, _parser=reopen)
