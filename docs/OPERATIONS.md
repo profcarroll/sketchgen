@@ -603,10 +603,23 @@ from a tenth attempt whose image never arrived, while its second drew a working
 puzzle from an image it built itself. The other 38 are already showing their
 best attempt and this leaves them untouched.
 
-The wider value of the run is the labelling: **31 of the 45 kept entries never
-failed a QA check at all**. They ran, and were recorded as gate failures for
-missing an assertion. This writes what each actually diverged on into
-`offplan_json`, which is what the pages read to stop calling them rejections.
+The wider value of the run is the labelling. Counted off the run itself rather
+than by eye, the 45 kept entries divide exactly:
+
+| | |
+|---|---|
+| Ran clean — never failed a QA check | **30** |
+| No clean attempt, a real gate failure | 15 |
+| Pointed at the wrong attempt | 7 |
+
+Those 30 ran. They threw nothing, did not freeze and stayed inside the frame
+budget, and were recorded as gate failures for missing an assertion a model
+wrote — `uses(webgl)` and `motion(idle)` most often, which is a sketch that chose
+2D over 3D or stillness over motion. This writes what each actually diverged on
+into `offplan_json`, which is what the pages read to stop calling them
+rejections.
+
+Running it a second time reports 0 repointed and changes nothing.
 
 Deploy, then run it once on the node:
 
