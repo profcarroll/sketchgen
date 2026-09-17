@@ -1,0 +1,22 @@
+-- 012_harness_version.sql — which referee judged this entry.
+--
+-- `executor_prompt_version` and `rules_file` are on every entry, so the two
+-- variables the experiment set on purpose are traceable through the corpus.
+-- What judged the result was not recorded anywhere, and on 2026-09-16 it
+-- changed several times in one day: the gate stopped reporting is_looping as a
+-- failure, a QA-clean job that only missed an assertion started landing in
+-- `held` instead of `failed`, an entry began keeping its best attempt rather
+-- than its last, and p5.sound started loading for a sketch that asked for it.
+--
+-- `attempts`, `state` and the failed/held split therefore mean different things
+-- on either side of that day, with nothing in the data to say which side a row
+-- is on. Anyone comparing across it — including whoever writes this up — would
+-- be reading one distribution as if it were two, or two as if they were one.
+--
+-- So: a plain integer, bumped by hand in sketchgen/worker.py whenever the gate
+-- or the routing changes, written onto every entry the worker creates. NULL is
+-- every row written before this column existed, which is exactly the set judged
+-- under the rules as they stood before that day, and that is a fact about them
+-- rather than missing data.
+
+ALTER TABLE entries ADD COLUMN harness_version INTEGER;

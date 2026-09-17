@@ -910,6 +910,39 @@ class TestTokensGauge(WebTestCase):
         self.assertIn('data-nav="peak"', page)
 
 
+class TestBillingCard(unittest.TestCase):
+    """The bill, and how old the figure is."""
+
+    def test_nothing_recorded_says_how_to_record_it(self):
+        card = web.billing_card({})
+        self.assertIn("Nothing recorded yet", card)
+        self.assertIn("bin/sketchgen billing", card)
+
+    def test_a_recorded_figure_is_shown_with_its_window(self):
+        card = web.billing_card({
+            "amount": "0", "currency": "USD",
+            "through": "2026-09-17", "checked": db.utc_now(),
+        })
+        self.assertIn("0.00", card)
+        self.assertIn("USD", card)
+        self.assertIn("through 2026-09-17", card)
+        # never claims to be live
+        self.assertIn("Not live", card)
+        self.assertNotIn("days old", card)
+
+    def test_a_stale_figure_says_so(self):
+        card = web.billing_card({
+            "amount": "12.5", "currency": "USD", "through": "2026-08-01",
+            "checked": "2026-08-01T00:00:00Z",
+        })
+        self.assertIn("12.50", card)
+        self.assertIn("days old", card)
+
+    def test_an_unreadable_amount_does_not_crash_the_console(self):
+        card = web.billing_card({"amount": "not-a-number", "currency": "USD"})
+        self.assertIn("not-a-number", card)
+
+
 class TestForms(WebTestCase):
     def test_post_new_queues_a_job_and_redirects(self):
         before = self._queued_ids()
