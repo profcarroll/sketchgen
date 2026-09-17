@@ -642,8 +642,9 @@ class TestEntries(WorkerTestCase):
     def test_the_entry_keeps_the_best_attempt_not_the_last(self):
         """Entry 429 publishes a blank tenth attempt; its second drew a puzzle.
 
-        Across the first 65 failed jobs the last attempt was the worst one 78%
-        of the time, and all 44 kept failures on the site are showing it.
+        The last attempt is usually the best one and the ranking agrees with it;
+        on the first 45 kept entries this moves 7. Entry 429 is one of the 7,
+        which is the whole reason the ranking exists.
         """
         good = make_report(
             "/tmp/x",
