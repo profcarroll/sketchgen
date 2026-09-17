@@ -118,9 +118,37 @@ class ValidatorTests(unittest.TestCase):
 
     def test_duplicates_are_dropped(self):
         ok, rejected = planner.validate(["responds(click)", "responds(click)"])
-        self.assertEqual(ok, ["responds(click)", "motion(idle)"])
+        # no_motion, not motion(idle): this plan answers input and said nothing
+        # about moving by itself — see the liveness tests below.
+        self.assertEqual(ok, ["responds(click)", "no_motion"])
         self.assertEqual([item["reason"] for item in rejected],
                          ["duplicate of an earlier line"])
+
+    def test_a_plan_that_answers_input_is_still_by_default(self):
+        """Entry 429: a jigsaw puzzle asked to move on its own.
+
+        A sketch defined by what a click or a drag does to it is still until it
+        is touched. Defaulting such a plan to motion(idle) writes an assertion
+        no correct puzzle, board game or drawing tool can ever pass, and the
+        gate then spends every attempt failing it.
+        """
+        for word in ("responds(click)", "responds(drag)", "responds(audio)"):
+            with self.subTest(word=word):
+                ok, _ = planner.validate([word])
+                self.assertEqual(ok, [word, "no_motion"])
+
+    def test_a_plan_that_answers_nothing_still_defaults_to_motion(self):
+        ok, _ = planner.validate(["uses(webgl)"])
+        self.assertEqual(ok, ["uses(webgl)", "motion(idle)"])
+
+    def test_motion_and_a_response_together_are_left_alone(self):
+        """A drifting field that also scatters under the cursor is a real sketch.
+
+        Only the default moved. A planner that asks for both still gets both.
+        """
+        ok, rejected = planner.validate(["motion(idle)", "responds(click)"])
+        self.assertEqual(ok, ["motion(idle)", "responds(click)"])
+        self.assertEqual(rejected, [])
 
     def test_no_motion_alone_is_not_overridden(self):
         ok, rejected = planner.validate(["no_motion"])

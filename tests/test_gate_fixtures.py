@@ -40,12 +40,20 @@ FIXTURES = GATE_DIR / "fixtures"
 #: and it stops a well-meaning reformat of the referee from landing without
 #: somebody deciding to change this line.
 #:
+#: Changed 2026-09-16 by ResourceLog (entry 429): the gate now records every
+#: resource the sketch asked for from outside SKETCH_ORIGIN and did not get, and
+#: reports them as notes and under `resources`. It adds no check and fails no
+#: run — reaching outside the sketch stays allowed. It exists because a failed
+#: image is not a page error, so `console_clean` stayed true while the canvas
+#: stayed blank, and the only evidence the executor got was three assertions
+#: reading zero pixels changed. The previous value, which is the one the node
+#: and the course repo carry until this is deployed, was
+#: 2cd5f5156f3669ee558f051d69939655a4a7bc82707b1469ffcb48cb54d1a85e.
+#:
 #: Changed 2026-09-15 by the frame budget (job 166, job 270): the gate now times
 #: its own idle window and fails `frame_budget` above --frame-budget-ms, or
-#: above the --budget-s wall ceiling. The previous value, which is the one the
-#: node and the course repo carry until this is deployed, was
-#: 426e8e7429984b1f5377c068886bebeaab8795a2a102a687c06938bb6a66b658.
-GATE_SHA256 = "2cd5f5156f3669ee558f051d69939655a4a7bc82707b1469ffcb48cb54d1a85e"
+#: above the --budget-s wall ceiling.
+GATE_SHA256 = "88bedeb8b32eadb5522984e3ef481375e904b94a9affdd2f0a76e38ccf436d99"
 
 #: How long the seven fixtures are allowed to take together. On the node a
 #: single gate run is about four seconds and the harness does thirteen of them —
