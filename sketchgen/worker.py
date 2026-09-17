@@ -553,6 +553,23 @@ ADVISORY_CHECKS = frozenset({"is_looping"})
 #: a brief another model wrote. Missing one of those is not a broken sketch, it
 #: is a different sketch, and 39 of the first 65 failed jobs had an attempt that
 #: passed every check above and was destroyed for it. Those now go to a person.
+#: Which referee judged an entry, written onto every entry this worker creates
+#: (migration 012). Bump it in the same commit as any change to what the gate
+#: fails a sketch for, or to how this module routes the result — the two
+#: variables the experiment sets on purpose are already traceable through
+#: executor_prompt_version and rules_file, and this is the third one, which
+#: nobody was recording.
+#:
+#: 1 — the rules as they stood to 2026-09-16: every false check ended a job,
+#:     is_looping among them; an entry kept its last attempt; p5.sound was
+#:     loaded only if the model wrote its own index.html. Rows judged under it
+#:     carry NULL, because the column did not exist while it was in force.
+#: 2 — QA is the only thing that fails a job; a clean run that missed an
+#:     assertion goes to `held` for a person; an entry keeps its best attempt;
+#:     the fallback index loads p5.sound for a sketch that asks for it; a
+#:     resource that did not arrive is named in the evidence.
+HARNESS_VERSION = 2
+
 QA_CHECKS = frozenset({
     "console_clean", "frame_advancing", "sound_lib_ok",
     "audio_context_running", "frame_budget",
@@ -1807,6 +1824,7 @@ class Worker:
             executor_prompt_version=kept.prompt_version if kept else None,
             rules_file=(kept.rules_file if kept and kept.rules_file else rules),
             assertions_json=job.assertions_json,
+            harness_version=HARNESS_VERSION,
             # NULL when the kept attempt satisfied the whole plan, which is what
             # tells a clean pass from a sketch a person is being asked to judge.
             offplan_json=json.dumps(missed) if missed else None,

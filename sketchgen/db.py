@@ -563,6 +563,7 @@ _ENTRY_FIELDS = (
     "rules_file",
     "assertions_json",
     "offplan_json",
+    "harness_version",
     "attempts",
     "prompt_tokens",
     "completion_tokens",

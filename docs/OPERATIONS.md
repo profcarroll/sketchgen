@@ -674,6 +674,42 @@ The job row is left `failed` on purpose: it is terminal, and a sixth terminal jo
 state meaning "its entry got a second look" would mean touching every count and
 funnel in the console to say nothing new.
 
+## The billing card
+
+The console's last panel says what this tenancy has cost. It is the one number
+the node cannot fetch for itself, on purpose: reading it needs an OCI API key
+that can create and destroy infrastructure, and that key does not belong on a
+machine that serves a public gallery and runs code a model wrote. There are no
+credentials in `~/.oci` on the node and there should not be.
+
+So it is two commands. Ask on the operator's machine, record on the node:
+
+```
+# on the operator's machine, where ~/.oci lives
+python3 bin/sketchgen billing                    # per service, and a total
+
+# then put that figure where the console can see it
+amount=$(python3 bin/sketchgen billing --amount-only)
+ssh sld-cloud "~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen \
+    billing --record --amount $amount --through $(date -u +%F) \
+    --db ~/sketchgen/sketchgen.db"
+```
+
+`--record` takes the number as an argument and touches no OCI endpoint, which is
+what lets it run on the node at all.
+
+The card shows the figure, the window it covers and when it was last checked,
+and marks itself once the reading is over a week old. It never presents itself
+as live: Oracle's usage data lags a day or more, so a card claiming to be
+current would be wrong twice over.
+
+**As of 2026-09-17 the answer is $0.00** — every service, Compute and Block
+Storage and VCN and Telemetry, from 1 August. The node is a
+`VM.Standard.A1.Flex 16/94`, which is four times the documented Always Free ARM
+allowance of 4 OCPU / 24 GB, and it is still being billed at nothing. Worth
+re-checking before that figure is quoted anywhere public, which is what the card
+is for.
+
 ## Backups: the nightly snapshot and the pull
 
 The database and the attempt archive are the only parts of this system with no
