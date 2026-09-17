@@ -486,13 +486,14 @@ class PublishIndexTests(PublishTestCase):
 
 
     def test_publish_index_repairs_a_page_published_without_the_write_path(self):
-        """The retroactive fix: entries 501-531, 2026-09-16.
+        """The retroactive fix: 36 published entries, 518 through 563.
 
         They went to the site rendered against a config with no write_path, so
         every one of them has no critique form. Nothing re-rendered an entry
         page after its own publish commit, so nothing ever put one back. This
         is the command that does — the same one update.sh now runs on every
-        deploy, by way of render-all.
+        deploy, by way of render-all. (A rejected entry has no form either,
+        and should not: lineage.spawn refuses a rejected parent.)
         """
         from sketchgen import publish as publication
 

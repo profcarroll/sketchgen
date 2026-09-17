@@ -541,7 +541,7 @@ Afterwards the rejections page lists those entries beside the gate's, each with
 its chip — `rejected · operator` against `rejected · gate` — and every entry
 whose parent was one of them has a real frame in its lineage instead of a blank.
 
-### Operator step, once: put the critique form back on entries 501-531
+### Operator step, once: put the critique form back on 36 published entries
 
 Publishing one entry renders it into a fresh staging directory, scans those
 bytes for personal data, and commits them. The generator reads the gallery's
@@ -550,8 +550,10 @@ config out of the directory it is writing into, and a staging directory has no
 empty — and an entry page with no write path gets no critique form, because
 there is nowhere to send a critique. Every page on the site went up that way.
 The ones that have a form have it because a later `render-all` or
-`publish-index` gave them one; entries 501-531, published after the last of
-those, never got theirs.
+`publish-index` gave them one. Entries 518 through 563 were published after the
+last of those and never got theirs — 36 pages. (A further 55 pages have no form
+and should not: they are rejections, and `lineage.spawn` refuses a rejected
+parent, so a form there would be an offer the pipeline will not honour.)
 
 The same render was also the reason a freshly published page said "not
 published" in its own lineage ledger and had no publish commit in Provenance:

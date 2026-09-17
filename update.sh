@@ -74,7 +74,8 @@ green "gallery checkout up to date"
 # publisher, at the moment that entry goes up, and until now nothing re-rendered
 # it afterwards: a template change, a new panel or a fixed generator reached
 # index.html on this step and never reached the hundreds of pages that ARE the
-# gallery. That is how entries 501-531 went to the site with no critique form.
+# gallery. That is how 36 published entries, 518 through 563, are on the site
+# with no critique form.
 # render-all is render-index plus one render per public entry, from the same
 # database and the same config.json, so a page that is already current comes out
 # byte-identical and step 5 sees nothing to commit for it. It takes a few
