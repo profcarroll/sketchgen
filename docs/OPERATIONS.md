@@ -541,6 +541,59 @@ Afterwards the rejections page lists those entries beside the gate's, each with
 its chip — `rejected · operator` against `rejected · gate` — and every entry
 whose parent was one of them has a real frame in its lineage instead of a blank.
 
+### Operator step, once: put the critique form back on 36 published entries
+
+Publishing one entry renders it into a fresh staging directory, scans those
+bytes for personal data, and commits them. The generator reads the gallery's
+config out of the directory it is writing into, and a staging directory has no
+`config.json`, so every entry published this way was rendered with `write_path`
+empty — and an entry page with no write path gets no critique form, because
+there is nowhere to send a critique. Every page on the site went up that way.
+The ones that have a form have it because a later `render-all` or
+`publish-index` gave them one. Entries 518 through 563 were published after the
+last of those and never got theirs — 36 pages. (A further 55 pages have no form
+and should not: they are rejections, and `lineage.spawn` refuses a rejected
+parent, so a form there would be an offer the pipeline will not honour.)
+
+The same render was also the reason a freshly published page said "not
+published" in its own lineage ledger and had no publish commit in Provenance:
+it was made before the push, so `published_utc` and `publish_commit` were still
+null when its bytes were written. Both are fixed at the source now — the
+publisher passes the checkout's config to the generator, and re-renders the
+entry after the push, with the stamps.
+
+Neither fix reaches a page that is already on the site. Deploy, and the
+re-render in step 4 of `update.sh` does that in one pass:
+
+```
+ssh sld-cloud 'bash ~/sketchgen/app/update.sh'     # pull, re-render every page, push
+```
+
+`update.sh` step 4 now runs `render-all` rather than `render-index`. An entry
+page used to be written once, by the publisher, and never again: a template
+change, a new panel or a fixed generator reached `index.html` and never reached
+the hundreds of pages that are the gallery. That gap is the part worth keeping
+fixed; the missing critique form was only the first thing it swallowed.
+
+To look before anything is pushed, or to do it without a deploy:
+
+```
+~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen publish-index
+```
+
+That re-renders every published entry and the index, commits once as
+`gallery: re-render every page`, and pushes with the gallery deploy key. It
+changes no entry's state and no database row.
+
+Expect a commit touching `e/*/index.html` for every entry published since the
+last full re-render. Spot-check afterwards:
+
+```
+curl -s https://profcarroll.github.io/sketchgen-gallery/e/531/ | grep -c critique-form
+```
+
+One, not zero.
+
 ## Backups: the nightly snapshot and the pull
 
 The database and the attempt archive are the only parts of this system with no
