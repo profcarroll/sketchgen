@@ -2,8 +2,10 @@
 
 Packet 4.2 of the sketchgen build. One ``ThreadingHTTPServer``, server-rendered
 HTML from ``sketchgen/templates/op_*.html``, no framework, no JS build, no CDN:
-the only script on any page is the few lines at the bottom of the layout that
-keep the worker pill honest, plus the console's own two-second refetch. The
+every script here is a few lines at the bottom of one page, hand-written, and
+every one of them only makes live something the server has already rendered
+once — the worker pill, the console's two-second refetch, the transcript
+stream, the click-to-run preview, and the Held page's batch tray. The
 whole thing is reached over the SSH tunnel that already carries ``preview`` on
 8080, so this one takes 8081.
 
@@ -13,7 +15,8 @@ The five screens are the wireframe's:
   ``/queue``       the tiles and the jobs table
   ``/new``         the form that writes a queued row
   ``/job/<id>``    transcript, per-attempt gate report, artefacts, provenance
-  ``/held``        what is waiting for a person to publish or reject
+  ``/held``        what is waiting for a person to publish or reject, marked
+                   up as one batch and run by one press of Process
 
 and every one of them carries the worker-state pill and the Pause / Stop now /
 Resume control in its header, because the operator needs that switch wherever
@@ -57,15 +60,31 @@ the safe direction for a gate whose whole point is that a person decides
 (spec §9). Its failures are flash messages too: a missing gallery checkout or
 deploy key is something to read on the page, not a traceback in the log.
 
+**The Held page is one press, not thirty.** Each card's four verbs used to be
+four submit buttons, so every decision was a round trip that waited on a render,
+two commits and two pushes — and a second press during any of them was a second
+publisher queuing on the gallery checkout lock behind the first. The verbs are
+**toggles that mark** now: pressed, a verb fills and nothing else happens. The
+whole page is one ``<form>`` whose submit button is **Process** in the sticky
+header's second row, and a press runs every mark as one batch — critiques while
+their parents are still held, then archives, then every rejection and
+publication in **one push and one index re-render** (§1.6, §1.7). One batch at a
+time per web process, and while one runs every control on the page is disabled
+and the single-entry routes refuse: "busy" is :attr:`App.batch`, on the server,
+so it outlives the page that pressed. The single-entry routes stay in
+:data:`ROUTES` for scripts and ``/entry/<id>`` habits, but no button here points
+at them. :data:`HELD_SCRIPT` makes the tray live; without it the POST still
+starts the batch and the tray, rendered server-side, refreshes itself.
+
 **Spawning a child belongs here and not on the public site** (packet 5.3).
 ``POST /entry/<id>/spawn`` hands one critique to :func:`sketchgen.lineage.spawn`,
 which composes the parent's prompt with it and queues the child. The form sits on
-the job page and on each held card; ``critique-by`` defaults to the operator's
-username, which is ``$SKETCHGEN_OPERATOR`` when it is set and the entry's own
-submitter otherwise. The gallery is generated, static, and has no way to write to
-this database — asking it to would mean a public form on a queue, and the
-publication gate exists precisely so a person stands between the queue and the
-site.
+the job page, and on the Held page a card's Critique mark queues one through the
+batch; ``critique-by`` defaults to the operator's username, which is
+``$SKETCHGEN_OPERATOR`` when it is set and the entry's own submitter otherwise.
+The gallery is generated, static, and has no way to write to this database —
+asking it to would mean a public form on a queue, and the publication gate
+exists precisely so a person stands between the queue and the site.
 
 **The sketch runs on the screens where it is judged.** The first use of this UI
 in anger found the hole: gate.png and strip.png are what the gate saw, and a
@@ -94,7 +113,7 @@ import sys
 import threading
 import time
 import urllib.parse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from dataclasses import field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1054,7 +1073,14 @@ def layout(
     flash: str | None = None,
     page_script: str = "",
     nav_marks: dict[str, Any] | None = None,
+    subheader: str = "",
 ) -> str:
+    """Every page: the header, the flash, the body, the scripts.
+
+    ``subheader`` is a second header row, sticky with the first one because they
+    are one box in the template — /held passes the batch tray and every other
+    page passes nothing and looks exactly as it did.
+    """
     text, css, tooltip = pill_for(control)
     state = control.state if control else "unknown"
     stop_now = worker.is_stop_now(control)
@@ -1079,6 +1105,7 @@ def layout(
         flash=flash_html,
         body=body,
         page_script=page_script,
+        subheader=subheader,
     )
 
 
@@ -2833,74 +2860,252 @@ def _card_face(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
     )
 
 
-def _decision_card(
-    app: App, conn: sqlite3.Connection, row: sqlite3.Row, *, kept: bool
+#: The static hint under a card nobody has marked yet: what the four toggles
+#: are for, and the promise that none of them is a request (§4.1).
+CARD_HINT = (
+    "Mark one outcome, and Critique if it should have a child. "
+    "Nothing happens until Process."
+)
+
+#: How a batch item's state is coloured on its card. Quiet is "not yet", amber
+#: is "now", green is "done", red is either kind of bad news — the same
+#: vocabulary the pills use everywhere else in this UI.
+CARD_PILLS = {
+    "queued": "quiet",
+    "working": "warn",
+    "done": "ok",
+    "refused": "bad",
+    "failed": "bad",
+}
+
+#: Which item a card wears when it carries two (Publish *and* Critique are two
+#: items), worst news first: what the operator has to do something about is
+#: what the card should say.
+_PILL_ORDER = ("failed", "refused", "working", "queued", "done")
+
+
+@dataclass
+class CardState:
+    """What a batch has to say about one entry, on that entry's own card.
+
+    Built from the batch's items for this entry, which is one of them usually
+    and two when the card was marked Publish *and* Critique. ``do``, ``cri`` and
+    ``text`` are only filled for a finished batch's refusals and failures: those
+    cards come back **pre-marked**, with the sentence still in the box and the
+    reason in the hint, so that a fix-and-retry is one press (§1.10).
+    """
+
+    pill: str = ""          # queued | working | done | refused | failed
+    message: str = ""
+    do: str = ""            # publish | reject | archive, already checked
+    cri: bool = False
+    text: str = ""
+    marked: bool = False
+
+
+def _card_states(batch: Batch | None) -> dict[int, CardState]:
+    """One :class:`CardState` per entry the batch has an item for."""
+    if batch is None:
+        return {}
+    states: dict[int, CardState] = {}
+    done = batch.state == "done"
+    for item in batch.items:
+        state = states.setdefault(item.entry_id, CardState())
+        if _PILL_ORDER.index(item.state) < _PILL_ORDER.index(state.pill or "done"):
+            state.pill = item.state
+        if item.message:
+            state.message = (
+                f"{state.message}; {item.message}" if state.message else item.message
+            )
+        if done and item.state in ("refused", "failed"):
+            # Still held, still marked. The mark it comes back with is the mark
+            # it went out with, because nothing about it has been done.
+            state.marked = True
+            if item.verb == "critique":
+                state.cri = True
+            else:
+                state.do = item.verb
+            if item.text:
+                state.text = item.text
+    return states
+
+
+def _card_hint(state: CardState | None) -> str:
+    """The one sentence under a card's toggles.
+
+    Server-rendered it is the static line, or the item's own news once a batch
+    has something to report about this entry; the script rewrites it on every
+    press with what Process will do to this card in particular.
+    """
+    if state is None or not state.message:
+        return f'<p class="hint decide-hint">{esc(CARD_HINT)}</p>'
+    if state.pill in ("refused", "failed"):
+        # ``data-reason`` is what tells the script to leave this sentence alone:
+        # why the last press did not work is more use than what the next one
+        # would do, right up until the operator touches the card.
+        return (
+            f'<p class="hint decide-hint bad" data-reason="1">{esc(state.message)}'
+            " — still held, still marked.</p>"
+        )
+    return f'<p class="hint decide-hint">{esc(state.message)}</p>'
+
+
+def _toggle(
+    entry_id: int,
+    css: str,
+    label: str,
+    aria: str,
+    *,
+    name: str,
+    value: str = "",
+    checked: bool = False,
+    disabled: bool = False,
 ) -> str:
-    """One entry waiting for a person: one input, four verbs, one form.
+    """One verb, as a mark rather than a request.
 
-    A held entry can be published, rejected, critiqued into a child, or
-    archived. A kept rejection — the gate refused every attempt and the worker
-    kept it (spec §9) — has no Reject, because it is a rejection already;
-    publishing it puts it on the gallery's rejections page rather than the grid.
+    A radio for each of the three outcomes and a checkbox for Critique, all
+    bound to the page's one form by ``form="held-batch"``. Radios are what make
+    one-outcome-per-card true with no script at all; the script only adds
+    press-again-to-clear and the Reject/Critique exclusion (§1.2).
+    """
+    kind = "checkbox" if not value else "radio"
+    return (
+        f'<label class="tog {css}"><input type="{kind}" form="held-batch" '
+        f'name="{name}"'
+        + (f' value="{esc(value)}"' if value else ' value="on"')
+        + f' aria-label="{esc(aria)} entry {entry_id}"'
+        + (" checked" if checked else "")
+        + (" disabled" if disabled else "")
+        + f"><span>{label}</span></label>"
+    )
 
-    One form with four ``formaction``s, which is plain HTML5 and needs no
-    script: the routes are the ones that already exist, and the button pressed
-    says which of them reads the text box. The box is the reason when Reject
-    presses it and the child's revision sentence when Critique does; two boxes
-    and two help strings for one decision were what made the old card six cards.
 
-    Archiving deletes nothing — not the row, not the attempt directories, not
-    the strip — and the archived entry is still readable at /entry/<id>. That
-    question has been asked once already, so the hint under the buttons answers
-    it before it is asked again.
+def _decision_card(
+    app: App,
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    *,
+    kept: bool,
+    state: CardState | None = None,
+    disabled: bool = False,
+) -> str:
+    """One entry waiting for a person: one box, four marks, and no request.
+
+    The four verbs used to be four submit buttons with four ``formaction``s, so
+    a decision was a round trip and thirty decisions were thirty of them — and
+    a second press during any one of them was a second publisher queuing on the
+    gallery checkout lock behind the first. They are toggles now. Pressed, a
+    verb fills with its own colour and nothing else happens; the only request on
+    the page is Process in the tray, which runs every mark as one batch (§1.1).
+
+    The controls are not in a form of their own: they join the page-wide
+    ``held-batch`` form by attribute, so the cards stay siblings in the grid
+    rather than nesting a form inside each one. Publish, Reject and Archive are
+    radios and therefore one choice; Critique is a checkbox and stacks with
+    Publish or Archive, or stands alone — a child is queued and the entry stays
+    held. A kept rejection — the gate refused every attempt and the worker kept
+    it (spec §9) — has no Reject, because it is a rejection already; publishing
+    it puts it on the gallery's rejections page rather than the grid.
+
+    The box is read at Process time by whichever marked verb reads it: the
+    reason for Reject, where an empty box has always meant "the operator gave
+    none", and the revision sentence for Critique, where it is not allowed to
+    be empty. Archiving deletes nothing — not the row, not the attempt
+    directories, not the strip — and the archived entry is still readable at
+    /entry/<id>.
+
+    ``state`` is what a running or finished batch has to say about this entry,
+    and ``disabled`` shuts every control while one runs: the page that pressed
+    is not the only page that might be open, and "busy" lives on the server.
     """
     entry_id = int(row["id"])
-    reject = (
-        ""
-        if kept
-        else (
-            f'<button type="submit" class="rej" formaction="/held/{entry_id}/reject" '
-            f'aria-label="Reject entry {entry_id}">× Reject</button>'
-        )
-    )
     placeholder = (
         "one sentence for a child"
         if kept
         else "why you are rejecting, or one sentence for a child"
     )
-    hint = (
-        "Publish puts it on the gallery's rejections page. Critique reads the "
-        "box. Archive takes it off this page; nothing is deleted."
+    marks = state or CardState()
+    classes = "panel card decide"
+    if marks.marked:
+        classes += " marked"
+    if marks.pill == "working":
+        classes += " is-working"
+    elif marks.pill == "done":
+        classes += " is-done"
+    pill = ""
+    if marks.pill:
+        classes += " has-state"
+        pill = (
+            f'<span class="pill st {CARD_PILLS.get(marks.pill, "quiet")}">'
+            f"{esc(marks.pill)}</span>"
+        )
+    need = " need" if marks.cri and not marks.text.strip() else ""
+    reject = (
+        ""
         if kept
-        else "Reject and Critique read the box. Archive takes it off this "
-        "page; nothing is deleted."
+        else _toggle(
+            entry_id, "rej", "× Reject", "Mark to reject",
+            name=f"do-{entry_id}", value="reject",
+            checked=marks.do == "reject", disabled=disabled,
+        )
     )
     return (
-        f'<section class="panel card" id="entry-{entry_id}" '
+        f'<section class="{classes}" id="entry-{entry_id}" '
         f'aria-label="Entry {entry_id}">'
+        f"{pill}"
         f"{_card_face(app, conn, row)}"
-        f'<form method="post" action="/held/{entry_id}/publish" class="say">'
-        '<input type="hidden" name="back" value="/held">'
-        f'<input type="text" name="text" id="say-{entry_id}" maxlength="400" '
-        f'aria-label="{esc(placeholder)}" placeholder="{esc(placeholder)}">'
-        '<div class="acts">'
-        f'<button type="submit" class="pub" aria-label="Publish entry {entry_id}">'
-        "+ Publish</button>"
-        f"{reject}"
-        f'<button type="submit" class="cri" formaction="/entry/{entry_id}/spawn" '
-        f'aria-label="Spawn a child of entry {entry_id}">› Critique</button>'
-        f'<button type="submit" class="arc" formaction="/held/{entry_id}/archive" '
-        f'aria-label="Archive entry {entry_id}">− Archive</button>'
-        "</div>"
-        f'<p class="hint">{hint}</p>'
-        "</form>"
+        '<div class="say">'
+        f'<input type="text" form="held-batch" name="text-{entry_id}" '
+        f'id="say-{entry_id}" maxlength="{BATCH_TEXT_MAX}"'
+        + (f' class="{need.strip()}"' if need else "")
+        + f' value="{esc(marks.text)}" '
+        f'aria-label="{esc(placeholder)}" placeholder="{esc(placeholder)}"'
+        + (" disabled" if disabled else "")
+        + ">"
+        f'<div class="acts" data-entry="{entry_id}"'
+        + (' data-kept="1"' if kept else "")
+        + ">"
+        + _toggle(
+            entry_id, "pub", "+ Publish", "Mark to publish",
+            name=f"do-{entry_id}", value="publish",
+            checked=marks.do == "publish", disabled=disabled,
+        )
+        + reject
+        + _toggle(
+            entry_id, "cri", "› Critique", "Mark for a critique child of",
+            name=f"cri-{entry_id}", checked=marks.cri, disabled=disabled,
+        )
+        + _toggle(
+            entry_id, "arc", "− Archive", "Mark to archive",
+            name=f"do-{entry_id}", value="archive",
+            checked=marks.do == "archive", disabled=disabled,
+        )
+        + "</div>"
+        + _card_hint(state)
+        + "</div>"
         "</section>"
     )
 
 
-def held_page(app: App, conn: sqlite3.Connection) -> str:
+def held_page(app: App, conn: sqlite3.Connection) -> tuple[str, str]:
+    """The Held page: ``(the tray for the header, the body)``.
+
+    Two pieces because they belong in two slots of the layout — the tray is the
+    sticky header's second row and the cards are the page — and one function
+    because they are one snapshot of one batch. Reading ``app.batch`` twice
+    could show a tray from one moment and a card from the next.
+    """
+    batch = _batch_snapshot(app)
+    running = batch is not None and batch.state == "running"
+    states = _card_states(batch)
     rows = _entry_rows(conn)
-    cards = [_decision_card(app, conn, row, kept=False) for row in rows]
+    cards = [
+        _decision_card(
+            app, conn, row, kept=False,
+            state=states.get(int(row["id"])), disabled=running,
+        )
+        for row in rows
+    ]
     if not cards:
         cards.append(
             '<section class="panel"><p class="dim">nothing is waiting. '
@@ -2912,19 +3117,25 @@ def held_page(app: App, conn: sqlite3.Connection) -> str:
     # rejections page only when somebody here publishes them, and the ones
     # already published (published_utc set) have left this page.
     kept = [row for row in _entry_rows(conn, "failed-kept") if not row["published_utc"]]
-    kept_cards = [_decision_card(app, conn, row, kept=True) for row in kept]
+    kept_cards = [
+        _decision_card(
+            app, conn, row, kept=True,
+            state=states.get(int(row["id"])), disabled=running,
+        )
+        for row in kept
+    ]
     if not kept_cards:
         kept_cards.append(
             '<section class="panel"><p class="dim">no kept rejection is waiting.'
             "</p></section>"
         )
-    return render(
+    body = render(
         "op_held",
-        count=len(rows),
         cards="\n".join(cards),
         kept_count=len(kept),
         kept_cards="\n".join(kept_cards),
     )
+    return batch_tray(batch, waiting=len(rows), kept=len(kept)), body
 
 
 def entry_page(app: App, conn: sqlite3.Connection, entry_id: int) -> str:
@@ -3766,6 +3977,630 @@ def dismiss_batch(app: App) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# The tray, and the page's own script (packet 12)
+#
+# The tray is the sticky header's second row on /held: the title and counts, a
+# tally of what is marked, Clear marks, and Process. It is also the <form> every
+# toggle and box on the page belongs to, so the page has exactly one request in
+# it and nothing else on it can start one.
+#
+# Everything below renders from a snapshot of `app.batch`, server-side, in three
+# states: no batch, one running, one finished and not yet dismissed. That is
+# what makes the page work with no JavaScript at all — the POST starts the batch
+# and redirects here, and the tray says where it has got to, refreshing itself
+# while it runs (§1.11). HELD_SCRIPT makes the same three states live.
+# ---------------------------------------------------------------------------
+
+
+def _batch_snapshot(app: App) -> Batch | None:
+    """A copy of the batch, taken once under the lock, for the page to read.
+
+    The runner mutates the batch from its own thread, and rendering a page is a
+    hundred reads: a copy means the tray, the bar and every card on the page are
+    all describing the same instant, which is the same reason
+    :func:`batch_document` takes its snapshot under the lock.
+    """
+    with app.batch_lock:
+        if app.batch is None:
+            return None
+        return replace(app.batch, items=[replace(item) for item in app.batch.items])
+
+
+#: The phases whose steps belong to entries, and which therefore count them.
+#: The push and the index are one step each and say only their own name.
+_COUNTED_PHASES = ("critique", "archive", "commit")
+
+
+def _tray_phases(batch: Batch) -> str:
+    """The five phases with their counts; a phase with nothing in it is absent."""
+    rows = []
+    for key, label in BATCH_PHASES:
+        of = batch.phase_of.get(key, 0)
+        if not of:
+            continue
+        done = batch.phase_done.get(key, 0)
+        css = "fin" if done >= of else ("on" if batch.phase == key else "")
+        text = f"{label} {done}/{of}" if key in _COUNTED_PHASES else label
+        mark = f' class="{css}"' if css else ""
+        rows.append(f"<li{mark}>{esc(text)}</li>")
+    return "".join(rows)
+
+
+def _tray_results(batch: Batch) -> str:
+    """What the batch did, refusals and failures first (§1.10).
+
+    The bad news is at the top because it is the news the operator has to do
+    something about: those cards are still on the page, still marked, with the
+    reason on them, so fixing one and pressing again is the whole of the retry.
+    """
+    rank = {"refused": 0, "failed": 0, "done": 1}
+    rows = sorted(
+        (item for item in batch.items if item.state in rank),
+        key=lambda item: (rank[item.state], batch.items.index(item)),
+    )
+    out = []
+    for item in rows:
+        css = "bad" if item.state in ("refused", "failed") else "dim"
+        out.append(
+            f'<li><span class="n">{item.entry_id}</span>'
+            f'<span class="{css}">{esc(item.message or item.state)}</span></li>'
+        )
+    if batch.index_note:
+        # The entries are already public; a failure re-rendering the index
+        # after them is a note and never an exception (§2.1 step 6).
+        out.append(
+            '<li><span class="n">index</span>'
+            f'<span class="bad">{esc(batch.index_note)}</span></li>'
+        )
+    out.append(
+        '<li><button type="submit" form="held-dismiss">Dismiss</button></li>'
+    )
+    return "".join(out)
+
+
+def batch_tray(batch: Batch | None, *, waiting: int, kept: int) -> str:
+    """The header's second row on /held, in whichever of its three states.
+
+    Nothing here is a judgement the server makes twice: the tally and the
+    ``Process N`` label are the script's, because they change on every press and
+    the press is not a request; the progress, the phases and the results are the
+    server's, because they are the batch's own state and a page with no script
+    has to be able to read them.
+    """
+    running = batch is not None and batch.state == "running"
+    done = batch is not None and batch.state == "done"
+    state = batch.state if batch is not None else ""
+    bar_done = " done" if done else ""
+    process = (
+        '<button type="submit" class="process" id="process" disabled '
+        'title="a batch is running; it finishes before another can start">'
+        "Processing…</button>"
+        if running
+        else '<button type="submit" class="process" id="process">Process</button>'
+    )
+    clear = (
+        '<button type="reset" id="clear"'
+        + (" disabled" if running else "")
+        + ">Clear marks</button>"
+    )
+    progress = phases = results = ""
+    if batch is not None:
+        now = batch_summary(batch) if done else batch.now
+        pct = round(100.0 * batch.step / batch.steps, 1) if batch.steps else 0.0
+        progress = (
+            f'<span class="now" id="now" aria-live="polite">{esc(now)}</span>'
+            f'<div class="bar{bar_done}" id="bar">'
+            f'<span id="bar-fill" style="width:{pct}%"></span></div>'
+            f'<span class="prog-t" id="prog-t">{batch.step} of {batch.steps} '
+            f"steps · {esc(human_seconds(batch_elapsed(batch)))}</span>"
+        )
+        phases = _tray_phases(batch)
+    if done:
+        results = _tray_results(batch)
+    # A scriptless page follows the batch by reloading itself; a scripted one
+    # polls /api/batch.json instead and is never reloaded under the operator.
+    refresh = (
+        '<noscript><meta http-equiv="refresh" content="2"></noscript>'
+        if running
+        else ""
+    )
+    # The entries a finished batch got through: the script drops their saved
+    # marks, because those cards have left the page and the marks are spent.
+    finished = " ".join(
+        str(item.entry_id)
+        for item in (batch.items if done else [])
+        if item.state == "done"
+    )
+    hide_prog = "" if progress else " hidden"
+    hide_phases = "" if phases else " hidden"
+    hide_results = "" if results else " hidden"
+    return (
+        f'<section class="tray" aria-label="Batch" data-state="{esc(state)}"'
+        f' data-done="{esc(finished)}">'
+        f"{refresh}"
+        '<form id="held-dismiss" method="post" action="/held/batch/dismiss"></form>'
+        '<form id="held-batch" method="post" action="/held/batch">'
+        '<div class="tray-in">'
+        '<div class="tray-row">'
+        f'<h1>Held <span class="dim">— {waiting} waiting · {kept} kept</span></h1>'
+        '<div class="tally" id="tally" aria-live="polite"></div>'
+        f'<div class="tray-btns">{clear}{process}</div>'
+        "</div>"
+        f'<div class="tray-row" id="prog-row"{hide_prog}>{progress}</div>'
+        f'<ol class="phases" id="phases"{hide_phases}>{phases}</ol>'
+        f'<ul class="results" id="results"{hide_results}>{results}</ul>'
+        "</div></form></section>"
+    )
+
+
+HELD_SCRIPT = """<script>
+// The Held page, live. Everything here is something the server has already
+// rendered once — the marks are real form controls, Process is the form's submit
+// button, and a POST with no script starts the batch and redirects to a tray
+// that refreshes itself. This adds the four things a page cannot do on its own:
+// press-again-to-clear on the radios, the tally beside the button, the batch
+// painted as it runs instead of on a two-second reload, and marks that survive
+// one.
+//
+// House rules, the same as the layout's own script: ES5-plain, textContent and
+// never innerHTML (a refusal quotes a prompt a model wrote), no library.
+(function () {
+  var form = document.getElementById("held-batch");
+  var tray = document.querySelector(".tray");
+  if (!form || !tray) { return; }
+
+  var KEY = "held-marks";
+  var POLL_MS = 1000;
+  var BUSY = "a batch is running; it finishes before another can start";
+  var IDLE = "Mark one outcome, and Critique if it should have a child. " +
+             "Nothing happens until Process.";
+  var CHIPS = [["publish", "pub", "publish"], ["reject", "rej", "reject"],
+               ["cri", "cri", "critique"], ["archive", "arc", "archive"]];
+  var COUNTED = {critique: 1, archive: 1, commit: 1};
+  var running = tray.getAttribute("data-state") === "running";
+  var timer = null;
+  var leaving = false;
+
+  function $(id) { return document.getElementById(id); }
+
+  function el(tag, cls, text) {
+    var node = document.createElement(tag);
+    if (cls) { node.className = cls; }
+    if (text !== undefined) { node.textContent = text; }
+    return node;
+  }
+
+  function trim(text) { return String(text || "").replace(/^\\s+|\\s+$/g, ""); }
+
+  function rows() { return document.querySelectorAll(".acts"); }
+  function idOf(row) { return row.getAttribute("data-entry"); }
+  function box(id) { return $("say-" + id); }
+  function radio(row, value) {
+    return row.querySelector('input[value="' + value + '"]');
+  }
+  function critique(row) { return row.querySelector('input[type="checkbox"]'); }
+
+  // The card this row of toggles belongs to. Walked rather than selected
+  // because the toggles are the only thing on the page that knows its entry id.
+  function card(row) {
+    var walk = row.parentNode;
+    while (walk && String(walk.className || "").indexOf("card") === -1) {
+      walk = walk.parentNode;
+    }
+    return walk;
+  }
+
+  function mark(cls, name, on) {
+    var out = String(cls || "").replace(new RegExp(" ?" + name, "g"), "");
+    return on ? out + " " + name : out;
+  }
+
+  function marksOf(row) {
+    var id = idOf(row);
+    var pub = radio(row, "publish");
+    var rej = radio(row, "reject");
+    var arc = radio(row, "archive");
+    var cri = critique(row);
+    var text = box(id);
+    return {
+      id: id,
+      row: row,
+      out: pub && pub.checked ? "publish"
+         : rej && rej.checked ? "reject"
+         : arc && arc.checked ? "archive" : "",
+      cri: !!(cri && cri.checked),
+      text: text ? text.value : "",
+      kept: row.getAttribute("data-kept") === "1"
+    };
+  }
+
+  // What Process will do to this one card, in one sentence. The wording is the
+  // mockup's: an operator reading a card should not have to hold the whole
+  // batch in their head to know what they have just asked for.
+  function hintFor(m) {
+    var host = card(m.row);
+    var hint = host ? host.querySelector(".decide-hint") : null;
+    if (!hint) { return; }
+    // A card a batch refused keeps the reason it came back with until the
+    // operator touches it: why the last press failed is what a retry needs.
+    if (hint.getAttribute("data-reason")) { return; }
+    if (m.cri && !trim(m.text)) {
+      hint.className = "hint decide-hint warn";
+      hint.textContent =
+        "Critique needs a sentence in the box before Process will run.";
+      return;
+    }
+    var parts = [];
+    if (m.cri) { parts.push("queue a child from the box"); }
+    if (m.out === "publish") {
+      parts.push(m.kept ? "publish this to the rejections page"
+                        : "publish this to the grid");
+    }
+    if (m.out === "reject") {
+      parts.push(trim(m.text) ? "reject this with the box as the reason"
+                              : "reject this as \\u201crejected by operator\\u201d");
+    }
+    if (m.out === "archive") {
+      parts.push("take it off this page; nothing is deleted");
+    }
+    if (m.cri && !m.out) { parts.push("leave it held"); }
+    hint.className = "hint decide-hint";
+    hint.textContent = parts.length
+      ? "Process will " + parts.join(", then ") + "." : IDLE;
+  }
+
+  function tally() {
+    var counts = {publish: 0, reject: 0, cri: 0, archive: 0};
+    var all = rows(), marked = 0, need = 0, i, m, host, text;
+    for (i = 0; i < all.length; i++) {
+      m = marksOf(all[i]);
+      host = card(m.row);
+      if (host) { host.className = mark(host.className, "marked", m.out || m.cri); }
+      text = box(m.id);
+      if (text) { text.className = m.cri && !trim(m.text) ? "need" : ""; }
+      hintFor(m);
+      if (!m.out && !m.cri) { continue; }
+      marked += 1;
+      if (m.out) { counts[m.out] += 1; }
+      if (m.cri) {
+        counts.cri += 1;
+        if (!trim(m.text)) { need += 1; }
+      }
+    }
+    var chips = $("tally");
+    if (chips) {
+      chips.textContent = "";
+      for (i = 0; i < CHIPS.length; i++) {
+        if (counts[CHIPS[i][0]]) {
+          chips.appendChild(el("span", "t " + CHIPS[i][1],
+                               counts[CHIPS[i][0]] + " " + CHIPS[i][2]));
+        }
+      }
+      // A marked Critique with an empty box is the one mark this page will not
+      // let through: one sentence cannot be a reason and a revision at once.
+      if (need) {
+        chips.appendChild(el("span", "t need", need + " needs a sentence"));
+      }
+      if (!marked && !running) {
+        chips.appendChild(
+          el("span", "none", "nothing marked — press a verb on any card"));
+      }
+    }
+    var go = $("process");
+    if (go) {
+      go.disabled = running || !marked || need > 0;
+      go.textContent = running ? "Processing…"
+                     : marked ? "Process " + marked : "Process";
+      go.title = running ? BUSY
+               : need ? "a marked Critique has an empty box" : "";
+    }
+    var clear = $("clear");
+    if (clear) { clear.disabled = running || !marked; }
+    return {marked: marked, need: need};
+  }
+
+  // Reject and Critique read the same box, so marking either clears the other.
+  function exclusive(row, input) {
+    var rej = radio(row, "reject");
+    var cri = critique(row);
+    if (!rej || !cri) { return; }
+    if (input === cri && cri.checked && rej.checked) { rej.checked = false; }
+    if (input === rej && rej.checked && cri.checked) { cri.checked = false; }
+  }
+
+  function wireInput(row, input) {
+    var was = false;
+    function remember() { was = input.checked === true; }
+    input.addEventListener("pointerdown", remember);
+    input.addEventListener("keydown", remember);
+    input.addEventListener("click", function () {
+      // A radio has no off of its own. An outcome pressed by mistake has to be
+      // undoable where it was pressed, so the second press on the filled one
+      // clears it — which is what the fill looks like it should do.
+      if (input.type === "radio" && was) { input.checked = false; }
+      was = input.checked === true;
+      settle(row, input);
+    });
+    input.addEventListener("change", function () { settle(row, input); });
+  }
+
+  // The card has been touched, so the reason it was carrying is history and
+  // the hint goes back to saying what the next press will do.
+  function forget(row) {
+    var host = card(row);
+    var hint = host ? host.querySelector(".decide-hint") : null;
+    if (hint) { hint.removeAttribute("data-reason"); }
+  }
+
+  function settle(row, input) {
+    exclusive(row, input);
+    forget(row);
+    tally();
+    save();
+  }
+
+  function typing(row) {
+    return function () {
+      forget(row);
+      tally();
+      save();
+    };
+  }
+
+  function wire() {
+    var all = rows(), i, j, inputs, text;
+    for (i = 0; i < all.length; i++) {
+      inputs = all[i].querySelectorAll("input");
+      for (j = 0; j < inputs.length; j++) { wireInput(all[i], inputs[j]); }
+      text = box(idOf(all[i]));
+      if (text) {
+        text.addEventListener("input", typing(all[i]));
+      }
+    }
+    var clear = $("clear");
+    if (clear) {
+      // type=reset puts the controls back where the server drew them, which is
+      // not the same as clearing them on a page a finished batch pre-marked.
+      clear.addEventListener("click", function (event) {
+        if (event && event.preventDefault) { event.preventDefault(); }
+        var each = rows(), k, kk, ins, field;
+        for (k = 0; k < each.length; k++) {
+          ins = each[k].querySelectorAll("input");
+          for (kk = 0; kk < ins.length; kk++) { ins[kk].checked = false; }
+          field = box(idOf(each[k]));
+          if (field) { field.value = ""; }
+          forget(each[k]);
+        }
+        tally();
+        save();
+      });
+    }
+  }
+
+  // Marks live in sessionStorage, so a reload — or the reload a finished batch
+  // does — does not lose forty decisions. Wrapped because a browser with
+  // storage refused is a browser this page still has to work in.
+  function save() {
+    var out = {}, all = rows(), i, m;
+    for (i = 0; i < all.length; i++) {
+      m = marksOf(all[i]);
+      if (m.out || m.cri || trim(m.text)) {
+        out[m.id] = {out: m.out, cri: m.cri, text: m.text};
+      }
+    }
+    try { sessionStorage.setItem(KEY, JSON.stringify(out)); } catch (e) {}
+  }
+
+  function restore() {
+    var saved = null;
+    try { saved = JSON.parse(sessionStorage.getItem(KEY) || "{}"); } catch (e) {}
+    if (!saved) { return; }
+    // What a finished batch got through is spent: those cards have left the
+    // page and their marks must not come back on the next one.
+    var spent = String(tray.getAttribute("data-done") || "").split(" "), i;
+    for (i = 0; i < spent.length; i++) {
+      if (spent[i]) { delete saved[spent[i]]; }
+    }
+    var all = rows(), row, id, want, hit, cri, text;
+    for (i = 0; i < all.length; i++) {
+      row = all[i];
+      id = idOf(row);
+      want = saved[id];
+      if (!want) { continue; }
+      hit = want.out ? radio(row, want.out) : null;
+      if (hit) { hit.checked = true; }
+      cri = critique(row);
+      if (cri && want.cri) { cri.checked = true; }
+      text = box(id);
+      if (text && want.text && !text.value) { text.value = want.text; }
+    }
+    save();
+  }
+
+  function lock(on) {
+    var all = rows(), i, j, inputs, text;
+    for (i = 0; i < all.length; i++) {
+      inputs = all[i].querySelectorAll("input");
+      for (j = 0; j < inputs.length; j++) { inputs[j].disabled = on; }
+      text = box(idOf(all[i]));
+      if (text) { text.disabled = on; }
+    }
+  }
+
+  // web.py:human_seconds, for the one duration this tray prints.
+  function dur(seconds) {
+    var s = Math.max(0, Math.round(Number(seconds) || 0));
+    if (s < 60) { return s + "s"; }
+    if (s < 3600) {
+      return (s / 60 | 0) + "m " + String(s % 60).padStart(2, "0") + "s";
+    }
+    if (s < 86400) {
+      return (s / 3600 | 0) + "h " +
+             String((s % 3600) / 60 | 0).padStart(2, "0") + "m";
+    }
+    return (s / 86400 | 0) + "d " + ((s % 86400) / 3600 | 0) + "h";
+  }
+
+  function phases(doc) {
+    var list = $("phases");
+    if (!list) { return; }
+    var rowsIn = doc.phases || [], i, row, css;
+    list.textContent = "";
+    list.hidden = !rowsIn.length;
+    for (i = 0; i < rowsIn.length; i++) {
+      row = rowsIn[i];
+      css = row.done >= row.of ? "fin" : doc.phase === row.key ? "on" : "";
+      list.appendChild(el("li", css, COUNTED[row.key]
+        ? row.label + " " + row.done + "/" + row.of : row.label));
+    }
+  }
+
+  var PILLS = {queued: "quiet", working: "warn", done: "ok",
+               refused: "bad", failed: "bad"};
+  var WORST = ["failed", "refused", "working", "queued", "done"];
+
+  function pills(doc) {
+    var items = doc.items || [], seen = {}, i, item, host, pill, hint;
+    for (i = 0; i < items.length; i++) {
+      item = items[i];
+      // A card marked Publish and Critique is two items; it wears the worse of
+      // them, because what needs doing something about is what it should say.
+      if (seen[item.entry_id] !== undefined &&
+          WORST.indexOf(items[seen[item.entry_id]].state) <=
+          WORST.indexOf(item.state)) { continue; }
+      seen[item.entry_id] = i;
+    }
+    for (var id in seen) {
+      if (!Object.prototype.hasOwnProperty.call(seen, id)) { continue; }
+      item = items[seen[id]];
+      host = $("entry-" + item.entry_id);
+      if (!host) { continue; }
+      pill = host.querySelector(".pill.st");
+      if (!pill) {
+        pill = el("span", "", "");
+        host.insertBefore(pill, host.childNodes[0]);
+      }
+      pill.className = "pill st " + (PILLS[item.state] || "quiet");
+      pill.textContent = item.state;
+      host.className = mark(mark(mark(host.className, "has-state", true),
+                                 "is-working", item.state === "working"),
+                            "is-done", item.state === "done");
+      hint = host.querySelector(".decide-hint");
+      if (hint && item.message) {
+        var bad = item.state === "refused" || item.state === "failed";
+        hint.className = bad ? "hint decide-hint bad" : "hint decide-hint";
+        hint.textContent = bad
+          ? item.message + " — still held, still marked." : item.message;
+        if (bad) { hint.setAttribute("data-reason", "1"); }
+      }
+    }
+  }
+
+  function paint(doc) {
+    if (!doc) { return; }
+    var prog = $("prog-row"), now = $("now"), bar = $("bar");
+    var fill = $("bar-fill"), text = $("prog-t");
+    if (prog) { prog.hidden = false; }
+    if (now) { now.textContent = doc.now || ""; }
+    if (bar) { bar.className = doc.state === "done" ? "bar done" : "bar"; }
+    if (fill && fill.style) {
+      fill.style.width = (Number(doc.bar_pct) || 0) + "%";
+    }
+    if (text) {
+      text.textContent = doc.step + " of " + doc.steps + " steps · " +
+                         dur(doc.elapsed_s);
+    }
+    phases(doc);
+    pills(doc);
+  }
+
+  function refuse(message) {
+    running = false;
+    lock(false);
+    var list = $("results");
+    if (list) {
+      list.textContent = "";
+      list.hidden = false;
+      var li = el("li");
+      li.appendChild(el("span", "n", ""));
+      li.appendChild(el("span", "bad", message || "nothing changed"));
+      list.appendChild(li);
+    }
+    tally();
+  }
+
+  function poll() {
+    if (timer) { return; }
+    timer = setInterval(function () {
+      window.fetch("/api/batch.json", {cache: "no-store"}).then(function (r) {
+        return r.json();
+      }).then(function (answer) {
+        var doc = answer && answer.batch;
+        if (!doc) { return; }
+        paint(doc);
+        // Done: the server renders the result and the cards that survived it,
+        // so the page asks for itself once rather than trying to be the report.
+        if (doc.state === "done" && !leaving) {
+          leaving = true;
+          clearInterval(timer);
+          window.location.href = "/held";
+        }
+      }).catch(function () {});
+    }, POLL_MS);
+  }
+
+  function body() {
+    var pairs = [], all = rows(), i, m;
+    for (i = 0; i < all.length; i++) {
+      m = marksOf(all[i]);
+      if (m.out) { pairs.push("do-" + m.id + "=" + encodeURIComponent(m.out)); }
+      if (m.cri) { pairs.push("cri-" + m.id + "=on"); }
+      if (m.text) {
+        pairs.push("text-" + m.id + "=" + encodeURIComponent(m.text));
+      }
+    }
+    return pairs.join("&");
+  }
+
+  form.addEventListener("submit", function (event) {
+    if (!window.fetch) { return; }   // no fetch: the browser posts it instead
+    event.preventDefault();
+    var sent = body();
+    running = true;
+    lock(true);
+    tally();
+    window.fetch(form.action, {
+      method: "POST",
+      headers: {"Accept": "application/json",
+                "Content-Type": "application/x-www-form-urlencoded"},
+      body: sent
+    }).then(function (response) {
+      return response.json().then(function (doc) {
+        return {status: response.status, doc: doc};
+      });
+    }).then(function (answer) {
+      if (answer.status === 202 && answer.doc && answer.doc.batch) {
+        paint(answer.doc.batch);
+        poll();
+      } else {
+        refuse(answer.doc && answer.doc.error);
+      }
+    }).catch(function () {
+      refuse("the press did not reach the server — nothing changed");
+    });
+  });
+
+  restore();
+  wire();
+  tally();
+  // A reload, a second tab, or a batch somebody else started: the tray the
+  // server drew says whether one is running, and the poll starts from there.
+  if (running) { poll(); }
+})();
+</script>"""
+
+
+# ---------------------------------------------------------------------------
 # Spawning a child from a critique (packet 5.3)
 # ---------------------------------------------------------------------------
 
@@ -4593,7 +5428,7 @@ class OpHandler(BaseHTTPRequestHandler):
         conn = self.app.connect()
         try:
             control = db.get_control(conn)
-            body = held_page(self.app, conn)
+            tray, body = held_page(self.app, conn)
             marks = nav_summary(conn)
         finally:
             conn.close()
@@ -4605,8 +5440,9 @@ class OpHandler(BaseHTTPRequestHandler):
                 control=control,
                 back="/held",
                 flash=self.flash(),
-                page_script=PREVIEW_SCRIPT,
+                page_script=PREVIEW_SCRIPT + HELD_SCRIPT,
                 nav_marks=marks,
+                subheader=tray,
             )
         )
 

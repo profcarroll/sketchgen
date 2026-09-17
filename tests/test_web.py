@@ -269,8 +269,11 @@ class TestPages(WebTestCase):
 
     def test_the_held_page_offers_kept_rejections_for_publishing(self):
         # A gate rejection the worker kept waits here too (spec §9): it can
-        # be published onto the rejections page, but there is nothing to
-        # reject. One already published has left the page.
+        # be marked for publication onto the rejections page, but there is
+        # nothing to reject. One already published has left the page.
+        #
+        # The verbs are marks in one page-wide form since packet 12, so what
+        # names the entry is the control's own name and not a form action.
         conn = self.db()
         try:
             job = db.enqueue(conn, "a kept rejection", "student-three")
@@ -287,10 +290,11 @@ class TestPages(WebTestCase):
             conn.close()
         try:
             page = self.text("/held")
-            self.assertIn(f'action="/held/{kept}/publish"', page)
-            self.assertNotIn(f'action="/held/{kept}/reject"', page)
-            self.assertNotIn(f'action="/held/{done}/publish"', page)
-            self.assertIn(f'action="/held/{self.entry_id}/reject"', page)
+            self.assertIn(f'name="do-{kept}" value="publish"', page)
+            self.assertNotIn(f'name="do-{kept}" value="reject"', page)
+            self.assertNotIn(f'id="entry-{done}"', page)
+            self.assertNotIn(f'name="do-{done}"', page)
+            self.assertIn(f'name="do-{self.entry_id}" value="reject"', page)
         finally:
             conn = self.db()
             conn.execute("DELETE FROM entries WHERE id IN (?, ?)", (kept, done))
@@ -353,17 +357,21 @@ class TestPages(WebTestCase):
     def test_every_number_says_which_kind_it_is(self):
         # "Entry 48 — job 49" was read as one thing with two ids, twice, on
         # 2026-09-14. The card carries the entry number alone as its heading,
-        # the job is named as a job on the meta line, every button still says
+        # the job is named as a job on the meta line, every control still says
         # which entry it acts on — in its aria-label since packet 6, because
         # the id in four button labels was the same number said four more
         # times — the queue has an entry column, and the job page names its
-        # entry.
+        # entry. Since packet 12 the four verbs mark rather than act, and the
+        # labels say so.
         held = self.text("/held")
         self.assertIn(f'<span class="n">{self.entry_id}</span>', held)
         self.assertIn(f'job <a href="/job/{self.held_id}">{self.held_id}</a>', held)
-        self.assertIn(f'aria-label="Publish entry {self.entry_id}"', held)
-        self.assertIn(f'aria-label="Reject entry {self.entry_id}"', held)
-        self.assertIn(f'aria-label="Spawn a child of entry {self.entry_id}"', held)
+        self.assertIn(f'aria-label="Mark to publish entry {self.entry_id}"', held)
+        self.assertIn(f'aria-label="Mark to reject entry {self.entry_id}"', held)
+        self.assertIn(
+            f'aria-label="Mark for a critique child of entry {self.entry_id}"', held
+        )
+        self.assertIn(f'aria-label="Mark to archive entry {self.entry_id}"', held)
         self.assertNotIn("— job", held)
         queue = self.text("/queue")
         self.assertIn('<th class="n">job</th><th class="n">entry</th>', queue)
@@ -1237,7 +1245,8 @@ class TestArchiveAndReject(WebTestCase):
     def test_archive_takes_an_unpublished_kept_failure_off_the_kept_list(self):
         _, entry_id = self.make_entry("failed-kept", prompt="one the gate refused")
         page = self.text("/held")
-        self.assertIn(f'action="/held/{entry_id}/archive"', page)
+        # the card offers the mark; the route it used to post to still answers
+        self.assertIn(f'name="do-{entry_id}" value="archive"', page)
         self.post(f"/held/{entry_id}/archive", {"back": "/held"})
         self.assertEqual("archived", self.row(entry_id)["state"])
         self.assertNotIn(f'id="entry-{entry_id}"', self.text("/held"))
@@ -1402,10 +1411,12 @@ class TestDecisionCard(WebTestCase):
         # and the word itself is gone from the card's face: it is a card about
         # an entry, on a page of them, which nothing has to say out loud
         self.assertNotIn("entry", visible.lower())
-        # the buttons still name it where it matters
-        for label in ("Publish", "Reject", "Archive"):
+        # the toggles still name it where it matters
+        for label in ("Mark to publish", "Mark to reject", "Mark to archive"):
             self.assertIn(f'aria-label="{label} entry {entry_id}"', card)
-        self.assertIn(f'aria-label="Spawn a child of entry {entry_id}"', card)
+        self.assertIn(
+            f'aria-label="Mark for a critique child of entry {entry_id}"', card
+        )
 
     def test_the_prompt_is_the_root_sentence_and_the_newest_revision(self):
         from sketchgen import lineage
@@ -1462,36 +1473,48 @@ class TestDecisionCard(WebTestCase):
 
     # -- the four verbs ----------------------------------------------------
 
-    def test_one_form_one_box_four_verbs(self):
+    def test_one_box_four_marks_and_no_form_of_the_cards_own(self):
+        # Packet 12: the card's form is gone. The four verbs are toggles bound
+        # to the page's one form by attribute, so the cards stay siblings in
+        # the grid and nothing on the card is a request.
         _, entry_id = self.card_entry()
         card = self.card(self.text("/held"), entry_id)
-        self.assertEqual(1, card.count("<form"))
+        self.assertEqual(0, card.count("<form"))
+        self.assertEqual(0, card.count("formaction"))
         self.assertEqual(1, card.count('type="text"'))
-        self.assertEqual(1, card.count('name="text"'))
-        self.assertIn(f'action="/held/{entry_id}/publish"', card)
-        for css, action in (
-            ("rej", f"/held/{entry_id}/reject"),
-            ("cri", f"/entry/{entry_id}/spawn"),
-            ("arc", f"/held/{entry_id}/archive"),
+        self.assertEqual(1, card.count(f'name="text-{entry_id}"'))
+        self.assertEqual(3, card.count('type="radio"'))
+        self.assertEqual(1, card.count('type="checkbox"'))
+        self.assertEqual(5, card.count('form="held-batch"'))
+        for css, name, value in (
+            ("pub", f"do-{entry_id}", "publish"),
+            ("rej", f"do-{entry_id}", "reject"),
+            ("arc", f"do-{entry_id}", "archive"),
         ):
-            self.assertIn(f'class="{css}" formaction="{action}"', card)
+            self.assertIn(f'class="tog {css}"', card)
+            self.assertIn(f'name="{name}" value="{value}"', card)
+        self.assertIn(f'name="cri-{entry_id}" value="on"', card)
         # critique_by left the page: a sentence typed here is the operator's
         self.assertNotIn("critique_by", card)
         # one help string, under all four
-        self.assertEqual(1, card.count('class="hint"'))
+        self.assertEqual(1, card.count("decide-hint"))
+        self.assertIn("Nothing happens until Process.", card)
 
     def test_a_kept_failure_card_has_no_reject(self):
         _, entry_id = self.card_entry(
             state="failed-kept", prompt="one the gate refused"
         )
-        card = self.card(self.text("/held"), entry_id)
-        self.assertNotIn("/reject", card)
-        self.assertNotIn('class="rej"', card)
-        self.assertIn(f'action="/held/{entry_id}/publish"', card)
-        self.assertIn(f'formaction="/entry/{entry_id}/spawn"', card)
-        self.assertIn(f'formaction="/held/{entry_id}/archive"', card)
-        # and the hint says where publishing puts it
-        self.assertIn("rejections page", card)
+        page = self.text("/held")
+        card = self.card(page, entry_id)
+        self.assertNotIn('value="reject"', card)
+        self.assertNotIn("Mark to reject", card)
+        self.assertNotIn('class="tog rej"', card)
+        self.assertEqual(2, card.count('type="radio"'))
+        self.assertIn(f'name="do-{entry_id}" value="publish"', card)
+        self.assertIn(f'name="do-{entry_id}" value="archive"', card)
+        self.assertIn(f'name="cri-{entry_id}"', card)
+        # and the kept section still says where publishing one puts it
+        self.assertIn("rejections page", page)
 
     def test_reject_reads_the_box_and_still_reads_the_old_field(self):
         _, new = self.card_entry(entry_id=9281)
@@ -1671,12 +1694,19 @@ class TestSpawn(WebTestCase):
             conn.commit()
             conn.close()
 
-    def test_the_form_is_on_the_held_cards_and_on_the_job_page(self):
+    def test_the_form_is_on_the_job_page_and_the_held_card_marks_instead(self):
+        # The job page still posts one critique to /entry/<id>/spawn. On the
+        # Held page the card's Critique toggle marks it instead and the batch
+        # queues the child, so the page has one form and not one per card.
         held = self.text("/held")
-        self.assertIn(f'action="/entry/{self.entry_id}/spawn"', held)
-        self.assertIn("Spawn a child", held)
+        self.assertNotIn(f'action="/entry/{self.entry_id}/spawn"', held)
+        self.assertIn(f'name="cri-{self.entry_id}"', held)
+        self.assertIn(
+            f'aria-label="Mark for a critique child of entry {self.entry_id}"', held
+        )
         job = self.text(f"/job/{self.held_id}")
         self.assertIn(f'action="/entry/{self.entry_id}/spawn"', job)
+        self.assertIn("Spawn a child", job)
 
 
 class TestSubmissions(WebTestCase):
@@ -2536,14 +2566,14 @@ class ManyResultish:
         self.index_note = index_note
 
 
-class TestHeldBatch(WebTestCase):
-    """POST /held/batch: the marks, the run order, the guards and the document.
+class BatchFixtures:
+    """Entries, presses and a way to look at a batch while it is running.
 
-    No git anywhere in here: ``publish.publish_many`` is patched with
-    :class:`FakeMany`, and the fallback path (§3.3) is exercised by taking that
-    name away and patching the single-entry ``publish.publish`` instead. What is
-    under test is the runner's bookkeeping and its refusals, which is all this
-    packet owns.
+    No git anywhere: ``publish.publish_many`` is patched with :class:`FakeMany`,
+    which can be held open with a :class:`threading.Event` so that a test reads
+    a running batch without sleeping through one. Shared by the runner's tests
+    (packet 11) and the page's (packet 12), which need exactly the same
+    scaffolding and must agree about what a batch looks like.
     """
 
     # -- fixtures ----------------------------------------------------------
@@ -2681,6 +2711,15 @@ class TestHeldBatch(WebTestCase):
                         delattr(publish, name)
                 else:
                     setattr(publish, name, value)
+
+
+class TestHeldBatch(BatchFixtures, WebTestCase):
+    """POST /held/batch: the marks, the run order, the guards and the document.
+
+    The fallback path (§3.3) is exercised by taking ``publish_many`` away and
+    patching the single-entry ``publish.publish`` instead. What is under test is
+    the runner's bookkeeping and its refusals, which is all packet 11 owns.
+    """
 
     # -- §3.1: every refusal, and nothing started --------------------------
 
@@ -3219,6 +3258,199 @@ class TestHeldBatch(WebTestCase):
         self.assertEqual(batch.items[0].state, "refused")
         self.assertIn("publisher not installed", batch.items[0].message)
         self.assertEqual(self.state_of(publish_id), "held")
+
+
+class TestHeldBatchPage(BatchFixtures, WebTestCase):
+    """The Held page as a batch: one form, four marks, and the tray (packet 12).
+
+    The card's four ``formaction``s are gone and so is the card's form. What is
+    under test here is what the server renders — the controls bound to the one
+    page-wide form, and the tray in each of its three states — because that is
+    what a browser with no JavaScript gets, and the script only makes it live.
+    """
+
+    def card(self, page, entry_id):
+        """Inside this entry's <section>, and nothing else on the page."""
+        needle = f'id="entry-{entry_id}"'
+        self.assertIn(needle, page)
+        inside = page.split(needle, 1)[1].split(">", 1)[1]
+        return inside.split("</section>", 1)[0]
+
+    def tray(self, page):
+        self.assertIn('<section class="tray"', page)
+        return page.split('<section class="tray"', 1)[1].split("</section>", 1)[0]
+
+    # -- §4.1: the card ----------------------------------------------------
+
+    def test_the_page_has_one_form_and_the_cards_have_none(self):
+        entry = self.held()
+        page = self.text("/held")
+        self.assertEqual(1, page.count('<form id="held-batch"'))
+        self.assertEqual(1, page.count('action="/held/batch"'))
+        self.assertNotIn("<form method=", self.card(page, entry))
+        # Nothing on this page acts on one entry any more: the marks are marks,
+        # and Process is the only request the page can make.
+        self.assertNotIn("formaction", page)
+        self.assertNotIn(f'action="/held/{entry}/publish"', page)
+        self.assertNotIn(f'action="/entry/{entry}/spawn"', page)
+
+    def test_a_held_card_carries_three_radios_and_a_checkbox(self):
+        entry = self.held()
+        card = self.card(self.text("/held"), entry)
+        self.assertEqual(3, card.count('type="radio"'))
+        self.assertEqual(1, card.count('type="checkbox"'))
+        self.assertEqual(5, card.count('form="held-batch"'))
+        for value in ("publish", "reject", "archive"):
+            self.assertIn(f'name="do-{entry}" value="{value}"', card)
+        self.assertIn(f'name="cri-{entry}" value="on"', card)
+        self.assertIn(f'name="text-{entry}"', card)
+
+    def test_a_kept_card_carries_two_radios_and_a_checkbox(self):
+        entry = self.held(prompt="one the gate refused", state="failed-kept")
+        card = self.card(self.text("/held"), entry)
+        self.assertEqual(2, card.count('type="radio"'))
+        self.assertEqual(1, card.count('type="checkbox"'))
+        self.assertNotIn('value="reject"', card)
+
+    def test_the_single_entry_routes_are_still_in_the_table(self):
+        # Nothing on the page points at them; scripts, the CLI-minded and
+        # /entry/<id> habits still do, so they stay.
+        paths = [route[1].pattern for route in web.ROUTES]
+        for pattern in (
+            r"^/held/(?P<entry_id>\d+)/publish$",
+            r"^/held/(?P<entry_id>\d+)/reject$",
+            r"^/held/(?P<entry_id>\d+)/archive$",
+            r"^/entry/(?P<entry_id>\d+)/spawn$",
+        ):
+            self.assertIn(pattern, paths)
+
+    # -- §4.2: the tray, in three states -----------------------------------
+
+    def test_with_no_batch_the_tray_is_the_title_and_the_button(self):
+        page = self.text("/held")
+        tray = self.tray(page)
+        self.assertIn("<h1>Held ", tray)
+        self.assertIn("waiting · ", tray)
+        self.assertIn('<div class="tally" id="tally" aria-live="polite"></div>', tray)
+        self.assertIn('id="process"', tray)
+        self.assertNotIn("Processing…", tray)
+        self.assertNotIn("disabled", tray.split('id="tally"', 1)[1])
+        self.assertIn('id="prog-row" hidden', tray)
+        self.assertIn('id="results" hidden', tray)
+        self.assertNotIn("http-equiv", tray)
+        # the page's own first heading went with it: the tray is the title now
+        self.assertEqual(1, page.count("<h1>Held "))
+        self.assertNotIn("Held for publication</h1>", page)
+
+    def test_while_a_batch_runs_the_page_is_locked_and_says_so(self):
+        marked = self.held()
+        gate = threading.Event()
+        many = FakeMany(commit_gate=gate)
+        with self.publisher(many=many):
+            self.assertEqual(
+                self.post_batch_json({f"do-{marked}": "publish"})[0], 202
+            )
+            self.until(
+                lambda: (self.batch_json() or {}).get("phase") == "commit",
+                "the commit phase",
+            )
+            page = self.text("/held")
+            tray = self.tray(page)
+            self.assertIn("Processing…", tray)
+            self.assertIn('id="process" disabled', tray)
+            self.assertIn('<noscript><meta http-equiv="refresh" content="2">', tray)
+            self.assertIn("0 of 3 steps · ", tray)
+            self.assertIn("Render &amp; commit 0/1", tray)
+            self.assertIn(f"Entry {marked} — rendering", tray)
+            # every control on every card, not only the marked one
+            card = self.card(page, marked)
+            self.assertEqual(5, card.count(" disabled>"))
+            self.assertIn('<span class="pill st warn">working</span>', card)
+            self.assertIn("is-working", page.split(f'id="entry-{marked}"', 1)[0][-90:])
+            other = self.card(page, self.entry_id)
+            self.assertEqual(5, other.count(" disabled>"))
+            self.assertNotIn("pill st", other)
+            gate.set()
+            self.finished()
+
+    def test_a_finished_batch_leaves_its_result_and_pre_marks_the_refusals(self):
+        refused = self.held()
+        done = self.held()
+        many = FakeMany(
+            refused={refused: "refused: sketch.js holds an email address"},
+            index_note="the index push was refused; the entries are public",
+        )
+        with self.publisher(many=many):
+            self.assertEqual(
+                self.post_batch_json(
+                    {
+                        f"do-{refused}": "publish",
+                        f"text-{refused}": "one that will not go",
+                        f"do-{done}": "publish",
+                    }
+                )[0],
+                202,
+            )
+            self.finished()
+        page = self.text("/held")
+        tray = self.tray(page)
+        self.assertRegex(tray, r"1 done · 1 refused in \d")
+        self.assertIn('class="bar done"', tray)
+        # the refusal is the first row, and the note the index left is there
+        self.assertLess(
+            tray.index("sketch.js holds an email address"),
+            tray.index(f'<span class="n">{done}</span>'),
+        )
+        self.assertIn("the index push was refused", tray)
+        self.assertIn('form="held-dismiss"', tray)
+        self.assertIn('action="/held/batch/dismiss"', page)
+        # the refused card is still there, still marked, with its sentence
+        card = self.card(page, refused)
+        self.assertIn('value="publish"', card)
+        self.assertEqual(1, card.count(" checked>"))
+        self.assertIn('value="one that will not go"', card)
+        self.assertIn('class="hint decide-hint bad" data-reason="1"', card)
+        self.assertIn("still held, still marked", card)
+        self.assertIn('<span class="pill st bad">refused</span>', card)
+        # nothing is disabled: the batch is over and the retry is one press
+        self.assertNotIn(" disabled", card)
+        self.assertNotIn("Processing…", tray)
+
+    def test_the_tray_is_on_held_and_nowhere_else(self):
+        for path in ("/", "/queue", "/new", "/submissions", f"/job/{self.held_id}",
+                     f"/entry/{self.entry_id}"):
+            with self.subTest(path=path):
+                page = self.text(path)
+                self.assertNotIn('class="tray"', page)
+                self.assertNotIn('id="held-batch"', page)
+
+    def test_both_header_rows_are_sticky_on_every_page(self):
+        # The sticky box is the wrapper, not header.top, so the tray sticks
+        # with the nav rather than under it.
+        for path in ("/", "/queue", "/new", "/held", "/submissions",
+                     f"/job/{self.held_id}"):
+            with self.subTest(path=path):
+                page = self.text(path)
+                self.assertIn('<div class="sticky">', page)
+                self.assertIn(".sticky { position: sticky;", page)
+                header = page.split("header.top {", 1)[1].split("}", 1)[0]
+                self.assertNotIn("position: sticky", header)
+
+    # -- §4.3: the script, as text -----------------------------------------
+
+    def test_the_script_is_on_the_held_page_and_writes_no_html(self):
+        page = self.text("/held")
+        self.assertIn("held-marks", page)
+        self.assertIn("/api/batch.json", page)
+        self.assertNotIn(".innerHTML", web.HELD_SCRIPT)
+        self.assertIn('"Accept": "application/json"', web.HELD_SCRIPT)
+        # ES5-plain, the same house rule as the layout's own script: no arrow
+        # functions, no template literals, and every variable a var.
+        self.assertNotIn("=>", web.HELD_SCRIPT)
+        self.assertNotIn("`", web.HELD_SCRIPT)
+        for line in web.HELD_SCRIPT.splitlines():
+            code = line.split("//", 1)[0]
+            self.assertNotRegex(code, r"\b(const|let|class)\s")
 
 
 class TestBindRefusal(unittest.TestCase):
