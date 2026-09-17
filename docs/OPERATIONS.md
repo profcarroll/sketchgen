@@ -597,10 +597,16 @@ One, not zero.
 ### Operator step, once: point every kept failure at its best attempt
 
 An entry has always taken its files from the attempt that **ended** the job.
-Across the first 65 failed jobs that was the worst attempt 78% of the time, and
-all 44 kept failures on the site are showing it. Entry 429 publishes a blank
-canvas from a tenth attempt whose image never arrived; its second attempt drew a
-working puzzle from an image it built itself.
+Usually that is also its best one. Not always: on the first 45 kept entries the
+dry-run moves **7**, and entry 429 is one of them — it publishes a blank canvas
+from a tenth attempt whose image never arrived, while its second drew a working
+puzzle from an image it built itself. The other 38 are already showing their
+best attempt and this leaves them untouched.
+
+The wider value of the run is the labelling: **31 of the 45 kept entries never
+failed a QA check at all**. They ran, and were recorded as gate failures for
+missing an assertion. This writes what each actually diverged on into
+`offplan_json`, which is what the pages read to stop calling them rejections.
 
 Deploy, then run it once on the node:
 
