@@ -2603,12 +2603,15 @@ class RepointKeptTests(GalleryTestCase):
         self.assertEqual(before["source_dir"], self.row(entry)["source_dir"])
         self.assertIsNone(self.row(entry)["offplan_json"])
 
-    def test_reclassify_moves_only_the_ones_that_run(self):
+    def test_it_never_changes_an_entry_s_state(self):
+        """--reclassify is gone: it wrote state with a raw UPDATE, and
+        failed-kept -> held is not a transition the machine allows for a
+        published entry at all. reopen-offplan is the version that asks."""
         runs = self.kept([self.CLEAN, self.BROKEN])
         broken = self.kept([self.BROKEN, self.BROKEN])
-        result = self.run_cli("--reclassify")
+        result = self.run_cli()
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual("held", self.row(runs)["state"])
+        self.assertEqual("failed-kept", self.row(runs)["state"])
         self.assertEqual("failed-kept", self.row(broken)["state"])
         # and a sketch that never ran is never called off-plan
         self.assertIsNone(self.row(broken)["offplan_json"])
@@ -2620,6 +2623,82 @@ class RepointKeptTests(GalleryTestCase):
         result = self.run_cli()
         self.assertIn("same attempt", result.stdout)
         self.assertEqual(after_first["source_dir"], self.row(entry)["source_dir"])
+
+
+class ReopenOffPlanTests(GalleryTestCase):
+    """The door back, and the 18 doors it must leave shut."""
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(CLI), "reopen-offplan", "--db", str(self.db_path), *args],
+            capture_output=True, text=True, check=False, env=dict(os.environ),
+        )
+
+    def kept(self, *, offplan, published=False):
+        job = db.enqueue(self.conn, "a jigsaw puzzle game", "profcarroll")
+        self.conn.execute("UPDATE jobs SET state = 'failed' WHERE id = ?", (job,))
+        entry = db.create_entry(
+            self.conn, job, state="failed-kept", prompt="a jigsaw puzzle game",
+            offplan_json=json.dumps(offplan) if offplan else None,
+            published_utc=db.utc_now() if published else None,
+        )
+        self.conn.commit()
+        return entry
+
+    def state(self, entry_id):
+        return self.conn.execute(
+            "SELECT state FROM entries WHERE id = ?", (entry_id,)
+        ).fetchone()["state"]
+
+    def test_an_unpublished_off_plan_entry_is_reopened(self):
+        entry = self.kept(offplan=["responds(drag)"])
+        result = self.run_cli("--all")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("failed-kept -> held", result.stdout)
+        self.assertIn("missed responds(drag)", result.stdout)
+        self.assertEqual("held", self.state(entry))
+
+    def test_a_published_entry_is_never_touched(self):
+        """The public record stands. 18 of the 30 are in exactly this case."""
+        entry = self.kept(offplan=["responds(drag)"], published=True)
+        result = self.run_cli("--all")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("nothing to reopen", result.stdout)
+        self.assertEqual("failed-kept", self.state(entry))
+
+    def test_the_state_machine_refuses_it_even_if_asked_directly(self):
+        """Belt and braces: the command declines to ask, and db refuses anyway."""
+        entry = self.kept(offplan=["responds(drag)"], published=True)
+        with self.assertRaises(db.IllegalTransition) as caught:
+            db.entry_transition(self.conn, entry, "held")
+        self.assertIn("already on the site", str(caught.exception))
+        self.assertIn("reopened", str(caught.exception))
+
+    def test_a_sketch_that_never_ran_is_not_reopened(self):
+        entry = self.kept(offplan=None)
+        result = self.run_cli("--all")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("nothing to reopen", result.stdout)
+        self.assertEqual("failed-kept", self.state(entry))
+
+    def test_dry_run_writes_nothing(self):
+        entry = self.kept(offplan=["motion(idle)"])
+        result = self.run_cli("--all", "--dry-run")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("would be reopened", result.stdout)
+        self.assertEqual("failed-kept", self.state(entry))
+
+    def test_it_refuses_without_all_or_ids(self):
+        result = self.run_cli()
+        self.assertEqual(3, result.returncode)
+        self.assertIn("say which", result.stderr)
+
+    def test_naming_an_ineligible_id_refuses_rather_than_skipping(self):
+        entry = self.kept(offplan=["motion(idle)"], published=True)
+        result = self.run_cli(str(entry))
+        self.assertEqual(3, result.returncode)
+        self.assertIn("not an unpublished off-plan kept failure", result.stderr)
+        self.assertEqual("failed-kept", self.state(entry))
 
 
 class PublishRejectedTests(GalleryTestCase):
