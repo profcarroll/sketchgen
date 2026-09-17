@@ -281,6 +281,10 @@ RUNTIME_NOTE_KEYWORDS = ("framecount", "audiocontext")
 
 MAX_CONSOLE_LINES = 10
 
+#: Failed resources shown in the evidence. The gate caps what it records at
+#: eight; this is the same number, so nothing recorded is silently dropped.
+MAX_RESOURCE_LINES = 8
+
 #: The gate's five fixed checks, said the way a person would say them, for the
 #: ``evaluating`` step's detail line. The gate keeps its own names everywhere it
 #: already has them — ``console_clean``, ``frame_advancing``, ``sound_lib_ok``
@@ -523,6 +527,20 @@ def resolve_rules(rules_file: str | None, job_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+#: Checks the gate records but never fails a run on — the inverse of
+#: ``FAILABLE_CHECKS`` in gate/sketch_gate.py, kept as the inverse so that a new
+#: failable check the gate adds is reported here without this list being touched.
+#:
+#: ``is_looping`` is a declaration a sketch makes about itself: noLoop() means "I
+#: am static and I redraw when something happens", which is the right shape for
+#: an interactive sketch and one the gate accepts (spec 3.1). Calling it a failed
+#: check told the executor the opposite. Entry 429, a jigsaw puzzle, was handed
+#: "checks failed: is_looping" on nine of its ten attempts — and it is the
+#: headline on that job's last_error — while the gate was accepting the noLoop()
+#: every single time.
+ADVISORY_CHECKS = frozenset({"is_looping"})
+
+
 def _notes_for_check(name: str, notes: list[str]) -> list[str]:
     keywords = CHECK_NOTE_KEYWORDS.get(name, ())
     hits = []
@@ -562,7 +580,10 @@ def build_evidence(report: dict[str, Any] | None, gate_exit: int | None,
     notes = [str(note) for note in (report.get("notes") or [])]
     console = report.get("console") or []
 
-    failed_checks = [name for name, value in checks.items() if value is False]
+    failed_checks = [
+        name for name, value in checks.items()
+        if value is False and name not in ADVISORY_CHECKS
+    ]
     failed_assertions = [
         name for name, value in assertions.items() if not (value or {}).get("pass")
     ]
@@ -576,6 +597,27 @@ def build_evidence(report: dict[str, Any] | None, gate_exit: int | None,
     if not summary:
         summary.append("nothing in the report named a failure; read the notes below")
     parts.append(f"gate exit {gate_exit}: " + "; ".join(summary))
+
+    # First, above the checks and the assertions both, for the same reason
+    # evidence_with_preflight puts its findings above the gate's own first line:
+    # the model reads the top of what it is given, and this is the cause of
+    # everything under it. When a sketch reaches outside itself and the thing
+    # does not arrive, the canvas can be blank and every assertion reads zero —
+    # which looks exactly like broken interaction code. Entry 429 spent eight
+    # attempts rewriting handlers that already worked.
+    resources = report.get("resources") or []
+    if resources:
+        parts.append("")
+        parts.append("Resources the sketch asked for and did not get:")
+        for item in resources[:MAX_RESOURCE_LINES]:
+            parts.append(f"- {item.get('url')} — {item.get('why')}")
+        parts.append(
+            "  Reaching outside the sketch is allowed. What you reach for has to "
+            "arrive: use a host that serves CORS headers, or carry the asset in "
+            "the sketch itself as a data: URI. Until it arrives the canvas may be "
+            "blank and every check and assertion below will read zero, whatever "
+            "the rest of the code does."
+        )
 
     if failed_checks:
         parts.append("")

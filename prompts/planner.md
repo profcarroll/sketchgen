@@ -32,6 +32,13 @@ word you invent is thrown away by the validator, so choose from this list only:
 
 Rules:
   - no_motion and motion(idle) are mutually exclusive. Choose at most one.
+  - A sketch that is defined by what input does to it is STILL until it is
+    touched. A puzzle, a board game, a drawing tool, a form: these are
+    responds(click) and no_motion, not motion(idle). Write motion(idle)
+    alongside responds() only when the canvas genuinely has a life of its own
+    between touches — a drifting field that also scatters under the cursor.
+    Asking a jigsaw puzzle to move on its own is asking for a sketch nobody
+    wrote and the gate cannot pass.
   - responds(audio) only when the prompt asks for sound, listening, or a
     microphone. Never as decoration.
   - size(w,h) only when the prompt names a size. Write the numbers in, as in

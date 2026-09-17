@@ -29,6 +29,25 @@ every sketch:
 | `audio_context_running` | audio was started without a user gesture, so the context is suspended |
 | `frame_budget` | one frame of the idle window cost more wall time than `--frame-budget-ms`, or the whole run passed the `--budget-s` ceiling |
 
+## Resources the sketch did not get
+
+`report.json` carries a `resources` list beside the checks: every URL outside
+`SKETCH_ORIGIN` that the page asked for and did not receive, each with the
+browser's own reason (`net::ERR_FAILED`, `HTTP 404`). The same lines appear in
+`notes`.
+
+**It is not a check and it never fails a run.** A sketch may reach outside
+itself for an image, a font or a library, and one that works out that it can has
+worked something out. This exists because failing to *arrive* was invisible: a
+failed image is not a page error, so `console_clean` stays true, the canvas
+stays blank, and the only evidence is every assertion reading zero pixels
+changed — which reads as broken interaction code.
+
+Entry 429, a jigsaw puzzle, loaded `https://picsum.photos/400/400` in
+`preload()` across eight attempts. Every run took eleven seconds and drew
+nothing, and the model spent those attempts rewriting handlers that already
+worked, because nothing it was shown mentioned the image.
+
 ## The frame budget
 
 Added 2026-09-15, after job 166 (entry 165) and job 270 (entry 269). Both drew

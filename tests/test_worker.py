@@ -34,7 +34,7 @@ from sketchgen import worker  # noqa: E402
 
 
 def make_report(sketch_dir, *, checks=None, assertions=None, notes=None,
-                console=None, exit_code=0):
+                console=None, resources=None, exit_code=0):
     """One report.json in sketch_gate.py's schema (see its report construction)."""
     base_checks = {
         "console_clean": True,
@@ -53,6 +53,7 @@ def make_report(sketch_dir, *, checks=None, assertions=None, notes=None,
         "checks": base_checks,
         "assertions": assertions or {},
         "notes": notes or [],
+        "resources": resources or [],
         "console": console or [],
         "artefacts": {
             "png": str(Path(sketch_dir) / ".gate" / "gate.png"),
@@ -1396,6 +1397,67 @@ class TestEvidence(unittest.TestCase):
         self.assertIn("[pageerror] TypeError: nope", text)
         self.assertNotIn("hello", text)
         self.assertIn("AudioContext state after the click probe: suspended", text)
+
+    def test_a_sketch_that_declares_itself_static_is_not_told_it_failed(self):
+        """Entry 429: nine attempts told to fix a check the gate never failed.
+
+        is_looping is absent from the gate's FAILABLE_CHECKS on purpose — a
+        sketch that calls noLoop() is declaring itself static and the gate
+        believes it. Reporting it as a failed check told the executor to stop
+        writing the event-driven sketches an interactive brief actually needs.
+        """
+        report = make_report(
+            "/tmp/x",
+            checks={"is_looping": False},
+            assertions={"motion(idle)": {"pass": False, "detail": "0 of 9 changed"}},
+            exit_code=1,
+        )
+        text = worker.build_evidence(report, 1)
+        self.assertNotIn("checks failed", text)
+        self.assertNotIn("Fixed checks that failed", text)
+        self.assertNotIn("is_looping", text)
+        # the real reason the run failed is still the first thing it reads
+        self.assertIn("assertions failed: motion(idle)", text.splitlines()[0])
+
+    def test_a_real_failed_check_beside_an_advisory_one_still_reports(self):
+        report = make_report(
+            "/tmp/x",
+            checks={"is_looping": False, "console_clean": False},
+            exit_code=1,
+        )
+        text = worker.build_evidence(report, 1)
+        self.assertIn("checks failed: console_clean", text.splitlines()[0])
+        self.assertNotIn("is_looping", text)
+
+    def test_a_resource_that_did_not_arrive_is_named(self):
+        """Entry 429 again: eight attempts, a blank canvas, and no reason given.
+
+        A failed image is not a page error, so console_clean stayed true and the
+        only evidence was three assertions reading zero pixels changed — which
+        reads as a broken click handler when the sketch never started at all.
+        """
+        report = make_report(
+            "/tmp/x",
+            assertions={
+                "responds(click)": {"pass": False, "detail": "0 of 160000 pixels changed"},
+            },
+            resources=[{"url": "https://picsum.photos/400/400", "type": "image",
+                        "why": "net::ERR_FAILED"}],
+            exit_code=1,
+        )
+        text = worker.build_evidence(report, 1)
+        self.assertIn("Resources the sketch asked for and did not get:", text)
+        self.assertIn("https://picsum.photos/400/400 — net::ERR_FAILED", text)
+        # named as a cause, never as a prohibition
+        self.assertIn("Reaching outside the sketch is allowed", text)
+        self.assertNotIn("checks failed", text)
+        # and it is above the zeroed assertion it explains
+        self.assertLess(text.index("picsum"), text.index("0 of 160000"))
+
+    def test_no_resource_section_when_nothing_failed_to_load(self):
+        report = make_report("/tmp/x", checks={"console_clean": False}, exit_code=1)
+        text = worker.build_evidence(report, 1)
+        self.assertNotIn("Resources the sketch", text)
 
     def test_only_the_first_ten_console_errors_are_carried(self):
         console = [{"t": "x", "type": "error", "text": f"error {i}"} for i in range(25)]

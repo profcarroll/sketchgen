@@ -80,9 +80,30 @@ SIZE_RE = re.compile(r"^size\(\s*(\d+)\s*,\s*(\d+)\s*\)$")
 EXCLUSIVE = [("motion(idle)", "no_motion")]
 
 #: One of these must be present: the spec's liveness check is the one that
-#: matters, so a plan that says nothing about motion gets ``motion(idle)``.
+#: matters, so a plan that says nothing about motion has one chosen for it.
 LIVENESS = ("motion(idle)", "no_motion")
 LIVENESS_DEFAULT = "motion(idle)"
+
+#: ...except when the plan is about answering input. A sketch defined by what a
+#: click or a drag does to it is still until it is touched: that is what a
+#: puzzle, a game board or a drawing tool IS, and ``motion(idle)`` asks it to
+#: move on its own as well. Entry 429, a jigsaw puzzle, carried
+#: responds(click) + responds(drag) + motion(idle) and spent all ten attempts
+#: failing an assertion no correct jigsaw puzzle can pass. So a plan that says
+#: nothing about motion and everything about input defaults the other way.
+#:
+#: Only the DEFAULT moves. A planner that asks for both still gets both: a
+#: particle field that also scatters under the cursor is a real sketch, and this
+#: is not the place to tell it that it is not.
+LIVENESS_DEFAULT_INTERACTIVE = "no_motion"
+INTERACTIVE = ("responds(click)", "responds(drag)", "responds(audio)")
+
+
+def _liveness_default(ok: list[str]) -> str:
+    """Which way to settle a plan that never mentioned motion."""
+    if any(word in ok for word in INTERACTIVE):
+        return LIVENESS_DEFAULT_INTERACTIVE
+    return LIVENESS_DEFAULT
 
 DEFAULT_HOST = "http://127.0.0.1:11434"
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "planner.md"
@@ -357,8 +378,9 @@ def validate_detailed(
         ok.append(word)
 
     if not any(w in ok for w in LIVENESS):
-        ok.append(LIVENESS_DEFAULT)
-        defaulted.append(LIVENESS_DEFAULT)
+        chosen = _liveness_default(ok)
+        ok.append(chosen)
+        defaulted.append(chosen)
     return ok, rejected, defaulted
 
 
@@ -366,8 +388,10 @@ def validate(assertions: list[str]) -> tuple[list[str], list[dict[str, str]]]:
     """Keep only vocabulary words; return ``(ok, rejected)``.
 
     Drops duplicates, refuses the second half of a mutually exclusive pair, and
-    adds ``motion(idle)`` when the model said nothing about motion at all. Use
-    :func:`validate_detailed` when you need to record which words were added.
+    settles the liveness question when the model said nothing about motion at
+    all — ``no_motion`` for a plan that answers input, ``motion(idle)``
+    otherwise. Use :func:`validate_detailed` when you need to record which words
+    were added.
     """
     ok, rejected, _ = validate_detailed(assertions)
     return ok, rejected
