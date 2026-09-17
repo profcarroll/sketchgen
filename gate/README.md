@@ -29,6 +29,36 @@ every sketch:
 | `audio_context_running` | audio was started without a user gesture, so the context is suspended |
 | `frame_budget` | one frame of the idle window cost more wall time than `--frame-budget-ms`, or the whole run passed the `--budget-s` ceiling |
 
+## What may fail a run, and what may not
+
+The gate reports two different kinds of thing and they are not the same kind of
+thing at all.
+
+`FAILABLE_CHECKS` is **quality assurance**: the page threw, the sketch froze, the
+addon it asked for is missing, audio started without a gesture, a frame cost more
+than the budget. A visitor meets the result of every one of these. They keep
+their teeth and always will.
+
+The **assertions** are a different question: does this sketch match a brief
+another model wrote? A sketch that misses one is not broken. It is a different
+sketch from the one that was predicted, which is sometimes a mistake and
+sometimes the only interesting thing that happened all day.
+
+`sketchgen/worker.py` now tells the two apart. A job that spends its attempts
+without ever failing a QA check goes to `held` — the same queue a clean pass goes
+to — with the assertions it missed recorded in `entries.offplan_json`, and a
+person decides. Only a QA failure still ends a job as `failed-kept`.
+
+This was measured before it was changed: of the first 65 failed jobs, **39 had an
+attempt that passed every check above** and was thrown away for missing an
+assertion. Among them a sketch that studied Chuck Close and went to Wikimedia for
+the real paintings, and one that worked out it could build its own image as a
+`data:` URI when it could not fetch one.
+
+The gate itself is unchanged by this. It still reports exactly what it sees and
+still exits 1 on either kind of miss; what changed is that the worker no longer
+treats both as the end of the road.
+
 ## Resources the sketch did not get
 
 `report.json` carries a `resources` list beside the checks: every URL outside

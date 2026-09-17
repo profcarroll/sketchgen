@@ -2574,6 +2574,47 @@ def _gate_summary(conn: sqlite3.Connection, job_id: int) -> str:
     return f"attempt {row['n']}: " + (first[0] if first else f"gate exit {row['gate_exit']}")
 
 
+def _offplan_names(row: sqlite3.Row) -> list[str]:
+    """The assertions this entry's kept attempt missed, if it missed any."""
+    try:
+        raw = row["offplan_json"]
+    except (IndexError, KeyError):
+        return []
+    if not raw:
+        return []
+    try:
+        names = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [str(n) for n in names] if isinstance(names, list) else []
+
+
+def _held_summary(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    """What this card is asking a person to judge.
+
+    Two different things arrive in Held now. One passed the gate outright. The
+    other spent every attempt without ever failing a QA check and diverged from
+    the plan the planner wrote — it runs, it is just not what was predicted, and
+    whether that is a mistake or the interesting part is exactly the judgement a
+    person is here to make.
+
+    :func:`_gate_summary` reads the LAST attempt, which for an off-plan entry is
+    not the attempt the card shows: the entry keeps its best one. So say which
+    attempt is on screen and what it diverged on, rather than quoting a verdict
+    on a different attempt entirely.
+    """
+    missed = _offplan_names(row)
+    if not missed:
+        return _gate_summary(conn, int(row["job_id"]))
+    kept = ""
+    source = str(row["source_dir"] or "")
+    if source:
+        tail = Path(source).name
+        if tail.startswith("attempt-"):
+            kept = f" (attempt {tail.split('-', 1)[1]} kept)"
+    return f"off-plan{kept}: runs clean, missed " + ", ".join(missed)
+
+
 def _runnable_attempt(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> int | None:
     """Which attempt of an entry the card's run button runs, if any.
 
@@ -2700,7 +2741,7 @@ def _card_face(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
         f"{stage}"
         f'<p class="prompt">{esc(root or "—")}</p>'
         f"{revision}"
-        f'<p class="meta">{esc(_gate_summary(conn, job_id))}'
+        f'<p class="meta">{esc(_held_summary(conn, row))}'
         f" · {esc(row['rules_file'] or '—')} · {esc(row['executor'] or '—')}"
         f' · job <a href="/job/{job_id}">{job_id}</a>'
         f" · {esc(_lineage_note(conn, row, with_generation=False))}"

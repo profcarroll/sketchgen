@@ -496,6 +496,34 @@ LINEAGE_JSON_LIMIT = 100 * 1024
 LINEAGE_ROOT_PROMPT_CAP = 200
 
 
+def _offplan(row: Any) -> list[str]:
+    """The assertions the kept attempt missed, for an entry that still runs.
+
+    ``offplan_json`` is written by the worker when a job spends its attempts
+    without ever failing a QA check: the sketch works and diverged from a
+    machine-written brief. Empty for every entry that passed the gate outright,
+    and for every row written before migration 011, which had no such column.
+    """
+    try:
+        raw = row["offplan_json"]
+    except (IndexError, KeyError):
+        return []
+    if not raw:
+        return []
+    try:
+        names = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    return [str(name) for name in names] if isinstance(names, list) else []
+
+
+def _and_list(items: list[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c`` — the gate's names read as a sentence."""
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
 def _is_public(row: Any) -> bool:
     """On the site: a public state AND the stamp a successful push leaves."""
     return row["state"] in PUBLIC_STATES and bool(row["published_utc"])
@@ -1971,7 +1999,19 @@ def _write_entry(
     if not title:
         title = f"entry {entry_id}"
     failed_note = ""
-    if row["state"] == "failed-kept":
+    offplan = _offplan(row)
+    if offplan:
+        # It ran. It threw nothing, it did not freeze, it stayed inside the
+        # frame budget — it simply is not what the plan predicted, and the plan
+        # was written by a model. Saying which assertion it diverged on is a
+        # description; calling it a rejection would be a verdict this gallery
+        # has no business handing down (see the note under Judgment: two
+        # populations, two scores, never one aggregate).
+        failed_note = (
+            '<p class="chip offplan">OFF-PLAN — this sketch runs. It differs from '
+            f"the plan the planner wrote for it: {_esc(_and_list(offplan))}.</p>"
+        )
+    elif row["state"] == "failed-kept":
         reason = _rejection_reason(conn, row)
         failed_note = (
             '<p class="chip failed">REJECTED BY THE GATE — kept, because a gallery that only '

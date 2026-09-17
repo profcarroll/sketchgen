@@ -540,6 +540,44 @@ def resolve_rules(rules_file: str | None, job_id: int) -> str:
 #: every single time.
 ADVISORY_CHECKS = frozenset({"is_looping"})
 
+#: The checks that are allowed to end a job — gate/sketch_gate.py's
+#: FAILABLE_CHECKS, named here because this module has to tell two kinds of
+#: failure apart and the gate does not.
+#:
+#: These are quality assurance: the page threw, the sketch froze, the addon it
+#: asked for is missing, audio was started without a gesture, a frame cost more
+#: than the budget. A visitor meets the result of every one of them, so they keep
+#: their teeth.
+#:
+#: Everything else the gate reports is an ASSERTION — whether the sketch matches
+#: a brief another model wrote. Missing one of those is not a broken sketch, it
+#: is a different sketch, and 39 of the first 65 failed jobs had an attempt that
+#: passed every check above and was destroyed for it. Those now go to a person.
+QA_CHECKS = frozenset({
+    "console_clean", "frame_advancing", "sound_lib_ok",
+    "audio_context_running", "frame_budget",
+})
+
+
+def qa_clean(report: dict[str, Any] | None) -> bool:
+    """True when nothing that is allowed to fail a job did.
+
+    A missing report is not clean: the gate could not be read, and this function
+    never guesses in the sketch's favour when it has nothing to go on.
+    """
+    if not report:
+        return False
+    checks = report.get("checks") or {}
+    return not any(checks.get(name) is False for name in QA_CHECKS)
+
+
+def missed_assertions(report: dict[str, Any] | None) -> list[str]:
+    """The assertions the sketch did not satisfy, in the gate's own order."""
+    if not report:
+        return []
+    return [name for name, value in (report.get("assertions") or {}).items()
+            if not (value or {}).get("pass")]
+
 
 def _notes_for_check(name: str, notes: list[str]) -> list[str]:
     keywords = CHECK_NOTE_KEYWORDS.get(name, ())
@@ -1682,6 +1720,43 @@ class Worker:
         db.set_control(self.conn, "paused", reason)
         self.log("control: paused")
 
+    @staticmethod
+    def _attempt_report(attempt: Any) -> dict[str, Any]:
+        """One attempt's gate report, or {} when it never reached the gate."""
+        path = getattr(attempt, "gate_report_path", None)
+        if not path:
+            return {}
+        try:
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _best_attempt(self, attempts: list[Any]) -> Any | None:
+        """The attempt worth keeping, which is usually not the last one.
+
+        Ranked on what a visitor would care about, in order: it runs at all (no
+        QA check false), then how much of the plan it managed, then recency as
+        the tiebreak.
+
+        The entry used to take attempts[-1] unconditionally. Across the first 65
+        failed jobs the last attempt was the worst one 78% of the time, and all
+        44 kept failures on the site are showing it: entry 429 publishes a blank
+        canvas because its tenth attempt fetched an image that never arrived,
+        while its second drew a working puzzle from an image it made itself.
+
+        A job whose gate run passed is unaffected. That attempt is QA-clean with
+        every assertion satisfied, which is the maximum, and the recency tiebreak
+        picks it over any earlier one — so one path serves both outcomes.
+        """
+        if not attempts:
+            return None
+        def rank(attempt: Any) -> tuple[int, int, int]:
+            report = self._attempt_report(attempt)
+            assertions = report.get("assertions") or {}
+            passed = sum(1 for v in assertions.values() if (v or {}).get("pass"))
+            return (1 if qa_clean(report) else 0, passed, int(attempt.n))
+        return max(attempts, key=rank)
+
     def _create_entry(self, job_id: int, state: str, rules: str) -> int | None:
         """The gallery-visible row, written when the job stops moving.
 
@@ -1695,17 +1770,19 @@ class Worker:
         if job is None:  # pragma: no cover - the job was just transitioned
             return None
         attempts = db.list_attempts(self.conn, job_id)
+        # `last` is the attempt that ENDED the job and is what the counters and
+        # the job's own error line are about; `kept` is the one the entry shows.
+        # For a pass they are the same attempt.
         last = attempts[-1] if attempts else None
+        kept = self._best_attempt(attempts)
 
-        report: dict[str, Any] = {}
-        if last is not None and last.gate_report_path:
-            try:
-                report = json.loads(
-                    Path(last.gate_report_path).read_text(encoding="utf-8")
-                )
-            except (OSError, ValueError):
-                report = {}
+        report = self._attempt_report(kept) if kept is not None else {}
         artefacts = report.get("artefacts") or {}
+        # Only a sketch that RAN can be off-plan. One that threw or froze missed
+        # its assertions too — of course it did, there was nothing on the canvas
+        # to assert about — and recording that as a divergence would put "this
+        # sketch runs" on the page of one that does not.
+        missed = missed_assertions(report) if qa_clean(report) else []
 
         def total(name: str) -> float | int | None:
             values = [getattr(row, name) for row in attempts]
@@ -1720,13 +1797,16 @@ class Worker:
             state=state,
             prompt=job.prompt,
             brief=job.brief,
-            statement=last.statement if last else None,
+            statement=kept.statement if kept else None,
             planner=job.planner,
             planner_prompt_version=self._planner_prompt_version,
-            executor=last.model if last else self.executor_model,
-            executor_prompt_version=last.prompt_version if last else None,
-            rules_file=(last.rules_file if last and last.rules_file else rules),
+            executor=kept.model if kept else self.executor_model,
+            executor_prompt_version=kept.prompt_version if kept else None,
+            rules_file=(kept.rules_file if kept and kept.rules_file else rules),
             assertions_json=job.assertions_json,
+            # NULL when the kept attempt satisfied the whole plan, which is what
+            # tells a clean pass from a sketch a person is being asked to judge.
+            offplan_json=json.dumps(missed) if missed else None,
             attempts=len(attempts),
             prompt_tokens=total("prompt_tokens"),
             completion_tokens=total("completion_tokens"),
@@ -1735,7 +1815,7 @@ class Worker:
             seed=report.get("seed", executor.DEFAULT_SEED),
             parent_entry_id=job.parent_entry_id,
             submitted_by=job.submitted_by,
-            source_dir=last.source_dir if last else None,
+            source_dir=kept.source_dir if kept else None,
             strip_path=artefacts.get("strip"),
             png_path=artefacts.get("png"),
         )
@@ -2088,6 +2168,26 @@ class Worker:
 
         first_line = (gate_evidence or "gate failed").splitlines()[0]
         if last:
+            # The attempts are spent. What happens now depends on WHY the gate
+            # said no, and the gate does not distinguish: a sketch that threw is
+            # not the same as a sketch that ran beautifully and drew something
+            # other than what a model's brief predicted.
+            #
+            # If any attempt came through with every QA check intact, this job
+            # produced a sketch that works. It goes to the same queue a clean
+            # pass goes to and a person decides. If none did, it is a failure
+            # and it is kept as one, exactly as before.
+            best = self._best_attempt(db.list_attempts(self.conn, job.id))
+            if best is not None and qa_clean(self._attempt_report(best)):
+                missed = missed_assertions(self._attempt_report(best))
+                db.transition(self.conn, job.id, "held")
+                self.log(
+                    f"job {job.id}: off-plan after {n} attempt(s) — attempt "
+                    f"{best.n} runs clean and missed "
+                    f"{', '.join(missed) or 'nothing'}; a person decides"
+                )
+                self._create_entry(job.id, "held", rules)
+                return None
             db.transition(self.conn, job.id, "failed", last_error=first_line)
             self.log(f"job {job.id}: failed after {n} attempt(s): {first_line}")
             self._create_entry(job.id, "failed-kept", rules)
