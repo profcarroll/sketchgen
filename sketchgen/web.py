@@ -95,6 +95,7 @@ import threading
 import time
 import urllib.parse
 from dataclasses import asdict, dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -258,6 +259,17 @@ class App:
     jobs_dir: str
     once_for_test: bool = False
     quit_event: threading.Event | None = None
+
+    #: The one batch this web process will run at a time, and the lock that
+    #: every reader and writer of it takes (§1.5, §1.9). It lives here rather
+    #: than in a table because a batch is a report on work in flight and not a
+    #: record: every step it takes is atomic on its own, so a process that dies
+    #: mid-batch loses the report and nothing else. ``batch_lock`` is the
+    #: state that says "busy", and it is on the server rather than in the page
+    #: that was open when the press happened, which is what stops the second
+    #: press queuing a second publisher behind the first.
+    batch: Batch | None = None
+    batch_lock: threading.Lock = dataclass_field(default_factory=threading.Lock)
 
     def connect(self) -> sqlite3.Connection:
         return db.connect(self.db_path)
@@ -3008,6 +3020,46 @@ def said(form: dict, *legacy: str) -> str:
     return ""
 
 
+def _reject_reason(reason: str) -> str:
+    """What the entry's ``reject_reason`` column gets.
+
+    An empty box is allowed and has always meant "the operator gave none"
+    (§1.3), so the words are the same whether the reason came from a single
+    press or from a batch item, and both callers spell it the same way.
+    """
+    return reason.strip() or "rejected by operator"
+
+
+def _reject_state(
+    conn: sqlite3.Connection, entry_id: int, reason: str
+) -> str | None:
+    """The first half of a rejection: the state flip, and no git at all.
+
+    Split out of :func:`reject_entry` because a batch does the two halves in
+    different places — every rejection's state moves first, and then one
+    :func:`publish.publish_many` carries the whole batch's commits to the
+    gallery in one push (§1.6). Returns ``None`` when the flip happened and the
+    refusal message when it did not, so the single route and the batch refuse
+    an entry that is no longer ``held`` in exactly the same words.
+    """
+    row = conn.execute(
+        "SELECT id, job_id, state FROM entries WHERE id = ?", (entry_id,)
+    ).fetchone()
+    if row is None:
+        return f"there is no entry {entry_id}"
+    if row["state"] != "held":
+        return f"entry {entry_id} is {row['state']}, not held — nothing changed"
+    reason = _reject_reason(reason)
+    try:
+        db.entry_transition(conn, entry_id, "rejected", reject_reason=reason)
+    except (db.IllegalTransition, db.UnknownEntry) as exc:
+        return f"refused: {exc}"
+    job = db.get_job(conn, int(row["job_id"]))
+    if job is not None and job.state == "held":
+        db.transition(conn, job.id, "rejected", last_error=reason)
+    return None
+
+
 def reject_entry(
     app: App, conn: sqlite3.Connection, entry_id: int, reason: str
 ) -> str:
@@ -3030,23 +3082,11 @@ def reject_entry(
     ``published_utc``, which is how the console already shows a kept failure
     that is waiting: pending, and publishable again later.
     """
-    row = conn.execute(
-        "SELECT id, job_id, state FROM entries WHERE id = ?", (entry_id,)
-    ).fetchone()
-    if row is None:
-        return f"there is no entry {entry_id}"
-    if row["state"] != "held":
-        return f"entry {entry_id} is {row['state']}, not held — nothing changed"
-    reason = reason.strip() or "rejected by operator"
-    try:
-        db.entry_transition(conn, entry_id, "rejected", reject_reason=reason)
-    except (db.IllegalTransition, db.UnknownEntry) as exc:
-        return f"refused: {exc}"
-    job = db.get_job(conn, int(row["job_id"]))
-    if job is not None and job.state == "held":
-        db.transition(conn, job.id, "rejected", last_error=reason)
+    refusal = _reject_state(conn, entry_id, reason)
+    if refusal is not None:
+        return refusal
     published = publish_entry(app, conn, entry_id)
-    return f"Entry {entry_id} rejected — {reason}. {published}"
+    return f"Entry {entry_id} rejected — {_reject_reason(reason)}. {published}"
 
 
 def archive_entry(conn: sqlite3.Connection, entry_id: int) -> str:
@@ -3068,6 +3108,661 @@ def archive_entry(conn: sqlite3.Connection, entry_id: int) -> str:
         f"Entry {entry_id} archived — off the lists, nothing deleted; "
         f"it is still at /entry/{entry_id}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Held, as a batch (packet 11)
+#
+# The four verbs on a card stop being four requests and become four marks; one
+# press of Process runs the lot. Why: a publish is a render, two commits and
+# two pushes, and the page waits on all of it before it redirects. Thirty
+# entries waiting is thirty waits, and a second press during any of them is a
+# second publisher queuing on the gallery checkout lock behind the first. A
+# batch removes the waiting and the second press together — the "busy" state is
+# :attr:`App.batch`, on the server, so it outlives the page that pressed.
+#
+# Everything here is memory. The batch is a report on work in flight, not a
+# record of it: the gallery's ``git log`` and the entries table are the record,
+# and each step this runner takes is atomic on its own. So there is no table
+# and no migration, and a web process that dies mid-batch loses the report and
+# nothing else (§1.9).
+# ---------------------------------------------------------------------------
+
+#: The three mutually exclusive outcomes a card's ``do-<id>`` field may carry.
+#: Critique is not one of them: it is its own field, because it stacks with
+#: Publish or Archive and stands alone (§1.2).
+BATCH_OUTCOMES = frozenset({"publish", "reject", "archive"})
+
+#: The card's box, as long as packet 12's ``maxlength`` lets it be.
+BATCH_TEXT_MAX = 400
+
+#: The five phases, in the order a batch runs them (§1.6), with the labels the
+#: tray prints. Order is about what is legal and not about what was marked
+#: first: a line may not grow from a ``rejected`` parent and an archived entry
+#: is off the lists, so critiques are queued while their parents are still
+#: held; archives are a state flip with no git in them; and the rejections and
+#: publications go to the gallery together so that eight of them are one push
+#: and one index re-render instead of sixteen pushes (§1.7).
+BATCH_PHASES: tuple[tuple[str, str], ...] = (
+    ("critique", "Critiques"),
+    ("archive", "Archives"),
+    ("commit", "Render & commit"),
+    ("push", "Push"),
+    ("index", "Index"),
+)
+
+#: The two refusals that are about the batch rather than about an entry. The
+#: first answers the press that starts a second batch, the second answers the
+#: single-entry routes while one is running (§3.5).
+BATCH_BUSY = "a batch is already running — nothing changed"
+BATCH_GUARD = "a batch is running — nothing changed; it will finish first"
+
+#: ``do-431``, ``cri-431``, ``text-431``: the form-field contract packet 12's
+#: one page-wide form sends, and the only fields read here.
+BATCH_FIELD_RE = re.compile(r"^(do|cri|text)-(.*)$")
+
+
+@dataclass
+class BatchItem:
+    """One thing the batch will do to one entry.
+
+    A card marked Publish *and* Critique is two of these, because they are two
+    pieces of work with two outcomes to report and they happen in different
+    phases.
+    """
+
+    entry_id: int
+    verb: str                 # "critique" | "archive" | "reject" | "publish"
+    text: str = ""
+    state: str = "queued"     # queued | working | done | refused | failed
+    message: str = ""
+
+
+@dataclass
+class Batch:
+    """One press of Process, and everything the tray needs to describe it.
+
+    ``step`` counts *finished* steps and ``now`` is the sentence for the step in
+    flight, so the bar is counted in real work and never in elapsed time: there
+    is no median here to measure a batch against and the bar does not pretend
+    to one (§1.8).
+
+    ``phase_of`` and ``phase_done`` are not in the plan's sketch of this class
+    and are here because the counts have to survive the run: a push and an
+    index are one step each and only exist when something was committed, and
+    ``publish_many``'s ``on_step`` says which phase it has reached but not how
+    far through the whole batch that is.
+    """
+
+    id: str                   # utc_now() at the start; the tray's identity
+    items: list[BatchItem]    # already in run order (§1.6)
+    state: str = "running"    # running | done
+    phase: str = ""           # critique | archive | commit | push | index
+    now: str = ""             # the one present-tense sentence
+    step: int = 0
+    steps: int = 0
+    started_utc: str = ""
+    ended_utc: str | None = None
+    index_note: str | None = None
+    phase_of: dict[str, int] = dataclass_field(default_factory=dict)
+    phase_done: dict[str, int] = dataclass_field(default_factory=dict)
+
+
+def _entry_states(
+    conn: sqlite3.Connection, entry_ids: Iterable[int]
+) -> dict[int, str]:
+    """The current state of each of these entries; missing ids are absent."""
+    ids = sorted(set(int(entry_id) for entry_id in entry_ids))
+    if not ids:
+        return {}
+    marks = ", ".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT id, state FROM entries WHERE id IN ({marks})", tuple(ids)
+    ).fetchall()
+    return {int(row["id"]): str(row["state"]) for row in rows}
+
+
+def batch_plan(
+    conn: sqlite3.Connection, form: dict[str, list[str]]
+) -> list[BatchItem]:
+    """Read one press of Process into run order, or refuse the whole press.
+
+    Every refusal here is raised before anything runs and means nothing
+    changed, which is the promise the tally beside the button makes: what it
+    says the press will do is what the press does, all of it or none of it
+    (§1.12). The box is read at Process time by whichever verb reads it — the
+    reason for Reject, where empty is allowed, and the revision sentence for
+    Critique, where it is not (§1.3).
+
+    An entry whose state moved between the page load and the press is a
+    different thing and is **not** refused here: it is that one item's own
+    refusal at run time, reported on that one item, because the other
+    twenty-nine marks are still good. The exception is Reject, which is only
+    legal from ``held`` and which a kept rejection is never offered.
+    """
+    outcome: dict[int, str] = {}
+    critique: set[int] = set()
+    text: dict[int, str] = {}
+    for key, values in form.items():
+        match = BATCH_FIELD_RE.match(key)
+        if match is None:
+            continue  # `back`, and anything else the form happens to carry
+        kind, tail = match.group(1), match.group(2)
+        if not tail.isdigit():
+            raise Refused(f"{key}: that is not an entry id — nothing changed")
+        entry_id = int(tail)
+        value = (values or [""])[0].strip()
+        if kind == "do":
+            if value:  # a radio nobody pressed sends nothing at all
+                outcome[entry_id] = value
+        elif kind == "cri":
+            if value:  # a checkbox sends "on" when it is ticked and nothing when not
+                critique.add(entry_id)
+        else:
+            text[entry_id] = value[:BATCH_TEXT_MAX]
+    marked = sorted(set(outcome) | critique)
+    if not marked:
+        raise Refused("nothing is marked — nothing changed")
+    for entry_id, verb in sorted(outcome.items()):
+        if verb not in BATCH_OUTCOMES:
+            raise Refused(
+                f"entry {entry_id}: {verb} is not publish, reject or archive "
+                "— nothing changed"
+            )
+    states = _entry_states(conn, marked)
+    for entry_id in marked:
+        if entry_id not in states:
+            raise Refused(f"there is no entry {entry_id} — nothing changed")
+    for entry_id in sorted(critique):
+        if not text.get(entry_id):
+            raise Refused(
+                f"entry {entry_id}: a critique needs a sentence — nothing changed"
+            )
+        if outcome.get(entry_id) == "reject":
+            raise Refused(
+                f"entry {entry_id}: Reject and Critique read the same box, and "
+                "one sentence cannot be a reason and a revision at once "
+                "— nothing changed"
+            )
+    for entry_id, verb in sorted(outcome.items()):
+        if verb == "reject" and states[entry_id] != "held":
+            raise Refused(
+                f"entry {entry_id} is {states[entry_id]}, not held — a kept "
+                "rejection is a rejection already — nothing changed"
+            )
+    items = [
+        BatchItem(entry_id, "critique", text.get(entry_id, ""))
+        for entry_id in sorted(critique)
+    ]
+    for verb in ("archive", "reject", "publish"):
+        items.extend(
+            BatchItem(entry_id, verb, text.get(entry_id, ""))
+            for entry_id in sorted(
+                key for key, value in outcome.items() if value == verb
+            )
+        )
+    return items
+
+
+def _publisher() -> Any | None:
+    """``sketchgen.publish``, or ``None`` when packet 3.2 is not installed."""
+    try:
+        from sketchgen import publish  # type: ignore[attr-defined]
+    except ImportError:
+        return None
+    return publish
+
+
+def _publish_many() -> Callable[..., Any] | None:
+    """:func:`publish.publish_many` if it is there, else ``None`` (§3.3).
+
+    Looked up by name at run time, and never imported at the top, so this
+    packet lands and works before packet 10 does: without it the runner loops
+    the single-entry publish and reports each as its own commit step, which is
+    today's cost wearing the batch's interface. A test patches the name in and
+    out to exercise both paths.
+    """
+    module = _publisher()
+    found = getattr(module, "publish_many", None) if module is not None else None
+    return found if callable(found) else None
+
+
+def _phase_totals(items: Iterable[BatchItem], *, many: bool) -> dict[str, int]:
+    """How many steps each phase is going to take.
+
+    One per critique, one per archive, one per entry to be committed, one for
+    the push and one for the index (§1.8). Nothing to commit means no push and
+    no index; no ``publish_many`` means the same, because the fallback carries
+    a push and an index inside every one of its commit steps.
+    """
+    counts = {key: 0 for key, _label in BATCH_PHASES}
+    for item in items:
+        key = "commit" if item.verb in ("reject", "publish") else item.verb
+        counts[key] = counts.get(key, 0) + 1
+    together = 1 if (counts["commit"] and many) else 0
+    counts["push"] = together
+    counts["index"] = together
+    return counts
+
+
+def start_batch(app: App, items: list[BatchItem]) -> Batch:
+    """Put one batch on ``app`` and start the thread that runs it.
+
+    One batch at a time, per web process (§1.5): the lock is taken to look, a
+    running batch is refused, a finished one is replaced, and the lock is
+    released before the thread starts so that the first thing the runner does
+    is not to wait on the request that made it. The thread is a daemon because
+    ``update.sh`` restarting this process is allowed to abandon a batch where it
+    stands — deploy with the tray empty.
+    """
+    batch = Batch(
+        id=db.utc_now(),
+        items=list(items),
+        started_utc=db.utc_now(),
+        phase_of=_phase_totals(items, many=_publish_many() is not None),
+    )
+    batch.steps = sum(batch.phase_of.values())
+    with app.batch_lock:
+        if app.batch is not None and app.batch.state == "running":
+            raise Refused(BATCH_BUSY)
+        app.batch = batch
+    threading.Thread(
+        target=_BatchRun(app, batch).run, name="held-batch", daemon=True
+    ).start()
+    return batch
+
+
+class _BatchRun:
+    """The runner: one thread, its own connection, every write under the lock.
+
+    Its own connection because the request that started it has already closed
+    its own by the time the thread gets going, and because a sqlite3 connection
+    belongs to the thread that opened it. Its own *lock discipline* because
+    ``/api/batch.json`` is read every second from every open tab while this is
+    writing: readers take a snapshot under :attr:`App.batch_lock`, and every
+    mutation of the batch here takes it too.
+    """
+
+    def __init__(self, app: App, batch: Batch) -> None:
+        self.app = app
+        self.batch = batch
+
+    # -- the run -----------------------------------------------------------
+
+    def run(self) -> None:
+        """Never raises. An exception is the batch's report, not a traceback.
+
+        Whatever goes wrong, the items that had not finished become ``failed``
+        with the exception's own words and the batch still ends ``done`` with
+        an ``ended_utc``, because a tray stuck on ``Processing…`` would lock the
+        page for as long as the process lives (§1.5) and there would be nothing
+        on the screen saying why.
+        """
+        conn = None
+        try:
+            conn = self.app.connect()
+            self._critiques(conn)
+            self._archives(conn)
+            self._publications(conn)
+        except Exception as exc:  # noqa: BLE001 - the thread never raises out
+            self._blame(exc)
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            self._finish()
+
+    def _critiques(self, conn: sqlite3.Connection) -> None:
+        """Queue every marked child while its parent is still ``held``.
+
+        First, and for that reason: :func:`spawn_child` grows a line from a
+        held, published or kept entry and refuses a rejected one, so a card
+        marked Publish and Critique together has to spawn before the publish
+        stamps it, and a card marked Archive and Critique before the archive
+        takes it off the lists.
+        """
+        for item in self._of("critique"):
+            self._step(
+                "critique",
+                f"Entry {item.entry_id} — queuing a child from the critique",
+                item,
+            )
+            self._settle(item, spawn_child(conn, item.entry_id, {"text": [item.text]}))
+
+    def _archives(self, conn: sqlite3.Connection) -> None:
+        for item in self._of("archive"):
+            self._step("archive", f"Entry {item.entry_id} — archiving", item)
+            self._settle(item, archive_entry(conn, item.entry_id))
+
+    def _publications(self, conn: sqlite3.Connection) -> None:
+        """Every rejection's state flip, then one trip to the gallery.
+
+        The flips happen first and all together: a rejection is a state flip
+        plus a publish to the rejections catalog (see :func:`reject_entry`), and
+        the publish half is the same render-scan-commit the publications get, so
+        both verbs go to the gallery in the same call with the rejections
+        leading. A flip that is refused drops that entry before anything is
+        rendered, and the phase it was counted in shrinks by the step it will
+        not take.
+        """
+        commits = self._of("reject") + self._of("publish")
+        if not commits:
+            return
+        entry_ids: list[int] = []
+        for item in commits:
+            if item.verb == "reject":
+                refusal = _reject_state(conn, item.entry_id, item.text)
+                if refusal is not None:
+                    self._close(item, "refused", refusal)
+                    self._shrink("commit")
+                    continue
+            entry_ids.append(item.entry_id)
+        if not entry_ids:
+            self._shrink("push")
+            self._shrink("index")
+            return
+        many = _publish_many()
+        if many is None:
+            self._one_at_a_time(conn, commits)
+        else:
+            self._all_at_once(conn, many, commits, entry_ids)
+
+    def _one_at_a_time(
+        self, conn: sqlite3.Connection, commits: list[BatchItem]
+    ) -> None:
+        """Without packet 10: today's publish, once per entry (§3.3).
+
+        Each entry is its own commit step and carries its own push and index
+        inside it, so there is no push step and no index step to show. The batch
+        is exactly as slow as thirty single presses were; what it is not is
+        thirty waits in front of a person, and the interface the tray reads is
+        the same one ``publish_many`` will fill.
+        """
+        for item in commits:
+            if item.state != "queued":
+                continue  # a rejection whose flip was refused above
+            self._step(
+                "commit",
+                f"Entry {item.entry_id} — rendering, scanning, "
+                f"committing e/{item.entry_id}/",
+                item,
+            )
+            message = publish_entry(self.app, conn, item.entry_id)
+            if is_refusal(message):
+                self._close(item, "refused", message)
+            else:
+                self._close(item, "done", self._won(item, message))
+
+    def _all_at_once(
+        self,
+        conn: sqlite3.Connection,
+        many: Callable[..., Any],
+        commits: list[BatchItem],
+        entry_ids: list[int],
+    ) -> None:
+        """One ``publish_many``: n commits, one push, one index (§1.7).
+
+        The invariant that comes with it is ``publish.py``'s own: a row becomes
+        ``published`` only after the push that carried its commit has
+        succeeded. So a push that fails is not this batch's individual failures
+        — it is every publication in it reported failed and still held, with
+        the checkout back where the batch found it — while a per-entry refusal
+        (the personal-data scan, the generator, bytes already in the gallery)
+        drops that one entry and the batch goes on.
+        """
+        module = _publisher()
+        refused_type = getattr(module, "PublishRefused", None) if module else None
+        try:
+            result = many(conn, entry_ids, on_step=self._publisher_step)
+        except Exception as exc:  # noqa: BLE001 - reported, never raised
+            # Nothing had happened yet when a checkout refusal was raised (not
+            # a repo, dirty tree, wrong branch, no remote), so it is every
+            # entry's refusal and not one entry's; a failure is a failure on
+            # all of them for the same reason.
+            kind = (
+                "refused"
+                if refused_type is not None and isinstance(exc, refused_type)
+                else "failed"
+            )
+            note = f"refused: {exc}" if kind == "refused" else f"publish failed: {exc}"
+            for item in commits:
+                if item.state in ("queued", "working"):
+                    self._close(item, kind, note)
+            return
+        published = {
+            int(getattr(entry, "entry_id", -1))
+            for entry in (getattr(result, "published", None) or [])
+        }
+        refused = dict(getattr(result, "refused", None) or {})
+        failed = dict(getattr(result, "failed", None) or {})
+        for item in commits:
+            if item.state not in ("queued", "working"):
+                continue
+            entry_id = item.entry_id
+            if entry_id in published:
+                self._close(item, "done", self._won(item, ""))
+            elif entry_id in refused:
+                self._close(item, "refused", str(refused[entry_id]))
+            elif entry_id in failed:
+                self._close(item, "failed", str(failed[entry_id]))
+            else:  # pragma: no cover - a publisher that forgot an entry
+                self._close(
+                    item, "failed", "the publisher did not report on this entry"
+                )
+        with self.app.batch_lock:
+            self.batch.index_note = getattr(result, "index_note", None)
+
+    def _publisher_step(
+        self, phase: str, entry_id: int | None = None, sentence: str = ""
+    ) -> None:
+        """``publish_many``'s ``on_step``, turned into this batch's now line.
+
+        The sentence it hands over is ignored on purpose: the three packets of
+        this plan have to agree on the words, so the words are written here and
+        the publisher only has to say which phase it has reached and whose
+        entry it is.
+        """
+        if phase == "commit" and entry_id is not None:
+            self._step(
+                "commit",
+                f"Entry {entry_id} — rendering, scanning, committing e/{entry_id}/",
+                self._commit_item(int(entry_id)),
+            )
+        elif phase == "push":
+            # Committed, and not published: the row moves after the push, so
+            # until then these items are back in the queue rather than done.
+            self._parked()
+            commits = self.batch.phase_of.get("commit", 0)
+            self._step("push", f"Pushing {commits} commits to the gallery")
+        elif phase == "index":
+            self._step("index", "Re-rendering the index and pushing it")
+
+    # -- bookkeeping, all of it under the lock ------------------------------
+
+    def _of(self, verb: str) -> list[BatchItem]:
+        return [item for item in self.batch.items if item.verb == verb]
+
+    def _commit_item(self, entry_id: int) -> BatchItem | None:
+        """The publish-or-reject item for this entry; they are exclusive."""
+        for item in self.batch.items:
+            if item.entry_id == entry_id and item.verb in ("reject", "publish"):
+                return item
+        return None
+
+    def _step(self, phase: str, sentence: str, item: BatchItem | None = None) -> None:
+        """One step begins: move the phase, the now line and the counters.
+
+        ``step`` is what has *finished*, so entering a phase finishes every
+        phase before it, and the k-th step of a phase finishes that phase's
+        k-1st. The phases run once each, in :data:`BATCH_PHASES` order, which
+        is what makes that arithmetic safe to do from one side.
+        """
+        with self.app.batch_lock:
+            batch = self.batch
+            same = 1 if batch.phase == phase else 0
+            already = batch.phase_done.get(phase, 0) + same
+            for key, _label in BATCH_PHASES:
+                if key == phase:
+                    break
+                batch.phase_done[key] = batch.phase_of.get(key, 0)
+            batch.phase_done[phase] = already
+            batch.phase = phase
+            batch.now = sentence
+            batch.step = sum(batch.phase_done.values())
+            if item is not None:
+                item.state = "working"
+
+    def _shrink(self, phase: str, count: int = 1) -> None:
+        """A step this batch is not going to take after all."""
+        with self.app.batch_lock:
+            batch = self.batch
+            batch.phase_of[phase] = max(0, batch.phase_of.get(phase, 0) - count)
+            batch.steps = sum(batch.phase_of.values())
+
+    def _parked(self) -> None:
+        with self.app.batch_lock:
+            for item in self.batch.items:
+                if item.verb in ("reject", "publish") and item.state == "working":
+                    item.state = "queued"
+                    item.message = "committed, waiting for the push"
+
+    def _close(self, item: BatchItem, state: str, message: str) -> None:
+        with self.app.batch_lock:
+            item.state = state
+            item.message = message
+
+    def _settle(self, item: BatchItem, message: str) -> None:
+        """Classify what a flash-message function just told us.
+
+        The functions this runner calls were written for a page that prints one
+        sentence, so their report is a sentence. :func:`is_refusal` is what
+        already decides whether such a sentence means nothing happened, and it
+        decides it here too rather than a second rule drifting away from the
+        first.
+        """
+        self._close(item, "refused" if is_refusal(message) else "done", message)
+
+    def _won(self, item: BatchItem, detail: str) -> str:
+        """What a finished commit says on its card."""
+        if item.verb == "reject":
+            return (
+                f"Rejected — {_reject_reason(item.text)}"
+                f"{'. ' + detail if detail else ', and on the rejections page'}"
+            )
+        return detail or f"Published as e/{item.entry_id}/"
+
+    def _blame(self, exc: BaseException) -> None:
+        note = str(exc) or exc.__class__.__name__
+        sys.stderr.write(f"{db.utc_now()} batch {self.batch.id} failed: {note}\n")
+        with self.app.batch_lock:
+            for item in self.batch.items:
+                if item.state in ("queued", "working"):
+                    item.state = "failed"
+                    item.message = note
+
+    def _finish(self) -> None:
+        with self.app.batch_lock:
+            batch = self.batch
+            # The batch is over, so every step it was ever going to take is
+            # accounted for and the bar is full: what is left to read is the
+            # summary and the rows under it, not a bar stopped at four fifths.
+            for key, _label in BATCH_PHASES:
+                batch.phase_done[key] = batch.phase_of.get(key, 0)
+            batch.steps = sum(batch.phase_of.values())
+            batch.step = batch.steps
+            batch.state = "done"
+            batch.ended_utc = db.utc_now()
+            batch.now = batch_summary(batch)
+
+
+def batch_elapsed(batch: Batch) -> float:
+    """Seconds from the press to now, or to the end if it has ended."""
+    started = _parse_utc(batch.started_utc)
+    ended = _parse_utc(batch.ended_utc) or datetime.now(timezone.utc)
+    if started is None:
+        return 0.0
+    return max(0.0, (ended - started).total_seconds())
+
+
+def batch_summary(batch: Batch) -> str:
+    """``6 done · 1 refused in 48s`` — what stays in the tray afterwards.
+
+    ``failed`` is counted with its own word when there is one, because a
+    rejected personal-data scan and a push that broke are not the same news and
+    the operator's next press depends on which it was (§1.10).
+    """
+    counts = {state: 0 for state in ("done", "refused", "failed")}
+    for item in batch.items:
+        if item.state in counts:
+            counts[item.state] += 1
+    parts = [f"{counts['done']} done"]
+    parts.extend(
+        f"{counts[state]} {state}" for state in ("refused", "failed") if counts[state]
+    )
+    return f"{' · '.join(parts)} in {human_seconds(batch_elapsed(batch))}"
+
+
+def batch_document(app: App) -> dict[str, Any] | None:
+    """The batch as the tray and the poller read it, or ``None``.
+
+    One snapshot, taken under the lock, so a document can never show a step
+    from one moment and an item from the next. ``index_note`` is deliberately
+    not in here: a finished batch is re-rendered from ``app.batch`` server-side,
+    which is where that note belongs, and the poller stops at ``done``.
+    """
+    with app.batch_lock:
+        batch = app.batch
+        if batch is None:
+            return None
+        steps = batch.steps or 0
+        return {
+            "id": batch.id,
+            "state": batch.state,
+            "phase": batch.phase,
+            "now": batch.now,
+            "step": batch.step,
+            "steps": steps,
+            "bar_pct": round(100.0 * batch.step / steps, 1) if steps else 0.0,
+            "elapsed_s": int(batch_elapsed(batch)),
+            "phases": [
+                {
+                    "key": key,
+                    "label": label,
+                    "done": batch.phase_done.get(key, 0),
+                    "of": batch.phase_of.get(key, 0),
+                }
+                for key, label in BATCH_PHASES
+                if batch.phase_of.get(key, 0)
+            ],
+            "items": [
+                {
+                    "entry_id": item.entry_id,
+                    "verb": item.verb,
+                    "state": item.state,
+                    "message": item.message,
+                }
+                for item in batch.items
+            ],
+            "summary": batch.now if batch.state == "done" else None,
+        }
+
+
+def batch_running(app: App) -> bool:
+    """Whether a batch is in flight right now (§1.5, §3.5)."""
+    with app.batch_lock:
+        return app.batch is not None and app.batch.state == "running"
+
+
+def dismiss_batch(app: App) -> str | None:
+    """Clear a finished batch from the tray. A running one is refused."""
+    with app.batch_lock:
+        batch = app.batch
+        if batch is not None and batch.state == "running":
+            return BATCH_GUARD
+        app.batch = None
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -3436,6 +4131,9 @@ ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     ("POST", re.compile(r"^/job/(?P<job_id>\d+)/cancel$"), "post_cancel"),
     ("POST", re.compile(r"^/job/(?P<job_id>\d+)/laptop$"), "post_laptop"),
     ("GET", re.compile(r"^/held$"), "page_held"),
+    ("GET", re.compile(r"^/api/batch\.json$"), "api_batch"),
+    ("POST", re.compile(r"^/held/batch$"), "post_batch"),
+    ("POST", re.compile(r"^/held/batch/dismiss$"), "post_batch_dismiss"),
     ("POST", re.compile(r"^/held/(?P<entry_id>\d+)/publish$"), "post_publish"),
     ("POST", re.compile(r"^/held/(?P<entry_id>\d+)/reject$"), "post_reject"),
     ("POST", re.compile(r"^/held/(?P<entry_id>\d+)/archive$"), "post_archive"),
@@ -3912,8 +4610,69 @@ class OpHandler(BaseHTTPRequestHandler):
             )
         )
 
+    # -- the batch (packet 11) ---------------------------------------------
+
+    def wants_json(self) -> bool:
+        """Whether this request asked for the document rather than a page.
+
+        Packet 12's script posts the form with ``Accept: application/json`` so
+        that it can switch the tray to its running state in place; a browser
+        with no script sends the same body and gets the 303 it expects.
+        """
+        return "application/json" in (self.headers.get("Accept") or "")
+
+    def api_batch(self) -> None:
+        self.json_out({"batch": batch_document(self.app)})
+
+    def post_batch(self) -> None:
+        form = self.form()
+        json_wanted = self.wants_json()
+        if batch_running(self.app):
+            # Checked first and checked again inside start_batch: this is the
+            # double-press bug, and a press that lost the race must not get as
+            # far as reading the marks, let alone running them.
+            self._batch_refusal(BATCH_BUSY, 409, json_wanted)
+            return
+        conn = self.app.connect()
+        try:
+            items = batch_plan(conn, form)
+        except Refused as exc:
+            self._batch_refusal(str(exc), 400, json_wanted)
+            return
+        finally:
+            conn.close()
+        try:
+            start_batch(self.app, items)
+        except Refused as exc:
+            self._batch_refusal(str(exc), 409, json_wanted)
+            return
+        if json_wanted:
+            self.json_out({"batch": batch_document(self.app)}, 202)
+        else:
+            # The tray renders the progress server-side and refreshes itself,
+            # so there is nothing to say in a flash that the page will not say
+            # better a moment later.
+            self.redirect("/held")
+
+    def post_batch_dismiss(self) -> None:
+        self.form()
+        refusal = dismiss_batch(self.app)
+        if refusal is not None and self.wants_json():
+            self.json_out({"error": refusal}, 409)
+            return
+        self.redirect("/held", refusal)
+
+    def _batch_refusal(self, message: str, status: int, json_wanted: bool) -> None:
+        """One refusal, in whichever dialect the request asked for."""
+        if json_wanted:
+            self.json_out({"error": message}, status)
+        else:
+            self.redirect("/held", message)
+
     def post_publish(self, entry_id: str) -> None:
         self.form()
+        if self._batch_guard():
+            return
         conn = self.app.connect()
         try:
             message = publish_entry(self.app, conn, int(entry_id))
@@ -3923,6 +4682,8 @@ class OpHandler(BaseHTTPRequestHandler):
 
     def post_reject(self, entry_id: str) -> None:
         form = self.form()
+        if self._batch_guard():
+            return
         reason = said(form, "reason")
         conn = self.app.connect()
         try:
@@ -3933,6 +4694,8 @@ class OpHandler(BaseHTTPRequestHandler):
 
     def post_archive(self, entry_id: str) -> None:
         form = self.form()
+        if self._batch_guard():
+            return
         back = (form.get("back") or ["/held"])[0]
         if not back.startswith("/") or back.startswith("//"):
             back = "/held"
@@ -3942,6 +4705,24 @@ class OpHandler(BaseHTTPRequestHandler):
         finally:
             conn.close()
         self.redirect(back, message)
+
+    def _batch_guard(self) -> bool:
+        """Do nothing and say so, while a batch is running (§3.5).
+
+        The three routes that reach the gallery are shut for the duration, and
+        the reason is the one in §1.5: a second publisher would queue on the
+        checkout lock behind the batch's, holding a request open for as long as
+        the batch takes and then doing work the operator has forgotten asking
+        for. ``post_spawn`` is not guarded — it is the job page's form too, it
+        touches no git, and SQLite serialises the write.
+
+        Call it after :meth:`form`, so the request body is read either way and
+        the connection stays usable for the next request on it.
+        """
+        if not batch_running(self.app):
+            return False
+        self.redirect("/held", BATCH_GUARD)
+        return True
 
     def page_entry(self, entry_id: str) -> None:
         conn = self.app.connect()

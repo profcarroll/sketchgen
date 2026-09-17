@@ -11,6 +11,7 @@ database and the jobs directory and nothing else.
 """
 
 import base64
+import contextlib
 import http.client
 import json
 import os
@@ -2463,6 +2464,761 @@ class TestLiveTranscript(WebTestCase):
 
     def test_api_job_json_for_an_unknown_job_is_404(self):
         self.assertEqual(self.get("/api/job/9999.json")[0], 404)
+
+
+class FakeMany:
+    """A stand-in for publish.publish_many: no git, and it can be held open.
+
+    It calls ``on_step`` exactly where packet 10 says it will — one ``commit``
+    per entry, then ``push``, then ``index`` — and returns something shaped
+    like a ``ManyResult``. The two Events are how a test looks at a batch while
+    it is running without sleeping through it: ``commit_gate`` stops it with one
+    entry mid-commit, ``push_gate`` stops it after the push step has begun.
+    """
+
+    def __init__(self, *, refused=None, failed=None, boom=None,
+                 commit_gate=None, push_gate=None, index_note=None):
+        self.refused = dict(refused or {})
+        self.failed = dict(failed or {})
+        self.boom = boom
+        self.commit_gate = commit_gate
+        self.push_gate = push_gate
+        self.index_note = index_note
+        self.calls = []        # the entry-id lists it was asked to publish
+        self.steps = []        # (phase, entry_id), in the order they happened
+
+    def __call__(self, conn, entry_ids, *, on_step=None, **kwargs):
+        entry_ids = list(entry_ids)
+        self.calls.append(entry_ids)
+        for entry_id in entry_ids:
+            self._step(on_step, "commit", entry_id)
+            if self.commit_gate is not None:
+                self.commit_gate.wait(10)
+                self.commit_gate = None      # the first entry only
+        if self.boom is not None:
+            raise self.boom
+        self._step(on_step, "push", None)
+        if self.push_gate is not None:
+            self.push_gate.wait(10)
+        self._step(on_step, "index", None)
+        published = [
+            Committed(entry_id)
+            for entry_id in entry_ids
+            if entry_id not in self.refused and entry_id not in self.failed
+        ]
+        return ManyResultish(
+            published=published,
+            refused={k: v for k, v in self.refused.items() if k in entry_ids},
+            failed={k: v for k, v in self.failed.items() if k in entry_ids},
+            index_note=self.index_note,
+        )
+
+    def _step(self, on_step, phase, entry_id):
+        self.steps.append((phase, entry_id))
+        if on_step is not None:
+            on_step(phase, entry_id, "whatever packet 10 would have said")
+
+
+class Committed:
+    """One row of ManyResult.published: the runner reads ``entry_id``."""
+
+    def __init__(self, entry_id):
+        self.entry_id = entry_id
+        self.commit = "0" * 40
+
+
+class ManyResultish:
+    def __init__(self, published, refused, failed, index_note=None):
+        self.published = published
+        self.refused = refused
+        self.failed = failed
+        self.index_commit = None
+        self.index_note = index_note
+
+
+class TestHeldBatch(WebTestCase):
+    """POST /held/batch: the marks, the run order, the guards and the document.
+
+    No git anywhere in here: ``publish.publish_many`` is patched with
+    :class:`FakeMany`, and the fallback path (§3.3) is exercised by taking that
+    name away and patching the single-entry ``publish.publish`` instead. What is
+    under test is the runner's bookkeeping and its refusals, which is all this
+    packet owns.
+    """
+
+    # -- fixtures ----------------------------------------------------------
+
+    def setUp(self):
+        self.server.app.batch = None
+
+    def tearDown(self):
+        # The tray is emptied between tests and the rows are left where they
+        # are: a spawned child job points at its parent entry, so deleting the
+        # fixtures would mean unpicking a lineage this packet went to some
+        # trouble to write. Every test here names its own entries, and the
+        # database is this class's own temporary file.
+        self.server.app.batch = None
+
+    def held(self, prompt="a sketch waiting for a person", state="held"):
+        """One entry in ``state``, with a job behind it in a matching state."""
+        conn = self.db()
+        try:
+            job = db.enqueue(conn, prompt, "student-batch", publication="hold")
+            if state == "held":
+                db.transition(conn, job, "executing", executor="qwen3-coder:30b")
+                db.transition(conn, job, "gating")
+                db.transition(conn, job, "held")
+            else:
+                conn.execute("UPDATE jobs SET state = 'failed' WHERE id = ?", (job,))
+            entry = db.create_entry(
+                conn, job, state, prompt=prompt, submitted_by="student-batch"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return entry
+
+    def state_of(self, entry_id):
+        conn = self.db()
+        try:
+            row = db.get_entry(conn, entry_id)
+            return None if row is None else row["state"]
+        finally:
+            conn.close()
+
+    def children_of(self, entry_id):
+        conn = self.db()
+        try:
+            return [
+                int(row["id"])
+                for row in conn.execute(
+                    "SELECT id FROM jobs WHERE parent_entry_id = ?", (entry_id,)
+                )
+            ]
+        finally:
+            conn.close()
+
+    # -- requests ----------------------------------------------------------
+
+    def post_batch(self, fields, path="/held/batch"):
+        """A form press: (status, the flash out of the Location header)."""
+        status, location = self.post(path, fields)
+        flash = ""
+        if "flash=" in location:
+            flash = urllib.parse.unquote_plus(location.split("flash=", 1)[1])
+        return status, location, flash
+
+    def post_batch_json(self, fields, path="/held/batch"):
+        """The same press with ``Accept: application/json``: (status, document)."""
+        body = urllib.parse.urlencode(fields, doseq=True).encode("utf-8")
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request(
+                "POST",
+                path,
+                body=body,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+            )
+            response = conn.getresponse()
+            raw = response.read()
+            return response.status, json.loads(raw) if raw else None
+        finally:
+            conn.close()
+
+    def batch_json(self):
+        status, content_type, body = self.get("/api/batch.json")
+        self.assertEqual(status, 200)
+        self.assertIn("application/json", content_type)
+        return json.loads(body)["batch"]
+
+    # -- waiting, bounded, on real state and never on a duration -----------
+
+    def until(self, predicate, what, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            value = predicate()
+            if value:
+                return value
+            time.sleep(0.005)
+        self.fail(f"timed out waiting for {what}")
+
+    def finished(self):
+        return self.until(
+            lambda: self.server.app.batch
+            if self.server.app.batch and self.server.app.batch.state == "done"
+            else None,
+            "the batch to finish",
+        )
+
+    def items_by_entry(self, batch):
+        return {(item.entry_id, item.verb): item for item in batch.items}
+
+    # -- patching the publisher -------------------------------------------
+
+    @contextlib.contextmanager
+    def publisher(self, many=None, single=None):
+        """Install (or remove) ``publish_many`` and ``publish`` for one test."""
+        from sketchgen import publish
+
+        before = {
+            name: getattr(publish, name, None) for name in ("publish_many", "publish")
+        }
+        for name, value in (("publish_many", many), ("publish", single)):
+            if value is None:
+                if hasattr(publish, name):
+                    delattr(publish, name)
+            else:
+                setattr(publish, name, value)
+        try:
+            yield
+        finally:
+            for name, value in before.items():
+                if value is None:
+                    if hasattr(publish, name):
+                        delattr(publish, name)
+                else:
+                    setattr(publish, name, value)
+
+    # -- §3.1: every refusal, and nothing started --------------------------
+
+    def assertNothingStarted(self):
+        self.assertIsNone(self.server.app.batch)
+        self.assertIsNone(self.batch_json())
+
+    def test_a_press_with_nothing_marked_changes_nothing(self):
+        status, location, flash = self.post_batch({})
+        self.assertEqual(status, 303)
+        self.assertTrue(location.startswith("/held?"), location)
+        self.assertEqual(flash, "nothing is marked — nothing changed")
+        self.assertTrue(web.is_refusal(flash))
+        self.assertNothingStarted()
+
+    def test_a_press_that_only_fills_a_box_marks_nothing(self):
+        entry = self.held()
+        status, _location, flash = self.post_batch({f"text-{entry}": "typed and left"})
+        self.assertEqual(status, 303)
+        self.assertEqual(flash, "nothing is marked — nothing changed")
+        self.assertNothingStarted()
+        self.assertEqual(self.state_of(entry), "held")
+
+    def test_a_critique_with_an_empty_box_is_refused(self):
+        entry = self.held()
+        status, _location, flash = self.post_batch(
+            {f"cri-{entry}": "on", f"text-{entry}": "   "}
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual(
+            flash, f"entry {entry}: a critique needs a sentence — nothing changed"
+        )
+        self.assertNothingStarted()
+        self.assertEqual(self.children_of(entry), [])
+
+    def test_a_critique_cannot_join_a_rejection(self):
+        entry = self.held()
+        status, _location, flash = self.post_batch(
+            {
+                f"do-{entry}": "reject",
+                f"cri-{entry}": "on",
+                f"text-{entry}": "make the circles slower",
+            }
+        )
+        self.assertEqual(status, 303)
+        self.assertIn(f"entry {entry}:", flash)
+        self.assertIn("nothing changed", flash)
+        self.assertNothingStarted()
+        self.assertEqual(self.state_of(entry), "held")
+
+    def test_a_kept_rejection_cannot_be_rejected_again(self):
+        entry = self.held(state="failed-kept")
+        status, _location, flash = self.post_batch({f"do-{entry}": "reject"})
+        self.assertEqual(status, 303)
+        self.assertIn(f"entry {entry} is failed-kept, not held", flash)
+        self.assertNothingStarted()
+        self.assertEqual(self.state_of(entry), "failed-kept")
+
+    def test_an_unknown_entry_is_refused(self):
+        status, _location, flash = self.post_batch({"do-99999": "publish"})
+        self.assertEqual(status, 303)
+        self.assertEqual(flash, "there is no entry 99999 — nothing changed")
+        self.assertNothingStarted()
+
+    def test_a_verb_outside_the_three_is_refused(self):
+        entry = self.held()
+        status, _location, flash = self.post_batch({f"do-{entry}": "delete"})
+        self.assertEqual(status, 303)
+        self.assertIn("is not publish, reject or archive", flash)
+        self.assertNothingStarted()
+        self.assertEqual(self.state_of(entry), "held")
+
+    def test_a_field_that_does_not_name_an_entry_is_refused(self):
+        status, _location, flash = self.post_batch({"do-everything": "publish"})
+        self.assertEqual(status, 303)
+        self.assertIn("that is not an entry id", flash)
+        self.assertNothingStarted()
+
+    def test_a_refusal_for_a_script_is_json_and_400(self):
+        entry = self.held()
+        status, document = self.post_batch_json({f"cri-{entry}": "on"})
+        self.assertEqual(status, 400)
+        self.assertEqual(
+            document["error"],
+            f"entry {entry}: a critique needs a sentence — nothing changed",
+        )
+        self.assertNothingStarted()
+
+    # -- §1.6: the order is the plan's, not the form's ---------------------
+
+    def test_the_run_order_is_the_plans_and_not_the_forms(self):
+        publish_id = self.held()
+        archive_id = self.held()
+        critique_id = self.held()
+        reject_id = self.held()
+        # Marked in the worst order the form could send them in.
+        form = {
+            f"do-{publish_id}": ["publish"],
+            f"cri-{critique_id}": ["on"],
+            f"text-{critique_id}": ["make the circles slower"],
+            f"do-{reject_id}": ["reject"],
+            f"do-{archive_id}": ["archive"],
+        }
+        conn = self.db()
+        try:
+            items = web.batch_plan(conn, form)
+        finally:
+            conn.close()
+        self.assertEqual(
+            [(item.verb, item.entry_id) for item in items],
+            [
+                ("critique", critique_id),
+                ("archive", archive_id),
+                ("reject", reject_id),
+                ("publish", publish_id),
+            ],
+        )
+
+    def test_a_batch_runs_the_phases_in_order_and_ends_done(self):
+        critique_id = self.held()
+        archive_id = self.held()
+        reject_id = self.held()
+        publish_id = self.held()
+        many = FakeMany()
+        with self.publisher(many=many):
+            status, _location, flash = self.post_batch(
+                {
+                    f"do-{publish_id}": "publish",
+                    f"do-{reject_id}": "reject",
+                    f"do-{archive_id}": "archive",
+                    f"cri-{critique_id}": "on",
+                    f"text-{critique_id}": "make the circles slower",
+                }
+            )
+            self.assertEqual((status, flash), (303, ""))
+            batch = self.finished()
+        # rejections first, then publications, in one call, with one push
+        self.assertEqual(many.calls, [[reject_id, publish_id]])
+        self.assertEqual(
+            many.steps,
+            [("commit", reject_id), ("commit", publish_id),
+             ("push", None), ("index", None)],
+        )
+        items = self.items_by_entry(batch)
+        self.assertEqual([item.verb for item in batch.items],
+                         ["critique", "archive", "reject", "publish"])
+        for key, item in items.items():
+            self.assertEqual(item.state, "done", key)
+        # the state the runner owns: the flip, the archive, the child
+        self.assertEqual(self.state_of(reject_id), "rejected")
+        self.assertEqual(self.state_of(archive_id), "archived")
+        self.assertEqual(len(self.children_of(critique_id)), 1)
+        # 1 critique + 1 archive + 2 commits + 1 push + 1 index
+        self.assertEqual(batch.steps, 6)
+        self.assertEqual(batch.step, 6)
+        self.assertEqual(batch.state, "done")
+        self.assertTrue(batch.ended_utc)
+        self.assertRegex(batch.now, r"^4 done in \d")
+
+    def test_a_publish_and_critique_card_spawns_while_the_parent_is_held(self):
+        entry = self.held()
+        gate = threading.Event()
+        many = FakeMany(commit_gate=gate)
+        with self.publisher(many=many):
+            status, _document = self.post_batch_json(
+                {f"do-{entry}": "publish", f"cri-{entry}": "on",
+                 f"text-{entry}": "make the circles slower"}
+            )
+            self.assertEqual(status, 202)
+            # Held inside the commit: the child is already queued and the
+            # parent has not been published out from under it.
+            self.until(lambda: self.children_of(entry), "the child to be queued")
+            self.assertEqual(self.state_of(entry), "held")
+            gate.set()
+            batch = self.finished()
+        items = self.items_by_entry(batch)
+        self.assertEqual(items[(entry, "critique")].state, "done")
+        self.assertIn("Queued as #", items[(entry, "critique")].message)
+        self.assertEqual(items[(entry, "publish")].state, "done")
+
+    # -- §1.5: one batch at a time, and the guards -------------------------
+
+    def test_a_second_press_during_a_run_is_refused_and_the_first_finishes(self):
+        first = self.held()
+        second = self.held()
+        gate = threading.Event()
+        many = FakeMany(commit_gate=gate)
+        with self.publisher(many=many):
+            status, _document = self.post_batch_json({f"do-{first}": "publish"})
+            self.assertEqual(status, 202)
+            status, location, flash = self.post_batch({f"do-{second}": "publish"})
+            self.assertEqual(status, 303)
+            self.assertEqual(flash, "a batch is already running — nothing changed")
+            status, document = self.post_batch_json({f"do-{second}": "publish"})
+            self.assertEqual(status, 409)
+            self.assertEqual(
+                document["error"], "a batch is already running — nothing changed"
+            )
+            gate.set()
+            batch = self.finished()
+        self.assertEqual([item.entry_id for item in batch.items], [first])
+        self.assertEqual(many.calls, [[first]])
+
+    def test_the_three_gallery_routes_refuse_while_a_batch_runs(self):
+        marked = self.held()
+        other = self.held()
+        gate = threading.Event()
+        many = FakeMany(commit_gate=gate)
+        guarded = [
+            f"/held/{other}/publish",
+            f"/held/{other}/reject",
+            f"/held/{other}/archive",
+        ]
+        with self.publisher(many=many):
+            status, _document = self.post_batch_json({f"do-{marked}": "publish"})
+            self.assertEqual(status, 202)
+            for path in guarded:
+                with self.subTest(path=path):
+                    status, location, flash = self.post_batch({"text": "no"}, path=path)
+                    self.assertEqual(status, 303)
+                    self.assertEqual(
+                        flash,
+                        "a batch is running — nothing changed; it will finish first",
+                    )
+            # nothing the guarded routes were asked to do has happened
+            self.assertEqual(self.state_of(other), "held")
+            gate.set()
+            self.finished()
+        # …and the same press works once the batch is over
+        status, location, flash = self.post_batch({}, path=f"/held/{other}/archive")
+        self.assertEqual(status, 303)
+        self.assertIn("archived", flash)
+        self.assertEqual(self.state_of(other), "archived")
+
+    def test_spawning_is_not_guarded(self):
+        marked = self.held()
+        other = self.held()
+        gate = threading.Event()
+        many = FakeMany(commit_gate=gate)
+        with self.publisher(many=many):
+            status, _document = self.post_batch_json({f"do-{marked}": "publish"})
+            self.assertEqual(status, 202)
+            status, _location, flash = self.post_batch(
+                {"text": "make the circles slower"}, path=f"/entry/{other}/spawn"
+            )
+            self.assertEqual(status, 303)
+            self.assertIn("Queued as #", flash)
+            gate.set()
+            self.finished()
+        self.assertEqual(len(self.children_of(other)), 1)
+
+    # -- §3.4: the document ------------------------------------------------
+
+    def test_the_json_is_the_document_the_tray_reads(self):
+        critique_id = self.held()
+        archive_id = self.held()
+        publish_id = self.held()
+        gate = threading.Event()
+        many = FakeMany(commit_gate=gate)
+        with self.publisher(many=many):
+            status, posted = self.post_batch_json(
+                {
+                    f"cri-{critique_id}": "on",
+                    f"text-{critique_id}": "make the circles slower",
+                    f"do-{archive_id}": "archive",
+                    f"do-{publish_id}": "publish",
+                }
+            )
+            self.assertEqual(status, 202)
+            self.assertIn("batch", posted)
+            document = self.until(
+                lambda: (self.batch_json() or {}).get("phase") == "commit"
+                and self.batch_json(),
+                "the commit phase",
+            )
+            self.assertEqual(
+                sorted(document),
+                sorted(
+                    [
+                        "id", "state", "phase", "now", "step", "steps", "bar_pct",
+                        "elapsed_s", "phases", "items", "summary",
+                    ]
+                ),
+            )
+            self.assertEqual(document["id"], self.server.app.batch.id)
+            self.assertEqual(document["state"], "running")
+            self.assertEqual(
+                document["now"],
+                f"Entry {publish_id} — rendering, scanning, "
+                f"committing e/{publish_id}/",
+            )
+            # 1 critique + 1 archive + 1 commit + 1 push + 1 index, two done
+            self.assertEqual(document["steps"], 5)
+            self.assertEqual(document["step"], 2)
+            self.assertEqual(document["bar_pct"], 40.0)
+            self.assertIsInstance(document["elapsed_s"], int)
+            self.assertIsNone(document["summary"])
+            self.assertEqual(
+                document["phases"],
+                [
+                    {"key": "critique", "label": "Critiques", "done": 1, "of": 1},
+                    {"key": "archive", "label": "Archives", "done": 1, "of": 1},
+                    {"key": "commit", "label": "Render & commit", "done": 0, "of": 1},
+                    {"key": "push", "label": "Push", "done": 0, "of": 1},
+                    {"key": "index", "label": "Index", "done": 0, "of": 1},
+                ],
+            )
+            self.assertEqual(
+                document["items"][0],
+                {
+                    "entry_id": critique_id,
+                    "verb": "critique",
+                    "state": "done",
+                    "message": self.items_by_entry(self.server.app.batch)[
+                        (critique_id, "critique")
+                    ].message,
+                },
+            )
+            self.assertEqual(
+                [item["state"] for item in document["items"]],
+                ["done", "done", "working"],
+            )
+            gate.set()
+            self.finished()
+        done = self.batch_json()
+        self.assertEqual(done["state"], "done")
+        self.assertEqual(done["summary"], done["now"])
+        self.assertRegex(done["summary"], r"^3 done in \d")
+        self.assertEqual(done["bar_pct"], 100.0)
+
+    def test_a_phase_with_nothing_in_it_is_not_in_the_document(self):
+        archive_id = self.held()
+        many = FakeMany()
+        with self.publisher(many=many):
+            status, _document = self.post_batch_json({f"do-{archive_id}": "archive"})
+            self.assertEqual(status, 202)
+            self.finished()
+        document = self.batch_json()
+        self.assertEqual([phase["key"] for phase in document["phases"]], ["archive"])
+        self.assertEqual(document["steps"], 1)
+        self.assertEqual(many.calls, [])  # no commit, so no trip to the gallery
+
+    def test_an_item_between_its_commit_and_the_push_is_back_in_the_queue(self):
+        publish_id = self.held()
+        gate = threading.Event()
+        many = FakeMany(push_gate=gate)
+        with self.publisher(many=many):
+            status, _document = self.post_batch_json({f"do-{publish_id}": "publish"})
+            self.assertEqual(status, 202)
+            document = self.until(
+                lambda: (self.batch_json() or {}).get("phase") == "push"
+                and self.batch_json(),
+                "the push phase",
+            )
+            self.assertEqual(document["now"], "Pushing 1 commits to the gallery")
+            self.assertEqual(document["items"][0]["state"], "queued")
+            self.assertEqual(
+                document["items"][0]["message"], "committed, waiting for the push"
+            )
+            gate.set()
+            self.finished()
+        self.assertEqual(self.batch_json()["items"][0]["state"], "done")
+
+    def test_dismiss_refuses_a_running_batch_and_clears_a_finished_one(self):
+        publish_id = self.held()
+        gate = threading.Event()
+        many = FakeMany(commit_gate=gate)
+        with self.publisher(many=many):
+            status, _document = self.post_batch_json({f"do-{publish_id}": "publish"})
+            self.assertEqual(status, 202)
+            status, location, flash = self.post_batch({}, path="/held/batch/dismiss")
+            self.assertEqual(status, 303)
+            self.assertEqual(
+                flash, "a batch is running — nothing changed; it will finish first"
+            )
+            self.assertIsNotNone(self.batch_json())
+            gate.set()
+            self.finished()
+        status, location, flash = self.post_batch({}, path="/held/batch/dismiss")
+        self.assertEqual(status, 303)
+        self.assertEqual(location, "/held")
+        self.assertIsNone(self.batch_json())
+        self.assertIsNone(self.server.app.batch)
+
+    # -- the outcomes a batch reports on its items -------------------------
+
+    def test_one_refused_entry_is_reported_on_its_item_and_the_batch_goes_on(self):
+        refused_id = self.held()
+        publish_id = self.held()
+        many = FakeMany(refused={refused_id: "personal data in sketch.js"})
+        with self.publisher(many=many):
+            self.assertEqual(
+                self.post_batch_json(
+                    {f"do-{refused_id}": "publish", f"do-{publish_id}": "publish"}
+                )[0],
+                202,
+            )
+            batch = self.finished()
+        items = self.items_by_entry(batch)
+        self.assertEqual(items[(refused_id, "publish")].state, "refused")
+        self.assertEqual(
+            items[(refused_id, "publish")].message, "personal data in sketch.js"
+        )
+        self.assertEqual(items[(publish_id, "publish")].state, "done")
+        self.assertRegex(batch.now, r"^1 done · 1 refused in \d")
+
+    def test_a_push_that_fails_leaves_every_publication_failed(self):
+        first = self.held()
+        second = self.held()
+        broke = "! [remote rejected]"
+        many = FakeMany(failed={first: broke, second: broke})
+        with self.publisher(many=many):
+            self.assertEqual(
+                self.post_batch_json(
+                    {f"do-{first}": "publish", f"do-{second}": "publish"}
+                )[0],
+                202,
+            )
+            batch = self.finished()
+        for item in batch.items:
+            self.assertEqual(item.state, "failed")
+            self.assertEqual(item.message, broke)
+        self.assertRegex(batch.now, r"^0 done · 2 failed in \d")
+
+    def test_a_checkout_refusal_is_every_entrys_refusal(self):
+        from sketchgen import publish
+
+        first = self.held()
+        second = self.held()
+        many = FakeMany(boom=publish.PublishRefused("gallery checkout is dirty"))
+        with self.publisher(many=many):
+            self.assertEqual(
+                self.post_batch_json(
+                    {f"do-{first}": "publish", f"do-{second}": "publish"}
+                )[0],
+                202,
+            )
+            batch = self.finished()
+        for item in batch.items:
+            self.assertEqual(item.state, "refused")
+            self.assertEqual(item.message, "refused: gallery checkout is dirty")
+        self.assertEqual(batch.state, "done")
+
+    def test_an_entry_whose_state_moved_is_its_own_items_refusal(self):
+        # Marked Archive on the page, archived by something else before the
+        # press lands: not a validation failure, just that item's own refusal.
+        entry = self.held()
+        conn = self.db()
+        try:
+            db.archive_entry(conn, entry)
+        finally:
+            conn.close()
+        many = FakeMany()
+        with self.publisher(many=many):
+            self.assertEqual(
+                self.post_batch_json({f"do-{entry}": "archive"})[0], 202
+            )
+            batch = self.finished()
+        self.assertEqual(batch.items[0].state, "refused")
+        self.assertIn("refused:", batch.items[0].message)
+        self.assertEqual(batch.state, "done")
+
+    def test_an_exception_inside_the_thread_still_ends_the_batch(self):
+        critique_id = self.held()
+        publish_id = self.held()
+
+        def boom(conn, entry_id, form):
+            raise RuntimeError("the runner broke")
+
+        before = web.spawn_child
+        web.spawn_child = boom
+        many = FakeMany()
+        try:
+            with self.publisher(many=many):
+                self.assertEqual(
+                    self.post_batch_json(
+                        {
+                            f"cri-{critique_id}": "on",
+                            f"text-{critique_id}": "make the circles slower",
+                            f"do-{publish_id}": "publish",
+                        }
+                    )[0],
+                    202,
+                )
+                batch = self.finished()
+        finally:
+            web.spawn_child = before
+        self.assertEqual(batch.state, "done")
+        self.assertTrue(batch.ended_utc)
+        for item in batch.items:
+            self.assertEqual(item.state, "failed")
+            self.assertEqual(item.message, "the runner broke")
+        self.assertEqual(many.calls, [])  # it never reached the gallery
+        self.assertRegex(batch.now, r"^0 done · 2 failed in \d")
+
+    # -- §3.3: the same batch without packet 10 ----------------------------
+
+    def test_without_publish_many_the_runner_publishes_one_at_a_time(self):
+        reject_id = self.held()
+        publish_id = self.held()
+        calls = []
+
+        def single(conn, entry_id, **kwargs):
+            calls.append(entry_id)
+            return Committed(entry_id)
+
+        with self.publisher(many=None, single=single):
+            self.assertEqual(
+                self.post_batch_json(
+                    {f"do-{reject_id}": "reject", f"text-{reject_id}": "too static",
+                     f"do-{publish_id}": "publish"}
+                )[0],
+                202,
+            )
+            batch = self.finished()
+        # one commit step each, no push step and no index step to show
+        self.assertEqual(calls, [reject_id, publish_id])
+        self.assertEqual(batch.steps, 2)
+        self.assertEqual(batch.step, 2)
+        self.assertEqual(
+            [phase["key"] for phase in self.batch_json()["phases"]], ["commit"]
+        )
+        items = self.items_by_entry(batch)
+        self.assertEqual(items[(reject_id, "reject")].state, "done")
+        self.assertIn("too static", items[(reject_id, "reject")].message)
+        self.assertEqual(items[(publish_id, "publish")].state, "done")
+        self.assertEqual(self.state_of(reject_id), "rejected")
+
+    def test_without_a_publisher_at_all_every_commit_is_refused(self):
+        publish_id = self.held()
+        with self.publisher(many=None, single=None):
+            self.assertEqual(
+                self.post_batch_json({f"do-{publish_id}": "publish"})[0], 202
+            )
+            batch = self.finished()
+        self.assertEqual(batch.items[0].state, "refused")
+        self.assertIn("publisher not installed", batch.items[0].message)
+        self.assertEqual(self.state_of(publish_id), "held")
 
 
 class TestBindRefusal(unittest.TestCase):
