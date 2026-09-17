@@ -1401,7 +1401,78 @@ PER_SKETCH_COLUMNS = (
 )
 
 
-def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None) -> str:
+#: How old a recorded figure may be before the card says so.
+BILLING_STALE_DAYS = 7
+
+
+def billing_values(conn: sqlite3.Connection) -> dict[str, str]:
+    """The four billing keys, read while the request still holds a connection."""
+    return {
+        "amount": db.get_meta(conn, "billing_amount") or "",
+        "currency": db.get_meta(conn, "billing_currency") or "USD",
+        "through": db.get_meta(conn, "billing_through") or "",
+        "checked": db.get_meta(conn, "billing_checked_utc") or "",
+    }
+
+
+def _days_since(stamp: str) -> float | None:
+    when = _parse_utc(stamp)
+    if when is None:
+        return None
+    return (datetime.now(timezone.utc) - when).total_seconds() / 86400.0
+
+
+def billing_card(values: dict[str, str] | None) -> str:
+    """What the tenancy has actually cost, as somebody last checked.
+
+    Never a live figure. Reading it needs an OCI key that can create and destroy
+    infrastructure, and that key is not on this node and is not going to be: the
+    node serves a public gallery and runs code a model wrote. ``sketchgen
+    billing`` asks, on the operator's machine; ``--record`` writes the answer
+    into ``meta`` for this card to read.
+
+    So the card shows the number AND how old it is, because a stale figure
+    presented as current is worse than none. Oracle's own usage data lags a day
+    or more, so even a fresh reading is behind; the card names the window it
+    covers rather than implying "now".
+    """
+    values = values or {}
+    amount = values.get("amount") or ""
+    if not amount:
+        return (
+            '<p class="dim">Nothing recorded yet. On the operator\'s machine, '
+            'where <code>~/.oci</code> lives:</p>'
+            '<pre style="font-size:12px">python3 bin/sketchgen billing</pre>'
+            '<p class="dim" style="font-size:12px">then record it here — '
+            'docs/OPERATIONS.md, &ldquo;The billing card&rdquo;.</p>'
+        )
+    try:
+        big = f"{float(amount):,.2f}"
+    except (TypeError, ValueError):
+        big = str(amount)
+    age = _days_since(values.get("checked", ""))
+    stale = ""
+    if age is not None and age > BILLING_STALE_DAYS:
+        stale = f' <span class="pill rejected">{int(age)} days old</span>'
+    line = "charged by Oracle for this tenancy"
+    if values.get("through"):
+        line += f", through {esc(values['through'])}"
+    if values.get("checked"):
+        line += f" · last checked {esc(values['checked'])}"
+    return (
+        f'<p style="font-size:34px;margin:0 0 4px">{esc(big)} '
+        f'<span class="dim" style="font-size:16px">{esc(values.get("currency", "USD"))}'
+        f'</span>{stale}</p>'
+        f'<p class="dim" style="font-size:12px">{line}</p>'
+        '<p class="dim" style="font-size:12px">Not live. Reading it needs an OCI '
+        'key that can build and destroy infrastructure, which is deliberately not '
+        'on this node; and Oracle\'s usage data lags a day or more, so this is '
+        'behind even when freshly checked.</p>'
+    )
+
+
+def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
+                 billing: dict[str, str] | None = None) -> str:
     """The wireframe's Console, rendered from packet 4.1's document.
 
     Every value is read by its path through :func:`_dig`, and every path is
@@ -1631,6 +1702,7 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None) -> s
         per_sketch_rows="\n".join(per_sketch_rows),
         cost_a="cost 16/96",
         cost_b="cost 4/24",
+        billing_card=billing_card(billing),
     )
 
 
@@ -3511,6 +3583,7 @@ class OpHandler(BaseHTTPRequestHandler):
         try:
             control = db.get_control(conn)
             marks = nav_summary(conn)
+            billing = billing_values(conn)
         finally:
             conn.close()
         doc = console_document(self.app)
@@ -3518,7 +3591,7 @@ class OpHandler(BaseHTTPRequestHandler):
             layout(
                 title="Console",
                 here="/",
-                body=console_page(doc, marks.get("tokens")),
+                body=console_page(doc, marks.get("tokens"), billing),
                 control=control,
                 back="/",
                 flash=self.flash(),
