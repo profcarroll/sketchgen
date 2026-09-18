@@ -1,8 +1,9 @@
 /* gallery.js — the only script the published gallery loads.
  *
- * Five jobs, all of them read-or-write against the gallery write path
+ * Six jobs, all of them read-or-write against the gallery write path
  * (packet 3.3), whose base URL comes from config.json and from nowhere else:
  *
+ *   0. view     POST <base>/view               one view of one entry page
  *   1. counts   GET  <base>/counts?entries=1,2,3   views and likes per entry
  *   2. like     POST <base>/like               one like, identified by GitHub
  *   3. vote     POST <base>/vote               one answer to one question
@@ -1471,6 +1472,23 @@
     });
   }
 
+  /* One view per entry page, sent once the write path's base is known. Scoped
+   * to main.entry so the grid, with hundreds of [data-entry] cards, sends none.
+   * The Worker de-duplicates a signed-in viewer for 60 s; a view that does not
+   * land is not an error. */
+  function sendView() {
+    var main = document.querySelector("main.entry[data-entry]");
+    if (!main || !base()) { return; }
+    var id = Number(main.getAttribute("data-entry"));
+    if (!id) { return; }
+    fetch(base() + "/view", {
+      method: "POST",
+      credentials: "include",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ entry_id: id })
+    }).catch(function () {});
+  }
+
   ready(function () {
     // First, before any request: the token /callback handed back in the
     // fragment, stored for this origin and stripped from the address bar.
@@ -1484,6 +1502,7 @@
     applySort(sort);
     wireSort();
     loadConfig().then(function () {
+      sendView();
       loadCounts();
       wireLike();
       // Both forms are wired before loadMe answers and revealed only by it.

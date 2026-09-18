@@ -4083,18 +4083,26 @@ def batch_tray(batch: Batch | None, *, waiting: int, kept: int) -> str:
         + (" disabled" if running else "")
         + ">Clear marks</button>"
     )
-    progress = phases = results = ""
+    phases = results = ""
+    now_text = step_text = ""
+    pct = 0.0
     if batch is not None:
-        now = batch_summary(batch) if done else batch.now
+        now_text = batch_summary(batch) if done else batch.now
         pct = round(100.0 * batch.step / batch.steps, 1) if batch.steps else 0.0
-        progress = (
-            f'<span class="now" id="now" aria-live="polite">{esc(now)}</span>'
-            f'<div class="bar{bar_done}" id="bar">'
-            f'<span id="bar-fill" style="width:{pct}%"></span></div>'
-            f'<span class="prog-t" id="prog-t">{batch.step} of {batch.steps} '
-            f"steps · {esc(human_seconds(batch_elapsed(batch)))}</span>"
+        step_text = (
+            f"{batch.step} of {batch.steps} steps · "
+            f"{human_seconds(batch_elapsed(batch))}"
         )
         phases = _tray_phases(batch)
+    # The skeleton is always rendered, empty when nothing runs: the script only
+    # fills these nodes, it never builds them, and the press that starts a
+    # batch happens on a page that has no batch yet.
+    progress = (
+        f'<span class="now" id="now" aria-live="polite">{esc(now_text)}</span>'
+        f'<div class="bar{bar_done}" id="bar">'
+        f'<span id="bar-fill" style="width:{pct}%"></span></div>'
+        f'<span class="prog-t" id="prog-t">{esc(step_text)}</span>'
+    )
     if done:
         results = _tray_results(batch)
     # A scriptless page follows the batch by reloading itself; a scripted one
@@ -4111,7 +4119,7 @@ def batch_tray(batch: Batch | None, *, waiting: int, kept: int) -> str:
         for item in (batch.items if done else [])
         if item.state == "done"
     )
-    hide_prog = "" if progress else " hidden"
+    hide_prog = "" if batch is not None else " hidden"
     hide_phases = "" if phases else " hidden"
     hide_results = "" if results else " hidden"
     return (
