@@ -2797,5 +2797,62 @@ class PublishRejectedTests(GalleryTestCase):
         self.assertIn("--dry-run", result.stdout)
 
 
+class MicSketchTests(GalleryTestCase):
+    """A listening sketch runs in its own tab, not the sandboxed frame.
+
+    The published sketch iframe is sandbox="allow-scripts" — an opaque origin
+    with no allow="microphone" — so getUserMedia is refused and a mic sketch
+    reads a dead mic in the embed. It only works in its own top-level tab, where
+    the Pages origin is a secure context, so the stage and the ledger tiles route
+    it there. Making sound is unaffected: it plays in the frame after a click.
+    """
+
+    MIC_JS = (
+        "function setup(){ createCanvas(windowWidth, windowHeight);\n"
+        "  let mic = new p5.AudioIn(); mic.start(); }\n"
+        "function draw(){ background(0); }\n"
+    )
+
+    def _make_mic(self, entry_id):
+        src = self.conn.execute(
+            "SELECT source_dir FROM entries WHERE id = ?", (entry_id,)
+        ).fetchone()["source_dir"]
+        path = Path(src)
+        (path / "sketch.js").write_text(self.MIC_JS, encoding="utf-8")
+        return path
+
+    def test_the_stage_of_a_mic_entry_opens_a_tab_not_an_embed(self):
+        one = self.ids[0]
+        self._make_mic(one)
+        gallery.render_all(self.conn, self.dest, self.config)
+        page = (self.dest / "e" / str(one) / "index.html").read_text(encoding="utf-8")
+        self.assertIn("stage-mic", page)
+        self.assertIn('href="sketch/" target="_blank"', page)
+        self.assertIn("listens to the microphone", page)
+        # never the self-starting embed for this one
+        self.assertNotIn('<iframe class="sketch"', page)
+
+    def test_lineage_json_marks_a_mic_entry_and_leaves_others_alone(self):
+        one = self.ids[0]
+        self._make_mic(one)
+        gallery.render_all(self.conn, self.dest, self.config)
+        entries = json.loads(
+            (self.dest / "lineage.json").read_text(encoding="utf-8")
+        )["entries"]
+        self.assertTrue(entries[str(one)]["mic"])
+        # a published sibling that only draws stays false
+        self.assertFalse(entries[str(self.ids[1])].get("mic", False))
+
+    def test_needs_mic_catches_listening_and_ignores_making_sound(self):
+        src = self._make_mic(self.ids[0])
+        self.assertTrue(gallery._needs_mic(src))
+        (src / "sketch.js").write_text(
+            "function setup(){ let o = new p5.Oscillator('sine'); o.start(); }\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(gallery._needs_mic(src))
+        self.assertFalse(gallery._needs_mic(None))
+
+
 if __name__ == "__main__":
     unittest.main()
