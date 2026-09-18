@@ -1,0 +1,552 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sketchgen Kiosk</title>
+<style>
+/* Kiosk mode: one visual world, a projector in a dark room. The palette is the
+   gallery's own dark theme (gallery.css), with the ground pushed to true black so
+   letterbox bars vanish against a projector's off-state. No web font: like the
+   gallery, nothing but p5 is fetched. */
+:root {
+  --ground: #050608;
+  --ink: #ecedef;
+  --ink-soft: #a3a9b8;
+  --ink-faint: #6b7180;
+  --accent: #8fabff;
+  --agent: #e0a85a;
+  --line: rgba(236, 237, 239, 0.14);
+  --scrim: rgba(5, 6, 8, 0.78);
+  --scrim-soft: rgba(5, 6, 8, 0.55);
+  --key-ground: rgba(236, 237, 239, 0.09);
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.45;
+  overflow: hidden;
+}
+body.idle { cursor: none; }
+a { color: var(--accent); }
+
+/* ---- the room ------------------------------------------------------------ */
+.kiosk {
+  position: fixed; inset: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr);
+}
+.stage {
+  grid-column: 2;
+  position: relative;
+  display: grid; place-items: center;
+  min-width: 0; min-height: 0;
+  overflow: hidden;
+}
+.stage canvas { display: block; max-width: 100%; max-height: 100%; }
+.stage.fading canvas, .stage.fading .caption { opacity: 0; }
+.stage canvas, .caption { transition: opacity 420ms ease; }
+
+/* time left on this sketch */
+.progress {
+  position: fixed; top: 0; left: 0; height: 2px; width: 0;
+  background: var(--accent); z-index: 5;
+  transition: width 250ms linear;
+}
+.progress.paused { background: var(--ink-faint); }
+
+/* top-right status: place in the sequence, paused */
+.status {
+  position: fixed; top: 0.8rem; right: 1rem; z-index: 4;
+  margin: 0; font-size: 0.78rem; letter-spacing: 0.04em;
+  color: var(--ink-faint); font-variant-numeric: tabular-nums;
+  text-transform: uppercase;
+}
+.status .paused { color: var(--ink); }
+.status .hint { margin-left: 1em; }
+.status .hint kbd { font-size: 0.7rem; padding: 0 0.35em; }
+
+/* ---- caption block over the bottom of the stage ---------------------------- */
+.caption {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 3rem 2rem 1.5rem;
+  background: linear-gradient(to top, var(--scrim-soft), rgba(5,6,8,0));
+  pointer-events: none;
+  display: grid; gap: 0.45rem;
+  max-width: 62rem;
+}
+.caption:empty { display: none; }
+.prompt {
+  margin: 0;
+  font-size: clamp(1.25rem, 2.6vw, 2.2rem);
+  line-height: 1.2; font-weight: 500;
+  text-wrap: balance;
+  text-shadow: 0 1px 12px rgba(0,0,0,0.6);
+}
+.prompt .num { color: var(--ink-faint); font-weight: 400; margin-right: 0.4em; font-variant-numeric: tabular-nums; }
+.revisions {
+  margin: 0; font-size: 0.95rem; color: var(--ink-soft);
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.revisions b { font-weight: 500; color: var(--ink); }
+.authors { margin: 0; font-size: 0.95rem; color: var(--ink-soft); }
+.authors span { color: var(--ink); }
+.facts {
+  margin: 0; padding: 0; list-style: none;
+  display: flex; flex-wrap: wrap; gap: 0.35rem 1.1rem;
+  font-size: 0.8rem; letter-spacing: 0.03em; color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+.facts li b { font-weight: 500; color: var(--ink); }
+.facts li.gen b { color: var(--accent); }
+
+/* ---- side columns: code left, words right --------------------------------- */
+.column {
+  grid-column: 3;
+  width: clamp(18rem, 26vw, 34rem);
+  min-height: 0; overflow: hidden auto; scrollbar-width: none;
+  background: var(--scrim);
+  border-left: 1px solid var(--line);
+  padding: 1.5rem 1.5rem 1.5rem;
+  display: flex; flex-direction: column; gap: 1.4rem;
+}
+.column[hidden] { display: none; }
+.column.code { grid-column: 1; border-left: 0; border-right: 1px solid var(--line); width: clamp(20rem, 30vw, 40rem); padding-right: 0; overflow: hidden; }
+.column h2 {
+  margin: 0 0 0.4rem; font-size: 0.72rem; font-weight: 500;
+  letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint);
+}
+.column p { margin: 0; font-size: 0.98rem; max-width: 62ch; color: var(--ink); }
+.column .note { margin-top: 0.3rem; font-size: 0.78rem; color: var(--ink-faint); }
+.column section[hidden] { display: none; }
+
+.judgment .pop { display: grid; grid-template-columns: 5.5rem 1fr; gap: 0.25rem 0.75rem; align-items: baseline; }
+.judgment .pop-label { font-size: 0.8rem; letter-spacing: 0.06em; text-transform: uppercase; }
+.judgment .human .pop-label { color: var(--accent); }
+.judgment .agent .pop-label { color: var(--agent); }
+.judgment .score { font-size: 1.05rem; font-variant-numeric: tabular-nums; }
+.judgment .quad { grid-column: 2; font-size: 0.85rem; color: var(--ink-soft); }
+
+.codewrap { flex: 1; min-height: 0; overflow: hidden; position: relative; }
+.codewrap pre {
+  margin: 0; font-family: var(--mono); font-size: 0.74rem; line-height: 1.5;
+  color: var(--ink-soft); white-space: pre; tab-size: 2;
+  will-change: transform;
+}
+.codewrap pre .ln { display: inline-block; width: 2.6em; color: var(--ink-faint); user-select: none; }
+.codewrap::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3rem;
+  background: linear-gradient(to bottom, rgba(5,6,8,0), var(--ground));
+}
+.code h2 .file { color: var(--ink-soft); text-transform: none; letter-spacing: 0; font-family: var(--mono); }
+
+/* ---- the config menu: any key opens it ------------------------------------- */
+.menu {
+  position: fixed; left: 50%; bottom: 3rem; transform: translate(-50%, 0);
+  z-index: 10; width: min(60rem, calc(100vw - 2rem));
+  background: var(--scrim); backdrop-filter: blur(6px);
+  border: 1px solid var(--line); border-radius: 6px;
+  padding: 1.1rem 1.4rem 1rem;
+  display: grid; gap: 1rem 2rem;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  transition: opacity 180ms ease, transform 180ms ease;
+}
+.menu[hidden] { display: none; }
+.menu h2 {
+  margin: 0 0 0.55rem; font-size: 0.72rem; font-weight: 500;
+  letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint);
+  display: flex; justify-content: space-between; align-items: baseline;
+}
+.menu h2 .val { color: var(--ink); text-transform: none; letter-spacing: 0; font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+.rows { margin: 0; padding: 0; list-style: none; display: grid; gap: 0.3rem; }
+.rows li {
+  display: grid; grid-template-columns: 4.6rem 1fr auto; gap: 0.6rem; align-items: center;
+  font-size: 0.9rem; color: var(--ink-soft);
+}
+.rows li.on { color: var(--ink); }
+.rows li .state { font-size: 0.78rem; color: var(--ink-faint); font-variant-numeric: tabular-nums; }
+.rows li.on .state { color: var(--accent); }
+.rows li.current { color: var(--ink); }
+.rows li.current .state { color: var(--accent); }
+kbd {
+  font-family: var(--mono); font-size: 0.75rem; color: var(--ink);
+  background: var(--key-ground); border: 1px solid var(--line); border-bottom-width: 2px;
+  border-radius: 4px; padding: 0.05em 0.45em; white-space: nowrap;
+}
+.keys { display: inline-flex; gap: 0.25rem; }
+.menu footer {
+  grid-column: 1 / -1; border-top: 1px solid var(--line); padding-top: 0.7rem;
+  display: flex; flex-wrap: wrap; gap: 0.4rem 1.5rem; justify-content: space-between;
+  font-size: 0.78rem; color: var(--ink-faint);
+}
+.menu footer code { font-family: var(--mono); color: var(--ink-soft); word-break: break-all; }
+.menu footer p { margin: 0; }
+
+/* ---- first-run card: the one gesture that starts audio and fullscreen ------- */
+.welcome {
+  position: fixed; inset: 0; z-index: 20; display: grid; place-items: center;
+  background: var(--ground);
+}
+.welcome[hidden] { display: none; }
+.welcome .card { max-width: 30rem; padding: 0 1.5rem; text-align: center; }
+.welcome h1 { font-size: 1.2rem; font-weight: 500; margin: 0 0 0.4rem; }
+.welcome p { color: var(--ink-soft); margin: 0.3rem 0; font-size: 0.95rem; }
+.welcome .go {
+  margin-top: 1.2rem; display: inline-block; padding: 0.6rem 1.2rem;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--key-ground);
+  color: var(--ink); font: inherit; cursor: pointer;
+}
+.welcome .go:focus-visible, .go:hover { border-color: var(--accent); outline: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  .stage canvas, .caption, .menu, .progress { transition: none; }
+}
+
+/* ---- phone width: columns stack under the stage ----------------------------- */
+@media (max-width: 760px) {
+  body { overflow: auto; }
+  .kiosk { position: static; display: block; min-height: 100dvh; }
+  .stage { height: 62dvh; }
+  .column, .column.code { width: 100%; border: 0; border-top: 1px solid var(--line); max-height: 60dvh; }
+  .caption { padding: 2rem 1rem 1rem; }
+  .menu { grid-template-columns: 1fr; bottom: 1rem; max-height: calc(100dvh - 2rem); overflow: auto; }
+}
+</style>
+
+<div class="welcome" id="welcome">
+  <div class="card">
+    <h1>sketchgen · kiosk</h1>
+    <p>Sketches from the gallery play one after another, full screen.</p>
+    <p>Press any key at any time for the controls.</p>
+    <button class="go" id="go" type="button">Start</button>
+    <p class="note" style="margin-top:1rem;font-size:0.8rem">This first press is the one gesture the browser needs before it will run audio or go full screen.</p>
+  </div>
+</div>
+
+<div class="progress" id="progress"></div>
+<p class="status" id="status"></p>
+
+<div class="kiosk">
+  <aside class="column code" id="codecol" hidden>
+    <section>
+      <h2><span>Source</span> <span class="file" id="codefile">sketch.js</span></h2>
+      <div class="codewrap"><pre id="code"></pre></div>
+    </section>
+  </aside>
+
+  <main class="stage" id="stage">
+    <div class="caption" id="caption"></div>
+  </main>
+
+  <aside class="column words" id="wordscol" hidden>
+    <section id="sec-brief" hidden>
+      <h2>Brief</h2>
+      <p id="brief"></p>
+      <p class="note">The planner's expansion of the prompt. What the executor was asked to build.</p>
+    </section>
+    <section id="sec-statement" hidden>
+      <h2>Artist's statement · <span id="stmt-by"></span>, unedited</h2>
+      <p id="statement"></p>
+      <p class="note">The executor's own account of what it built. A claim about the work, not a finding about it.</p>
+    </section>
+    <section id="sec-judgment" class="judgment" hidden>
+      <h2>Judgment</h2>
+      <div class="pop human"><span class="pop-label">Humans</span><span class="score" id="j-human"></span><span class="quad" id="q-human"></span></div>
+      <div class="pop agent" style="margin-top:.5rem"><span class="pop-label">Agents</span><span class="score" id="j-agent"></span><span class="quad" id="q-agent"></span></div>
+      <p class="note">Bradley–Terry per population. Two scores, never one aggregate.</p>
+    </section>
+  </aside>
+</div>
+
+<div class="menu" id="menu" hidden role="dialog" aria-label="Kiosk controls">
+  <section>
+    <h2><span>Playback</span> <span class="val" id="m-every">60 s each</span></h2>
+    <ul class="rows">
+      <li id="m-pause"><span class="keys"><kbd>space</kbd></span><span>pause / play</span><span class="state" id="m-pause-state">playing</span></li>
+      <li><span class="keys"><kbd>→</kbd></span><span>next sketch</span><span class="state"></span></li>
+      <li><span class="keys"><kbd>←</kbd></span><span>previous sketch</span><span class="state"></span></li>
+      <li><span class="keys"><kbd>]</kbd> <kbd>[</kbd></span><span>longer / shorter, 15 s steps</span><span class="state" id="m-every2">60 s</span></li>
+      <li><span class="keys"><kbd>F</kbd></span><span>full screen</span><span class="state"></span></li>
+      <li><span class="keys"><kbd>H</kbd></span><span>hide every overlay</span><span class="state" id="m-hide-state"></span></li>
+      <li><span class="keys"><kbd>esc</kbd></span><span>close this menu</span><span class="state">or wait 8 s</span></li>
+    </ul>
+  </section>
+  <section>
+    <h2><span>Order</span> <span class="val"><kbd>S</kbd> cycles</span></h2>
+    <ul class="rows" id="m-orders"></ul>
+  </section>
+  <section>
+    <h2><span>Overlays</span> <span class="val" id="m-count"></span></h2>
+    <ul class="rows" id="m-overlays"></ul>
+  </section>
+  <footer>
+    <p>Launch link for this setup: <code id="launch"></code></p>
+    <p id="m-note">Views and likes here are example numbers; the live kiosk asks the write path for real ones.</p>
+  </footer>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js"></script>
+<script src="kiosk-data.js"></script>
+<script>
+(function () {
+  "use strict";
+  var ENTRIES = window.KIOSK_ENTRIES || [];
+  // Example engagement counts, so the caption has something to show. The live
+  // kiosk fetches these from the write path's /counts endpoint.
+  var COUNTS = { 97: { views: 412, likes: 9 }, 93: { views: 1088, likes: 23 }, 78: { views: 655, likes: 14 }, 58: { views: 301, likes: 4 } };
+
+  var ORDERS = [
+    { key: "newest", label: "newest first" },
+    { key: "oldest", label: "oldest first" },
+    { key: "random", label: "random" },
+    { key: "liked", label: "most liked" },
+    { key: "reviewed", label: "most reviewed" },
+    { key: "controversial", label: "controversial" },
+    { key: "consensus", label: "consensus" }
+  ];
+  var OVERLAYS = [
+    { key: "prompt", k: "P", label: "prompt" },
+    { key: "authors", k: "A", label: "authors: who prompted, planned, wrote" },
+    { key: "generation", k: "G", label: "generation and lineage" },
+    { key: "views", k: "V", label: "views" },
+    { key: "likes", k: "L", label: "likes" },
+    { key: "brief", k: "B", label: "brief" },
+    { key: "statement", k: "T", label: "artist's statement" },
+    { key: "judgment", k: "J", label: "judgment: humans, agents" },
+    { key: "code", k: "C", label: "the sketch.js that is running" },
+    { key: "licence", k: "I", label: "license" },
+    { key: "date", k: "D", label: "creation date" },
+    { key: "tokens", k: "K", label: "tokens" },
+    { key: "seconds", k: "W", label: "seconds to write" }
+  ];
+
+  var state = {
+    every: 60, paused: false, order: "newest", hideAll: false,
+    show: { prompt: true, authors: true, generation: true, views: true, likes: true },
+    i: 0, elapsed: 0, seq: []
+  };
+  try {
+    var saved = JSON.parse(localStorage.getItem("sketchgen-kiosk") || "null");
+    if (saved && saved.show) { state.every = saved.every || 60; state.order = saved.order || "newest"; state.show = saved.show; }
+  } catch (e) {}
+  function persist() { try { localStorage.setItem("sketchgen-kiosk", JSON.stringify({ every: state.every, order: state.order, show: state.show })); } catch (e) {} }
+
+  var $ = function (id) { return document.getElementById(id); };
+  var stage = $("stage"), caption = $("caption"), menu = $("menu");
+
+  /* ---- ordering -------------------------------------------------------- */
+  function sequence(order) {
+    var ids = ENTRIES.map(function (e, n) { return n; });
+    var by = function (f) { ids.sort(function (a, b) { return f(ENTRIES[b]) - f(ENTRIES[a]); }); };
+    if (order === "newest") by(function (e) { return Date.parse(e.published); });
+    else if (order === "oldest") by(function (e) { return -Date.parse(e.published); });
+    else if (order === "liked") by(function (e) { return (COUNTS[e.id] || {}).likes || 0; });
+    else if (order === "reviewed") by(function (e) { return parseInt(e.human_score.split("over ")[1]) + parseInt(e.agent_score.split("over ")[1]); });
+    else if (order === "controversial") by(function (e) { return Math.abs(parseFloat(e.human_score) - parseFloat(e.agent_score)); });
+    else if (order === "consensus") by(function (e) { return -Math.abs(parseFloat(e.human_score) - parseFloat(e.agent_score)); });
+    else { for (var n = ids.length - 1; n > 0; n--) { var r = Math.floor(Math.random() * (n + 1)); var t = ids[n]; ids[n] = ids[r]; ids[r] = t; } }
+    return ids;
+  }
+
+  /* ---- running a sketch ------------------------------------------------ */
+  var HOOKS = ["preload", "setup", "draw", "mousePressed", "mouseReleased", "mouseClicked", "mouseMoved", "mouseDragged", "mouseWheel", "windowResized", "touchStarted", "touchMoved", "touchEnded"];
+  var inst = null;
+  function run(entry) {
+    if (inst) { inst.remove(); inst = null; }
+    HOOKS.forEach(function (h) { window[h] = undefined; });
+    // The kiosk keeps the keyboard: a sketch's keyPressed never sees a kiosk key.
+    var tail = HOOKS.map(function (h) { return "window." + h + " = (typeof " + h + " === 'function') ? " + h + " : undefined;"; }).join("");
+    try { new Function(entry.src + "\n;" + tail)(); } catch (e) { console.error("sketch failed to load", e); }
+    inst = new p5(undefined, stage);
+    setTimeout(fit, 30);
+  }
+  function fit() {
+    var c = stage.querySelector("canvas");
+    if (!c) return;
+    var w = c.width / (inst ? inst.pixelDensity() : 1), h = c.height / (inst ? inst.pixelDensity() : 1);
+    var s = Math.min(stage.clientWidth / w, stage.clientHeight / h);
+    c.style.width = Math.floor(w * s) + "px";
+    c.style.height = Math.floor(h * s) + "px";
+  }
+  window.addEventListener("resize", function () { setTimeout(fit, 60); });
+
+  /* ---- painting the words ---------------------------------------------- */
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c]; }); }
+  function fmtDate(iso) { var d = new Date(iso); return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" }) + " " + d.toISOString().slice(11, 16) + " UTC"; }
+  function n(x) { return Number(x).toLocaleString(); }
+  function on(key) { return !state.hideAll && !!state.show[key]; }
+
+  function paint(entry) {
+    var counts = COUNTS[entry.id] || { views: "—", likes: "—" };
+    var parts = entry.prompt.split(/\n\s*\n/);
+    var html = "";
+    if (on("prompt")) {
+      html += "<h1 class=\"prompt\"><span class=\"num\">#" + entry.id + "</span>" + esc(parts[0]) + "</h1>";
+      if (parts.length > 1) {
+        var revs = parts.slice(1).map(function (p) { return p.replace(/^revise:\s*/i, ""); });
+        html += "<p class=\"revisions\"><b>" + (revs.length === 1 ? "revised once" : "revised " + revs.length + " times") + ", latest:</b> " + esc(revs[revs.length - 1]) + "</p>";
+      }
+    }
+    if (on("authors")) {
+      html += "<p class=\"authors\">Prompted by <span>" + esc(entry.submitted_by) + "</span> · planned by <span>" + esc(entry.planner) + "</span> · written by <span>" + esc(entry.executor) + "</span> under the " + esc(entry.rules) + " rules" + (entry.attempts > 1 ? ", gate passed on attempt " + entry.attempts : "") + "</p>";
+    }
+    var facts = [];
+    if (on("generation")) {
+      facts.push("<li class=\"gen\"><b>generation " + entry.generation + "</b>" + (entry.parent ? " · revised from #" + entry.parent + (entry.critique_by ? " after a critique by " + esc(entry.critique_by) : "") : " · a root") + "</li>");
+    }
+    if (on("views")) facts.push("<li><b>" + n(counts.views) + "</b> views</li>");
+    if (on("likes")) facts.push("<li><b>" + n(counts.likes) + "</b> likes</li>");
+    if (on("date")) facts.push("<li>created <b>" + fmtDate(entry.created) + "</b></li>");
+    if (on("tokens")) facts.push("<li><b>" + n(entry.prompt_tokens) + "</b> prompt + <b>" + n(entry.completion_tokens) + "</b> completion tokens</li>");
+    if (on("seconds")) facts.push("<li>written in <b>" + entry.wall_s.toFixed(1) + " s</b></li>");
+    if (on("licence")) facts.push("<li><b>" + esc(entry.licence) + "</b></li>");
+    if (facts.length) html += "<ul class=\"facts\">" + facts.join("") + "</ul>";
+    caption.innerHTML = html;
+
+    var words = on("brief") || on("statement") || on("judgment");
+    $("wordscol").hidden = !words;
+    $("sec-brief").hidden = !on("brief"); $("brief").textContent = entry.brief;
+    $("sec-statement").hidden = !on("statement"); $("statement").textContent = entry.statement; $("stmt-by").textContent = entry.executor;
+    $("sec-judgment").hidden = !on("judgment");
+    $("j-human").textContent = entry.human_score; $("q-human").textContent = entry.human_quad;
+    $("j-agent").textContent = entry.agent_score; $("q-agent").textContent = entry.agent_quad;
+
+    $("codecol").hidden = !on("code");
+    if (on("code")) {
+      $("codefile").textContent = "e/" + entry.id + "/sketch/sketch.js · " + n(entry.src.length) + " bytes, unedited";
+      $("code").innerHTML = entry.src.replace(/\s+$/, "").split("\n").map(function (line, k) { return "<span class=\"ln\">" + (k + 1) + "</span>" + esc(line); }).join("\n");
+      $("code").style.transform = "";
+      codeScroll.start = performance.now();
+    }
+    setTimeout(fit, 30);
+  }
+  // The source scrolls slowly past when it is taller than its column: a
+  // reading pace, then it rests at the end.
+  var codeScroll = { start: 0 };
+  function scrollCode(now) {
+    var pre = $("code"), wrap = pre.parentNode;
+    if (!$("codecol").hidden && pre.scrollHeight > wrap.clientHeight) {
+      var overflow = pre.scrollHeight - wrap.clientHeight + 48;
+      var t = Math.max(0, (now - codeScroll.start - 4000) / 1000);
+      pre.style.transform = "translateY(-" + Math.min(overflow, t * 18) + "px)";
+    }
+    requestAnimationFrame(scrollCode);
+  }
+  requestAnimationFrame(scrollCode);
+
+  /* ---- the menu -------------------------------------------------------- */
+  function paintMenu() {
+    $("m-every").textContent = state.every + " s each";
+    $("m-every2").textContent = state.every + " s";
+    $("m-pause-state").textContent = state.paused ? "paused" : "playing";
+    $("m-pause").className = state.paused ? "on" : "";
+    $("m-hide-state").textContent = state.hideAll ? "hidden" : "";
+    $("m-orders").innerHTML = ORDERS.map(function (o, k) {
+      return "<li class=\"" + (o.key === state.order ? "current" : "") + "\"><span class=\"keys\"><kbd>" + (k + 1) + "</kbd></span><span>" + o.label + "</span><span class=\"state\">" + (o.key === state.order ? "●" : "") + "</span></li>";
+    }).join("");
+    $("m-overlays").innerHTML = OVERLAYS.map(function (o) {
+      return "<li class=\"" + (state.show[o.key] ? "on" : "") + "\"><span class=\"keys\"><kbd>" + o.k + "</kbd></span><span>" + o.label + "</span><span class=\"state\">" + (state.show[o.key] ? "on" : "off") + "</span></li>";
+    }).join("");
+    var shown = OVERLAYS.filter(function (o) { return state.show[o.key]; });
+    $("m-count").textContent = shown.length + " of " + OVERLAYS.length + " on";
+    $("launch").textContent = "kiosk.html?order=" + state.order + "&every=" + state.every + "&show=" + shown.map(function (o) { return o.key; }).join(",");
+  }
+  var menuTimer = null;
+  function openMenu() {
+    menu.hidden = false; paintMenu();
+    clearTimeout(menuTimer);
+    menuTimer = setTimeout(closeMenu, 8000);
+  }
+  function closeMenu() { menu.hidden = true; clearTimeout(menuTimer); }
+
+  /* ---- playback -------------------------------------------------------- */
+  function current() { return ENTRIES[state.seq[state.i]]; }
+  function show(k, dir) {
+    state.i = ((k % state.seq.length) + state.seq.length) % state.seq.length;
+    state.elapsed = 0;
+    stage.classList.add("fading");
+    setTimeout(function () {
+      var e = current();
+      run(e); paint(e);
+      stage.classList.remove("fading");
+      paintStatus();
+    }, 420);
+  }
+  function paintStatus() {
+    var e = current();
+    $("status").innerHTML = (state.paused ? "<span class=\"paused\">paused</span> · " : "") +
+      (state.i + 1) + " of " + state.seq.length + " · " + esc(state.order) +
+      (menu.hidden ? "<span class=\"hint\"><kbd>any key</kbd> controls</span>" : "");
+  }
+  var last = performance.now();
+  function tick(now) {
+    var dt = (now - last) / 1000; last = now;
+    if (!state.paused) state.elapsed += dt;
+    $("progress").style.width = Math.min(100, 100 * state.elapsed / state.every) + "%";
+    $("progress").className = "progress" + (state.paused ? " paused" : "");
+    if (state.elapsed >= state.every) show(state.i + 1);
+    requestAnimationFrame(tick);
+  }
+
+  function reorder(order) {
+    var id = current() ? current().id : null;
+    state.order = order; state.seq = sequence(order);
+    state.i = Math.max(0, state.seq.findIndex(function (n) { return ENTRIES[n].id === id; }));
+  }
+
+  /* ---- keys ------------------------------------------------------------ */
+  document.addEventListener("keydown", function (ev) {
+    if (!$("welcome").hidden) return;
+    if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
+    var k = ev.key;
+    if (menu.hidden) {
+      // The first press only brings up the controls, so nothing changes by accident.
+      if (k !== "Escape") { ev.preventDefault(); openMenu(); paintStatus(); }
+      return;
+    }
+    ev.preventDefault();
+    var handled = true;
+    if (k === "Escape") { closeMenu(); paintStatus(); return; }
+    else if (k === " ") { state.paused = !state.paused; }
+    else if (k === "ArrowRight" || k === "n" || k === "N") { show(state.i + 1); }
+    else if (k === "ArrowLeft") { show(state.i - 1); }
+    else if (k === "]") { state.every = Math.min(600, state.every + 15); }
+    else if (k === "[") { state.every = Math.max(15, state.every - 15); }
+    else if (k === "f" || k === "F") { if (document.fullscreenElement) document.exitFullscreen(); else document.documentElement.requestFullscreen && document.documentElement.requestFullscreen(); }
+    else if (k === "h" || k === "H") { state.hideAll = !state.hideAll; paint(current()); }
+    else if (k === "s" || k === "S") { var at = ORDERS.findIndex(function (o) { return o.key === state.order; }); reorder(ORDERS[(at + 1) % ORDERS.length].key); }
+    else if (/^[1-7]$/.test(k)) { reorder(ORDERS[parseInt(k, 10) - 1].key); }
+    else {
+      var ov = OVERLAYS.find(function (o) { return o.k.toLowerCase() === k.toLowerCase(); });
+      if (ov) { state.show[ov.key] = !state.show[ov.key]; state.hideAll = false; paint(current()); }
+      else handled = false;
+    }
+    if (handled) { persist(); paintMenu(); paintStatus(); openMenu(); }
+  });
+
+  /* ---- cursor goes away when the hand does ------------------------------ */
+  var idleTimer = null;
+  document.addEventListener("mousemove", function () {
+    document.body.classList.remove("idle");
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(function () { document.body.classList.add("idle"); }, 3000);
+  });
+
+  /* ---- start ----------------------------------------------------------- */
+  $("go").addEventListener("click", function () {
+    $("welcome").hidden = true;
+    state.seq = sequence(state.order);
+    state.i = 0;
+    run(current()); paint(current()); paintStatus();
+    last = performance.now();
+    requestAnimationFrame(tick);
+    setTimeout(openMenu, 600);
+  });
+})();
+</script>
