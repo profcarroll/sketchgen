@@ -184,6 +184,14 @@ class WebTestCase(unittest.TestCase):
         finally:
             conn.close()
 
+        # Whoever ran the suite is not the operator under test: no login from
+        # gh (the cache says "asked, none, never ask again") and none from
+        # the environment. TestNewJob sets each on purpose and puts it back.
+        cls._operator_env = os.environ.pop("SKETCHGEN_OPERATOR", None)
+        cls._gh_cache_before = dict(web._gh_cache)
+        web._gh_cache.clear()
+        web._gh_cache.update(login=None, asked=float("inf"))
+
         cls.server = web.make_server(
             bind="127.0.0.1",
             port=0,
@@ -204,6 +212,10 @@ class WebTestCase(unittest.TestCase):
         cls.thread.join(timeout=5)
         cls.server.server_close()
         cls._tmp.cleanup()
+        web._gh_cache.clear()
+        web._gh_cache.update(cls._gh_cache_before)
+        if cls._operator_env is not None:
+            os.environ["SKETCHGEN_OPERATOR"] = cls._operator_env
 
     # -- helpers -----------------------------------------------------------
 
@@ -1001,6 +1013,240 @@ class TestForms(WebTestCase):
             return {job.id for job in db.list_jobs(conn, "queued")}
         finally:
             conn.close()
+
+
+class TestNewJob(WebTestCase):
+    """The New job page after its 2026-09-18 redesign: signed by the node's
+    login, a parent you can see, defaults you can keep, a batch per line."""
+
+    def setUp(self):
+        self._env = os.environ.pop("SKETCHGEN_OPERATOR", None)
+
+    def tearDown(self):
+        os.environ.pop("SKETCHGEN_OPERATOR", None)
+        if self._env is not None:
+            os.environ["SKETCHGEN_OPERATOR"] = self._env
+        web._gh_cache.clear()
+        web._gh_cache.update(login=None, asked=float("inf"))
+        conn = self.db()
+        try:
+            db.set_meta(conn, web.DEFAULTS_KEY, None)
+        finally:
+            conn.close()
+
+    def signed_in_as(self, login):
+        web._gh_cache.clear()
+        web._gh_cache.update(login=login, asked=float("inf"))
+
+    def post_page(self, path, fields):
+        """(status, body text) for a POST that answers with a page."""
+        data = urllib.parse.urlencode(fields, doseq=True).encode("utf-8")
+        request = urllib.request.Request(self.url(path), data=data, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, exc.read().decode("utf-8")
+
+    def newest_job(self):
+        conn = self.db()
+        try:
+            return db.get_job(conn, max(job.id for job in db.list_jobs(conn)))
+        finally:
+            conn.close()
+
+    def queued_ids(self):
+        conn = self.db()
+        try:
+            return {job.id for job in db.list_jobs(conn, "queued")}
+        finally:
+            conn.close()
+
+    # -- who signs it --------------------------------------------------------
+
+    def test_the_nodes_login_signs_the_job(self):
+        self.signed_in_as("profcarroll")
+        page = self.text("/new")
+        self.assertIn('<span class="pill ok" title="via gh on this node">profcarroll</span>', page)
+        self.assertIn('<div id="other-box" hidden>', page)
+        self.assertNotIn("required", page.split("Submitted by")[1].split("Parent entry")[0])
+        status, location = self.post("/new", {"prompt": "a signed sketch"})
+        self.assertEqual(status, 303, location)
+        self.assertEqual("profcarroll", self.newest_job().submitted_by)
+
+    def test_the_environment_outranks_gh(self):
+        self.signed_in_as("profcarroll")
+        os.environ["SKETCHGEN_OPERATOR"] = "teaching-assistant"
+        page = self.text("/new")
+        self.assertIn("teaching-assistant", page)
+        self.assertIn("via $SKETCHGEN_OPERATOR", page)
+        # (the gallery link in the header names profcarroll; the pill must not)
+        self.assertNotIn(">profcarroll</span>", page)
+        self.assertEqual("teaching-assistant", web.operator_username())
+
+    def test_a_typed_name_is_somebody_elses_job(self):
+        self.signed_in_as("profcarroll")
+        status, _ = self.post("/new", {"prompt": "for a student", "submitted_by": "student-nine"})
+        self.assertEqual(status, 303)
+        self.assertEqual("student-nine", self.newest_job().submitted_by)
+        # ...and a refused one keeps the student's name in an open box
+        status, body = self.post_page(
+            "/new", {"prompt": "", "submitted_by": "student-nine"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn('<div id="other-box">', body)
+        self.assertIn('value="student-nine"', body)
+
+    def test_without_a_login_the_box_is_required_and_blank_is_refused(self):
+        page = self.text("/new")
+        self.assertIn('name="submitted_by" required', page)
+        self.assertIn("No GitHub login on this node", page)
+        before = self.queued_ids()
+        status, body = self.post_page("/new", {"prompt": "unsigned"})
+        self.assertEqual(status, 400)
+        self.assertIn("no GitHub login on this node", body)
+        self.assertEqual(before, self.queued_ids())
+
+    # -- the parent ------------------------------------------------------------
+
+    def test_the_parent_is_drawn_and_presets_planner_and_rules(self):
+        page = self.text(f"/new?parent={self.entry_id}")
+        self.assertIn(f'value="{self.entry_id}"', page)
+        self.assertIn(f'<a href="/entry/{self.entry_id}">entry {self.entry_id}</a>', page)
+        self.assertIn("three circles breathing", page)
+        self.assertIn("generation 0", page)
+        # the entry ran under control; spawn() would keep it, and so does this
+        self.assertIn('<option value="control" selected>', page)
+        self.assertIn('class="pick on"', page)
+        self.assertIn("recent entries a line can grow from", page)
+
+    def test_a_parent_that_cannot_grow_a_line_is_refused(self):
+        conn = self.db()
+        try:
+            job_id = db.enqueue(conn, "a closed line", "student-two")
+            db.transition(conn, job_id, "executing", executor="x")
+            db.transition(conn, job_id, "gating")
+            db.transition(conn, job_id, "held")
+            closed = db.create_entry(conn, job_id, "held", prompt="a closed line")
+            db.entry_transition(conn, closed, "rejected", reject_reason="no")
+        finally:
+            conn.close()
+        page = self.text(f"/new?parent={closed}")
+        self.assertIn("this will be refused", page)
+        before = self.queued_ids()
+        status, body = self.post_page(
+            "/new", {"prompt": "a child of a closed line", "submitted_by": "student-two",
+                     "parent_entry_id": str(closed)},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("rejected", body)
+        self.assertEqual(before, self.queued_ids())
+        # and an unknown one, as before
+        status, body = self.post_page(
+            "/new", {"prompt": "orphan", "submitted_by": "student-two",
+                     "parent_entry_id": "999999"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("there is no entry 999999", body)
+
+    def test_a_job_can_descend_from_the_entry_on_the_job_page(self):
+        page = self.text(f"/job/{self.held_id}")
+        self.assertIn(f'href="/new?parent={self.entry_id}"', page)
+
+    # -- defaults --------------------------------------------------------------
+
+    def test_save_as_defaults_keeps_the_options_and_the_prompt(self):
+        status, body = self.post_page(
+            "/new/defaults",
+            {"action": "save", "prompt": "still being typed", "planner": "paid",
+             "rules": "random", "publication": "auto", "max_attempts": "5",
+             "assert": ["responds(click)", "size"], "size_w": "800", "size_h": "600"},
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Saved as defaults", body)
+        self.assertIn("still being typed", body)
+        fresh = self.text("/new")
+        self.assertIn("Defaults saved", fresh)
+        self.assertIn('<option value="paid" selected>', fresh)
+        self.assertIn('<option value="random" selected>', fresh)
+        self.assertIn('<option value="auto" selected>', fresh)
+        self.assertIn('value="5"', fresh)
+        self.assertIn('value="responds(click)" checked', fresh)
+        self.assertIn('value="size" checked', fresh)
+        self.assertIn('value="800"', fresh)
+        self.assertNotIn('value="motion(idle)" checked', fresh)
+        # a job queued with the form untouched carries them
+        status, _ = self.post(
+            "/new", {"prompt": "under the defaults", "submitted_by": "student-two",
+                     "rules": "random", "publication": "auto", "max_attempts": "5"},
+        )
+        self.assertEqual(status, 303)
+        job = self.newest_job()
+        self.assertEqual(("random", "auto", 5), (job.rules_file, job.publication, job.max_attempts))
+
+    def test_forget_them_goes_back_to_the_built_in_ones(self):
+        self.post_page("/new/defaults", {"action": "save", "rules": "random", "max_attempts": "7"})
+        status, body = self.post_page(
+            "/new/defaults", {"action": "clear", "prompt": "kept", "rules": "random"}
+        )
+        self.assertEqual(status, 200)
+        self.assertIn("Forgot the saved defaults", body)
+        self.assertIn("kept", body)
+        self.assertIn('<option value="treatment" selected>', body)
+        fresh = self.text("/new")
+        self.assertIn("Built-in defaults", fresh)
+        self.assertIn('<option value="treatment" selected>', fresh)
+        self.assertIn('value="3"', fresh)
+
+    def test_bad_defaults_are_refused_and_nothing_is_saved(self):
+        status, body = self.post_page("/new/defaults", {"action": "save", "max_attempts": "40"})
+        self.assertEqual(status, 400)
+        self.assertIn("max attempts must be", body)
+        conn = self.db()
+        try:
+            self.assertIsNone(db.get_meta(conn, web.DEFAULTS_KEY))
+        finally:
+            conn.close()
+
+    # -- a batch, and prompts to run again --------------------------------------
+
+    def test_one_job_per_line_queues_a_batch(self):
+        before = self.queued_ids()
+        status, location = self.post(
+            "/new", {"prompt": "first line\n\n  second line \nthird line",
+                     "submitted_by": "student-two", "many": "1", "rules": "random"},
+        )
+        self.assertEqual(status, 303)
+        self.assertIn("Queued%203%20jobs", location)
+        new_ids = sorted(self.queued_ids() - before)
+        self.assertEqual(3, len(new_ids))
+        conn = self.db()
+        try:
+            prompts = [db.get_job(conn, job_id).prompt for job_id in new_ids]
+            rules = {db.get_job(conn, job_id).rules_file for job_id in new_ids}
+        finally:
+            conn.close()
+        self.assertEqual(["first line", "second line", "third line"], prompts)
+        self.assertEqual({"random"}, rules)
+        # blank lines only is no job at all
+        status, body = self.post_page(
+            "/new", {"prompt": "\n  \n", "submitted_by": "student-two", "many": "1"}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("a job needs a prompt", body)
+
+    def test_recent_prompts_are_offered_and_a_link_fills_the_box(self):
+        page = self.text("/new")
+        self.assertIn("recent prompts, to run again", page)
+        self.assertIn("a slow field of dots that drift", page)
+        self.assertIn("/new?prompt=a%20slow%20field", page)
+        filled = self.text("/new?prompt=" + urllib.parse.quote("hello, gate"))
+        self.assertIn(">hello, gate</textarea>", filled)
+
+    def test_the_header_says_where_the_job_would_land(self):
+        page = self.text("/new")
+        self.assertRegex(page, r"behind \d+ queued jobs?|the queue is empty")
 
 
 class TestControl(WebTestCase):

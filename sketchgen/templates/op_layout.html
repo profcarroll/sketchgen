@@ -317,10 +317,68 @@ form.stack textarea { min-height: 6em; }
   font-size: 13px; margin: 0; text-transform: none; letter-spacing: normal;
   color: var(--fg); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
-.chip input { margin-right: 5px; }
-.chip input[type=number] { width: 5em; padding: 1px 4px; border: 1px solid var(--line);
-                           border-radius: 4px; background: var(--bg); color: var(--fg); font: inherit; }
+/* form.stack's label rule (block, uppercase, a margin) outranks .chip on
+   specificity, so the chips used to come out as shouting blocks with the
+   size boxes stacked under them. Named at the same rank, a chip is a chip. */
+form.stack label.chip, label.chip {
+  display: inline-flex; align-items: center; gap: 3px; margin: 0; text-transform: none;
+  letter-spacing: normal; font-size: 13px; color: var(--fg); cursor: pointer;
+  white-space: nowrap; }
+.chip input { margin: 0 4px 0 0; }
+form.stack .chip input[type=number], .chip input[type=number] {
+  width: 4.5em; padding: 1px 4px; border: 1px solid var(--line); border-radius: 4px;
+  background: var(--bg); color: var(--fg); font: inherit; font-size: 12px; }
 .row { display: flex; gap: 14px; flex-wrap: wrap; align-items: flex-end; }
+/* The New job page (2026-09-18). A prompt panel, then who and what it
+   descends from side by side, then the assertions, then the run options with
+   the one primary button and the two default buttons pushed to the right.
+   The submitter is a pill when this node knows the operator's GitHub login
+   and a box only when it does not; the parent is a card you can see rather
+   than a number you have to trust. */
+.newjob h2 { margin-bottom: 8px; }
+.newjob .help { font-size: 12px; color: var(--dim); margin: 8px 0 0; line-height: 1.5; }
+.newjob .help code { font-size: 11px; background: var(--code); padding: 0 4px; border-radius: 3px; }
+.newjob textarea { min-height: 7em; font-size: 15px; }
+.newjob .opts { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center;
+                margin-top: 8px; font-size: 12px; color: var(--dim); }
+.newjob .opts label { display: inline; margin: 0; text-transform: none; letter-spacing: normal;
+                      font-size: 12px; color: var(--fg); cursor: pointer; }
+.newjob .opts input { margin-right: 5px; vertical-align: -1px; }
+button.link { border: 0; background: none; padding: 0; color: var(--accent);
+              text-decoration: underline; font-size: inherit; cursor: pointer; }
+button.link:hover { border: 0; }
+.signed { display: flex; flex-wrap: wrap; gap: 8px 10px; align-items: center; margin: 2px 0 0;
+          font-size: 12px; }
+.signed .pill { text-transform: none; letter-spacing: 0; font-size: 13px; }
+.parent-card { display: flex; gap: 12px; align-items: flex-start; margin-top: 10px; }
+.parent-card img { width: 180px; max-width: 40%; flex: none; border: 1px solid var(--line);
+                   border-radius: 5px; }
+.parent-card > div { min-width: 0; flex: 1 1 auto; }
+.parent-card .meta { margin: 0 0 4px; font-size: 12px; }
+.parent-card .prompt { margin: 4px 0; overflow-wrap: anywhere; }
+.parent-card .rev { margin: 2px 0; font-size: 12px; color: var(--dim); overflow-wrap: anywhere; }
+.parent-card .rev .k { text-transform: uppercase; letter-spacing: .05em; font-size: 10px; }
+.pick-fold, .recent-fold { margin-top: 12px; }
+.pick-fold > summary, .recent-fold > summary {
+  cursor: pointer; font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+  color: var(--dim); }
+.picks { display: grid; gap: 6px; margin-top: 8px; }
+.pick { display: grid; grid-template-columns: 56px 3em auto minmax(0, 1fr); gap: 8px;
+        align-items: center; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px;
+        text-decoration: none; color: var(--fg); font-size: 12px; }
+.pick:hover { border-color: var(--accent); }
+.pick.on { border-color: var(--accent); background: var(--code); }
+.pick img, .pick .no-img { display: block; width: 56px; height: 28px; object-fit: cover;
+                           border-radius: 3px; border: 1px solid var(--line); }
+.pick .no-img { background: var(--bar-bg); }
+.pick .n { font-weight: 700; font-variant-numeric: tabular-nums; }
+.pick .p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.recent { list-style: none; margin: 6px 0 0; padding: 0; font-size: 13px; }
+.recent li { padding: 4px 0; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+.recent li .dim { font-size: 12px; }
+.newjob .actions { align-items: center; }
+.newjob .actions .spacer { flex: 1 1 auto; }
+.newjob .actions .note { font-size: 12px; color: var(--dim); }
 .row > * { flex: 1 1 160px; }
 .err { color: var(--bad); }
 .actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }

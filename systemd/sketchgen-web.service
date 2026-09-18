@@ -18,6 +18,10 @@ Environment=SKETCHGEN_JOBS=%h/sketchgen/jobs
 Environment=SKETCHGEN_GATE=%h/sketchgen/app/gate/sketch_gate.py
 Environment=SKETCHGEN_GALLERY=%h/sketchgen/gallery
 Environment=OLLAMA_HOST_URL=http://127.0.0.1:11434
+# Who the New job page signs jobs as, and who a critique is by: unset, the page
+# asks `gh auth status` for the operator's login. Set this when gh is not on
+# the node or is signed in as somebody else.
+#Environment=SKETCHGEN_OPERATOR=profcarroll
 ExecStart=%h/sketchgen/.venv/bin/python3 %h/sketchgen/app/bin/sketchgen web --bind 127.0.0.1 --port 8081
 Restart=on-failure
 RestartSec=10
