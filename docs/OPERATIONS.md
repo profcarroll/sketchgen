@@ -1108,6 +1108,23 @@ superscript: everything that is public, published entries and kept rejections
 together. All of them are rendered by the server on every page load and repainted by the
 same two-second poll that keeps the worker pill honest.
 
+**New job** signs a job as you. The submitter is a pill carrying the operator's GitHub
+login — `$SKETCHGEN_OPERATOR` if the web unit sets it, else whatever `gh auth status` on
+the node reports, asked once per process — and a box for somebody else's username only
+opens when you ask for one; with neither source the box is back and required. The same
+login is what a critique on Held is signed by. The parent entry is a card, not a number:
+type an id or pick one of the recent held, published or kept entries and the page draws
+its strip, state, generation and prompt, presets planner and rules from it the way
+`lineage.spawn` does, and refuses a rejected or archived one before the queue sees it;
+`/new?parent=<id>` is what the job page's "descended from" link opens. Assertions and
+the run options open the way you last saved them — **Save as defaults** keeps the
+current ticks and options in the database's `meta` row, **Forget them** goes back to the
+built-in ones, and either leaves the prompt you were typing where it is. **One job per
+line** queues a batch of prompts under one setting, which is the cheap way to feed
+`rules=random` for the A/B measurement; the button counts them, and every line shares
+the one submitter, parent, assertions and options. Recent root prompts sit under the box
+to run again under other rules.
+
 ## The write-path sync as a timer
 
 `install-unit` also copies `systemd/sketchgen-sync.{service,timer}`. The service is a

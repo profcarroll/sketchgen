@@ -81,7 +81,10 @@ starts the batch and the tray, rendered server-side, refreshes itself.
 which composes the parent's prompt with it and queues the child. The form sits on
 the job page, and on the Held page a card's Critique mark queues one through the
 batch; ``critique-by`` defaults to the operator's username, which is
-``$SKETCHGEN_OPERATOR`` when it is set and the entry's own submitter otherwise.
+``$SKETCHGEN_OPERATOR`` when it is set, whatever ``gh`` on this node is signed
+in as when it is not (:func:`github_login`), and the entry's own submitter
+otherwise. The New job page signs a job the same way: the login is a pill,
+not a box, and the box only appears for a job queued on somebody's behalf.
 The gallery is generated, static, and has no way to write to this database —
 asking it to would mean a public form on a queue, and the publication gate
 exists precisely so a person stands between the queue and the site.
@@ -109,6 +112,7 @@ import os
 import re
 import sqlite3
 import string
+import subprocess
 import sys
 import threading
 import time
@@ -1939,26 +1943,364 @@ def _chips(picked: set[str], size_w: str, size_h: str) -> str:
     return "\n".join(chips)
 
 
-def new_page(form: dict[str, list[str]] | None = None, error: str | None = None) -> str:
-    form = form or {}
+#: Where the New job page keeps the operator's own defaults — one row in the
+#: meta scratchpad (migration 003), JSON, under this key. The built-in ones are
+#: what the page showed before anyone pressed "Save as defaults", and what it
+#: shows again after "Forget them".
+DEFAULTS_KEY = "new_job_defaults"
+BUILTIN_DEFAULTS: dict[str, Any] = {
+    "planner": "local",
+    "rules": "treatment",
+    "publication": "hold",
+    "max_attempts": "3",
+    "assert": [],
+    "size_w": "400",
+    "size_h": "400",
+}
+
+#: How many recent spawnable entries the parent picker offers, and how many
+#: recent root prompts the prompt panel offers to reuse.
+PARENT_PICK_LIMIT = 12
+RECENT_PROMPTS_LIMIT = 8
+
+
+def load_defaults(conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]:
+    """The saved defaults on top of the built-in ones, and when they were saved.
+
+    A missing row, an unreadable one, or one from a database still on
+    migration 001 all mean "the built-in ones": the page renders either way.
+    """
+    merged = {key: list(value) if isinstance(value, list) else value
+              for key, value in BUILTIN_DEFAULTS.items()}
+    raw = db.get_meta(conn, DEFAULTS_KEY)
+    if not raw:
+        return merged, None
+    try:
+        doc = json.loads(raw)
+    except ValueError:
+        return merged, None
+    if not isinstance(doc, dict):
+        return merged, None
+    for key in BUILTIN_DEFAULTS:
+        if key in doc:
+            merged[key] = doc[key]
+    saved = doc.get("saved_utc")
+    return merged, str(saved) if saved else None
+
+
+def defaults_from(form: dict[str, list[str]]) -> dict[str, Any]:
+    """What the form says the defaults should be, checked the way a job is.
+
+    Raises ValueError with the sentence the page should show. The assertions
+    are kept as the ticked chip values (``size`` rather than ``size(400,400)``)
+    because that is what re-ticks them; the size box keeps its own two numbers.
+    """
+
+    def one(name: str, default: str) -> str:
+        values = form.get(name) or []
+        return (values[0] if values else default).strip()
+
+    planner_choice = one("planner", "local")
+    if planner_choice not in {value for value, _ in PLANNER_CHOICES}:
+        raise ValueError("planner must be local or paid")
+    rules = one("rules", "treatment")
+    if rules not in {value for value, _ in RULES_CHOICES}:
+        raise ValueError("rules must be control, treatment or random")
+    publication = one("publication", "hold")
+    if publication not in {value for value, _ in PUBLICATION_CHOICES}:
+        raise ValueError("publication must be hold or auto")
+    raw_attempts = one("max_attempts", "3")
+    if not raw_attempts.isdigit() or not 1 <= int(raw_attempts) <= 10:
+        raise ValueError("max attempts must be a whole number from 1 to 10")
+    chip_values = {"size" if word == "size(w,h)" else word for word in planner.VOCAB}
+    ticked = [value for value in (form.get("assert") or []) if value in chip_values]
+    size_w, size_h = one("size_w", "400"), one("size_h", "400")
+    if not (size_w.isdigit() and size_h.isdigit()):
+        raise ValueError("size(w,h) needs two whole numbers")
+    return {
+        "planner": planner_choice,
+        "rules": rules,
+        "publication": publication,
+        "max_attempts": raw_attempts,
+        "assert": ticked,
+        "size_w": size_w,
+        "size_h": size_h,
+    }
+
+
+def save_defaults(conn: sqlite3.Connection, form: dict[str, list[str]]) -> str:
+    """Write the form's options as the page's defaults. Returns the flash."""
+    doc = defaults_from(form)
+    doc["saved_utc"] = db.utc_now()
+    db.set_meta(conn, DEFAULTS_KEY, json.dumps(doc))
+    words = ", ".join(doc["assert"]) or "none"
+    return (
+        f"Saved as defaults — {doc['planner']} · {doc['rules']} · "
+        f"{doc['publication']} · {doc['max_attempts']} attempts · assertions: {words}"
+    )
+
+
+def clear_defaults(conn: sqlite3.Connection) -> str:
+    """Back to the built-in defaults. Returns the flash."""
+    db.set_meta(conn, DEFAULTS_KEY, None)
+    return "Forgot the saved defaults — the page shows the built-in ones again"
+
+
+def _planner_word(value: str | None) -> str:
+    """An entry's or job's ``planner`` column as the form's two-way choice."""
+    return "paid" if (value or "") == "paid" else "local"
+
+
+def _spawnable_rows(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+    marks = ",".join("?" for _ in lineage.SPAWNABLE)
+    return conn.execute(
+        f"SELECT * FROM entries WHERE state IN ({marks}) "
+        "ORDER BY created_utc DESC, id DESC LIMIT ?",
+        (*sorted(lineage.SPAWNABLE), limit),
+    ).fetchall()
+
+
+def _parent_card(app: App, conn: sqlite3.Connection, parent_id: int | None) -> str:
+    """The entry the new job descends from, drawn so the operator can see it.
+
+    A bare id was the whole of this field until 2026-09-18, and a number is
+    not something a person can check. This is the strip, the state, the
+    generation, the root prompt and the newest revision — enough to know
+    whether it is the entry you meant — and a refusal in red when the line
+    cannot grow from it.
+    """
+    if not parent_id:
+        return (
+            '<p class="help" id="parent-card">none — a fresh root. Pick one below '
+            "and the job is a child of it: the queue and the job page say so, and "
+            "planner and rules are preset from it so the line stays a fair "
+            "comparison with itself.</p>"
+        )
+    row = db.get_entry(conn, parent_id)
+    if row is None:
+        return f'<p class="err" id="parent-card">there is no entry {parent_id}</p>'
+    state = str(row["state"])
+    root, revisions = lineage.split_prompt(row["prompt"] or "")
+    generation = lineage.generation_of(conn, parent_id)
+    revision = (
+        f'<p class="rev"><span class="k">revise:</span> {esc(revisions[-1])}</p>'
+        if revisions
+        else ""
+    )
+    refusal = (
+        ""
+        if state in lineage.SPAWNABLE
+        else f'<p class="err">entry {parent_id} is {esc(state_label(state))}: a line '
+        "grows from a held, published or kept entry, so this will be refused</p>"
+    )
+    return (
+        f'<div class="parent-card" id="parent-card" data-prompt="{esc(root)}">'
+        f"{_entry_image(app, row)}"
+        f'<div><p class="meta"><a href="/entry/{parent_id}">entry {parent_id}</a> '
+        f'<span class="pill {esc(state)}">{esc(state_label(state))}</span> '
+        f'<span class="dim">generation {generation} · {_planner_word(row["planner"])} · '
+        f'{esc(row["rules_file"] or "—")} · {esc(row["submitted_by"] or "—")}</span></p>'
+        f'<p class="prompt">{esc(root or "—")}</p>{revision}'
+        '<p class="help"><button type="button" class="link" id="use-parent-prompt">'
+        "use its prompt</button> as the starting point, or write a fresh one.</p>"
+        f"</div></div>{refusal}"
+    )
+
+
+def _parent_picker(app: App, conn: sqlite3.Connection, chosen: int | None) -> str:
+    """The last few entries a line can grow from, as one-line rows.
+
+    Each row is a link to ``/new?parent=<id>`` so it works with no script; with
+    the page's script a click fills the id box and the card instead, and the
+    prompt already typed stays where it is.
+    """
+    rows = _spawnable_rows(conn, PARENT_PICK_LIMIT)
+    if not rows:
+        return ""
+    items = []
+    for row in rows:
+        entry_id = int(row["id"])
+        state = str(row["state"])
+        root, _ = lineage.split_prompt(row["prompt"] or "")
+        image = _entry_image(app, row)
+        thumb = image if image.startswith("<img") else '<span class="no-img"></span>'
+        items.append(
+            f'<a class="pick{" on" if entry_id == chosen else ""}" '
+            f'href="/new?parent={entry_id}" data-parent="{entry_id}" '
+            f'data-state="{esc(state_label(state))}" data-state-class="{esc(state)}" '
+            f'data-planner="{_planner_word(row["planner"])}" '
+            f'data-rules="{esc(row["rules_file"] or "")}" data-prompt="{esc(root)}">'
+            f'{thumb}<span class="n">{entry_id}</span>'
+            f'<span class="pill {esc(state)}">{esc(state_label(state))}</span>'
+            f'<span class="p">{esc(truncate(root, 80))}</span></a>'
+        )
+    return (
+        '<details class="pick-fold"><summary>recent entries a line can grow from</summary>'
+        f'<div class="picks">{"".join(items)}</div></details>'
+    )
+
+
+def _recent_prompts(conn: sqlite3.Connection) -> str:
+    """The last few root prompts, to run again — under other rules, say."""
+    rows = conn.execute(
+        "SELECT id, prompt, state, rules_file FROM jobs WHERE critique IS NULL "
+        "ORDER BY created_utc DESC, id DESC LIMIT 60"
+    ).fetchall()
+    seen: set[str] = set()
+    items = []
+    for row in rows:
+        root, _ = lineage.split_prompt(row["prompt"] or "")
+        key = " ".join(root.lower().split())
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        href = "/new?prompt=" + urllib.parse.quote(root)
+        items.append(
+            f'<li><a href="{esc(href)}" data-prompt="{esc(root)}">{esc(truncate(root, 110))}</a>'
+            f' <span class="dim">— job {int(row["id"])} · {esc(row["rules_file"] or "—")} · '
+            f'{esc(state_label(str(row["state"])))}</span></li>'
+        )
+        if len(items) >= RECENT_PROMPTS_LIMIT:
+            break
+    if not items:
+        return ""
+    return (
+        '<details class="recent-fold"><summary>recent prompts, to run again</summary>'
+        f'<ul class="recent">{"".join(items)}</ul></details>'
+    )
+
+
+def _submitter_block(typed: str) -> str:
+    """Who the job is signed as: a pill when the node knows, a box when not.
+
+    ``typed`` is what a re-rendered form carried. A name that is not the
+    login opens the box with it, so a refused job queued for a student does
+    not lose the student's name.
+    """
+    login, source = operator_login()
+    if login is None:
+        return (
+            '<label for="submitted_by">GitHub username</label>'
+            '<input type="text" id="submitted_by" name="submitted_by" required '
+            f'pattern="[A-Za-z0-9-]{{1,39}}" value="{esc(typed)}" '
+            'placeholder="whose job this is">'
+            '<p class="help">No GitHub login on this node, so this is typed. '
+            "<code>gh auth login</code> as the operator, or set "
+            "<code>SKETCHGEN_OPERATOR</code> in the web unit, and it becomes a pill.</p>"
+        )
+    other = bool(typed) and typed != login
+    return (
+        f'<p class="signed"><span class="pill ok" title="via {esc(source)}">{esc(login)}</span>'
+        f'<span class="dim">via {esc(source)}</span>'
+        '<button type="button" class="link" id="other-submitter"'
+        f'{" hidden" if other else ""}>queue it for somebody else</button></p>'
+        f'<div id="other-box"{"" if other else " hidden"}>'
+        '<label for="submitted_by">Their GitHub username</label>'
+        '<input type="text" id="submitted_by" name="submitted_by" '
+        f'pattern="[A-Za-z0-9-]{{1,39}}" value="{esc(typed if other else "")}" '
+        f'placeholder="blank means {esc(login)}">'
+        "</div>"
+        '<p class="help">Only a GitHub username ever goes on a job (course policy: '
+        "no personal data). It is what the queue, the job page and the gallery "
+        "show as the author.</p>"
+    )
+
+
+def _queue_note(conn: sqlite3.Connection, control: db.Control | None) -> str:
+    queued = _count(conn, "SELECT COUNT(*) FROM jobs WHERE state = 'queued'")
+    waiting = (
+        "the queue is empty"
+        if queued == 0
+        else f"behind {queued} queued job{'' if queued == 1 else 's'}"
+    )
+    text, _, _ = pill_for(control)
+    if text == "RUNNING":
+        return waiting
+    return f"{waiting} · worker {text.lower()}, so it waits"
+
+
+def _defaults_note(saved_utc: str | None) -> str:
+    if saved_utc:
+        return (
+            f"Defaults saved {esc(saved_utc[:16].replace('T', ' '))} UTC: the "
+            "assertions and the run options open this way. Save again to move them."
+        )
+    return (
+        "Built-in defaults. Set the assertions and the run options the way you "
+        "usually want them, then Save as defaults and the page opens that way."
+    )
+
+
+def new_page(
+    app: App,
+    conn: sqlite3.Connection,
+    form: dict[str, list[str]] | None = None,
+    error: str | None = None,
+    control: db.Control | None = None,
+) -> str:
+    """The form. ``form`` is what a refused POST carried, or what a link asked
+    for (``?parent=``, ``?prompt=``); every field it does not carry comes from
+    the saved defaults."""
+    given = form or {}
+    defaults, saved_utc = load_defaults(conn)
+    base: dict[str, list[str]] = {
+        key: (list(value) if isinstance(value, list) else [str(value)])
+        for key, value in defaults.items()
+    }
+    base.update({key: list(values) for key, values in given.items()})
+    form = base
 
     def one(name: str, default: str = "") -> str:
         values = form.get(name) or []
         return values[0] if values else default
 
+    parent_raw = one("parent_entry_id").strip()
+    parent_id = int(parent_raw) if parent_raw.isdigit() else None
     picked = set(form.get("assert") or [])
     return render(
         "op_new",
         error=f'<p class="err">{esc(error)}</p>' if error else "",
         prompt=esc(one("prompt")),
-        submitted_by=esc(one("submitted_by")),
+        many_checked=" checked" if one("many") else "",
+        recent=_recent_prompts(conn),
+        submitter=_submitter_block(one("submitted_by").strip()),
+        parent_entry_id=esc(parent_raw),
+        parent_card=_parent_card(app, conn, parent_id),
+        parent_picker=_parent_picker(app, conn, parent_id),
         planner_options=_options(PLANNER_CHOICES, one("planner", "local")),
-        parent_entry_id=esc(one("parent_entry_id")),
         chips=_chips(picked, one("size_w", "400"), one("size_h", "400")),
         rules_options=_options(RULES_CHOICES, one("rules", "treatment")),
         publication_options=_options(PUBLICATION_CHOICES, one("publication", "hold")),
         max_attempts=esc(one("max_attempts", "3")),
+        queue_note=esc(_queue_note(conn, control)),
+        defaults_note=_defaults_note(saved_utc),
     )
+
+
+def form_from_query(
+    conn: sqlite3.Connection, query: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """What a link into /new asks the form to start with.
+
+    ``?parent=<id>`` fills the parent and — as :func:`sketchgen.lineage.spawn`
+    does — presets planner and rules from that entry, so a line stays a fair
+    comparison with itself unless the operator changes them on purpose.
+    ``?prompt=`` fills the prompt: the recent-prompts list and anything else
+    that wants to hand a sentence to this page.
+    """
+    form: dict[str, list[str]] = {}
+    parent = (query.get("parent") or [""])[0].strip()
+    if parent.isdigit():
+        form["parent_entry_id"] = [parent]
+        row = db.get_entry(conn, int(parent))
+        if row is not None and row["state"] in lineage.SPAWNABLE:
+            form["planner"] = [_planner_word(row["planner"])]
+            if row["rules_file"] in {value for value, _ in RULES_CHOICES}:
+                form["rules"] = [str(row["rules_file"])]
+    prompt = (query.get("prompt") or [""])[0]
+    if prompt.strip():
+        form["prompt"] = [prompt]
+    return form
 
 
 def _assertions_from(form: dict[str, list[str]]) -> tuple[list[str], str | None]:
@@ -1999,7 +2341,13 @@ def create_job(conn: sqlite3.Connection, form: dict[str, list[str]]) -> tuple[in
     prompt = one("prompt")
     if not prompt:
         raise ValueError("a job needs a prompt")
-    submitted_by = one("submitted_by")
+    submitted_by = one("submitted_by") or (github_login() or "")
+    if not submitted_by:
+        raise ValueError(
+            "no GitHub login on this node to sign the job with — type the "
+            "submitter's GitHub username, or `gh auth login` / set "
+            "SKETCHGEN_OPERATOR so the page knows who you are"
+        )
     if not USERNAME_RE.match(submitted_by):
         raise ValueError(
             "submitted by must be a GitHub username — letters, digits and "
@@ -2024,10 +2372,15 @@ def create_job(conn: sqlite3.Connection, form: dict[str, list[str]]) -> tuple[in
         if not parent_raw.isdigit():
             raise ValueError("parent entry id must be a number")
         parent = int(parent_raw)
-        if not conn.execute(
-            "SELECT 1 FROM entries WHERE id = ?", (parent,)
-        ).fetchone():
+        parent_row = db.get_entry(conn, parent)
+        if parent_row is None:
             raise ValueError(f"there is no entry {parent} to descend from")
+        if parent_row["state"] not in lineage.SPAWNABLE:
+            raise ValueError(
+                f"entry {parent} is {state_label(str(parent_row['state']))}: a "
+                "line grows from a held, published or kept entry, not a "
+                "rejected or archived one"
+            )
 
     words, problem = _assertions_from(form)
     if problem:
@@ -2052,6 +2405,45 @@ def create_job(conn: sqlite3.Connection, form: dict[str, list[str]]) -> tuple[in
         (job_id,),
     )
     return job_id, position
+
+
+def create_jobs(
+    conn: sqlite3.Connection, form: dict[str, list[str]]
+) -> list[tuple[int, int]]:
+    """One job, or with ``many`` ticked one per non-empty line of the prompt.
+
+    Every line gets the same submitter, parent, assertions and options — the
+    point of the tick is a batch of prompts under one setting, which is what
+    MEASURE[agents-md-ab] wants fed to ``rules=random``. The lines are all
+    checked before any is queued, so a bad line refuses the lot rather than
+    half of it.
+    """
+    if not (form.get("many") or [""])[0].strip():
+        return [create_job(conn, form)]
+    raw = (form.get("prompt") or [""])[0]
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not lines:
+        raise ValueError("a job needs a prompt")
+    # A dry pass first: create_job validates and then writes, so give it a
+    # savepoint to unwind if a later line is the one that is wrong.
+    conn.execute("SAVEPOINT many")
+    try:
+        queued = [create_job(conn, {**form, "prompt": [line]}) for line in lines]
+    except Exception:
+        conn.execute("ROLLBACK TO many")
+        conn.execute("RELEASE many")
+        raise
+    conn.execute("RELEASE many")
+    return queued
+
+
+def queued_flash(queued: list[tuple[int, int]]) -> str:
+    if len(queued) == 1:
+        job_id, position = queued[0]
+        return f"Queued as #{job_id} · position {position}"
+    first, _ = queued[0]
+    last, position = queued[-1]
+    return f"Queued {len(queued)} jobs, #{first} to #{last} · last at position {position}"
 
 
 # ---------------------------------------------------------------------------
@@ -2390,7 +2782,7 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
         ("planner", job.planner or "—"),
         ("executor", job.executor or "—"),
         ("rules file", job.rules_file or "—"),
-        ("parent entry", job.parent_entry_id if job.parent_entry_id else "—"),
+        ("parent entry", f"entry {job.parent_entry_id}" if job.parent_entry_id else "—"),
         ("critique", job.critique or "—"),
         ("critique by", job.critique_by or "—"),
         ("submitted by", job.submitted_by),
@@ -2409,6 +2801,8 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
     spawn = (
         '<section class="panel"><h2>Lineage</h2>'
         f'<div class="actions">{spawn_form(entry, f"/job/{job.id}")}</div>'
+        f'<p class="dim" style="font-size:12px;margin:10px 0 0">Or write a fresh prompt '
+        f'<a href="/new?parent={int(entry["id"])}">descended from entry {int(entry["id"])}</a>.</p>'
         "</section>"
         if entry is not None
         else ""
@@ -4609,21 +5003,175 @@ HELD_SCRIPT = """<script>
 
 
 # ---------------------------------------------------------------------------
+# The New job page's script: everything on it already works without this
+# ---------------------------------------------------------------------------
+
+#: Five conveniences, each one a few lines, none of them load-bearing: the
+#: picker's rows are links and the recent prompts are links, so with no script
+#: the same click lands on the same page by a round trip — and loses the
+#: prompt typed so far, which is what the script is for.
+NEW_JOB_SCRIPT = r"""<script>
+(function () {
+  var form = document.getElementById("newjob");
+  if (!form) { return; }
+  var prompt = document.getElementById("prompt");
+  var parentBox = document.getElementById("parent_entry_id");
+  var queue = document.getElementById("queue-it");
+  var many = document.getElementById("many");
+
+  // Ctrl+Enter (Cmd+Enter) queues, from anywhere on the form.
+  form.addEventListener("keydown", function (event) {
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+      event.preventDefault();
+      queue.click();
+    }
+  });
+
+  // "One job per line" tells the button how many that is.
+  function relabel() {
+    if (!many || !many.checked) { queue.textContent = "Queue it"; return; }
+    var n = prompt.value.split("\n").filter(function (l) { return l.trim(); }).length;
+    queue.textContent = n > 1 ? "Queue " + n + " jobs" : "Queue it";
+  }
+  if (many) { many.addEventListener("change", relabel); prompt.addEventListener("input", relabel); relabel(); }
+
+  // The submitter pill, and the box under it for a job queued on somebody's behalf.
+  var other = document.getElementById("other-submitter");
+  var otherBox = document.getElementById("other-box");
+  if (other && otherBox) {
+    other.addEventListener("click", function () {
+      other.hidden = true; otherBox.hidden = false;
+      var input = otherBox.querySelector("input"); if (input) { input.focus(); }
+    });
+  }
+
+  // Picking a parent fills the id, the card and — as spawn() would — planner and rules.
+  var card = document.getElementById("parent-card");
+  function pickParent(row) {
+    parentBox.value = row.dataset.parent;
+    document.querySelectorAll(".pick.on").forEach(function (el) { el.classList.remove("on"); });
+    row.classList.add("on");
+    var planner = form.querySelector("[name=planner]");
+    var rules = form.querySelector("[name=rules]");
+    if (planner && row.dataset.planner) { planner.value = row.dataset.planner; }
+    if (rules && row.dataset.rules) { rules.value = row.dataset.rules; }
+    if (card) {
+      var img = row.querySelector("img");
+      card.className = "parent-card"; card.dataset.prompt = row.dataset.prompt;
+      card.innerHTML = (img ? "<img src=\"" + img.getAttribute("src") + "\" alt=\"frame strip\">" : "") +
+        "<div><p class=\"meta\"><a href=\"/entry/" + row.dataset.parent + "\">entry " + row.dataset.parent +
+        "</a> <span class=\"pill " + row.dataset.stateClass + "\">" + row.dataset.state + "</span>" +
+        " <span class=\"dim\">" + row.dataset.planner + " · " + (row.dataset.rules || "—") + "</span></p>" +
+        "<p class=\"prompt\"></p><p class=\"help\"><button type=\"button\" class=\"link\" id=\"use-parent-prompt\">use its prompt</button>" +
+        " as the starting point, or write a fresh one.</p></div>";
+      card.querySelector(".prompt").textContent = row.dataset.prompt;
+      wireUsePrompt();
+    }
+  }
+  document.querySelectorAll(".pick").forEach(function (row) {
+    row.addEventListener("click", function (event) { event.preventDefault(); pickParent(row); });
+  });
+  function wireUsePrompt() {
+    var use = document.getElementById("use-parent-prompt");
+    if (!use) { return; }
+    use.addEventListener("click", function () {
+      var current = document.getElementById("parent-card");
+      if (current && current.dataset.prompt) { prompt.value = current.dataset.prompt; prompt.focus(); relabel(); }
+    });
+  }
+  wireUsePrompt();
+
+  // A recent prompt goes into the box rather than around through the server.
+  document.querySelectorAll(".recent a[data-prompt]").forEach(function (link) {
+    link.addEventListener("click", function (event) {
+      event.preventDefault(); prompt.value = link.dataset.prompt; prompt.focus(); relabel();
+    });
+  });
+})();
+</script>"""
+
+
+# ---------------------------------------------------------------------------
 # Spawning a child from a critique (packet 5.3)
 # ---------------------------------------------------------------------------
+
+
+#: A ``gh auth status`` that failed is asked again after this long, so a node
+#: that signs in after the service started is noticed without a restart. A
+#: login that was found is kept for the life of the process.
+GH_RETRY_S = 600.0
+_gh_cache: dict[str, Any] = {}
+_gh_lock = threading.Lock()
+_GH_LOGIN_RE = re.compile(r"Logged in to github\.com (?:account|as) ([A-Za-z0-9-]+)")
+
+
+def _ask_gh() -> str | None:
+    """One ``gh auth status``, parsed. None for no gh, no login, or no answer."""
+    try:
+        done = subprocess.run(
+            ["gh", "auth", "status", "--hostname", "github.com"],
+            capture_output=True, text=True, timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = _GH_LOGIN_RE.search(done.stdout + done.stderr)
+    if match is None or not USERNAME_RE.match(match.group(1)):
+        return None
+    return match.group(1)
+
+
+def gh_login() -> str | None:
+    """Whatever ``gh`` on this node is signed in as, or None; cached.
+
+    The web process runs as the operator's own user (a ``--user`` unit), so
+    ``gh``'s keyring or hosts file is the operator's, and the login it reports
+    is the operator's GitHub username — which is the one thing course policy
+    allows on a job. Asked once, in a subprocess with a timeout, never on a
+    hot path: the answer is remembered.
+    """
+    now = time.monotonic()
+    with _gh_lock:
+        asked = _gh_cache.get("asked")
+        if asked is not None and (_gh_cache.get("login") or now - asked < GH_RETRY_S):
+            return _gh_cache.get("login")
+    login = _ask_gh()
+    with _gh_lock:
+        _gh_cache.update(login=login, asked=now)
+    return login
+
+
+def operator_login() -> tuple[str | None, str]:
+    """The operator's GitHub login and where it came from.
+
+    ``$SKETCHGEN_OPERATOR`` first, when it is a GitHub username — the explicit
+    setting wins over the ambient one — then :func:`gh_login`. ``(None, "")``
+    when neither knows.
+    """
+    name = (os.environ.get("SKETCHGEN_OPERATOR") or "").strip()
+    if name and USERNAME_RE.match(name):
+        return name, "$SKETCHGEN_OPERATOR"
+    login = gh_login()
+    if login:
+        return login, "gh on this node"
+    return None, ""
+
+
+def github_login() -> str | None:
+    """The operator's GitHub login, or None. See :func:`operator_login`."""
+    return operator_login()[0]
 
 
 def operator_username(row: sqlite3.Row | None = None) -> str:
     """Who the UI signs a critique as, by default.
 
-    ``$SKETCHGEN_OPERATOR`` when it is set to something that is a GitHub
-    username, the entry's own submitter when it is not, and the literal
-    ``operator`` when there is neither. The field is editable on the form, so
-    this is a default and never a claim: ``critique_by`` is a model id when a
-    model wrote the sentence.
+    The operator's GitHub login when this node knows it
+    (:func:`operator_login`), the entry's own submitter when it does not, and
+    the literal ``operator`` when there is neither. The field is editable on
+    the form, so this is a default and never a claim: ``critique_by`` is a
+    model id when a model wrote the sentence.
     """
-    name = (os.environ.get("SKETCHGEN_OPERATOR") or "").strip()
-    if name and USERNAME_RE.match(name):
+    name = github_login()
+    if name:
         return name
     if row is not None:
         submitter = (row["submitted_by"] or "").strip()
@@ -4968,6 +5516,7 @@ ROUTES: list[tuple[str, re.Pattern[str], str]] = [
     ("GET", re.compile(r"^/queue$"), "page_queue"),
     ("GET", re.compile(r"^/new$"), "page_new"),
     ("POST", re.compile(r"^/new$"), "post_new"),
+    ("POST", re.compile(r"^/new/defaults$"), "post_new_defaults"),
     ("GET", re.compile(r"^/api/job/(?P<job_id>\d+)\.json$"), "api_job"),
     ("GET", re.compile(r"^/events/job/(?P<job_id>\d+)$"), "events_job"),
     ("GET", re.compile(r"^/job/(?P<job_id>\d+)$"), "page_job"),
@@ -5211,43 +5760,85 @@ class OpHandler(BaseHTTPRequestHandler):
         try:
             control = db.get_control(conn)
             marks = nav_summary(conn)
+            body = new_page(
+                self.app, conn, form_from_query(conn, self.query()), control=control
+            )
         finally:
             conn.close()
         self.html(
             layout(
                 title="New job",
                 here="/new",
-                body=new_page(),
+                body=body,
                 control=control,
                 back="/new",
                 flash=self.flash(),
                 nav_marks=marks,
+                page_script=NEW_JOB_SCRIPT,
             )
         )
 
-    def post_new(self) -> None:
-        form = self.form()
+    def _new_page_with(
+        self, form: dict[str, list[str]], *, error: str | None = None,
+        flash: str | None = None, status: int = 200,
+    ) -> None:
+        """The form again, with what was typed still in it."""
         conn = self.app.connect()
         try:
             control = db.get_control(conn)
+            self.html(
+                layout(
+                    title="New job",
+                    here="/new",
+                    body=new_page(self.app, conn, form, error, control=control),
+                    control=control,
+                    back="/new",
+                    flash=flash,
+                    nav_marks=nav_summary(conn),
+                    page_script=NEW_JOB_SCRIPT,
+                ),
+                status=status,
+            )
+        finally:
+            conn.close()
+
+    def post_new(self) -> None:
+        form = self.form()
+        error: str | None = None
+        conn = self.app.connect()
+        try:
             try:
-                job_id, position = create_job(conn, form)
+                queued = create_jobs(conn, form)
             except (ValueError, sqlite3.Error) as exc:
-                self.html(
-                    layout(
-                        title="New job",
-                        here="/new",
-                        body=new_page(form, str(exc)),
-                        control=control,
-                        back="/new",
-                        nav_marks=nav_summary(conn),
-                    ),
-                    status=400,
-                )
+                error = str(exc)
+                queued = []
+        finally:
+            conn.close()
+        if not queued:
+            self._new_page_with(form, error=error, status=400)
+            return
+        self.redirect("/queue", queued_flash(queued))
+
+    def post_new_defaults(self) -> None:
+        """Save as defaults, or forget them. The page comes back with the
+        prompt still typed — a redirect would have thrown it away."""
+        form = self.form()
+        action = (form.get("action") or ["save"])[0]
+        conn = self.app.connect()
+        try:
+            try:
+                if action == "clear":
+                    flash = clear_defaults(conn)
+                    for key in BUILTIN_DEFAULTS:
+                        form.pop(key, None)
+                else:
+                    flash = save_defaults(conn, form)
+            except (ValueError, sqlite3.Error) as exc:
+                self._new_page_with(form, error=str(exc), status=400)
                 return
         finally:
             conn.close()
-        self.redirect("/queue", f"Queued as #{job_id} · position {position}")
+        self._new_page_with(form, flash=flash)
 
     def page_job(self, job_id: str) -> None:
         conn = self.app.connect()
