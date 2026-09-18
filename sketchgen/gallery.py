@@ -600,6 +600,11 @@ def _lineage_index(
                 item["submitted_by"] = row["submitted_by"]
                 item["strip"] = f"e/{entry_id}/strip.png"
                 item["root_prompt"] = root_prompt
+                # So a ledger tile the script paints routes a listening sketch to
+                # its own tab, the same as the server-rendered tiles do.
+                item["mic"] = _needs_mic(
+                    Path(row["source_dir"]) if row["source_dir"] else None
+                )
             entries[str(entry_id)] = item
         return {"generated_utc": generated_utc, "entries": entries}
 
@@ -1438,23 +1443,67 @@ def _heavy_chip(heavy: dict[str, float | None]) -> str:
     return f'<span class="chip heavy">{_esc(text)}</span>'
 
 
+#: Microphone *input* — the one thing a sandboxed, opaque-origin sketch frame
+#: cannot do. A published sketch runs in an ``sandbox="allow-scripts"`` iframe with
+#: no ``allow="microphone"``, so ``getUserMedia`` is refused and a listening sketch
+#: reads a dead mic; it only works opened in its own top-level tab, where the
+#: Pages origin (https) is a secure context the browser will grant the mic. Making
+#: sound — ``p5.Oscillator``, ``loadSound`` — works in the frame after a click and
+#: is deliberately NOT matched here: only listening has to leave the page.
+_MIC_RE = re.compile(r"p5\.AudioIn|getUserMedia|mediaDevices")
+
+
+def _needs_mic(source: Path | None) -> bool:
+    """True when the sketch at ``source`` opens the microphone (see :data:`_MIC_RE`)."""
+    if source is None:
+        return False
+    text = ""
+    for name in ("sketch.js", "index.html"):
+        try:
+            text += (source / name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    return bool(_MIC_RE.search(text))
+
+
 def _frame(
     has_sketch: bool,
     title: str,
     *,
     heavy: dict[str, float | None] | None = None,
     has_strip: bool = False,
+    mic: bool = False,
 ) -> str:
     """The stage: an iframe that starts itself, or a frame that waits.
 
     A sketch the gate had to grind through does not get to start itself the
     moment somebody opens the page. It renders as the strip with a play button
     — the same run-in-place helper the ledger tiles use — and says why.
+
+    A microphone sketch never starts in the embedded frame at all: the mic is
+    refused an opaque, sandboxed origin, so the strip becomes a link that opens
+    the sketch in its own tab, where the origin is real and the browser can grant
+    it. Making sound is not this — see :data:`_MIC_RE`.
     """
     if not has_sketch:
         return (
             '<p class="none">The sketch source is not in this checkout, so there '
             "is nothing to run here.</p>"
+        )
+    if mic:
+        poster = (
+            f'<img src="strip.png" alt="four frames from {_esc(title)}">'
+            if has_strip else "<span data-play-label></span>"
+        )
+        return (
+            '<div class="stage-run stage-mic">\n'
+            '      <a class="play" href="sketch/" target="_blank" rel="noopener"'
+            f' aria-label="run {_esc(title)} in a new tab">{poster}'
+            '<span class="play-label">run in a tab ▸</span></a>\n'
+            '      <p class="run-note">This sketch listens to the microphone, which '
+            "a browser only opens for a page in its own tab — so it runs there, not "
+            "in this embedded frame.</p>\n"
+            "    </div>"
         )
     if heavy is not None and has_strip:
         return (
@@ -1565,10 +1614,11 @@ def _ledger_tile(entry_id: int, item: dict[str, Any] | None, width: str) -> str:
     """
     if not (item or {}).get("public"):
         return f'<div class="ledger-tile {width} blank" aria-hidden="true"></div>'
+    mic = ' data-run-mic="1"' if (item or {}).get("mic") else ""
     return (
         f'<div class="ledger-tile {width}">'
         f'<button type="button" class="play" data-play '
-        f'data-run-href="../{entry_id}/sketch/" '
+        f'data-run-href="../{entry_id}/sketch/"{mic} '
                 f'aria-label="run entry {entry_id}" data-run-name="entry {entry_id}">'
         f'<img src="../{entry_id}/strip.png" loading="lazy" '
         f'alt="the first frame of entry {entry_id}">'
@@ -2034,7 +2084,8 @@ def _write_entry(
         subtitle=_subtitle(revisions, meta),
         byline=_byline(row, meta),
         failed_note=failed_note,
-        frame=_frame(has_sketch, title, heavy=_heavy(meta), has_strip=has_strip),
+        frame=_frame(has_sketch, title, heavy=_heavy(meta), has_strip=has_strip,
+                     mic=has_sketch and _needs_mic(source)),
         seed=_dash(meta["seed"]),
         state_chip=_state_chip(row["state"]),
         brief=_paragraphs(str(row["brief"] or ""), "No brief was recorded for this job."),
