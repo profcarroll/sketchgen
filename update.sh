@@ -8,6 +8,7 @@
 #
 # What it does, in order:
 #   1. Pulls the generator repo (~/sketchgen/app)
+#   1a. If that pull changed THIS script, hands over to the pulled copy
 #   1b. Pauses the generator, letting the attempt in flight finish
 #   2. Re-installs the unit files into ~/.config/systemd/user and reloads
 #   2b. Applies any pending database migration (db init)
@@ -90,10 +91,30 @@ resume_generator() {
 trap 'resume_generator || true' EXIT
 
 # --- 1. Pull the generator ---------------------------------------------------
+SELF="$APP/update.sh"
+script_hash() { sha256sum "$SELF" 2>/dev/null | cut -d' ' -f1; }
+self_before=$(script_hash)
+
 step "Pulling generator (~/sketchgen/app)"
 cd "$APP" || die "cannot cd to $APP"
 git pull origin main || die "git pull failed in $APP"
 green "generator up to date"
+
+# --- 1a. Hand over to the pulled copy of this script -------------------------
+# bash reads a script as it runs it, from the file it was given when it
+# started, so a pull that changes update.sh does not change the run that
+# pulled it: the rest of this run is still the old script, and whatever the
+# new one added — a migration step on 2026-09-16, the render's --progress flag
+# on 2026-09-18 — silently does not happen until the deploy after. Twice that
+# has looked like a broken feature. So when the pull changed the file on disk,
+# exec the new copy: same arguments, same environment, nothing of this run to
+# undo yet (the generator is not paused until 1b). The guard stops a loop if a
+# file somehow changes on every pull; the second copy runs on regardless.
+if [ "${SKETCHGEN_UPDATE_REEXEC:-}" != yes ] && [ "$(script_hash)" != "$self_before" ]; then
+    dim "update.sh itself changed in that pull — handing over to the new copy"
+    export SKETCHGEN_UPDATE_REEXEC=yes
+    exec bash "$SELF" "$@"
+fi
 
 # --- 1b. Pause the generator -------------------------------------------------
 step "Pausing the generator for the deploy"

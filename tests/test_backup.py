@@ -368,6 +368,22 @@ class BackupUnitTests(unittest.TestCase):
         text = (REPO_ROOT / "update.sh").read_text(encoding="utf-8")
         self.assertIn("bin/sketchgen install-unit", text)
 
+    def test_update_sh_hands_over_to_the_copy_it_pulled(self):
+        """A pull that changes update.sh must not finish as the old script.
+
+        Twice (2026-09-16, 2026-09-18) a deploy pulled a new step into this
+        file and then ran on without it, because bash keeps the file it
+        opened. The hash is taken before the pull and checked after; a
+        change execs the pulled copy under a guard so it cannot loop.
+        """
+        text = (REPO_ROOT / "update.sh").read_text(encoding="utf-8")
+        pull = text.index("git pull origin main")
+        self.assertIn("self_before=$(script_hash)", text[:pull])
+        after = text[pull:]
+        self.assertIn('exec bash "$SELF" "$@"', after)
+        self.assertIn("SKETCHGEN_UPDATE_REEXEC", after)
+        self.assertLess(after.index('exec bash "$SELF"'), after.index("control pause"))
+
     def test_install_unit_knows_about_them(self):
         text = (REPO_ROOT / "bin" / "sketchgen").read_text(encoding="utf-8")
         self.assertIn("sketchgen-backup.service", text)
