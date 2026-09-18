@@ -717,33 +717,79 @@ that can create and destroy infrastructure, and that key does not belong on a
 machine that serves a public gallery and runs code a model wrote. There are no
 credentials in `~/.oci` on the node and there should not be.
 
-So it is two commands. Ask on the operator's machine, record on the node:
+So it is two halves, joined by ssh. Ask on the operator's machine, record on the
+node:
 
 ```
-# on the operator's machine, where ~/.oci lives
-python3 bin/sketchgen billing                    # per service, and a total
-
-# then put that figure where the console can see it
-amount=$(python3 bin/sketchgen billing --amount-only)
-ssh sld-cloud "~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen \
-    billing --record --amount $amount --through $(date -u +%F) \
-    --db ~/sketchgen/sketchgen.db"
+# on the operator's machine, where ~/.oci lives — does both, in one command
+python3 bin/sketchgen billing --sync sld-cloud
 ```
 
-`--record` takes the number as an argument and touches no OCI endpoint, which is
-what lets it run on the node at all.
+`--sync` queries the Usage API here and pipes the reading into
+`billing --record --from-json -` on the far side. `--record` touches no OCI
+endpoint, which is what lets it run on the node at all. To look without
+recording, run `billing` with no flags; to see the raw reading, `--json`.
 
-The card shows the figure, the window it covers and when it was last checked,
-and marks itself once the reading is over a week old. It never presents itself
-as live: Oracle's usage data lags a day or more, so a card claiming to be
-current would be wrong twice over.
+### What is stored, and why it is not one number
 
-**As of 2026-09-17 the answer is $0.00** — every service, Compute and Block
-Storage and VCN and Telemetry, from 1 August. The node is a
-`VM.Standard.A1.Flex 16/94`, which is four times the documented Always Free ARM
-allowance of 4 OCPU / 24 GB, and it is still being billed at nothing. Worth
-re-checking before that figure is quoted anywhere public, which is what the card
-is for.
+A reading is a *day at a time*, one row per service and SKU, in `billing_usage`
+(migration 013). The old four `meta` keys are still written and the big figure
+on the card still comes from them, but they are a snapshot and a snapshot
+cannot say whether the bill is moving.
+
+On an Always Free tenancy it never appears to move. The dollar figure is 0.00
+every day and stays 0.00 right up until the day it doesn't. What moves first is
+the metered **quantity** — 96 OCPU-hours in a day is four OCPUs held for
+twenty-four hours — so the card draws thirty days of that, and turns the bars
+amber on the first day anything is actually charged.
+
+Two queries go into one reading, because neither of Oracle's answers is
+complete: `queryType=USAGE` returns the quantity and its unit with no currency,
+`queryType=COST` returns the amount and its currency with a null unit. `fetch()`
+joins them on (day, service, SKU).
+
+### Tell the node which tenancy it is in
+
+Run this once on the node, after any rebuild:
+
+```
+~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen billing --identify \
+    --db ~/sketchgen/sketchgen.db
+```
+
+It reads the instance metadata service at 169.254.169.254 — link-local,
+readable by anything on the instance and nothing off it, and carrying no
+authority to change anything — and records the tenancy, instance, shape, OCPUs
+and memory into `meta`. No credentials involved.
+
+That is what makes a reading checkable. `--record` refuses a reading whose
+tenancy is not the node's, and the card says so in red rather than showing the
+figure as if it were this account's. `--force` records it anyway, under its own
+tenancy — the two accounts stay two accounts, because `tenancy` is in the
+table's primary key.
+
+**This is not hypothetical.** On 2026-09-18 the operator's `~/.oci/config` was
+found to be pointing at a *different tenancy from the one the node runs in*: a
+separate Oracle account holding a 4 OCPU / 24 GB instance created 2026-08-05.
+Every figure this card had ever shown — including the "$0.00, every service,
+from 1 August" recorded on 2026-09-17 — was that other account's. Nothing in the
+old four keys could have caught it; an amount is just an amount. Until an API
+key exists in the node's own tenancy, the card has nothing true to show, and it
+now says that instead of showing a zero.
+
+### The meter against the machine
+
+The card also compares what Oracle is metering with what the node actually is,
+and says so when they disagree. A tenancy metered at 4 OCPU for a machine
+running 16 is not getting a discount, it is a discrepancy, and the right time to
+find out is not when an invoice explains it. The line beneath the bars gives the
+average OCPU and GB held over the full days in the window, against the Always
+Free allowance of 4 OCPU / 24 GB.
+
+The card never presents itself as live: Oracle's usage data lags a day or more,
+so a card claiming to be current would be wrong twice over. It shows the figure,
+the window it covers, when it was last checked, and marks itself once the
+reading is over a week old.
 
 ## Backups: the nightly snapshot and the pull
 

@@ -18,6 +18,7 @@ from typing import Any, Iterable
 
 __all__ = [
     "ACTIVITY_KEEP",
+    "NODE_IDENTITY_KEYS",
     "DEFAULT_DB_PATH",
     "ENTRY_TRANSITIONS",
     "TRANSITIONS",
@@ -32,6 +33,9 @@ __all__ = [
     "add_submission",
     "archive_entry",
     "begin_step",
+    "billing_daily",
+    "billing_services",
+    "billing_tenancies",
     "claim_next",
     "connect",
     "create_entry",
@@ -50,6 +54,7 @@ __all__ = [
     "list_jobs",
     "pending_submissions",
     "recent_activity",
+    "record_billing",
     "record_critique",
     "record_judgment",
     "release_submission",
@@ -1172,6 +1177,120 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str | None) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
+
+
+# ---------------------------------------------------------------------------
+# Billing — migration 013's daily meter readings
+# ---------------------------------------------------------------------------
+
+#: Meta keys the node writes about itself, with no credentials, from the
+#: instance metadata service. They are what a billing reading is checked
+#: against: a figure read from one tenancy must not be shown as another's.
+NODE_IDENTITY_KEYS = (
+    "node_tenancy",
+    "node_instance_id",
+    "node_shape",
+    "node_ocpus",
+    "node_memory_gb",
+    "node_identified_utc",
+)
+
+
+def record_billing(
+    conn: sqlite3.Connection,
+    tenancy: str,
+    rows: Iterable[dict[str, Any]],
+    fetched_utc: str | None = None,
+) -> int:
+    """Write daily meter readings, replacing any earlier reading of the same day.
+
+    Oracle restates the most recent day or two while its meters settle, so a
+    re-read of a day is an improvement on the last one and simply overwrites
+    it. Days not mentioned by this reading are left alone: a query for
+    September must never erase August.
+
+    Returns the number of rows written.
+    """
+    stamp = fetched_utc or utc_now()
+    written = 0
+    for row in rows:
+        conn.execute(
+            "INSERT INTO billing_usage (tenancy, day, service, sku, sku_name, "
+            "quantity, unit, amount, currency, fetched_utc) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(tenancy, day, service, sku) DO UPDATE SET "
+            "sku_name = excluded.sku_name, quantity = excluded.quantity, "
+            "unit = excluded.unit, amount = excluded.amount, "
+            "currency = excluded.currency, fetched_utc = excluded.fetched_utc",
+            (
+                tenancy,
+                str(row["day"])[:10],
+                str(row.get("service") or "?"),
+                str(row.get("sku") or "?"),
+                row.get("sku_name"),
+                float(row.get("quantity") or 0.0),
+                row.get("unit"),
+                float(row.get("amount") or 0.0),
+                row.get("currency"),
+                stamp,
+            ),
+        )
+        written += 1
+    return written
+
+
+def billing_daily(
+    conn: sqlite3.Connection, tenancy: str, since: str | None = None
+) -> list[dict[str, Any]]:
+    """One row per UTC day: what it cost and how much of the node it metered.
+
+    ``ocpu_hours`` and ``gb_hours`` are pulled out by unit rather than by SKU,
+    because the part numbers are Oracle's and may be renumbered, while the
+    units are the physical quantity and will not be.
+    """
+    sql = (
+        "SELECT day, SUM(amount) AS amount, "
+        "SUM(CASE WHEN unit = 'OCPU Per Hour' THEN quantity ELSE 0 END) AS ocpu_hours, "
+        "SUM(CASE WHEN unit = 'Gigabyte Per Hour' THEN quantity ELSE 0 END) AS gb_hours, "
+        "MAX(currency) AS currency, MAX(fetched_utc) AS fetched_utc "
+        "FROM billing_usage WHERE tenancy = ?"
+    )
+    args: list[Any] = [tenancy]
+    if since:
+        sql += " AND day >= ?"
+        args.append(since)
+    sql += " GROUP BY day ORDER BY day"
+    return [dict(row) for row in conn.execute(sql, tuple(args))]
+
+
+def billing_services(
+    conn: sqlite3.Connection, tenancy: str, since: str | None = None
+) -> list[dict[str, Any]]:
+    """What each service cost over the window, dearest first then by name."""
+    sql = (
+        "SELECT service, SUM(amount) AS amount, MAX(currency) AS currency "
+        "FROM billing_usage WHERE tenancy = ?"
+    )
+    args: list[Any] = [tenancy]
+    if since:
+        sql += " AND day >= ?"
+        args.append(since)
+    sql += " GROUP BY service ORDER BY amount DESC, service"
+    return [dict(row) for row in conn.execute(sql, tuple(args))]
+
+
+def billing_tenancies(conn: sqlite3.Connection) -> list[str]:
+    """Every tenancy this database holds readings for, in name order.
+
+    More than one means somebody pointed the query at the wrong account. The
+    card says so rather than adding them together.
+    """
+    return [
+        str(row["tenancy"])
+        for row in conn.execute(
+            "SELECT DISTINCT tenancy FROM billing_usage ORDER BY tenancy"
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------
