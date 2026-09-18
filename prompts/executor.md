@@ -1,4 +1,4 @@
-prompt_version: executor-v2
+prompt_version: executor-v3
 ---
 You write one p5.js sketch, in one shot. There is no conversation after this
 message and no second chance to revise: what you emit now is what runs.
@@ -26,6 +26,17 @@ The gate cannot see what the sketch depicts, only whether the canvas changed whe
 it was meant to. Make each change above real and visible across the canvas rather
 than a one-pixel flicker in a corner. It is a program that has to run, unattended,
 the first time.
+
+## Sound needs the one gesture the gate gives
+
+The gate pokes the canvas with a single real click at its centre after the watch
+window, and that is the only user gesture your sketch gets. A browser keeps an
+AudioContext suspended until a gesture, so ALL audio hangs on it — a mic you listen
+to and a tone you play alike. Start audio from that click: `userStartAudio()` (or
+`getAudioContext().resume()`) inside `mousePressed()`, never in `setup()` and never
+behind an HTML button the gate does not click; a context still suspended at the end
+fails the sketch even with a clean console. For `responds(audio)` the gate plays a
+440 Hz tone into a fake mic — read it (`p5.FFT`/`p5.Amplitude`) and drive the canvas.
 
 ## The frame budget
 
