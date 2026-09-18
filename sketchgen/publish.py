@@ -884,11 +884,18 @@ def publish_index(
     key: str | None = None,
     remote: str | None = None,
     write_path: str | None = None,
+    on_step: Callable[[int, int, str], None] | None = None,
 ) -> tuple[str | None, str | None]:
     """Re-render every published entry and the index, commit and push.
 
     ``write_path`` overrides the gallery write-path URL recorded in the
     checkout's config.json; the re-render carries it into every page.
+
+    ``on_step(done, total, label)`` is called as each step begins, ``label``
+    naming it ("entry 431", "index", "staging", "commit", "push"), and once
+    more at the end with ``done == total``. The total is every entry plus
+    those four. It is how the deploy script draws its bar: five hundred pages
+    is minutes, and a minutes-long silence reads as a hang.
 
     For template or asset changes: no entry's state changes. Returns
     (sha, None) on success or (None, why); refuses on a dirty checkout.
@@ -918,17 +925,32 @@ def publish_index(
             "SELECT id FROM entries WHERE state IN ('published', 'failed-kept', "
             "'rejected') AND published_utc IS NOT NULL ORDER BY id"
         ).fetchall()
+        total = len(rows) + 4  # the entries, then index, staging, commit, push
+        done = 0
+
+        def step(label: str) -> None:
+            if on_step is not None:
+                on_step(done, total, label)
+
         for row in rows:
+            step(f"entry {row['id']}")
             gallery.render_entry(conn, row["id"], checkout, config)
+            done += 1
+        step("index")
         gallery.render_index(conn, checkout, config)
+        done += 1
+        step("staging")
         _git(checkout, "rm", "-q", "--ignore-unmatch", "--", "failed.html")  # renamed to rejections.html
         # Everything in the checkout is generated output (the generator also writes
         # files INDEX_PATHS does not list, pairs.json for one), so stage it all.
         added = _git(checkout, "add", "-A", "--", ".")
         if added.returncode != 0:
             return None, f"git add failed: {added.stderr.strip()}"
+        done += 1
         if _git(checkout, "diff", "--cached", "--quiet").returncode == 0:
+            step("unchanged")
             return None, "site unchanged"
+        step("commit")
         committed = subprocess.run(
             ["git", "commit", "-F", "-"],
             cwd=str(checkout),
@@ -939,11 +961,15 @@ def publish_index(
         )
         if committed.returncode != 0:
             return None, f"commit failed: {committed.stderr.strip()}"
+        done += 1
         sha = _git_out(checkout, "rev-parse", "HEAD")
+        step("push")
         pushed = _git(checkout, "push", target, f"HEAD:refs/heads/{branch}", env=env)
         if pushed.returncode != 0:
             _undo(checkout, before)
             return None, f"push failed: {pushed.stderr.strip() or 'git push failed'}"
+        done += 1
+        step("pushed")
         return sha, None
 
 
