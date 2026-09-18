@@ -3336,11 +3336,24 @@ class TestHeldBatchPage(BatchFixtures, WebTestCase):
         self.assertNotIn("Processing…", tray)
         self.assertNotIn("disabled", tray.split('id="tally"', 1)[1])
         self.assertIn('id="prog-row" hidden', tray)
+        # Hidden, but present: the script fills these nodes on every poll and
+        # never builds them, and the press that starts a batch happens here.
+        for node in ('id="now"', 'id="bar-fill"', 'id="prog-t"'):
+            self.assertIn(node, tray)
         self.assertIn('id="results" hidden', tray)
         self.assertNotIn("http-equiv", tray)
         # the page's own first heading went with it: the tray is the title now
         self.assertEqual(1, page.count("<h1>Held "))
         self.assertNotIn("Held for publication</h1>", page)
+
+    def test_the_layout_hides_what_it_marks_hidden_and_the_stop_pill_is_clickable(self):
+        page = self.text("/held")
+        # .tray-row sets display itself, which beats the browser's [hidden] rule
+        self.assertIn(".tray-row[hidden], .phases[hidden], .results[hidden] { display: none; }", page)
+        # the label floats over the iframe; if it ignores the pointer, the
+        # click falls through to the sandboxed frame and stop never fires
+        label = page.split(".preview-run .play-label {", 1)[1].split("}", 1)[0]
+        self.assertNotIn("pointer-events: none", label)
 
     def test_while_a_batch_runs_the_page_is_locked_and_says_so(self):
         marked = self.held()
