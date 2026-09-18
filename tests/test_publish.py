@@ -485,6 +485,65 @@ class PublishIndexTests(PublishTestCase):
         self.assertEqual(why2, "site unchanged")
 
 
+    def test_publish_index_reports_every_step_to_the_bar(self):
+        """update.sh draws a bar from on_step; a step it skips is a bar that lies."""
+        import io
+        from sketchgen import publish as publication
+        from sketchgen.cli import publishindex
+        result = self.publish_cli("--by", "profcarroll")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        seen = []
+        sha, why = publication.publish_index(
+            self.conn, self.gallery, remote=str(self.bare),
+            write_path="https://writepath.example/",
+            on_step=lambda done, total, label: seen.append((done, total, label)),
+        )
+        self.assertIsNone(why, why)
+        labels = [label for _, _, label in seen]
+        self.assertEqual(
+            labels,
+            [f"entry {self.entry_id}", "index", "staging", "commit", "push", "pushed"],
+        )
+        total = 1 + 4
+        self.assertTrue(all(t == total for _, t, _ in seen))
+        self.assertEqual([d for d, _, _ in seen], [0, 1, 2, 3, 4, 5])
+        # The bar itself: redrawn in place, ended once, and it says so.
+        out = io.StringIO()
+        draw = publishindex.progress_bar(out)
+        for done, t, label in seen:
+            draw(done, t, label)
+        text = out.getvalue()
+        self.assertEqual(text.count("\n"), 1)
+        self.assertTrue(text.endswith("\n"))
+        self.assertIn("100% 5/5", text)
+        self.assertIn("· pushed", text.split("\r")[-1])
+        # And when nothing changed it still ends the line rather than leaving
+        # the cursor mid-bar for the next thing the deploy prints.
+        seen.clear()
+        publication.publish_index(
+            self.conn, self.gallery, remote=str(self.bare),
+            write_path="https://writepath.example/",
+            on_step=lambda done, total, label: seen.append((done, total, label)),
+        )
+        self.assertEqual(seen[-1][2], "unchanged")
+        out = io.StringIO()
+        draw = publishindex.progress_bar(out)
+        for done, t, label in seen:
+            draw(done, t, label)
+        self.assertTrue(out.getvalue().endswith("· unchanged\n"))
+
+    def test_the_bar_line_shows_an_estimate_only_once_it_has_one(self):
+        from sketchgen.cli import publishindex
+        early = publishindex.bar_line(1, 500, "entry 3", 2.0)
+        self.assertNotIn("left", early)
+        self.assertTrue(early.startswith("[░"), early)
+        mid = publishindex.bar_line(250, 500, "entry 300", 300.0)
+        self.assertIn(" 50% 250/500 5:00 ~5:00 left · entry 300", mid)
+        self.assertEqual(mid.count("█"), 15)
+        end = publishindex.bar_line(500, 500, "pushed", 601.0)
+        self.assertIn("100% 500/500 10:01 · pushed", end)
+        self.assertNotIn("left", end)
+
     def test_publish_index_repairs_a_page_published_without_the_write_path(self):
         """The retroactive fix: 36 published entries, 518 through 563.
 

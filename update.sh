@@ -159,9 +159,13 @@ green "gallery checkout up to date"
 # already current comes out byte-identical and there is nothing to commit for it.
 step "Re-rendering and pushing the gallery (index and every entry)"
 cd "$APP"
+# --progress: one line redrawn per page, with the count and an estimate. Five
+# hundred pages is minutes and only ever more; a silent minutes-long step is
+# indistinguishable from a hang, and got killed as one.
 "$VENV" bin/sketchgen publish-index \
     --db "$DB" \
     --gallery-dir "$GALLERY" \
+    --progress \
     || die "publish-index failed"
 green "gallery re-rendered and pushed"
 
