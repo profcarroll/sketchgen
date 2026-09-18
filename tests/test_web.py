@@ -1649,6 +1649,44 @@ class TestDecisionCard(WebTestCase):
         self.assertEqual(1, card.count("<img"))
         self.assertIn("strip.png", card)
 
+    def test_a_microphone_sketch_is_run_in_a_tab_not_the_sandboxed_frame(self):
+        # A listening sketch reads a dead mic in the sandboxed preview iframe
+        # (opaque origin, no allow="microphone"), so the poster becomes a link to
+        # its own tab — where http://localhost is a secure context and the mic
+        # works — and there is no data-play button to run the useless embed.
+        job_id, entry_id = self.card_entry()
+        (self.jobs_dir / str(job_id) / "attempt-1" / "sketch.js").write_text(
+            "function setup(){ createCanvas(windowWidth, windowHeight);\n"
+            "  let mic = new p5.AudioIn(); mic.start(); }\n"
+            "function draw(){ background(0); }\n",
+            encoding="utf-8",
+        )
+        card = self.card(self.text("/held"), entry_id)
+        self.assertIn("microphone sketch", card)
+        self.assertIn("run in a tab", card)
+        self.assertIn(f'href="/preview/{job_id}/1/" target="_blank"', card)
+        # the sandboxed run-in-place affordance is gone for this one
+        self.assertNotIn("data-play", card)
+        self.assertNotIn("data-preview", card)
+
+    def test_a_sketch_that_only_plays_sound_still_runs_in_place(self):
+        # Producing audio works in the sandbox once the viewer clicks the canvas,
+        # so an oscillator keeps the ordinary run-in-page button; only listening
+        # is forced to a tab.
+        job_id, entry_id = self.card_entry()
+        (self.jobs_dir / str(job_id) / "attempt-1" / "sketch.js").write_text(
+            "let osc;\n"
+            "function setup(){ createCanvas(windowWidth, windowHeight);\n"
+            "  osc = new p5.Oscillator('sine'); }\n"
+            "function mousePressed(){ userStartAudio(); osc.start(); }\n"
+            "function draw(){ background(0); }\n",
+            encoding="utf-8",
+        )
+        card = self.card(self.text("/held"), entry_id)
+        self.assertNotIn("microphone sketch", card)
+        self.assertIn("data-play", card)
+        self.assertIn("data-preview", card)
+
     def test_the_entry_id_is_said_once_and_otherwise_only_to_a_screen_reader(self):
         _, entry_id = self.card_entry()
         card = self.card(self.text("/held"), entry_id)
