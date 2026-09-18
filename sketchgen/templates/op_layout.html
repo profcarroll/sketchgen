@@ -72,6 +72,32 @@ header.top nav a.here { font-weight: 600; border-bottom: 2px solid var(--accent)
 .tok .n { font-variant-numeric: tabular-nums; font-weight: 600; }
 .spark-wide .spark { display: block; margin: 2px 0; }
 .spark-wide .lab.dim { color: var(--dim); }
+/* The bill's daily bars: one reading a day. Bars rather than a line because
+   a day is a discrete figure Oracle may restate, not a sample of something
+   continuous. The last bar is drawn faint — today is always partial. Amber is
+   for a day that was actually charged; while the tenancy is inside its
+   allowance every bar is the accent, and the height is metered OCPU-hours,
+   which is the number that moves before the money does. */
+.billbars { display: flex; align-items: flex-end; gap: 2px; height: 44px;
+            margin: 12px 0 2px; }
+.billbars i { flex: 1 1 0; background: var(--accent); opacity: .5;
+              min-height: 1px; border-radius: 1px 1px 0 0; }
+.billbars i.partial { opacity: .22; }
+.billbars i.charged { background: var(--warn); opacity: .9; }
+.billrow { display: flex; justify-content: space-between; font-size: 12px;
+           color: var(--dim); }
+.billtab { width: 100%; font-size: 12px; margin-top: 10px; }
+.billtab td { padding: 1px 0; }
+.billtab td.n { text-align: right; font-variant-numeric: tabular-nums; }
+/* Two things the card says out loud rather than in passing: the figure came
+   from another account, and the meter is smaller than the machine. Both mean
+   the big number above is not what it looks like, so they are bordered and in
+   the bad colour, not dimmed into the caveats at the bottom. */
+.billwarn { margin: 10px 0 0; padding: 7px 9px; border-radius: 6px;
+            border: 1px solid var(--bad); color: var(--bad); font-size: 12px;
+            line-height: 1.45; }
+.billwarn.soft { border-color: var(--warn); color: var(--warn); }
+.billwarn code { background: none; color: inherit; padding: 0; }
 .control { display: flex; gap: 8px; align-items: center; }
 .control form { display: flex; gap: 6px; margin: 0; }
 button {
