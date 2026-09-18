@@ -1048,8 +1048,17 @@
   }
 
   function startSketch(host, src, options) {
-    stopSketch();
     var opts = options || {};
+    if (opts.mic) {
+      // A listening sketch cannot reach the microphone inside our sandboxed
+      // frame — an opaque origin with no allow="microphone" is refused it — so
+      // it runs in its own tab, where the Pages origin is a secure context the
+      // browser will grant. Making sound is not this; only listening leaves.
+      window.open(src, "_blank", "noopener");
+      runNote(host, "opened in a new tab — the microphone works there");
+      return;
+    }
+    stopSketch();
     var mount = opts.mount || host;
     var button = host.querySelector("[data-play]");
     if (!button) { return; }
@@ -1183,7 +1192,8 @@
     label.setAttribute("data-play-label", "");
     button.appendChild(label);
     button.addEventListener("click", runInPlace(tile, "../" + id + "/sketch/", {
-      name: "entry " + id
+      name: "entry " + id,
+      mic: !!(item && item.mic)
     }));
     tile.appendChild(button);
     return tile;
@@ -1380,13 +1390,15 @@
       if (button.getAttribute("data-run-wired")) { return; }
       button.setAttribute("data-run-wired", "1");
       var host = button.parentNode;
+      var mic = !!button.getAttribute("data-run-mic");
       button.addEventListener("click", runInPlace(host, button.getAttribute("data-run-href"), {
         name: button.getAttribute("data-run-name") || "this sketch",
-        idle: "click to run",
-        note: "running · click to stop"
+        idle: mic ? "opens in a tab" : "click to run",
+        note: "running · click to stop",
+        mic: mic
       }));
       // Only now that something will happen when it is clicked.
-      runNote(host, "click to run");
+      runNote(host, mic ? "opens in a tab (needs the microphone)" : "click to run");
     });
   }
 
