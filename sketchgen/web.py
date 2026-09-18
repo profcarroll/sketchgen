@@ -1447,15 +1447,55 @@ PER_SKETCH_COLUMNS = (
 #: How old a recorded figure may be before the card says so.
 BILLING_STALE_DAYS = 7
 
+#: The Always Free ARM allowance: four OCPUs and 24 GB, held concurrently, at
+#: any duty cycle. It is the line the card measures the node against, because
+#: below it the bill is zero by policy and above it the bill is zero only
+#: until somebody at Oracle notices.
+ALWAYS_FREE_OCPUS = 4.0
+ALWAYS_FREE_GB = 24.0
 
-def billing_values(conn: sqlite3.Connection) -> dict[str, str]:
-    """The four billing keys, read while the request still holds a connection."""
-    return {
+#: How many days of meter readings the card draws.
+BILLING_BAR_DAYS = 30
+
+
+def _billing_since(days: int = BILLING_BAR_DAYS) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
+def billing_values(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Everything the card needs, read while the request still holds a connection.
+
+    The four ``billing_*`` keys are the headline figure as somebody last
+    recorded it. The rest is migration 013's daily rows, which is what makes
+    this a trend rather than a snapshot — and the node's own account of itself,
+    which is what makes it checkable.
+    """
+    values: dict[str, Any] = {
         "amount": db.get_meta(conn, "billing_amount") or "",
         "currency": db.get_meta(conn, "billing_currency") or "USD",
         "through": db.get_meta(conn, "billing_through") or "",
         "checked": db.get_meta(conn, "billing_checked_utc") or "",
+        "tenancy": db.get_meta(conn, "billing_tenancy") or "",
+        "node_tenancy": db.get_meta(conn, "node_tenancy") or "",
+        "node_shape": db.get_meta(conn, "node_shape") or "",
+        "node_ocpus": db.get_meta(conn, "node_ocpus") or "",
+        "node_memory_gb": db.get_meta(conn, "node_memory_gb") or "",
+        "daily": [],
+        "services": [],
+        "tenancies": [],
     }
+    tenancy = values["tenancy"] or values["node_tenancy"]
+    try:
+        values["tenancies"] = db.billing_tenancies(conn)
+        if tenancy:
+            since = _billing_since()
+            values["daily"] = db.billing_daily(conn, tenancy, since)
+            values["services"] = db.billing_services(conn, tenancy, since)
+    except sqlite3.OperationalError:
+        # A database still on migration 012 has no billing_usage. The headline
+        # figure is still readable, so the card degrades to what it always was.
+        pass
+    return values
 
 
 def _days_since(stamp: str) -> float | None:
@@ -1465,19 +1505,183 @@ def _days_since(stamp: str) -> float | None:
     return (datetime.now(timezone.utc) - when).total_seconds() / 86400.0
 
 
-def billing_card(values: dict[str, str] | None) -> str:
+def billing_bars(daily: list[dict[str, Any]]) -> str:
+    """One bar per day, scaled to the tallest.
+
+    The height is always the metered OCPU-hours, never the amount. Money is
+    the wrong axis for this: the day the node was resized from 4 OCPU to 16 is
+    the day worth seeing, and it was charged nothing, so a chart drawn in
+    dollars flattens the sixteen days that explain the bill into hairlines
+    beside the one day that has it. Amber marks a day that was charged, which
+    puts the money back without spending the axis on it.
+    """
+    if not daily:
+        return ""
+    peak = max(float(row.get("ocpu_hours") or 0.0) for row in daily)
+    key = "ocpu_hours" if peak > 0 else "amount"
+    if key == "amount":
+        peak = max(float(row.get("amount") or 0.0) for row in daily)
+    peak = peak or 1.0
+    bars = []
+    for index, row in enumerate(daily):
+        value = float(row.get(key) or 0.0)
+        amount = float(row.get("amount") or 0.0)
+        classes = []
+        if amount > 0:
+            classes.append("charged")
+        if index == len(daily) - 1:
+            classes.append("partial")
+        title = (f"{row.get('day')}: "
+                 f"{float(row.get('ocpu_hours') or 0.0) / 24.0:.2f} OCPU held, "
+                 f"{amount:.2f} charged")
+        bars.append(
+            f'<i class="{" ".join(classes)}" '
+            f'style="height:{max(1.0, value / peak * 100.0):.1f}%" '
+            f'title="{esc(title)}"></i>'
+        )
+    label = ("OCPU held a day · amber is charged" if key == "ocpu_hours"
+             else "charged a day")
+    return (
+        f'<div class="billbars">{"".join(bars)}</div>'
+        f'<div class="billrow"><span>{esc(daily[0]["day"])}</span>'
+        f'<span>{esc(label)}</span>'
+        f'<span>{esc(daily[-1]["day"])}</span></div>'
+    )
+
+
+def _last_full_day(daily: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The most recent complete day, which is the only one worth averaging.
+
+    Today is partial and always reads low. And a window average is no better
+    once the shape has changed inside it: four days at 16 OCPU after twelve at
+    4 averages to something the node has never been.
+    """
+    full = daily[:-1] or daily
+    return full[-1] if full else None
+
+
+def billing_held(daily: list[dict[str, Any]]) -> str:
+    """What the meter says the node is, against what is free.
+
+    The last full day, not the window: this is a status line, and the status
+    is what Oracle metered yesterday, not what it averaged over a month in
+    which the machine was resized.
+    """
+    row = _last_full_day(daily)
+    if row is None:
+        return ""
+    ocpu = float(row.get("ocpu_hours") or 0.0) / 24.0
+    gigabytes = float(row.get("gb_hours") or 0.0) / 24.0
+    if ocpu <= 0:
+        return ""
+    over = ocpu > ALWAYS_FREE_OCPUS + 0.05 or gigabytes > ALWAYS_FREE_GB + 1.0
+    note = (
+        '<span class="pill rejected">over the free allowance</span>'
+        if over else
+        '<span class="pill">inside the free allowance</span>'
+    )
+    return (
+        f'<p class="dim" style="font-size:12px;margin:8px 0 0">On '
+        f'{esc(str(row.get("day")))}, the last full day, Oracle metered '
+        f'<b>{ocpu:.2f} OCPU</b> and <b>{gigabytes:.0f} GB</b> held. '
+        f'Always Free is {ALWAYS_FREE_OCPUS:.0f} OCPU / '
+        f'{ALWAYS_FREE_GB:.0f} GB. {note}</p>'
+    )
+
+
+def billing_shape_warning(values: dict[str, Any]) -> str:
+    """Said out loud when the meter and the machine disagree about its size.
+
+    A metered figure well under the provisioned shape means the tenancy is
+    being charged for less than it is running. That is good news exactly until
+    it is corrected, and it is not something to find out from an invoice. The
+    comparison is the last full day, because a window average spanning a
+    resize disagrees with the machine by arithmetic rather than by fault.
+    """
+    row = _last_full_day(values.get("daily") or [])
+    try:
+        provisioned = float(values.get("node_ocpus") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if row is None or provisioned <= 0:
+        return ""
+    metered = float(row.get("ocpu_hours") or 0.0) / 24.0
+    if metered <= 0 or metered >= provisioned - 0.1:
+        return ""
+    return (
+        '<p class="billwarn">'
+        f'On {esc(str(row.get("day")))} the meter says {metered:.2f} OCPU; '
+        f'this node is {provisioned:.0f} OCPU '
+        f'({esc(values.get("node_shape", "") or "shape unknown")}). '
+        'Oracle is billing for less than is running — treat the total above as '
+        'a floor, not the answer.</p>'
+    )
+
+
+def billing_tenancy_warning(values: dict[str, Any]) -> str:
+    """Said out loud when the figure came from an account that is not this one.
+
+    On 2026-09-18 it had been for weeks, and nothing said so. The node knows
+    its own tenancy without any credentials; the figure carries the tenancy it
+    was read from; a card that shows one while implying the other is worse
+    than a card showing nothing.
+    """
+    node = str(values.get("node_tenancy") or "")
+    read = str(values.get("tenancy") or "")
+    if not node:
+        return (
+            '<p class="billwarn soft">'
+            'This node has not said which tenancy it is in, so the figure '
+            'cannot be checked against it. Run <code>sketchgen billing '
+            '--identify</code> on the node.</p>'
+        )
+    if read and read != node:
+        return (
+            '<p class="billwarn">'
+            'This figure was read from a different tenancy than the one this '
+            'node runs in. It is some other account\'s bill. Point '
+            '<code>~/.oci/config</code> at ' + esc(node[-20:]) + ' and read it '
+            'again.</p>'
+        )
+    return ""
+
+
+def billing_services_table(values: dict[str, Any]) -> str:
+    """What each service came to over the window, dearest first."""
+    services = values.get("services") or []
+    if not services:
+        return ""
+    currency = esc(values.get("currency") or "USD")
+    rows = "".join(
+        f'<tr><td>{esc(row["service"])}</td>'
+        f'<td class="n">{float(row["amount"] or 0.0):,.2f}</td></tr>'
+        for row in services
+    )
+    return (
+        f'<table class="billtab"><tbody>{rows}</tbody></table>'
+        f'<p class="dim" style="font-size:12px;margin:4px 0 0">'
+        f'last {BILLING_BAR_DAYS} days, in {currency}</p>'
+    )
+
+
+def billing_card(values: dict[str, Any] | None) -> str:
     """What the tenancy has actually cost, as somebody last checked.
 
-    Never a live figure. Reading it needs an OCI key that can create and destroy
-    infrastructure, and that key is not on this node and is not going to be: the
-    node serves a public gallery and runs code a model wrote. ``sketchgen
-    billing`` asks, on the operator's machine; ``--record`` writes the answer
-    into ``meta`` for this card to read.
+    Never a live figure. Reading it needs an OCI key that can create and
+    destroy infrastructure, and that key is not on this node and is not going
+    to be: the node serves a public gallery and runs code a model wrote.
+    ``sketchgen billing`` asks, on the operator's machine; ``--sync`` ships the
+    answer here for this card to read.
 
     So the card shows the number AND how old it is, because a stale figure
     presented as current is worse than none. Oracle's own usage data lags a day
     or more, so even a fresh reading is behind; the card names the window it
     covers rather than implying "now".
+
+    And it shows the two things a single number cannot: the shape of the last
+    thirty days, and whether the meter agrees with the machine. A tenancy
+    inside its free allowance reads 0.00 every day until the day it doesn't,
+    so the dollar figure is the last place the news arrives.
     """
     values = values or {}
     amount = values.get("amount") or ""
@@ -1485,7 +1689,8 @@ def billing_card(values: dict[str, str] | None) -> str:
         return (
             '<p class="dim">Nothing recorded yet. On the operator\'s machine, '
             'where <code>~/.oci</code> lives:</p>'
-            '<pre style="font-size:12px">python3 bin/sketchgen billing</pre>'
+            '<pre style="font-size:12px">python3 bin/sketchgen billing --sync '
+            '&lt;host&gt;</pre>'
             '<p class="dim" style="font-size:12px">then record it here — '
             'docs/OPERATIONS.md, &ldquo;The billing card&rdquo;.</p>'
         )
@@ -1507,15 +1712,20 @@ def billing_card(values: dict[str, str] | None) -> str:
         f'<span class="dim" style="font-size:16px">{esc(values.get("currency", "USD"))}'
         f'</span>{stale}</p>'
         f'<p class="dim" style="font-size:12px">{line}</p>'
-        '<p class="dim" style="font-size:12px">Not live. Reading it needs an OCI '
-        'key that can build and destroy infrastructure, which is deliberately not '
-        'on this node; and Oracle\'s usage data lags a day or more, so this is '
-        'behind even when freshly checked.</p>'
+        + billing_tenancy_warning(values)
+        + billing_shape_warning(values)
+        + billing_bars(values.get("daily") or [])
+        + billing_held(values.get("daily") or [])
+        + billing_services_table(values)
+        + '<p class="dim" style="font-size:12px;margin-top:10px">Not live. '
+        'Reading it needs an OCI key that can build and destroy infrastructure, '
+        'which is deliberately not on this node; and Oracle\'s usage data lags '
+        'a day or more, so this is behind even when freshly checked.</p>'
     )
 
 
 def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
-                 billing: dict[str, str] | None = None) -> str:
+                 billing: dict[str, Any] | None = None) -> str:
     """The wireframe's Console, rendered from packet 4.1's document.
 
     Every value is read by its path through :func:`_dig`, and every path is
