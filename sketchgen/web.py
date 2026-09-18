@@ -2719,6 +2719,29 @@ def has_preview(app: App, job_id: int, attempt_n: int) -> bool:
     return (attempt_dir(app, job_id, attempt_n) / "index.html").is_file()
 
 
+#: Microphone *input* — the one thing a sandboxed, opaque-origin preview iframe
+#: cannot do. `getUserMedia` is refused without a real origin and an
+#: `allow="microphone"` grant, and `sandbox="allow-scripts"` gives neither, so a
+#: listening sketch reads a dead mic in every embedded frame and only works in
+#: its own top-level tab (http://localhost and 127.0.0.1 are secure contexts, so
+#: the operator's own preview URL opens there with a real mic). Producing sound —
+#: `p5.Oscillator`, `loadSound` — is deliberately NOT here: it plays in place
+#: after an in-canvas click, so it keeps the ordinary run-in-page button.
+_MIC_RE = re.compile(r"p5\.AudioIn|getUserMedia|mediaDevices")
+
+
+def needs_microphone(app: App, job_id: int, attempt_n: int) -> bool:
+    """True when this attempt's source opens the microphone (see :data:`_MIC_RE`)."""
+    directory = attempt_dir(app, job_id, attempt_n)
+    text = ""
+    for name in ("sketch.js", "index.html"):
+        try:
+            text += (directory / name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    return bool(_MIC_RE.search(text))
+
+
 def _poster_url(app: App, job_id: int, attempt_n: int) -> str | None:
     """The still the play button is drawn on: the strip, else the last frame.
 
@@ -2805,22 +2828,42 @@ def preview_frame(
         if poster else
         '<span class="no-still">no frame on disk</span>'
     )
-    tab = (
-        f' <a href="{esc(url)}" target="_blank" rel="noopener">open in a tab ↗</a>'
-        if tab_link
-        else ""
-    )
-    frame = (
-        f'<div class="preview-run" data-preview data-src="{esc(url)}" '
-        f'data-label="{esc(label)}" data-w="{PREVIEW_W}" data-h="{PREVIEW_H}">'
-        f'<button type="button" class="play" data-play '
-        f'aria-label="run {esc(label)}">{still}'
-        f'<span class="play-label" data-play-label>run ▸</span></button>'
-        f"</div>"
-        f'<p class="dim" style="font-size:12px">'
-        f"{cost_chip(report)}{tab}"
-        f"</p>"
-    )
+    # A microphone sketch cannot run in the sandboxed frame this page builds:
+    # the mic is refused an opaque origin, so an embedded run shows a dead canvas
+    # and reads as a broken sketch. For those the tab IS the run — the poster is
+    # a link, not a play button, and the mic note stands where the tab anchor
+    # otherwise would. The tab link is unconditional here (tab_link is about the
+    # convenience anchor beside an ordinary run; this is the only way to run it).
+    if needs_microphone(app, job_id, attempt_n):
+        frame = (
+            f'<div class="preview-run preview-mic">'
+            f'<a class="play" href="{esc(url)}" target="_blank" rel="noopener" '
+            f'aria-label="run {esc(label)} in a tab">{still}'
+            f'<span class="play-label">run in a tab ▸</span></a>'
+            f"</div>"
+            f'<p class="dim" style="font-size:12px">'
+            f"{cost_chip(report)}"
+            f' · <span class="mic-note">microphone sketch — the embedded '
+            f"frame can't reach the mic, so it runs only in its own tab</span>"
+            f"</p>"
+        )
+    else:
+        tab = (
+            f' <a href="{esc(url)}" target="_blank" rel="noopener">open in a tab ↗</a>'
+            if tab_link
+            else ""
+        )
+        frame = (
+            f'<div class="preview-run" data-preview data-src="{esc(url)}" '
+            f'data-label="{esc(label)}" data-w="{PREVIEW_W}" data-h="{PREVIEW_H}">'
+            f'<button type="button" class="play" data-play '
+            f'aria-label="run {esc(label)}">{still}'
+            f'<span class="play-label" data-play-label>run ▸</span></button>'
+            f"</div>"
+            f'<p class="dim" style="font-size:12px">'
+            f"{cost_chip(report)}{tab}"
+            f"</p>"
+        )
     if summary is None:
         return frame
     return (
