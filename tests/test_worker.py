@@ -1515,6 +1515,29 @@ class TestEvidence(unittest.TestCase):
         self.assertNotIn("hello", text)
         self.assertIn("AudioContext state after the click probe: suspended", text)
 
+    def test_a_suspended_audio_context_is_given_the_fix_not_just_the_symptom(self):
+        """0 of the first 1,392 attempts ever reached a running AudioContext.
+
+        The gate names the symptom ("AudioContext state ... suspended"); the
+        evidence has to name the fix, the way it does for frame_budget, or the
+        executor rewrites everything but the one line that matters — the gesture
+        the gate gives is a canvas-centre click, and audio has to start from it.
+        """
+        report = make_report(
+            "/tmp/x",
+            checks={"audio_context_running": False},
+            notes=["AudioContext state after the click probe: suspended"],
+            exit_code=1,
+        )
+        text = worker.build_evidence(report, 1)
+        self.assertIn("audio_context_running = false", text)
+        # the symptom the gate wrote is still there
+        self.assertIn("AudioContext state after the click probe: suspended", text)
+        # and now the fix is too, beneath the check it belongs to
+        self.assertIn("fix:", text)
+        self.assertIn("userStartAudio()", text)
+        self.assertIn("mousePressed()", text)
+
     def test_a_sketch_that_declares_itself_static_is_not_told_it_failed(self):
         """Entry 429: nine attempts told to fix a check the gate never failed.
 

@@ -275,6 +275,27 @@ CHECK_NOTE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "frame_budget": ("frame_budget", "ms per frame"),
 }
 
+#: What the evidence tells the executor to DO about a failed check, when the
+#: gate's own note names the symptom but not the fix. The gate ships a remedy
+#: with frame_budget (its FRAME_BUDGET_REMEDY); the checks below have none of
+#: their own, so the sentence lives here. Each is one clause, imperative, in the
+#: same voice as the frame-budget one.
+#:
+#: audio_context_running: 0 of the first 1,392 gate attempts ever reached a
+#: running AudioContext. The note the gate writes is "AudioContext state after
+#: the click probe: suspended" — true, and no help: every one of those sketches
+#: started its audio without the single canvas-centre click the gate gives, and
+#: nothing in the evidence said that was the thing to change.
+CHECK_REMEDIES: dict[str, str] = {
+    "audio_context_running": (
+        "the gate pokes the canvas with one real click at its centre and gives "
+        "the sketch no other gesture; a browser keeps an AudioContext suspended "
+        "until a gesture, so start audio from that click — call `userStartAudio()` "
+        "(or `getAudioContext().resume()`) inside `mousePressed()` on the canvas, "
+        "not in `setup()` and not behind an HTML button the gate never clicks"
+    ),
+}
+
 #: Notes worth carrying even when nothing failed on them: the two runtime facts
 #: the executor cannot get by reading its own source (spec §3.3).
 RUNTIME_NOTE_KEYWORDS = ("framecount", "audiocontext")
@@ -681,6 +702,9 @@ def build_evidence(report: dict[str, Any] | None, gate_exit: int | None,
             parts.append(f"- {name} = false")
             for note in _notes_for_check(name, notes):
                 parts.append(f"    {note}")
+            remedy = CHECK_REMEDIES.get(name)
+            if remedy:
+                parts.append(f"    fix: {remedy}")
 
     if failed_assertions:
         parts.append("")
