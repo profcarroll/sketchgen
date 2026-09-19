@@ -591,6 +591,78 @@ class KioskTests(unittest.TestCase):
         self.assertEqual(["written in —"], self.report["unjudged"]["facts"])
 
 
+    # ---- the one write (docs/plans/kiosk-views.md §3) --------------------
+
+    def test_a_sketch_becomes_a_view_after_ten_seconds_and_not_before(self):
+        run = self.report["views"]
+        self.assertEqual(0, run["atNine"])
+        self.assertEqual(
+            [
+                {
+                    "url": "https://write.example.invalid/api/view",
+                    "method": "POST",
+                    "body": {"entry_id": run["seat"], "source": "kiosk"},
+                    # No credentials and no headers but the content type: the
+                    # projector posts a view and names nobody, not even
+                    # itself. This is the same assertion the text test makes,
+                    # made again against what actually reached the network.
+                    "keys": ["body", "headers", "method"],
+                }
+            ],
+            run["atTen"],
+        )
+
+    def test_one_seat_is_one_view_however_many_frames_it_takes(self):
+        # The test that matters most. /view de-duplicates a signed-in viewer
+        # and the kiosk signs nobody in, so a view posted per frame would be
+        # sixty a second into a counter with nothing downstream to catch it.
+        self.assertEqual(1, self.report["views"]["afterSixHundredFrames"])
+
+    def test_a_sketch_somebody_skipped_past_is_not_a_view(self):
+        run = self.report["views"]["afterASkip"]
+        self.assertNotEqual(run["entry"], run["now"])
+        self.assertEqual(0, run["posts"])
+
+    def test_the_ten_seconds_are_playing_seconds_not_wall_clock(self):
+        # Paused at nine seconds, then ten minutes of a paused room: still
+        # nothing. One second after it plays again, the view it had earned.
+        self.assertEqual(0, self.report["views"]["whilePaused"])
+        self.assertEqual(1, self.report["views"]["afterResuming"])
+
+    def test_a_slot_shorter_than_the_threshold_still_counts(self):
+        # Fifteen seconds is the shortest slot the kiosk allows, and a
+        # projector set to it shows real sketches to a real room.
+        self.assertEqual(1, self.report["views"]["shortSlot"])
+
+    def test_it_stops_counting_an_empty_room_and_starts_again_when_asked(self):
+        run = self.report["views"]
+        # Eight hours of playing seconds at ten minutes a sketch is forty-eight
+        # sketches; the forty-eighth is past the limit and is not counted.
+        self.assertEqual(47, run["unattended"])
+        # The sketches never stopped — only the counting did.
+        self.assertEqual(1, run["stillPlaying"])
+        # One key, and the room is an audience again.
+        self.assertEqual(48, run["afterSomebodyArrives"])
+
+    def test_views_0_turns_it_off_and_survives_the_next_key(self):
+        run = self.report["views"]["off"]
+        self.assertEqual(0, run["posts"])
+        # persist() rebuilds the address bar from query(), so a parameter
+        # missing from it is a parameter the first acting key throws away —
+        # and the launch link would then hand somebody a projector that counts
+        # when the one it was copied from did not.
+        self.assertIn("&views=0", run["link"])
+        self.assertIn("&views=0", run["bar"])
+
+    def test_the_gallery_can_turn_it_off_without_a_deploy(self):
+        # kiosk_views in config.json: one line in the gallery checkout, which
+        # is the only switch there is — the write path has none.
+        self.assertEqual(0, self.report["views"]["configOff"])
+
+    def test_a_gallery_with_no_write_path_posts_nothing(self):
+        self.assertEqual(0, self.report["views"]["noWritePathPosts"])
+
+
 def _without_comments(source: str) -> str:
     """kiosk.js with its comments taken out, so the bans below hold on code.
 
@@ -610,15 +682,27 @@ class KioskScriptTextTests(unittest.TestCase):
     def setUpClass(cls):
         cls.code = _without_comments(KIOSK_SCRIPT.read_text(encoding="utf-8"))
 
-    def test_it_never_writes_anything(self):
-        # A play on a projector is not a view. No POST, and no method: at all,
-        # because every method other than GET is a write to this write path.
-        self.assertNotIn("method:", self.code)
-        self.assertNotIn("method :", self.code)
+    def test_it_writes_one_thing_and_only_one(self):
+        # A play on a projector is a view now (docs/plans/kiosk-views.md), but
+        # it is the only write on this page and /view is the only endpoint it
+        # may reach. Every method other than GET is a write to this write
+        # path, so the count of them is the count of writes: one.
+        methods = re.findall(r"method\s*:\s*\"([A-Z]+)\"", self.code)
+        self.assertEqual(["POST"], methods)
+        # And it goes where it says it goes. The fetch and its options are one
+        # expression in the source, so the endpoint and the method that reach
+        # the network together are read together here.
+        posts = re.findall(
+            r"fetch\(([^\n]*?),\s*\{\s*\n\s*method", self.code
+        )
+        self.assertEqual(['base() + "/view"'], [one.strip() for one in posts])
 
     def test_it_presents_no_identity(self):
-        # /counts is a public read; the kiosk signs nobody in and so has
-        # nothing to present.
+        # /counts is a public read and /view takes an anonymous write; the
+        # kiosk signs nobody in and so has nothing to present. This matters
+        # more now that it writes, not less: a projector that presented one
+        # would file every sketch it played under whoever last signed in on
+        # that machine.
         self.assertNotIn("document.cookie", self.code)
         self.assertNotIn("credentials", self.code)
         self.assertNotIn("Authorization", self.code)
