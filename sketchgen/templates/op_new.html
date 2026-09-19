@@ -45,9 +45,13 @@ $chips
   <section class="panel">
     <h2>Run</h2>
     <div class="row">
-      <div>
+      <div style="flex:1 1 18em">
         <label for="planner">Planner</label>
         <select id="planner" name="planner">$planner_options</select>
+      </div>
+      <div style="flex:1 1 18em">
+        <label for="executor">Executor</label>
+        <select id="executor" name="executor">$executor_options</select>
       </div>
       <div>
         <label for="rules">Rules file</label>
@@ -72,6 +76,13 @@ $chips
       <button type="submit" formaction="/new/defaults" formnovalidate
               name="action" value="clear" title="back to the built-in defaults">Forget them</button>
     </div>
+    <p class="help">Both lists are the models this node has, read from Ollama
+      when the page was drawn — the planner's are the ones that can see, the
+      executor's the ones that can complete. One on this node costs
+      electricity; one under <em>off this node</em> sends the prompt away.
+      The executor is recorded on every attempt and on the entry, so a gallery
+      with more than one in it can still be read — but it is a second variable
+      beside the rules file the A/B is measuring, so change it on purpose.</p>
     <p class="help">$defaults_note</p>
   </section>
 </form>
