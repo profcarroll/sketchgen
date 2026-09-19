@@ -18,6 +18,8 @@ function parseCompound(text) {
       part.not.push(match[1]);
     } else if ((match = /^\.([A-Za-z0-9_-]+)/.exec(rest))) {
       part.classes.push(match[1]);
+    } else if ((match = /^#([A-Za-z0-9_-]+)/.exec(rest))) {
+      part.attrs.push(["id", match[1]]);
     } else if ((match = /^\[([A-Za-z0-9_:-]+)(?:=["']([^"']*)["'])?\]/.exec(rest))) {
       part.attrs.push([match[1], match[2] === undefined ? null : match[2]]);
     } else if ((match = /^([A-Za-z][A-Za-z0-9]*)/.exec(rest))) {
@@ -75,6 +77,150 @@ class Text {
   get textContent() { return this.data; }
 }
 
+/* ---- inline style ---------------------------------------------------------
+ *
+ * el.style reads and writes the style attribute, in both directions: gallery.js
+ * reads a mark's left off an attribute the generator wrote, and kiosk.js writes
+ * two custom properties onto the stage. A Proxy rather than a fixed list of
+ * properties, because neither script should have to declare in advance which
+ * ones it uses.
+ */
+
+function parseStyle(text) {
+  const out = {};
+  String(text || "").split(";").forEach(function (piece) {
+    const cut = piece.indexOf(":");
+    if (cut === -1) { return; }
+    const name = piece.slice(0, cut).trim();
+    if (name) { out[name] = piece.slice(cut + 1).trim(); }
+  });
+  return out;
+}
+
+function writeStyle(el, declarations) {
+  const text = Object.keys(declarations)
+    .map(function (name) { return name + ": " + declarations[name]; }).join("; ");
+  if (text) { el.setAttribute("style", text); } else { el.removeAttribute("style"); }
+}
+
+function dashed(name) {
+  return name.indexOf("--") === 0
+    ? name : name.replace(/[A-Z]/g, function (ch) { return "-" + ch.toLowerCase(); });
+}
+
+function styleOf(el) {
+  function setProperty(name, value) {
+    const declarations = parseStyle(el.getAttribute("style"));
+    declarations[name] = String(value);
+    writeStyle(el, declarations);
+  }
+  return new Proxy({}, {
+    get(target, prop) {
+      if (typeof prop !== "string") { return undefined; }
+      if (prop === "setProperty") { return setProperty; }
+      if (prop === "removeProperty") {
+        return function (name) {
+          const declarations = parseStyle(el.getAttribute("style"));
+          delete declarations[name];
+          writeStyle(el, declarations);
+        };
+      }
+      return parseStyle(el.getAttribute("style"))[dashed(prop)];
+    },
+    set(target, prop, value) {
+      if (typeof prop !== "string") { return true; }
+      if (value === "") {
+        const declarations = parseStyle(el.getAttribute("style"));
+        delete declarations[dashed(prop)];
+        writeStyle(el, declarations);
+        return true;
+      }
+      setProperty(dashed(prop), value);
+      return true;
+    }
+  });
+}
+
+/* ---- innerHTML ------------------------------------------------------------
+ *
+ * The kiosk paints its caption, its menu rows and its source listing by
+ * assigning markup, so the stub has to turn that markup back into elements or
+ * the tests would be reading a string and calling it a DOM. A parser for the
+ * subset the scripts actually write — open tag with quoted or bare attributes,
+ * text, close tag — which throws on anything else rather than dropping it.
+ */
+
+const ENTITIES = { amp: "&", lt: "<", gt: ">", quot: "\"", "#39": "'", apos: "'", nbsp: " " };
+
+function decodeEntities(text) {
+  return text.replace(/&(#?[A-Za-z0-9]+);/g, function (whole, name) {
+    if (Object.prototype.hasOwnProperty.call(ENTITIES, name)) { return ENTITIES[name]; }
+    throw new Error("dom.js does not know the entity &" + name + ";");
+  });
+}
+
+function encodeEntities(text) {
+  return text.replace(/[&<>]/g, function (ch) {
+    return ch === "&" ? "&amp;" : (ch === "<" ? "&lt;" : "&gt;");
+  });
+}
+
+function parseAttributes(blob) {
+  const attrs = [];
+  let rest = blob;
+  let match;
+  while (rest.trim().length) {
+    match = /^\s+([A-Za-z_:][A-Za-z0-9_:.-]*)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'>]+)))?/.exec(rest);
+    if (!match) { throw new Error("dom.js cannot parse attributes: " + blob); }
+    const value = match[2] !== undefined ? match[2]
+      : (match[3] !== undefined ? match[3] : (match[4] !== undefined ? match[4] : ""));
+    attrs.push([match[1], decodeEntities(value)]);
+    rest = rest.slice(match[0].length);
+  }
+  return attrs;
+}
+
+function parseHTML(html, into) {
+  const stack = [into];
+  let rest = String(html);
+  let match;
+  while (rest.length) {
+    if (rest.charAt(0) === "<") {
+      if ((match = /^<\/([A-Za-z][A-Za-z0-9]*)\s*>/.exec(rest))) {
+        const closed = stack.pop();
+        if (stack.length === 0 || closed.tagName !== match[1].toLowerCase()) {
+          throw new Error("dom.js: innerHTML closes </" + match[1] + "> that is not open");
+        }
+      } else if ((match = /^<([A-Za-z][A-Za-z0-9]*)((?:[^<>"']|"[^"]*"|'[^']*')*?)(\/?)>/.exec(rest))) {
+        const el = new Element(match[1]);
+        parseAttributes(match[2]).forEach(function (pair) { el.setAttribute(pair[0], pair[1]); });
+        stack[stack.length - 1].appendChild(el);
+        if (!match[3]) { stack.push(el); }
+      } else {
+        throw new Error("dom.js cannot parse innerHTML at: " + rest.slice(0, 40));
+      }
+    } else {
+      const cut = rest.indexOf("<");
+      const text = cut === -1 ? rest : rest.slice(0, cut);
+      match = [text];
+      stack[stack.length - 1].appendChild(new Text(decodeEntities(text)));
+    }
+    rest = rest.slice(match[0].length);
+  }
+  if (stack.length !== 1) {
+    throw new Error("dom.js: innerHTML left <" + stack[stack.length - 1].tagName + "> open");
+  }
+}
+
+function serialise(node) {
+  if (node.nodeType === 3) { return encodeEntities(node.data); }
+  const attrs = Object.keys(node.attributes)
+    .map(function (name) { return " " + name + "=\"" + encodeEntities(node.attributes[name]) + "\""; })
+    .join("");
+  return "<" + node.tagName + attrs + ">" +
+    node.childNodes.map(serialise).join("") + "</" + node.tagName + ">";
+}
+
 const REFLECTED = ["src", "href", "title", "type", "loading", "alt", "id"];
 
 class Element {
@@ -86,10 +232,48 @@ class Element {
     this.parentNode = null;
     this.listeners = {};
     this.hidden = false;
+    // Node lays nothing out, so every box is zero. A script that divides by a
+    // dimension has to cope with a stage it cannot measure anyway: that is a
+    // hidden element in a browser too.
+    this.clientWidth = 0;
+    this.clientHeight = 0;
+    this.scrollHeight = 0;
   }
 
   get className() { return this.attributes["class"] || ""; }
   set className(value) { this.attributes["class"] = String(value); }
+
+  get classList() {
+    const el = this;
+    function names() {
+      return String(el.attributes["class"] || "").split(/\s+/).filter(Boolean);
+    }
+    return {
+      add: function (name) {
+        const have = names();
+        if (have.indexOf(name) === -1) { have.push(name); }
+        el.attributes["class"] = have.join(" ");
+      },
+      remove: function (name) {
+        el.attributes["class"] = names().filter(function (one) { return one !== name; }).join(" ");
+      },
+      contains: function (name) { return names().indexOf(name) !== -1; },
+      toggle: function (name) {
+        if (this.contains(name)) { this.remove(name); return false; }
+        this.add(name);
+        return true;
+      }
+    };
+  }
+
+  get style() { return styleOf(this); }
+
+  get innerHTML() { return this.childNodes.map(serialise).join(""); }
+  set innerHTML(value) {
+    this.childNodes.forEach(function (child) { child.parentNode = null; });
+    this.childNodes = [];
+    parseHTML(value, this);
+  }
 
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) {
@@ -175,6 +359,12 @@ class Document extends Element {
   constructor() {
     super("#document");
     this.readyState = "complete";
+    // A page has these two whatever else it has; kiosk.js puts a class on the
+    // body and asks the root element about full screen.
+    this.documentElement = new Element("html");
+    this.appendChild(this.documentElement);
+    this.body = new Element("body");
+    this.documentElement.appendChild(this.body);
   }
   createElement(tag) { return new Element(tag); }
   createTextNode(value) { return new Text(value); }
@@ -184,17 +374,43 @@ class Document extends Element {
 function makeWindow() {
   var store = {};
   var document = new Document();
+  // The frames a script asked for, held rather than run: a test steps the
+  // clock by hand, so a timer counted off rAF deltas is deterministic.
+  var frames = [];
   var window = {
     document: document,
     location: { hash: "", search: "", pathname: "/e/82/" },
-    history: { replaceState: function () {} },
+    // Records what it was handed as well as doing nothing with it, so a test
+    // can read back the address bar the script means to leave behind.
+    history: {
+      lastUrl: null,
+      replaceState: function (state, title, url) { window.history.lastUrl = url; }
+    },
     localStorage: {
       getItem: function (key) { return Object.prototype.hasOwnProperty.call(store, key) ? store[key] : null; },
       setItem: function (key, value) { store[key] = String(value); },
       removeItem: function (key) { delete store[key]; }
     },
     // Nothing in a test reaches the network: the page must stand up anyway.
-    fetch: function () { return Promise.reject(new Error("offline")); }
+    fetch: function () { return Promise.reject(new Error("offline")); },
+    listeners: {},
+    addEventListener: function (name, fn) {
+      (window.listeners[name] = window.listeners[name] || []).push(fn);
+    },
+    setTimeout: setTimeout,
+    clearTimeout: clearTimeout,
+    setInterval: setInterval,
+    clearInterval: clearInterval,
+    clock: 0,
+    performance: { now: function () { return window.clock; } },
+    requestAnimationFrame: function (fn) { return frames.push(fn); },
+    // Advance the clock by ms and run every frame that was waiting on it.
+    step: function (ms) {
+      var due = frames;
+      frames = [];
+      window.clock += ms;
+      due.forEach(function (fn) { fn(window.clock); });
+    }
   };
   return window;
 }
