@@ -475,6 +475,8 @@ class TreeTests(GalleryTestCase):
             f"e/{three}/index.html",
             "rejections.html",
             "index.html",
+            "kiosk.html",
+            "kiosk.json",
             "lineage.json",
             f"lines/{one}.html",
         ]
@@ -2131,6 +2133,354 @@ class EntryCompassTests(GalleryTestCase):
                 self.assertNotIn('class="quads"', page)
 
 
+# ---------------------------------------------------------------------------
+# The kiosk (docs/plans/kiosk.md §5)
+# ---------------------------------------------------------------------------
+
+
+class KioskManifestTests(GalleryTestCase):
+    """``kiosk.json``: what a projector is handed before the first sketch.
+
+    The manifest is a second serialisation of values meta.json and the cards
+    already carry, so what these tests are really asking is whether the second
+    copy can disagree with the first — by carrying an entry the grid does not,
+    by inventing a zero where a population has not voted, or by coming out
+    differently on a second render of the same rows.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.render()
+
+    def manifest(self):
+        return json.loads((self.dest / "kiosk.json").read_text(encoding="utf-8"))
+
+    def rows(self):
+        return {int(entry["id"]): entry for entry in self.manifest()["entries"]}
+
+    def judge(self, question, kind, judge_id, a, b, choice):
+        db.record_judgment(self.conn, a, b, kind, judge_id, question, choice)
+
+    #: Every key spec §2 names, written out rather than imported so that the
+    #: test is a check on the shape and not a restatement of it. ``canvas`` is
+    #: absent from the list on purpose: it is the one optional key.
+    SPEC_2_KEYS = {
+        "id",
+        "prompt",
+        "brief",
+        "statement",
+        "submitted_by",
+        "planner",
+        "executor",
+        "rules_file",
+        "attempts",
+        "seed",
+        "created_utc",
+        "published_utc",
+        "prompt_tokens",
+        "completion_tokens",
+        "wall_s",
+        "licence",
+        "generation",
+        "parent_entry_id",
+        "critique_by",
+        "root_entry_id",
+        "sketch",
+        "source",
+        "href",
+        "judgment",
+    }
+
+    def test_render_index_writes_the_page_and_the_manifest(self):
+        for name in ("kiosk.html", "kiosk.json"):
+            with self.subTest(file=name):
+                self.assertTrue((self.dest / name).is_file())
+
+    def test_render_index_alone_writes_them_too(self):
+        # render_all is render_index plus the entry directories; a node that
+        # only re-indexes must still get the kiosk.
+        shutil.rmtree(self.dest)
+        self.dest.mkdir()
+        gallery.render_index(self.conn, self.dest, self.config)
+        for name in ("kiosk.html", "kiosk.json"):
+            with self.subTest(file=name):
+                self.assertTrue((self.dest / name).is_file())
+
+    def test_both_files_pass_the_guard(self):
+        # The read-only guard walks every text file in the checkout, which is
+        # the form that would catch a manifest smuggling a mail address out of
+        # a statement or a brief.
+        gallery.guard(self.dest)
+
+    def test_a_statement_with_an_email_in_it_refuses_the_whole_render(self):
+        # The manifest carries the statement verbatim, so it is one more file
+        # personal data could reach the public repository through.
+        self.conn.execute(
+            "UPDATE entries SET statement = ? WHERE id = ?",
+            ("Ask nobody@example.invalid what it means.", self.ids[0]),
+        )
+        self.conn.commit()
+        with self.assertRaises(gallery.Unsafe) as caught:
+            gallery.render_index(self.conn, self.dest, self.config)
+        self.assertIn("email-shaped string", str(caught.exception))
+
+    def test_only_published_entries_are_in_it(self):
+        one, two, kept = self.ids
+        held = add_child(self.conn, self.tmp, two, state="held")
+        self.render()
+        ids = [int(entry["id"]) for entry in self.manifest()["entries"]]
+        self.assertEqual([one, two], ids)
+        self.assertNotIn(kept, ids)
+        self.assertNotIn(held, ids)
+
+    def test_the_entries_are_in_ascending_id_order(self):
+        # _entries returns created_utc order; the manifest promises id order,
+        # because the browser's tie-breaks are by id and a stable file is
+        # easier to diff.
+        third = add_child(self.conn, self.tmp, self.ids[0], state="published")
+        self.render()
+        ids = [int(entry["id"]) for entry in self.manifest()["entries"]]
+        self.assertEqual(sorted(ids), ids)
+        self.assertIn(third, ids)
+
+    def test_every_spec_key_is_present_for_a_root_and_for_a_child(self):
+        rows = self.rows()
+        for name, entry_id in (("root", self.ids[0]), ("child", self.ids[1])):
+            with self.subTest(entry=name):
+                self.assertEqual(self.SPEC_2_KEYS, set(rows[entry_id]) - {"canvas"})
+
+    def test_a_root_says_so_with_nulls_and_a_child_names_its_parent(self):
+        one, two, _ = self.ids
+        rows = self.rows()
+        self.assertIsNone(rows[one]["parent_entry_id"])
+        self.assertIsNone(rows[one]["critique_by"])
+        self.assertEqual(1, rows[one]["generation"])
+        self.assertEqual(one, rows[one]["root_entry_id"])
+        self.assertEqual(one, rows[two]["parent_entry_id"])
+        self.assertEqual("gemma4:e4b", rows[two]["critique_by"])
+        self.assertEqual(2, rows[two]["generation"])
+        self.assertEqual(one, rows[two]["root_entry_id"])
+
+    def test_the_provenance_is_the_same_values_meta_json_carries(self):
+        one = self.ids[0]
+        meta = json.loads(
+            (self.dest / "e" / str(one) / "meta.json").read_text(encoding="utf-8")
+        )
+        row = self.rows()[one]
+        for key in gallery.KIOSK_META_KEYS:
+            with self.subTest(key=key):
+                self.assertEqual(meta[key], row[key])
+
+    def test_where_to_run_it_and_where_to_read_it(self):
+        one = self.ids[0]
+        row = self.rows()[one]
+        self.assertEqual(f"e/{one}/sketch/", row["sketch"])
+        self.assertEqual(f"e/{one}/sketch/sketch.js", row["source"])
+        self.assertEqual(f"e/{one}/", row["href"])
+        # and all three are really there, relative to the gallery root
+        self.assertTrue((self.dest / row["source"]).is_file())
+        self.assertTrue((self.dest / row["href"] / "index.html").is_file())
+
+    def test_an_unjudged_population_is_absent_not_zero(self):
+        """A score nobody voted on is not a low score (spec §2).
+
+        The fixture holds no judgments at all, so both populations are missing;
+        seeding one human pair on one question brings ``human`` back with that
+        question alone, and leaves ``agent`` away.
+        """
+        one, two, _ = self.ids
+        self.assertEqual({}, self.rows()[one]["judgment"])
+        self.judge("look", "human", "profcarroll", one, two, "A")
+        self.render()
+        judgment = self.rows()[one]["judgment"]
+        self.assertNotIn("agent", judgment)
+        self.assertEqual({"look"}, set(judgment["human"]))
+
+    def test_a_judged_entry_carries_score_n_and_pct_and_nothing_else(self):
+        one, two, _ = self.ids
+        for question in ("look", "brief"):
+            self.judge(question, "human", "profcarroll", one, two, "A")
+            self.judge(question, "agent", "qwen3.5:4b", one, two, "B")
+        self.render()
+        rows = self.rows()
+        for entry_id in (one, two):
+            for population in ("human", "agent"):
+                for question in ("look", "brief"):
+                    with self.subTest(entry=entry_id, population=population,
+                                      question=question):
+                        cell = rows[entry_id]["judgment"][population][question]
+                        # rank and pool place a mark on a card's track; the
+                        # kiosk has no track, so they are dropped
+                        self.assertEqual({"score", "n", "pct"}, set(cell))
+                        self.assertEqual(1, cell["n"])
+        # and the numbers are the ones the cards were drawn from
+        scores = gallery._all_scores(self.conn)
+        stand = gallery._standing(scores["human"]["look"], one)
+        self.assertEqual(stand["score"], rows[one]["judgment"]["human"]["look"]["score"])
+        self.assertEqual(stand["pct"], rows[one]["judgment"]["human"]["look"]["pct"])
+
+    def test_a_second_render_gives_the_same_bytes(self):
+        # No clock is read and the order is total, which is what lets the
+        # publisher's commit mean something.
+        first = (self.dest / "kiosk.json").read_bytes()
+        self.render()
+        self.assertEqual(first, (self.dest / "kiosk.json").read_bytes())
+
+
+class KioskCanvasTests(GalleryTestCase):
+    """The one thing the kiosk cannot ask the sketch itself (spec §4.3).
+
+    The frame is ``allow-scripts`` without ``allow-same-origin`` and therefore
+    opaque, so a fixed-size canvas would sit top-left in a stage-sized frame
+    with nothing to centre it. The generator reads the source instead. Each
+    case here rewrites the attempt directory's own ``sketch.js`` — the file
+    ``_write_entry`` copies — and asks what the manifest then says.
+    """
+
+    def sketch_says(self, call):
+        """The manifest row for entry one, with its sketch rewritten to ``call``."""
+        one = self.ids[0]
+        row = self.conn.execute(
+            "SELECT source_dir FROM entries WHERE id = ?", (one,)
+        ).fetchone()
+        (Path(row["source_dir"]) / "sketch.js").write_text(
+            "function setup() {\n  %s;\n}\nfunction draw() { background(0); }\n" % call,
+            encoding="utf-8",
+        )
+        self.render()
+        entries = json.loads(
+            (self.dest / "kiosk.json").read_text(encoding="utf-8")
+        )["entries"]
+        return next(entry for entry in entries if int(entry["id"]) == one)
+
+    def test_two_integer_literals_give_a_size(self):
+        self.assertEqual([800, 600], self.sketch_says("createCanvas(800, 600)")["canvas"])
+
+    def test_a_third_argument_does_not_take_the_size_away(self):
+        # 27 of the 222 published sketches are WEBGL; they have a size like
+        # any other and the regex stops before the third argument.
+        self.assertEqual(
+            [640, 480], self.sketch_says("createCanvas(640, 480, WEBGL)")["canvas"]
+        )
+
+    def test_a_window_sized_sketch_has_no_key_at_all(self):
+        # Absent, not null and not zero: no key is what tells the browser to
+        # let the frame fill the stage.
+        self.assertNotIn(
+            "canvas", self.sketch_says("createCanvas(windowWidth, windowHeight)")
+        )
+
+    def test_variables_are_not_a_size(self):
+        self.assertNotIn("canvas", self.sketch_says("createCanvas(w, h)"))
+
+    def test_whitespace_between_the_literals_is_allowed(self):
+        self.assertEqual(
+            [1024, 768], self.sketch_says("createCanvas(  1024 ,\n    768 )")["canvas"]
+        )
+
+
+class KioskPageTests(GalleryTestCase):
+    """``kiosk.html`` is a shell, and the nav that reaches it.
+
+    The page carries no entry data by design: ``kiosk.js`` fetches
+    ``kiosk.json``, so a gallery of 222 entries does not put 222 prompts into
+    every projector's first paint, and the page never goes stale between an
+    entry landing and the next full render.
+    """
+
+    #: Verbatim from docs/plans/kiosk-mockup/kiosk.html. The copy is the visual
+    #: spec's, and the start card is the only copy in the page a person reads
+    #: before anything runs.
+    START_CARD = (
+        "sketchgen · kiosk",
+        "Sketches from the gallery play one after another, full screen.",
+        "Press any key at any time for the controls.",
+        "Start",
+        "This first press is the one gesture the browser needs before it will "
+        "run audio or go full screen.",
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.render()
+        self.kiosk = (self.dest / "kiosk.html").read_text(encoding="utf-8")
+
+    def test_the_start_card_says_what_the_mockup_says(self):
+        for line in self.START_CARD:
+            with self.subTest(line=line):
+                self.assertIn(line, self.kiosk)
+
+    def test_the_page_carries_no_entry_data(self):
+        self.assertNotIn("data-entry", self.kiosk)
+        self.assertNotIn("sketchgen-entries", self.kiosk)
+        for row in self.conn.execute("SELECT prompt FROM entries"):
+            with self.subTest(prompt=row["prompt"][:32]):
+                self.assertNotIn(str(row["prompt"]), self.kiosk)
+
+    def test_exactly_one_kiosk_script_tag(self):
+        scripts = [
+            attrs.get("src", "")
+            for tag, attrs in elements(self.kiosk)
+            if tag == "script" and attrs.get("src")
+        ]
+        self.assertEqual(["./assets/gallery.js", "./assets/kiosk.js"], scripts)
+        # No p5 and no kiosk-data.js: the mockup loads both because an artefact
+        # cannot frame the gallery, and the real page frames it (spec §1.4).
+        self.assertNotIn("p5.min.js", self.kiosk)
+        self.assertNotIn("kiosk-data.js", self.kiosk)
+
+    def test_the_body_is_the_kiosk_from_load(self):
+        # The CSS hangs the whole layout off body.kiosk; adding the class in
+        # script would show the gallery's own page first and then repaint.
+        self.assertIn('<body class="kiosk">', self.kiosk)
+
+    def test_the_menu_note_describes_the_live_page_not_the_mockup(self):
+        # The mockup's numbers are invented and its note says so. Here they
+        # are real, and a play is still never a view (spec §1.5).
+        self.assertIn(
+            "Views and likes are live from the write path; a play here is "
+            "never counted as a view.",
+            self.kiosk,
+        )
+        self.assertNotIn("example numbers", self.kiosk)
+
+    def test_the_page_parses(self):
+        self.assertEqual([], balance_errors(self.dest / "kiosk.html"))
+
+    def test_every_page_links_to_the_kiosk_after_compare(self):
+        one = self.ids[0]
+        pages = [
+            "index.html",
+            "rejections.html",
+            "compare.html",
+            "kiosk.html",
+            f"e/{one}/index.html",
+            f"lines/{one}.html",
+        ]
+        for name in pages:
+            with self.subTest(page=name):
+                page = (self.dest / name).read_text(encoding="utf-8")
+                nav = page.split('<p class="nav">')[1].split("</p>")[0]
+                self.assertLess(nav.index("compare.html"), nav.index("kiosk.html"))
+                self.assertIn(">kiosk</a>", nav)
+
+    def test_the_kiosk_marks_itself_current_and_no_other_page_does(self):
+        one = self.ids[0]
+        nav = self.kiosk.split('<p class="nav">')[1].split("</p>")[0]
+        self.assertIn('kiosk.html" aria-current="page"', nav)
+        for name in ("index.html", "compare.html", f"e/{one}/index.html"):
+            with self.subTest(page=name):
+                page = (self.dest / name).read_text(encoding="utf-8")
+                other = page.split('<p class="nav">')[1].split("</p>")[0]
+                self.assertNotIn("aria-current", other)
+
+    def test_a_line_page_reaches_the_kiosk_from_one_level_down(self):
+        # lines/<root>.html renders with root="../"; a kiosk link that forgot
+        # it would 404 from there and nowhere else.
+        line = (self.dest / "lines" / f"{self.ids[0]}.html").read_text(encoding="utf-8")
+        self.assertIn('href="../kiosk.html"', line)
+
+
 class GuardTests(GalleryTestCase):
 
     def test_an_email_in_a_statement_is_refused_and_nothing_is_left(self):
@@ -2283,6 +2633,15 @@ class CommandLineTests(GalleryTestCase):
                 result = self.run_cli(name, "--help")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("--gallery-dir", result.stdout)
+
+    def test_render_index_help_names_the_files_it_writes(self):
+        # The help is the only place an operator reads the file list, and a
+        # deploy that does not know kiosk.json is written cannot know to pull
+        # the gallery checkout before the next publish.
+        result = self.run_cli("render-index", "--help")
+        for name in ("kiosk.html", "kiosk.json"):
+            with self.subTest(file=name):
+                self.assertIn(name, result.stdout)
 
     def test_render_all_writes_the_site(self):
         result = self.run_cli(
