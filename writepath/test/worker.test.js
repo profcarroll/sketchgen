@@ -106,11 +106,12 @@ function makeDB() {
       }
 
       case SQL.bumpView: {
-        const [entryId, updated] = args;
+        const [entryId, fromKiosk, updated] = args;
         const existing = store.views.get(entryId);
         store.views.set(entryId, {
           entry_id: entryId,
           count: existing ? existing.count + 1 : 1,
+          kiosk_count: (existing ? existing.kiosk_count : 0) + fromKiosk,
           updated_utc: updated,
         });
         return { rows: [] };
@@ -407,6 +408,57 @@ test("views increment, repeat within 60 s from one session is ignored, anonymous
   }
   assert.equal(store.views.get(3).count, 5);
   assert.equal(store.viewLog.size, 3); // octocat×2, hubot×1; nothing anonymous
+  // Everything above came from an entry page, so none of it is the kiosk's.
+  assert.equal(store.views.get(3).kiosk_count, 0);
+});
+
+test("a kiosk view is a view, and is also counted as the kiosk's", async () => {
+  const { env, store } = makeEnv();
+
+  await worker.fetch(post("/view", { entry_id: 3, source: "kiosk" }), env);
+  assert.deepEqual(store.views.get(3), {
+    entry_id: 3,
+    count: 1,
+    kiosk_count: 1,
+    updated_utc: store.views.get(3).updated_utc,
+  });
+
+  // An entry-page view on the same row moves the total and not the subset, so
+  // `count` stays what /counts and /pull report and `kiosk_count` stays the
+  // part of it that came from a projector.
+  await worker.fetch(post("/view", { entry_id: 3, source: "entry" }), env);
+  assert.equal(store.views.get(3).count, 2);
+  assert.equal(store.views.get(3).kiosk_count, 1);
+
+  // An absent source is the entry page: this is what gallery.js has always
+  // sent, and it has to keep meaning what it meant.
+  await worker.fetch(post("/view", { entry_id: 3 }), env);
+  assert.equal(store.views.get(3).count, 3);
+  assert.equal(store.views.get(3).kiosk_count, 1);
+});
+
+test("a source the Worker does not know is refused, and counts nothing", async () => {
+  const { env, store } = makeEnv();
+  for (const source of ["projector", "", 7, true, { source: "kiosk" }]) {
+    const response = await worker.fetch(post("/view", { entry_id: 3, source }), env);
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: "source must be entry or kiosk" });
+  }
+  assert.equal(store.views.get(3), undefined);
+});
+
+test("a kiosk view is anonymous and is never de-duplicated", async () => {
+  const { env, store } = makeEnv();
+  // The projector signs nobody in, so it presents no session and the 60 s
+  // window cannot apply to it. kiosk.js is the only thing standing between
+  // this endpoint and a view a second (docs/plans/kiosk-views.md §2).
+  for (let i = 0; i < 4; i += 1) {
+    const response = await worker.fetch(post("/view", { entry_id: 9, source: "kiosk" }), env);
+    assert.deepEqual(await response.json(), { ok: true, counted: true });
+  }
+  assert.equal(store.views.get(9).count, 4);
+  assert.equal(store.views.get(9).kiosk_count, 4);
+  assert.equal(store.viewLog.size, 0);
 });
 
 // ---------------------------------------------------------------------------

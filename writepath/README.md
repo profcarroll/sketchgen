@@ -47,6 +47,13 @@ session table to leak: `/logout` clears the cookie and the page drops its copy.
 **not** de-duplicated, on purpose: the only way would be to keep something that
 identifies the viewer.
 
+The kiosk page is signed out and always will be, so nothing here restrains it
+and it restrains itself instead (`docs/plans/kiosk-views.md`). It names itself
+with `source: "kiosk"` on `/view`, which lands in `views.kiosk_count` — a
+subset of `count`, kept so the projector's views can still be told from the
+ones a person clicked. `/counts` and `/pull` report `count` and only `count`,
+so the gallery and the node see one number, as they always have.
+
 `/counts` is public because the gallery shows view and like counts to human
 visitors. The agent-judge code (packet 5.2) must never call it — engagement is
 not judgment, and an agent that has seen a like count is no longer answering the
@@ -104,6 +111,17 @@ Nothing below has been done. Each step is the instructor's.
    `database_id` into `wrangler.toml` over the placeholder, and commit that.
 3. **Schema** —
    `wrangler d1 execute sketchgen-writepath --remote --file=./schema.sql`.
+
+   `schema.sql` is `CREATE TABLE IF NOT EXISTS` throughout, so re-running it
+   against a live database adds nothing. A column added to a table that already
+   exists is run by hand, **before** the Worker that writes it deploys — a
+   Worker whose statement names a column the database has not got fails every
+   call to that route. The one such column so far:
+
+   ```
+   wrangler d1 execute sketchgen-writepath --remote \
+     --command="ALTER TABLE views ADD COLUMN kiosk_count INTEGER NOT NULL DEFAULT 0;"
+   ```
 4. **Secrets** — four, from this directory, each read from `env` at runtime:
    - `wrangler secret put GITHUB_CLIENT_ID` — from step 1
    - `wrangler secret put GITHUB_CLIENT_SECRET` — from step 1

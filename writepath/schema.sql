@@ -43,9 +43,21 @@ CREATE TABLE IF NOT EXISTS likes (
 CREATE INDEX IF NOT EXISTS likes_updated_idx ON likes (updated_utc);
 
 -- View counters. One row per entry, an absolute running count.
+--
+-- `count` is every view, whatever asked for it, and it is the only number
+-- /counts and /pull ever report: the gallery shows one figure and the node
+-- mirrors one column. `kiosk_count` is the subset of `count` that arrived from
+-- the projector page (docs/plans/kiosk-views.md §3.4), kept so that the two
+-- can still be told apart when the term is written up. Nothing reads it yet;
+-- that is the point of writing it now rather than later.
+--
+-- An existing database does not pick this column up from a CREATE IF NOT
+-- EXISTS. It is added by hand, once, before the Worker that writes it deploys:
+--   ALTER TABLE views ADD COLUMN kiosk_count INTEGER NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS views (
     entry_id    INTEGER PRIMARY KEY,
     count       INTEGER NOT NULL DEFAULT 0,
+    kiosk_count INTEGER NOT NULL DEFAULT 0,
     updated_utc TEXT    NOT NULL
 );
 
