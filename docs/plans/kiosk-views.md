@@ -78,7 +78,8 @@ handler. Skipping with `→` never reaches the threshold, so skipped sketches co
 §1.5's strongest case was *one screen left running*. A dwell threshold does not answer it: a
 projector left on over a long weekend still posts views nobody saw.
 
-Stop counting — not playing — after `VIEW_STOP_HOURS = 8` with no key press and no mouse movement.
+Stop counting — not playing — after `VIEW_STOP_S = 8 * 60 * 60` playing seconds with no key press
+and no mouse movement, counted off the same rAF deltas as everything else here.
 The page keeps playing, the caption keeps updating, and the first key or twitch of the mouse starts
 counting again. The kiosk already tracks mouse movement for the 3 s cursor hide, so the input
 already exists.
@@ -153,18 +154,24 @@ Assuming §3.1, §3.2, §3.3 and answer (b).
   frame.
 - `viewAfter()` returns `Math.min(VIEW_AFTER_S, state.every)`.
 - `countingViews()` — `base()` is non-empty, `config.kiosk_views !== false`, `?views=0` absent, and
-  (§3.2) the last input was within `VIEW_STOP_HOURS`.
-- §3.2: record `lastInput` in the handlers that already exist for the cursor hide and the menu.
+  (§3.2) `state.sinceInput < VIEW_STOP_S`.
+- §3.2: `state.sinceInput` accumulates in `tick()` beside `state.elapsed`, and is cleared by
+  `onKey` and by the `mousemove` handler `wireIdle` already registers for the cursor hide.
+- `query()` carries `&views=0` when it is set. `persist()` rebuilds the address bar from that
+  string, so a parameter missing from it is one the first acting key throws away — and the launch
+  link in the menu footer would then hand somebody a projector that counts when the one it was
+  copied from did not.
 
-### `sketchgen/templates/kiosk.html` and `docs/plans/kiosk-mockup/kiosk.html`
+### `sketchgen/templates/kiosk.html`
 
-Line 86's note is now false. Proposed copy, to be settled before the branch opens:
+Line 86's note is now false, and it is the only place the room is ever told. New copy:
 
 > Views and likes are live from the write path; a sketch counts as a view once it has been on
 > screen for ten seconds.
 
-The mockup is the copy of record (`test_gallery.py:2426` cites it as the verbatim source), so it
-changes with the template or the two drift.
+The mockup does **not** change. `test_gallery.py:2426` cites it as the verbatim source for the
+start card, but this line is not the mockup's: the mockup's own note says its numbers are example
+numbers, which is still true of a page with no write path behind it.
 
 ### `sketchgen/gallery.py`
 

@@ -17,13 +17,34 @@
  *                   is on
  *   <root><sketch>  in a sandboxed iframe, which is where the sketch runs
  *
- * What it must never do (spec §4.5), and what the tests hold it to: POST
- * anything — a play on a projector is not a view, and one screen left running
- * would bend "most liked" and "most reviewed" without a person choosing
- * anything; read document.cookie; send credentials or an Authorization header,
- * because /counts is a public read and this page never signs anybody in;
- * evaluate sketch source; touch a localStorage key other than sketchgen-kiosk;
- * or hold more than one iframe at a time.
+ * The one thing it writes (docs/plans/kiosk-views.md), and the only one:
+ *
+ *   <base>/view     one view of one entry, once that entry has been on the
+ *                   stage, playing, for ten seconds
+ *
+ * That endpoint de-duplicates a signed-in viewer and nothing else — an
+ * anonymous view is counted exactly as it arrives, on purpose, because
+ * de-duplicating one would mean keeping an IP or a fingerprint. This page
+ * signs nobody in, so every request it makes counts, and the three conditions
+ * below are the only restraint there is:
+ *
+ *   1. ten seconds of un-paused time on one seat, so a held arrow key skips
+ *      without counting, and a throttled tab counts nothing at all: the timer
+ *      is rAF deltas, and a browser stops handing those to a hidden page;
+ *   2. once per seat, ever — a boolean set before the request goes out, so no
+ *      frame can post a second one while the first is still in flight;
+ *   3. nothing after eight hours of playing with no key and no mouse. The
+ *      sketches keep playing; a room nobody is in stops being an audience.
+ *
+ * Any of that can be turned off without a deploy: kiosk_views in config.json
+ * for the gallery, ?views=0 for one projector.
+ *
+ * What it must never do (spec §4.5), and what the tests hold it to: write
+ * anything but that one view; read document.cookie; present an identity of any
+ * kind, because /counts is a public read, /view takes an anonymous one, and
+ * this page never signs anybody in; evaluate sketch source; touch a
+ * localStorage key other than sketchgen-kiosk; or hold more than one iframe at
+ * a time.
  *
  * This is the only script the page loads. gallery.js is not on it: its ready()
  * asks /me for the signed-in viewer, and a projector in a lobby has no viewer
@@ -53,6 +74,14 @@
   var CODE_HOLD_MS = 4000;    /* read the top of the file before it moves */
   var CODE_SPEED = 18;        /* pixels a second, a reading pace */
   var COUNTS_EVERY_MS = 600000;
+
+  /* How long a sketch has to have been on the stage before it is a view, and
+   * how long a room can go without a key or a mouse before it stops being an
+   * audience. Both are counted in playing seconds off the same rAF deltas the
+   * playback timer uses, not off a wall clock: a projector whose tab the
+   * browser has backgrounded is neither playing nor being watched. */
+  var VIEW_AFTER_S = 10;
+  var VIEW_STOP_S = 8 * 60 * 60;
 
   /* The write path answers one statement per ask and its database binds at
    * most a hundred parameters, which is the number gallery.js batches on. */
@@ -129,7 +158,10 @@
     i: 0,
     elapsed: 0,
     seq: [],
-    playing: false
+    playing: false,
+    viewed: false,      /* has this seat been counted? cleared by seat() */
+    sinceInput: 0,      /* playing seconds since the last key or mouse move */
+    viewsOff: false     /* ?views=0, which is not a key and is not persisted */
   };
 
   /* ---- small helpers ---------------------------------------------------- */
@@ -202,9 +234,10 @@
 
   /* ---- views and likes -------------------------------------------------- */
 
-  /* A plain public GET: no credentials, no Authorization header, no cookie.
-   * This page never signs anybody in, so it has nothing to present and
-   * presenting nothing is the point — the kiosk reads and never writes. */
+  /* A plain public GET, and anonymous like the view below it: no cookie, no
+   * bearer, nothing that names anybody. /counts is a public read and this
+   * page never signs anybody in, so it has nothing to present — and
+   * presenting nothing is still the point now that it does write. */
   function fetchCounts(ids) {
     return fetch(base() + "/counts?entries=" + encodeURIComponent(ids.join(",")))
       .then(function (response) { return response.json(); })
@@ -216,6 +249,42 @@
         }
       })
       .catch(function () { /* leave this batch's em dashes where they are */ });
+  }
+
+  /* The write, and the whole of it (docs/plans/kiosk-views.md §3).
+   *
+   * Anonymous, like the read above: no cookie, no bearer, nothing that names
+   * anybody. /view takes a view without one, and a projector in a lobby has
+   * no viewer to name — a kiosk that presented an identity would be filing
+   * every sketch it played under whoever last signed in on that machine.
+   *
+   * Fire and forget. A view that does not land is not an error and there is
+   * nothing to tell the room, which is how gallery.js sends the entry page's.
+   * `source` lets the write path keep the projector's views apart from the
+   * ones a person clicked; an absent one means the entry page, so nothing
+   * else that posts here has to change. */
+  function sendView(entry) {
+    if (!entry) { return; }
+    fetch(base() + "/view", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entry_id: entry.id, source: "kiosk" })
+    }).catch(function () { /* the room is not told, and does not need to be */ });
+  }
+
+  /* Ten seconds, or the whole slot when the slot is shorter than ten: a
+   * projector set to 15 s still counts what it shows. */
+  function viewAfter() {
+    return Math.min(VIEW_AFTER_S, state.every);
+  }
+
+  /* Every condition in one place, so there is one line to read when asking
+   * why a kiosk is or is not counting. A gallery with no write path has
+   * nowhere to post; the other three are the restraints. */
+  function countingViews() {
+    if (!base() || state.viewsOff) { return false; }
+    if (config && config.kiosk_views === false) { return false; }
+    return state.sinceInput < VIEW_STOP_S;
   }
 
   function loadCounts() {
@@ -317,6 +386,10 @@
     }
     show = params.get("show");
     if (show !== null) { state.show = showFrom(show.split(",")); }
+    // Not a key, and never written to storage: which sketches the gallery
+    // counts is a property of the projector somebody set up, not something a
+    // bumped keyboard should be able to change on the way past.
+    state.viewsOff = params.get("views") === "0";
   }
 
   /* The launch link and the address bar are the same three parameters, built
@@ -327,7 +400,13 @@
   function query() {
     return "order=" + state.order +
       "&every=" + state.every +
-      "&show=" + shownKeys().join(",");
+      "&show=" + shownKeys().join(",") +
+      // persist() rewrites the address bar from this string, so a parameter
+      // that is not in it is a parameter the first acting key throws away.
+      // It rides in the launch link for the same reason: the link is supposed
+      // to reproduce the projector, and a projector that counts nothing is
+      // not reproduced by a link that counts.
+      (state.viewsOff ? "&views=0" : "");
   }
 
   /* Both halves of §1.8 at once. The address bar keeps only these three
@@ -778,6 +857,9 @@
   function seat() {
     var entry = current();
     state.elapsed = 0;
+    // A new sketch is a new view to earn. Cleared here rather than in go(),
+    // because seat() is the one path every sketch on the stage comes through.
+    state.viewed = false;
     showEntry(entry);
     paint(entry);
     paintStatus();
@@ -832,7 +914,15 @@
   function tick(stamp) {
     var delta = (stamp - last) / 1000;
     last = stamp;
-    if (!state.paused) { state.elapsed += delta; }
+    if (!state.paused) { state.elapsed += delta; state.sinceInput += delta; }
+    // Before the advance below, so a fifteen-second slot counts the sketch it
+    // is about to leave. The flag is set first and the request goes second:
+    // the other order posts once a frame for as long as the first one is in
+    // flight, into an endpoint that de-duplicates none of it.
+    if (!state.viewed && state.elapsed >= viewAfter() && countingViews()) {
+      state.viewed = true;
+      sendView(current());
+    }
     $("progress").style.width =
       Math.min(100, 100 * state.elapsed / state.every) + "%";
     $("progress").className = "progress" + (state.paused ? " paused" : "");
@@ -867,6 +957,9 @@
     var overlay;
     var at;
     if (!state.playing) { return; }
+    // Somebody is here. Set before the modifier check below returns, because
+    // a browser shortcut is still a person at the keyboard.
+    state.sinceInput = 0;
     // A modifier chord is a browser shortcut and stays one.
     if (event.metaKey || event.ctrlKey || event.altKey) { return; }
     if ($("menu").hidden) {
@@ -966,6 +1059,9 @@
   function wireIdle() {
     var idleTimer = null;
     document.addEventListener("mousemove", function () {
+      // The same handler the cursor hides on, for the same reason: this is
+      // where the page already learns that the room is not empty.
+      state.sinceInput = 0;
       document.body.classList.remove("idle");
       window.clearTimeout(idleTimer);
       idleTimer = window.setTimeout(function () {
