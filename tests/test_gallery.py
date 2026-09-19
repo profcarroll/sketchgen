@@ -2423,7 +2423,12 @@ class KioskPageTests(GalleryTestCase):
             for tag, attrs in elements(self.kiosk)
             if tag == "script" and attrs.get("src")
         ]
-        self.assertEqual(["./assets/gallery.js", "./assets/kiosk.js"], scripts)
+        # kiosk.js alone. gallery.js would bring the session line, but its
+        # ready() also asks the write path /me with the viewer's cookie and
+        # bearer token on every load, and a projector has no business sending
+        # either: nothing is fetched but kiosk.json, config.json, /counts and
+        # the frames (spec §1.11). kiosk.js carries its own copy of base().
+        self.assertEqual(["./assets/kiosk.js"], scripts)
         # No p5 and no kiosk-data.js: the mockup loads both because an artefact
         # cannot frame the gallery, and the real page frames it (spec §1.4).
         self.assertNotIn("p5.min.js", self.kiosk)
