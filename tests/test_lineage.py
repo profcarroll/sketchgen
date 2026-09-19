@@ -150,6 +150,7 @@ class LineageTestCase(unittest.TestCase):
             assertions_json=json.dumps(["motion(idle)"]),
             rules_file="treatment",
             planner="gemma4:e4b",
+            executor="qwen3-coder:30b-a3b-q4_K_M",
             parent_entry_id=job.parent_entry_id,
             strip_path=strip_path,
             submitted_by=by,
@@ -303,6 +304,34 @@ class TestSpawn(LineageTestCase):
         )
         # inherited, so the line stays a fair comparison with itself
         self.assertEqual("treatment", job.rules_file)
+        self.assertEqual("gemma4:e4b", job.planner)
+        self.assertEqual("qwen3-coder:30b-a3b-q4_K_M", job.executor)
+
+    def test_a_child_is_written_by_the_model_that_wrote_its_parent(self):
+        """A revision by a different model is a revision of nothing: the two
+        model columns are variables in the same way the rules file is."""
+        job_id = lineage.spawn(
+            self.conn,
+            parent_entry_id=self.root_entry,
+            critique="slow the whole field down",
+            critique_by="gemma4:e4b",
+            submitted_by="profcarroll",
+        )
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual("gemma4:e4b", job.planner)
+        self.assertEqual("qwen3-coder:30b-a3b-q4_K_M", job.executor)
+
+    def test_either_model_can_be_overridden_on_purpose(self):
+        job_id = lineage.spawn(
+            self.conn,
+            parent_entry_id=self.root_entry,
+            critique="try the same revision with another hand",
+            critique_by="profcarroll",
+            submitted_by="profcarroll",
+            executor="qwen3.5:9b",
+        )
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual("qwen3.5:9b", job.executor)
         self.assertEqual("gemma4:e4b", job.planner)
         # and no lineage row yet: there is no child entry to key one on
         self.assertEqual(
