@@ -523,6 +523,68 @@ class TestPaidPlanner(WorkerTestCase):
         self.assertEqual(["executing", "gating", "held"], self.states)
 
 
+class TestTheJobsOwnPlannerModel(WorkerTestCase):
+    """``jobs.planner`` has said "a model id, or 'paid'" since migration 001.
+    Until 2026-09-19 only the 'paid' half was read; the New job page can now
+    name a model, so the model id half has to reach the call."""
+
+    def recording_planner(self):
+        seen = []
+
+        def plan(*, job, host, model, seed=1):
+            seen.append(model)
+            return planner.Plan(brief="a brief the stub planner wrote",
+                                assertions=["motion(idle)"],
+                                prompt_version="planner-v1", tokens={},
+                                durations={}, raw="")
+
+        plan.seen = seen
+        return plan
+
+    def test_the_model_the_job_names_is_the_model_that_is_called(self):
+        job_id = db.enqueue(self.conn, "planned by a model of its own", "octocat",
+                            planner="qwen3.5:9b")
+        plan = self.recording_planner()
+        self.assertEqual(0, self.make_worker(planner_fn=plan).run_once())
+
+        self.assertEqual(["qwen3.5:9b"], plan.seen)
+        self.assertEqual("qwen3.5:9b", db.get_job(self.conn, job_id).planner)
+
+    def test_the_model_the_job_names_is_the_model_the_entry_records(self):
+        job_id = db.enqueue(self.conn, "provenance, not a guess", "octocat",
+                            planner="qwen3.5:9b")
+        self.assertEqual(0, self.make_worker(
+            planner_fn=self.recording_planner()).run_once())
+        row = self.entries(job_id)[0]
+        self.assertEqual("qwen3.5:9b", row["planner"])
+
+    def test_the_activity_row_says_which_model_is_planning(self):
+        db.enqueue(self.conn, "say which one", "octocat", planner="qwen3.5:9b")
+        self.make_worker(planner_fn=self.recording_planner()).run_once()
+        row = next(r for r in self.activity_rows() if r["step"] == "planning")
+        self.assertEqual("qwen3.5:9b", row["model"])
+        self.assertIn("qwen3.5:9b", row["detail"])
+
+    def test_an_empty_column_still_means_the_workers_default(self):
+        db.enqueue(self.conn, "nobody chose", "octocat")
+        plan = self.recording_planner()
+        self.make_worker(planner_fn=plan).run_once()
+        self.assertEqual([worker.DEFAULT_PLANNER_MODEL], plan.seen)
+
+    def test_the_word_local_from_an_older_page_means_the_default_too(self):
+        db.enqueue(self.conn, "an old row", "octocat", planner="local")
+        plan = self.recording_planner()
+        self.make_worker(planner_fn=plan).run_once()
+        self.assertEqual([worker.DEFAULT_PLANNER_MODEL], plan.seen)
+
+    def test_paid_is_still_read_before_any_model_is_chosen(self):
+        job_id = db.enqueue(self.conn, "a paid plan", "octocat", planner="paid")
+        plan = self.recording_planner()
+        self.make_worker(planner_fn=plan).run_once()
+        self.assertEqual([], plan.seen)
+        self.assertEqual("needs-laptop", db.get_job(self.conn, job_id).state)
+
+
 class TestMalformedExecutorResponse(WorkerTestCase):
     def test_the_attempt_is_recorded_and_the_job_repairs(self):
         job_id = self.enqueue(max_attempts=3)

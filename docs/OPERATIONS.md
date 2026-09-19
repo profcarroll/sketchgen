@@ -1162,7 +1162,8 @@ login is what a critique on Held is signed by. The parent entry is a card, not a
 type an id or pick one of the recent held, published or kept entries and the page draws
 its strip, state, generation and prompt, presets planner and rules from it the way
 `lineage.spawn` does, and refuses a rejected or archived one before the queue sees it;
-`/new?parent=<id>` is what the job page's "descended from" link opens. Assertions and
+`/new?parent=<id>` is what the job page's "descended from" link opens. **Planner** is
+the models this node actually has (see below). Assertions and
 the run options open the way you last saved them — **Save as defaults** keeps the
 current ticks and options in the database's `meta` row, **Forget them** goes back to the
 built-in ones, and either leaves the prompt you were typing where it is. **One job per
@@ -1170,6 +1171,50 @@ line** queues a batch of prompts under one setting, which is the cheap way to fe
 `rules=random` for the A/B measurement; the button counts them, and every line shares
 the one submitter, parent, assertions and options. Recent root prompts sit under the box
 to run again under other rules.
+
+### Which model plans a job
+
+The models live on their own volume — `OLLAMA_MODELS=/mnt/models`, 148 GB — so there
+is room for more of them than the pipeline names, and the **Planner** menu on New job
+lists the ones that are there rather than offering `local` or `paid`. It reads
+Ollama when the page is drawn (`GET /api/tags` for the list, `POST /api/show` for each
+one's capabilities, cached 60 s) and shows every **vision-capable** model in two
+groups:
+
+- **on this node** — runs here, costs electricity and nothing else. The worker's
+  default is marked `(default)` and is what a job gets if nobody chooses.
+- **off this node** — a `-cloud` tag, which Ollama proxies to ollama.com, and `paid`,
+  which stops the job at `needs-laptop` for the laptop to claim. Both send the prompt
+  off the box, which is why they are not in the first group: the gallery's "0 API
+  calls" is true of the first group only.
+
+The choice lands in `jobs.planner`, which has held "a model id, or `paid`" since
+migration 001 — no schema change — and the worker plans with the model the job names
+(`Worker.planner_model_for`). A blank column, or the word `local` from a row written by
+an older page, still means `worker.DEFAULT_PLANNER_MODEL`. The model is recorded on the
+entry, so provenance says which one planned it.
+
+Two things worth knowing:
+
+- **Capabilities come from `/api/show`, not `/api/tags`.** They disagree. On this node
+  `/api/tags` reports `gemma4:e4b` as `completion, thinking, tools` while `/api/show`
+  reports `audio, completion, thinking, tools, vision` — the tags list is written from
+  the manifest as it was pulled, `/api/show` reads the model. Filtering on the tags list
+  would drop the default planner out of its own menu.
+- **A model host that does not answer is not an error.** The menu falls back to the one
+  entry the page offered before it could ask — `local — <the worker's default>` — and
+  the page works. A tag chosen while the host was up is still accepted after it goes
+  down; the worker finds out at plan time and fails the job with the model named in
+  `last_error`.
+
+To offer a model that is not there yet:
+
+```bash
+ssh sld-cloud 'ollama pull qwen3.5:9b'
+```
+
+and reload New job. Nothing needs restarting — the list is read per page, and the cache
+is a minute long.
 
 ## The write-path sync as a timer
 

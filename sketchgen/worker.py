@@ -1908,6 +1908,29 @@ class Worker:
             return None
         return str(path)
 
+    def planner_model_for(self, job: db.Job) -> str:
+        """The model this job is planned with: its own, or this worker's default.
+
+        ``jobs.planner`` has held "a model id, or 'paid'" since migration 001,
+        but until 2026-09-19 nothing read the model id half of that: the New job
+        page offered ``local`` or ``paid``, ``local`` was written to the column
+        as whatever ``DEFAULT_PLANNER_MODEL`` happened to be, and this method's
+        job was done by a constant. Now the page lists the models the node
+        actually has (:mod:`sketchgen.models`) and the column carries the one
+        the operator picked, so it is read here.
+
+        A blank column, or the word ``local`` from a row written by an older
+        page, still means the worker's default. A tag naming a model this node
+        does not have is not caught here: the model host answers 404, the two
+        plan tries fail, and the job fails with that sentence in
+        ``last_error``, which names the model and is the truth about what went
+        wrong.
+        """
+        named = (job.planner or "").strip()
+        if not named or named in ("local", "paid"):
+            return self.planner_model
+        return named
+
     def _plan(self, job: db.Job) -> db.Job | None:
         """Step 4. Returns the updated job, or None when it stops here.
 
@@ -1928,23 +1951,24 @@ class Worker:
                      "(DECIDE[credential-model] B: no paid key on the node)")
             return None
 
+        model = self.planner_model_for(job)
         self._say(
             "planning",
             "Turning the prompt into a brief",
-            f"{self.planner_model} · job {job.id}",
+            f"{model} · job {job.id}",
             job_id=job.id,
-            model=self.planner_model,
+            model=model,
         )
         plan = None
         reason = "the planner said nothing"
         last_raw = ""
         for n in range(1, PLAN_TRIES + 1):
             seed = plan_seed(job.id, n)
-            self.log(f"job {job.id}: planning with {self.planner_model}, seed "
+            self.log(f"job {job.id}: planning with {model}, seed "
                      f"{seed} (try {n}/{PLAN_TRIES})")
             try:
                 plan = self.planner_fn(
-                    job=job, host=self.host, model=self.planner_model, seed=seed
+                    job=job, host=self.host, model=model, seed=seed
                 )
                 break
             except StopNow:
@@ -1982,7 +2006,7 @@ class Worker:
             "executing",
             brief=plan.brief,
             assertions_json=json.dumps(assertions),
-            planner=self.planner_model,
+            planner=model,
         )
         self.log(f"job {job.id}: planned, {plan.prompt_version}, assertions: "
                  f"{', '.join(assertions) or '(none)'}")
