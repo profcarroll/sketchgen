@@ -99,6 +99,19 @@ RATE_PER_HOUR_16_96 = float(os.environ.get("SKETCHGEN_RATE_PER_HOUR", "0.228"))
 # honest number for it is 0.00, not a smaller positive one.
 RATE_PER_HOUR_4_24 = 0.0
 
+# --- storage ---------------------------------------------------------------
+#
+# Compute is not the only meter that costs money once the trial credit lapses.
+# OCI's Always Free tier includes 200 GB of *total* block-volume storage (boot
+# volume plus any attached volumes); past that, storage bills at roughly
+# US$0.0255 per GB-month for the balanced default. The demo node runs a ~140 GB
+# boot disk plus a block volume the model blobs were moved onto (OLLAMA_MODELS,
+# /mnt/models), so the operator now has two volumes to weigh and a bill that is
+# only zero while the two together stay under 200 GB. SKETCHGEN_STORAGE_RATE and
+# SKETCHGEN_FREE_TIER_STORAGE_GB override both when Oracle's price list moves.
+FREE_TIER_STORAGE_GB = float(os.environ.get("SKETCHGEN_FREE_TIER_STORAGE_GB", "200"))
+STORAGE_RATE_USD_GB_MONTH = float(os.environ.get("SKETCHGEN_STORAGE_RATE", "0.0255"))
+
 #: The funnel's rows, in the order the console shows them.
 FUNNEL_NAMES = (
     "generated",
@@ -140,9 +153,12 @@ FILE_SAMPLE_LIMIT = 25
 #: core means somebody is decoding. See :func:`_slot`.
 BUSY_CPU_PCT = 20.0
 
-#: Directories the disk row names, in the order they are tried.
+#: Directories the disk row names, in the order they are tried. OLLAMA_MODELS
+#: wins when the service sets it; /mnt/models is where the demo node's block
+#: volume mounts; the last two are Ollama's system and per-user defaults.
 MODEL_DIRS = (
     os.environ.get("OLLAMA_MODELS", ""),
+    "/mnt/models",
     "/usr/share/ollama/.ollama/models",
     str(Path.home() / ".ollama" / "models"),
 )
@@ -469,26 +485,123 @@ def _du_gb(path: str | None, limit: int = 50000) -> float | None:
     return _round(total / _GIB, 2)
 
 
-def _disk_block() -> dict[str, float | None]:
-    try:
-        stats = os.statvfs("/")
-        block = float(stats.f_frsize)
-        total = stats.f_blocks * block / _GIB
-        free = stats.f_bavail * block / _GIB
-        used = (stats.f_blocks - stats.f_bfree) * block / _GIB
-    except OSError:  # pragma: no cover - "/" always statvfs's on Linux
-        total = free = used = None
-    models = None
+def _model_dir() -> str | None:
+    """The first of MODEL_DIRS that exists, or None if the store is not here."""
     for candidate in MODEL_DIRS:
-        models = _du_gb(candidate)
-        if models is not None:
+        if candidate and os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def _volume(path: str | None) -> dict[str, float | None]:
+    """total/used/free GiB of the filesystem `path` sits on (Nones if unknown)."""
+    total = used = free = None
+    if path:
+        try:
+            stats = os.statvfs(path)
+            block = float(stats.f_frsize)
+            total = _round(stats.f_blocks * block / _GIB, 1)
+            free = _round(stats.f_bavail * block / _GIB, 1)
+            used = _round((stats.f_blocks - stats.f_bfree) * block / _GIB, 1)
+        except OSError:  # pragma: no cover - a live mount always statvfs's
+            total = used = free = None
+    return {"total": total, "used": used, "free": free}
+
+
+def _same_filesystem(a: str, b: str) -> bool:
+    """True when two paths live on the same mount (same st_dev)."""
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:  # pragma: no cover - both paths exist when this is asked
+        return False
+
+
+def _free_tier_drops(
+    catalog: list[dict[str, Any]] | None, need_gb: float
+) -> list[dict[str, Any]]:
+    """One way to get under a free-tier model budget: the fewest models,
+    largest first, whose sizes sum to at least `need_gb`. Empty when nothing
+    has to go, or when the catalogue is unavailable (a dead Ollama host)."""
+    if need_gb <= 0 or not catalog:
+        return []
+    ordered = sorted(
+        (m for m in catalog if m.get("size_gb")),
+        key=lambda m: m["size_gb"],
+        reverse=True,
+    )
+    drops: list[dict[str, Any]] = []
+    freed = 0.0
+    for model in ordered:
+        if freed >= need_gb:
             break
+        drops.append({"name": model["name"], "size_gb": model["size_gb"]})
+        freed += model["size_gb"]
+    return drops
+
+
+def _storage_cost(
+    boot_total: float | None,
+    model_volume: dict[str, float | None],
+    models_gb: float | None,
+    catalog: list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    """What the block storage costs, and what dropping back to the Always Free
+    allowance would force off the model volume.
+
+    Both volumes are OCI block volumes, so the bill is on their *combined*
+    provisioned size above FREE_TIER_STORAGE_GB. Dropping to free tier means the
+    model volume can be no larger than what the boot disk leaves under that
+    allowance; anything the models use beyond that has to go."""
+    separate = model_volume.get("separate") is True
+    mv_total = model_volume.get("total")
+    block_gb = None
+    if boot_total is not None:
+        block_gb = boot_total + (mv_total if separate and mv_total else 0.0)
+    billable = usd = None
+    if block_gb is not None:
+        billable = max(0.0, block_gb - FREE_TIER_STORAGE_GB)
+        usd = billable * STORAGE_RATE_USD_GB_MONTH
+    free_tier_model_gb = over = None
+    would_drop: list[dict[str, Any]] = []
+    if boot_total is not None:
+        free_tier_model_gb = max(0.0, FREE_TIER_STORAGE_GB - boot_total)
+        over = max(0.0, (models_gb or 0.0) - free_tier_model_gb)
+        would_drop = _free_tier_drops(catalog, over)
     return {
-        "total": _round(total, 1),
-        "used": _round(used, 1),
-        "free": _round(free, 1),
+        "block_gb": _round(block_gb, 1),
+        "free_tier_gb": _round(FREE_TIER_STORAGE_GB, 1),
+        "billable_gb": _round(billable, 1),
+        "rate_usd_gb_month": STORAGE_RATE_USD_GB_MONTH,
+        "usd_month": _round(usd, 2),
+        "free_tier_model_gb": _round(free_tier_model_gb, 1),
+        "over_free_tier_gb": _round(over, 1),
+        "would_drop": would_drop,
+    }
+
+
+def _disk_block(catalog: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """The boot disk, the volume the model blobs live on, and the money.
+
+    ``total``/``used``/``free`` describe the boot disk (``/``) as they always
+    have. ``model_volume`` is the filesystem the blobs actually sit on now that
+    they can be moved off the boot disk; when it is a separate mount its
+    ``separate`` flag is true and it carries its own total/used/free."""
+    boot = _volume("/")
+    model_dir = _model_dir()
+    if model_dir is not None:
+        model_volume = _volume(model_dir)
+        model_volume["separate"] = _same_filesystem(model_dir, "/") is False
+    else:
+        model_volume = {"total": None, "used": None, "free": None, "separate": False}
+    models = _du_gb(model_dir)
+    return {
+        "total": boot["total"],
+        "used": boot["used"],
+        "free": boot["free"],
         "models": models,
         "chromium": _du_gb(CHROMIUM_DIR),
+        "model_volume": model_volume,
+        "cost": _storage_cost(boot["total"], model_volume, models, catalog),
     }
 
 
@@ -1283,7 +1396,6 @@ def collect(
         "cpu_total_pct": cpu_total,
         "mem_mb": mem,
         "swap_mb": swap,
-        "disk_gb": _disk_block(),
         "top": _top(before, after, info.get("MemTotal")),
     }
     # A core that vanished between the two samples (offline, or /proc unread)
@@ -1300,6 +1412,15 @@ def collect(
         for entry in (ps_body.get("models") or [])
         if isinstance(entry, dict)
     ]
+    # /api/tags is every model on disk (not just the resident ones), which is
+    # what the free-tier drop list is reasoned over. Unreachable host -> [].
+    tags_body = _http_json(base + "/api/tags") or {}
+    catalog = [
+        {"name": entry.get("name"), "size_gb": _round(entry.get("size", 0) / _GIB, 2)}
+        for entry in (tags_body.get("models") or [])
+        if isinstance(entry, dict) and entry.get("name")
+    ]
+    node["disk_gb"] = _disk_block(catalog)
 
     since = _session_start(conn)
     worker = _worker_block(conn, since)
@@ -1339,6 +1460,44 @@ def _bar(pct: float | None, width: int = 10) -> str:
     return "|" * filled + " " * (width - filled)
 
 
+def _disk_text_lines(disk: dict[str, Any]) -> list[str]:
+    """The storage rows: the boot disk, the volume the models are on, the bill,
+    and what dropping back to the free tier would force off."""
+    mv = disk["model_volume"]
+    cost = disk["cost"]
+    lines = [
+        f"  disk  boot {disk['used']} of {disk['total']} GiB used, "
+        f"{disk['free']} free   (chromium {disk['chromium']} GiB)"
+    ]
+    if mv["separate"]:
+        lines.append(
+            f"  vol   models {disk['models']} GiB on a separate volume: "
+            f"{mv['used']} of {mv['total']} GiB used, {mv['free']} free"
+        )
+    else:
+        lines.append(f"  vol   models {disk['models']} GiB on the boot disk")
+    if cost["block_gb"] is not None:
+        if cost["billable_gb"]:
+            bill = (f"${cost['usd_month']}/mo ({cost['billable_gb']} GiB over the "
+                    f"{cost['free_tier_gb']} GiB free tier)")
+        else:
+            bill = "no storage bill (under the free tier)"
+        lines.append(f"  cost  {cost['block_gb']} GiB block storage — {bill}")
+        if cost["over_free_tier_gb"]:
+            drops = ", ".join(
+                f"{d['name']} ({d['size_gb']} GiB)" for d in cost["would_drop"]
+            ) or "some models"
+            lines.append(
+                f"  free  free tier caps models at {cost['free_tier_model_gb']} GiB; "
+                f"{cost['over_free_tier_gb']} GiB over — would drop: {drops}"
+            )
+        else:
+            lines.append(
+                f"  free  models fit the {cost['free_tier_model_gb']} GiB free-tier budget"
+            )
+    return lines
+
+
 def render_text(doc: dict[str, Any]) -> str:
     node = doc["node"]
     model = doc["model"]
@@ -1355,13 +1514,14 @@ def render_text(doc: dict[str, Any]) -> str:
             f"{index:>2}[{_bar(pct, 6)}{(pct if pct is not None else 0):>5.1f}%]"
             for index, pct in list(enumerate(node["cpu_pct"]))[8:16]
         ))
-    mem, swap, disk = node["mem_mb"], node["swap_mb"], node["disk_gb"]
+    mem, swap = node["mem_mb"], node["swap_mb"]
     lines += [
         f"  mem   used {mem['used']} MB   cache {mem['cache']} MB   "
         f"available {mem['available']} MB of {mem['total']} MB",
         f"  swap  {swap['used']} MB of {swap['total']} MB",
-        f"  disk  {disk['used']} of {disk['total']} GiB used; "
-        f"models {disk['models']} GiB, chromium {disk['chromium']} GiB",
+    ]
+    lines += _disk_text_lines(node["disk_gb"])
+    lines += [
         f"  load  {node['load']} over {node['cores']} cores; "
         f"total cpu {node['cpu_total_pct']}%",
         "  top   " + "; ".join(
