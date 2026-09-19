@@ -28,6 +28,10 @@
  * plain links and the search is a form that submits to its own page, so the
  * page is right before this file runs and stays right if it never does.
  *
+ * And it greets somebody who arrived by scanning a projection: ?kiosk on an
+ * entry page reveals a strip the generator already wrote and then leaves the
+ * address bar, which asks nothing of anyone either (qr.md §6.2).
+ *
  * Vanilla, no framework, no build step. The page sets window.SKETCHGEN_ROOT to
  * its own relative path back to the gallery root.
  */
@@ -1484,6 +1488,47 @@
     });
   }
 
+  /* Somebody who arrived by scanning a projection (qr.md §6.2).
+   *
+   * The kiosk's QR carries ?kiosk and the entry page's does not, so this fires
+   * for exactly one kind of visitor: a stranger standing in front of a wall
+   * who took out a phone. The strip it reveals is markup the generator wrote,
+   * hidden, linking controls this page already has — nothing here is built
+   * with innerHTML out of a URL parameter.
+   *
+   * params.has, not params.get: a bare key parses to "", which is falsy, and
+   * a version of this that silently never fires would be worse than one that
+   * does not exist. ?kiosk, ?kiosk= and ?kiosk=1 all count, which is what a
+   * QR reader that normalises a bare key might hand us.
+   *
+   * Then the param goes, immediately. claimTokenFromHash() is the precedent
+   * and the reason is the same: an address bar people copy from should not
+   * carry provenance, so a scanner who texts the link to a friend does not
+   * pass a projection's along with it. Any other parameter survives. */
+  function greetAScan() {
+    var main = document.querySelector("main.entry[data-entry]");
+    var strip = document.querySelector("[data-scanned]");
+    var params = new URLSearchParams(window.location.search);
+    var revision = document.querySelector("[data-scanned-critique]");
+    var query;
+    if (!main || !strip || !params.has("kiosk")) { return; }
+    // A verb the gallery cannot honour is worse than one it never offered:
+    // with no write path in config.json the generator writes no critique
+    // panel at all, so the third link would point at nothing. Its separator
+    // is inside the same span and goes with it. This is the rule the kiosk's
+    // own third line follows (qr.md §5.3).
+    if (revision && !document.getElementById("critique-text")) {
+      revision.parentNode.removeChild(revision);
+    }
+    strip.hidden = false;
+    if (!window.history || !window.history.replaceState) { return; }
+    params.delete("kiosk");
+    query = params.toString();
+    window.history.replaceState(
+      null, "", window.location.pathname + (query ? "?" + query : "") + window.location.hash
+    );
+  }
+
   /* One view per entry page, sent once the write path's base is known. Scoped
    * to main.entry so the grid, with hundreds of [data-entry] cards, sends none.
    * The Worker de-duplicates a signed-in viewer for 60 s; a view that does not
@@ -1505,6 +1550,9 @@
     // First, before any request: the token /callback handed back in the
     // fragment, stored for this origin and stripped from the address bar.
     claimTokenFromHash();
+    // And the other parameter this page takes out of the address bar as soon
+    // as it has read it: the projection's ?kiosk (qr.md §6.2).
+    greetAScan();
     var sort = currentSort();
     if (sort !== DEFAULT_SORT) { carrySort(sort); }
     // Before applyFilters: this is what fills the box from ?q=, and the grid's

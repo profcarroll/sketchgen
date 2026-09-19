@@ -61,6 +61,7 @@ from typing import Any, Iterable
 
 from . import pairs as pairs_mod
 from . import lineage
+from . import qr
 
 __all__ = [
     "DEFAULT_GALLERY_URL",
@@ -2160,6 +2161,11 @@ def _write_entry(
         # entry sits on both questions at once, the boxes keep the numbers.
         compass=_compass(scores, entry_id),
         compare_href=f"../../compare.html?a={entry_id}",
+        # The clean URL, twice: the href and the text under this page's own
+        # QR code. The kiosk's code is the one that carries ?kiosk — somebody
+        # scanning a laptop on a lectern did not scan a projection, and the
+        # param would be a lie in the only place the difference is measurable.
+        entry_url=_esc(config.entry_url(entry_id)),
         critique=_critique_form(row, meta, title, revisions, config),
         source_rows=_source_rows(meta),
         provenance_rows=_provenance_rows(meta),
@@ -2538,6 +2544,13 @@ def _kiosk_entry(
     entry["sketch"] = f"e/{entry_id}/sketch/"
     entry["source"] = f"e/{entry_id}/sketch/sketch.js"
     entry["href"] = f"e/{entry_id}/"
+    # The **kiosk** code, the one whose payload carries ?kiosk: this manifest
+    # is read by one page and that page is the projection (qr.md §4).
+    entry["qr"] = f"e/{entry_id}/qr-kiosk.svg"
+    # And the clean URL, without the param — the same string meta.json already
+    # publishes as source.entry. It is what the kiosk *prints* under the code
+    # (§5.3), for somebody typing it, and typing is not scanning.
+    entry["url"] = config.entry_url(entry_id)
     canvas = _canvas_size(row, attempts)
     if canvas is not None:
         entry["canvas"] = canvas
@@ -2773,6 +2786,22 @@ def render_index(
             written.write_text(
                 dest / "lines" / f"{root}.html",
                 _line_page(conn, root, children, by_id),
+            )
+        # Two QR codes per public entry (spec qr.md §1.4). They depend on the
+        # entry's id and on config.gallery_url and on nothing else about the
+        # entry, so they belong to the index rather than to the entry page:
+        # update.sh runs render-index on every deploy and never re-renders 222
+        # entry pages, which is what makes this deployable without a
+        # render-all. Every public entry, not just the published ones — a kept
+        # rejection has a page too, and that page links its code.
+        for entry_id in sorted(by_id):
+            url = config.entry_url(entry_id)
+            written.write_text(dest / "e" / str(entry_id) / "qr.svg", qr.svg(url))
+            # The kiosk's code says it came off a projection; the entry page's
+            # does not (§1.8). Six bytes, which is what the version-4 budget
+            # affords, and the printed URL under both is the clean one.
+            written.write_text(
+                dest / "e" / str(entry_id) / "qr-kiosk.svg", qr.svg(url + "?kiosk")
             )
     except Exception:
         written.undo()
