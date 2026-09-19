@@ -211,10 +211,13 @@ with a trailing newline. Fixed:
   makes the gamble worse. Dark modules are `#000` on `#fff`, literal, not tokens — this file is
   read by a camera, not a theme.
 - **One `<path>` of horizontal runs**, not one `<rect>` per module: 33×33 is 1,089 modules and a
-  rect apiece is a 20 KB file the browser lays out 222 times. Runs bring it to about 2 KB.
+  rect apiece is a 20 KB file the browser lays out 222 times. Runs bring a version-4 code to
+  about 4 KB.
 - No `<script>`, no `<style>`, no external reference, no `<!DOCTYPE>`, no comment holding the URL.
-  The guard reads `.svg` as text; there is nothing personal in it, and the encoded URL is the
-  public one the entry page already prints.
+  The one `http://` in the file is `xmlns="http://www.w3.org/2000/svg"`, which is mandatory and is
+  a namespace name rather than a thing anything fetches; there must be no second one, and the
+  encoded URL must appear nowhere as text. The guard reads `.svg` as text; there is nothing
+  personal in it, and the URL the code holds is the public one the entry page already prints.
 - `aria-hidden="true"`, per §1.10.
 
 ## 4. The generator
@@ -294,7 +297,8 @@ box onto the stage, so nothing can ever sit on top of anything:
 - `.caption .words { flex: 1 1 auto; min-width: 0 }`, `.caption .qr { flex: 0 0 auto }`.
 - Inside `.qr`, the image sits on a white tile — `background: #fff; padding: 0.6rem;
   border-radius: 0.4rem` — and is `width: clamp(7rem, 13vh, 12rem); height: auto; display: block`.
-  The two lines of copy go under the tile, in the caption's small type, on the dark ground.
+  The lines of copy — three, or two with no write path (§5.3) — go under the tile, in the
+  caption's small type, on the dark ground.
 - Below 760 px, where the kiosk stacks, the caption becomes `flex-direction: column-reverse` so
   the code stays above the fold of the words rather than being pushed off a phone-shaped screen.
 
@@ -344,7 +348,8 @@ Encode anything. `fetch` the SVG. POST anything. Add a parameter to the URL. Cou
 </figure>
 ```
 
-`$entry_url` is `config.entry_url(entry_id)`, added to the substitution dict `_entry_page` builds.
+`$entry_url` is `config.entry_url(entry_id)`, added to the substitution dict `_write_entry`
+builds (there is no `_entry_page`; the entry page's dict is assembled there).
 The CSS is four lines in `gallery.css`: the figure is a flex row, the image sits on a white tile
 (as in §5.2 — the entry page has a dark theme too), the caption is the panel's `.note` type.
 
@@ -375,6 +380,10 @@ The rules:
   copy from should not carry provenance.
 - The strip is markup in `entry.html`, `hidden`, revealed by the script; nothing is built with
   `innerHTML` from a URL parameter.
+- With no write path in `config.json` the generator writes no critique panel, so the third verb
+  would link to nothing. Wrap it and its separator in one span and drop the span when its target
+  is absent — the same rule §5.3 gives the kiosk's third line, for the same reason: a verb the
+  gallery cannot honour is worse than one it never offered.
 - The view POST is unchanged. `sendView()` sends `{ entry_id }` and nothing else, and this packet
   does not teach the write path a new field (§9).
 - With no `?kiosk`, the entry page is byte-for-byte the page it is today plus §6.1's figure.
@@ -410,8 +419,9 @@ is the same thing a scanner does:
   change to the encoder can never be accidental. The two fixtures differ, which is also the test
   that the param reaches the payload.
 - **The document.** viewBox `0 0 41 41` for a version-4 code; exactly one `<rect>` and one
-  `<path>`; no `script`, `style`, `http://` or `https://` outside the encoded payload (there is no
-  URL text in the file at all); ends with `\n`.
+  `<path>`; no `script` and no `style`; exactly one `http://` — the mandatory SVG namespace — and
+  no `https://`, no `profcarroll`, no `kiosk` anywhere as text, since the URL lives in the modules
+  and nowhere else; ends with `\n`.
 
 `tests/test_gallery.py`:
 
@@ -466,8 +476,9 @@ One branch from `main`, one PR, merged by the instructor. Then, on the node, **i
    pages. About 222 pages, a few minutes, one commit. The codes themselves do not need it — step 2
    already wrote them — so if the entry-page figure has to wait for a quiet hour, the kiosk is
    already correct without it.
-4. Expect roughly 900 KB of new files in the gallery repository — two codes of about 2 KB for
-   each of about 222 entries — in one commit.
+4. Expect roughly 1.9 MB of new files in the gallery repository — two codes of about 4 KB for
+   each of about 222 entries — in one commit. It is text, it compresses, and it is written once
+   per entry for the life of the entry.
 5. Open `https://profcarroll.github.io/sketchgen-gallery/kiosk.html` on the projector, press Start,
    press `F`, and **scan the code with a phone** before walking away. No test in this repository
    can do that, and it is the only check that matters.

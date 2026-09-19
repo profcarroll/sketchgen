@@ -17,6 +17,13 @@
  *                   is on
  *   <root><sketch>  in a sandboxed iframe, which is where the sketch runs
  *
+ * The QR code beside each sketch is not on that list and never will be: it is
+ * an <img src> the browser loads and caches, pointing at a file render_index
+ * already wrote (qr.md §1.9). This file encodes nothing, fetches no SVG and
+ * adds no parameter to any URL. It counts a view of the sketch on the stage,
+ * below, and never a scan of the code: a camera is not a page load and this
+ * page cannot see one.
+ *
  * The one thing it writes (docs/plans/kiosk-views.md), and the only one:
  *
  *   <base>/view     one view of one entry, once that entry has been on the
@@ -120,7 +127,7 @@
     { key: "consensus", label: "consensus" }
   ];
 
-  /* The thirteen overlays, in the order the menu lists them and the order the
+  /* The fourteen overlays, in the order the menu lists them and the order the
    * launch link's show= names them. */
   var OVERLAYS = [
     { key: "prompt", k: "P", label: "prompt" },
@@ -128,6 +135,7 @@
     { key: "generation", k: "G", label: "generation and lineage" },
     { key: "views", k: "V", label: "views" },
     { key: "likes", k: "L", label: "likes" },
+    { key: "qr", k: "Q", label: "QR code: scan to open this entry" },
     { key: "brief", k: "B", label: "brief" },
     { key: "statement", k: "T", label: "artist's statement" },
     { key: "judgment", k: "J", label: "judgment: humans, agents" },
@@ -138,10 +146,26 @@
     { key: "seconds", k: "W", label: "seconds to write" }
   ];
 
-  /* Five on, eight off (spec §1.9). */
-  var DEFAULT_SHOW = ["prompt", "authors", "generation", "views", "likes"];
+  /* Six on, eight off (spec §1.9, amended by qr.md §1.7). The code is on by
+   * default because it is the reason that packet exists: a projection nobody
+   * can act on is a screensaver, and this is the only overlay that invites a
+   * stranger to do something. */
+  var DEFAULT_SHOW = ["prompt", "authors", "generation", "views", "likes", "qr"];
   var DEFAULT_EVERY = 60;
   var DEFAULT_ORDER = "newest";
+
+  /* The stored settings blob's shape. A projector that has been running since
+   * before the QR overlay existed has a show map that cannot mention a key
+   * that did not exist, so without this it would come back with the code off
+   * and nobody at the keyboard to notice (qr.md §5.1). */
+  var SETTINGS_VERSION = 2;
+
+  /* The third line under the code, and the only one that is a promise: all
+   * three verbs are the write path. A projection that invites a stranger to
+   * do something the gallery cannot accept is worse than one that only shows
+   * the URL, so with no write path this line is not printed at all — the same
+   * rule the views and likes overlays follow when they print an em dash. */
+  var QR_VERBS = "judge it · like it · ask for a revision";
 
   var ENTRIES = [];
   var COUNTS = {};
@@ -372,6 +396,11 @@
             list.push(key);
           }
         }
+        // A blob written before the QR overlay existed cannot mention it, so
+        // it would come back off on every projector that has ever been
+        // configured. Migrate rather than leave those rooms without the one
+        // overlay a visitor can act on (qr.md §5.1).
+        if (!saved.v || saved.v < SETTINGS_VERSION) { list.push("qr"); }
         state.show = showFrom(list);
       }
     }
@@ -414,6 +443,7 @@
   function persist() {
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
+        v: SETTINGS_VERSION,
         every: state.every, order: state.order, show: state.show
       }));
     } catch (err) { /* private mode: the URL still carries it */ }
@@ -713,6 +743,41 @@
     return html;
   }
 
+  /* The printed URL, minus its scheme, for width. Stripped for display only:
+   * the line is for somebody typing it into a phone, and https:// is eight
+   * characters nobody types. */
+  function plainUrl(url) {
+    return String(url).replace(/^https?:\/\//, "");
+  }
+
+  /* The QR block (qr.md §5.3): the code, then up to three fixed lines.
+   *
+   * entry.qr is the kiosk code's path, straight from the manifest and never
+   * assembled here — the script encodes nothing, fetches nothing and adds no
+   * parameter to anything. The code it names carries ?kiosk; the URL printed
+   * under it does not, because the line is for someone typing what they read
+   * and typing is not scanning (§1.8). */
+  function qrHtml(entry) {
+    var html;
+    if (!on("qr") || !entry.qr || !entry.url) { return ""; }
+    html = "<div class=\"qr\"><img class=\"code\" src=\"" + esc(ROOT + entry.qr) +
+      "\" alt=\"\">" +
+      "<p class=\"scan\">scan to open #" + esc(entry.id) + "</p>" +
+      "<p class=\"addr\">" + esc(plainUrl(entry.url)) + "</p>";
+    if (base()) { html += "<p class=\"verbs\">" + esc(QR_VERBS) + "</p>"; }
+    return html + "</div>";
+  }
+
+  /* The caption is a row of two now: the words, and the code beside them. An
+   * empty caption stays genuinely empty, because .caption:empty is what takes
+   * the scrim off the stage when H hides everything. */
+  function captionShell(entry) {
+    var words = captionHtml(entry);
+    var code = qrHtml(entry);
+    if (!words && !code) { return ""; }
+    return "<div class=\"words\">" + words + "</div>" + code;
+  }
+
   function paintWords(entry) {
     var words = on("brief") || on("statement") || on("judgment");
     $("wordscol").hidden = !words;
@@ -771,7 +836,10 @@
 
   function paint(entry) {
     if (!entry) { return; }
-    $("caption").innerHTML = captionHtml(entry);
+    // One <img> in the document at a time: replacing the caption's innerHTML
+    // is what guarantees the code swaps with the entry like every other
+    // overlay, with no second image left behind.
+    $("caption").innerHTML = captionShell(entry);
     paintWords(entry);
     paintCode(entry);
     fitFrame();
