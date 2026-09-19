@@ -1844,7 +1844,7 @@ class Worker:
             statement=kept.statement if kept else None,
             planner=job.planner,
             planner_prompt_version=self._planner_prompt_version,
-            executor=kept.model if kept else self.executor_model,
+            executor=kept.model if kept else self.executor_model_for(job),
             executor_prompt_version=kept.prompt_version if kept else None,
             rules_file=(kept.rules_file if kept and kept.rules_file else rules),
             assertions_json=job.assertions_json,
@@ -1908,6 +1908,48 @@ class Worker:
             return None
         return str(path)
 
+    def planner_model_for(self, job: db.Job) -> str:
+        """The model this job is planned with: its own, or this worker's default.
+
+        ``jobs.planner`` has held "a model id, or 'paid'" since migration 001,
+        but until 2026-09-19 nothing read the model id half of that: the New job
+        page offered ``local`` or ``paid``, ``local`` was written to the column
+        as whatever ``DEFAULT_PLANNER_MODEL`` happened to be, and this method's
+        job was done by a constant. Now the page lists the models the node
+        actually has (:mod:`sketchgen.models`) and the column carries the one
+        the operator picked, so it is read here.
+
+        A blank column, or the word ``local`` from a row written by an older
+        page, still means the worker's default. A tag naming a model this node
+        does not have is not caught here: the model host answers 404, the two
+        plan tries fail, and the job fails with that sentence in
+        ``last_error``, which names the model and is the truth about what went
+        wrong.
+        """
+        named = (job.planner or "").strip()
+        if not named or named in ("local", "paid"):
+            return self.planner_model
+        return named
+
+    def executor_model_for(self, job: db.Job) -> str:
+        """The model this job is written with: its own, or this worker's default.
+
+        The mirror of :meth:`planner_model_for`, over ``jobs.executor`` — a
+        column the schema has had since migration 001 and that nothing in the
+        pipeline ever wrote, so it is free to carry what the New job page asked
+        for. There is no ``paid`` here: ``needs`` has no ``execute`` value, so
+        there is no state for a job whose executor lives on the laptop.
+
+        A blank column, or the word ``local``, means the worker's default. A tag
+        naming a model this node does not have fails the attempt with the model
+        host's own answer, which is recorded as the attempt's evidence and
+        repaired against like any other executor failure.
+        """
+        named = (job.executor or "").strip()
+        if not named or named == "local":
+            return self.executor_model
+        return named
+
     def _plan(self, job: db.Job) -> db.Job | None:
         """Step 4. Returns the updated job, or None when it stops here.
 
@@ -1928,23 +1970,24 @@ class Worker:
                      "(DECIDE[credential-model] B: no paid key on the node)")
             return None
 
+        model = self.planner_model_for(job)
         self._say(
             "planning",
             "Turning the prompt into a brief",
-            f"{self.planner_model} · job {job.id}",
+            f"{model} · job {job.id}",
             job_id=job.id,
-            model=self.planner_model,
+            model=model,
         )
         plan = None
         reason = "the planner said nothing"
         last_raw = ""
         for n in range(1, PLAN_TRIES + 1):
             seed = plan_seed(job.id, n)
-            self.log(f"job {job.id}: planning with {self.planner_model}, seed "
+            self.log(f"job {job.id}: planning with {model}, seed "
                      f"{seed} (try {n}/{PLAN_TRIES})")
             try:
                 plan = self.planner_fn(
-                    job=job, host=self.host, model=self.planner_model, seed=seed
+                    job=job, host=self.host, model=model, seed=seed
                 )
                 break
             except StopNow:
@@ -1982,7 +2025,7 @@ class Worker:
             "executing",
             brief=plan.brief,
             assertions_json=json.dumps(assertions),
-            planner=self.planner_model,
+            planner=model,
         )
         self.log(f"job {job.id}: planned, {plan.prompt_version}, assertions: "
                  f"{', '.join(assertions) or '(none)'}")
@@ -2059,17 +2102,18 @@ class Worker:
         last = n >= job.max_attempts
         brief = brief_with_evidence(job.brief or job.prompt, evidence)
 
+        model = self.executor_model_for(job)
         self.log(f"job {job.id}: attempt {n}/{job.max_attempts} executing into "
-                 f"{attempt_dir}"
-                 + (" with the previous attempt's evidence" if evidence else ""))
+                 f"{attempt_dir} with {model}"
+                 + (" and the previous attempt's evidence" if evidence else ""))
         self._say(
             "writing",
             "Writing the sketch",
-            f"{self.executor_model} · job {job.id}, attempt {n} of "
+            f"{model} · job {job.id}, attempt {n} of "
             f"{job.max_attempts}"
             + (" · correcting from the last evaluation" if evidence else ""),
             job_id=job.id,
-            model=self.executor_model,
+            model=model,
         )
         try:
             execution = self.executor_fn(
@@ -2077,7 +2121,7 @@ class Worker:
                 assertions=assertions,
                 rules_file=rules,
                 out_dir=str(attempt_dir),
-                model=self.executor_model,
+                model=model,
                 host=self.host,
             )
         except StopNow:
@@ -2091,7 +2135,7 @@ class Worker:
                 ok=False,
                 error=f"{type(exc).__name__}: {' '.join(f'{exc}'.split())}",
                 source_dir=str(attempt_dir),
-                model=self.executor_model,
+                model=model,
             )
         self._check_stop()
 
@@ -2103,7 +2147,7 @@ class Worker:
                 n,
                 started_utc=started,
                 finished_utc=db.utc_now(),
-                model=execution.model or self.executor_model,
+                model=execution.model or model,
                 rules_file=rules,
                 prompt_version=execution.prompt_version,
                 prompt_tokens=execution.prompt_tokens,
@@ -2186,7 +2230,7 @@ class Worker:
             n,
             started_utc=started,
             finished_utc=db.utc_now(),
-            model=execution.model or self.executor_model,
+            model=execution.model or model,
             rules_file=rules,
             prompt_version=execution.prompt_version,
             prompt_tokens=execution.prompt_tokens,

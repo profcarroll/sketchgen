@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,7 +33,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sketchgen import db  # noqa: E402
+from sketchgen import executor  # noqa: E402
+from sketchgen import models  # noqa: E402
 from sketchgen import web  # noqa: E402
+from sketchgen import worker  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_CONSOLE = REPO_ROOT / "tests" / "fixtures" / "console" / "sample.json"
@@ -3785,6 +3789,379 @@ class TestBindRefusal(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0)
         self.assertIn("--once-for-test", result.stdout)
+
+
+# ---------------------------------------------------------------------------
+# The planner menu — the models this node has, rather than "local" or "paid"
+# ---------------------------------------------------------------------------
+
+#: What the node answered on 2026-09-19, trimmed to the shapes that matter:
+#: a vision model, the coder (no vision), a proxied cloud model, and an
+#: embedding model that can do neither.
+CATALOGUE = [
+    models.Model(name="gemma4:e4b",
+                 capabilities=frozenset({"completion", "vision", "audio",
+                                         "tools", "thinking"}),
+                 size_bytes=9608350718, parameter_size="8.0B", family="gemma4"),
+    models.Model(name="gemma4:26b",
+                 capabilities=frozenset({"completion", "vision", "tools"}),
+                 size_bytes=18604148513, parameter_size="25.2B", family="gemma4"),
+    models.Model(name="qwen3.5:9b",
+                 capabilities=frozenset({"completion", "vision", "tools"}),
+                 size_bytes=6594474711, parameter_size="9.7B", family="qwen35"),
+    models.Model(name="qwen3-coder:30b-a3b-q4_K_M",
+                 capabilities=frozenset({"completion", "tools"}),
+                 size_bytes=18556700761, parameter_size="30.5B"),
+    models.Model(name="nomic-embed-text:latest",
+                 capabilities=frozenset({"embedding"}), size_bytes=274302450),
+    models.Model(name="gemma4:31b-cloud",
+                 capabilities=frozenset({"completion", "vision", "tools"}),
+                 size_bytes=312, parameter_size="32.7B", remote=True),
+]
+
+
+class PlannerMenuTestCase(WebTestCase):
+    """A fixed catalogue, so the menu is the same on a node and on a laptop."""
+
+    catalogue = CATALOGUE
+
+    def setUp(self):
+        patcher = mock.patch.object(
+            web.models, "catalogue", lambda *a, **k: list(self.catalogue)
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.signed_in_as("profcarroll")
+        self.addCleanup(self.sign_out)
+        conn = self.db()
+        try:
+            db.set_meta(conn, web.DEFAULTS_KEY, None)
+        finally:
+            conn.close()
+
+    def sign_out(self):
+        web._gh_cache.clear()
+        web._gh_cache.update(login=None, asked=float("inf"))
+
+    def signed_in_as(self, login):
+        web._gh_cache.clear()
+        web._gh_cache.update(login=login, asked=float("inf"))
+
+    def queued_ids(self):
+        conn = self.db()
+        try:
+            return {job.id for job in db.list_jobs(conn, "queued")}
+        finally:
+            conn.close()
+
+    def newest_planner(self, before):
+        conn = self.db()
+        try:
+            new = {job.id for job in db.list_jobs(conn, "queued")} - before
+            self.assertEqual(1, len(new))
+            return db.get_job(conn, new.pop()).planner
+        finally:
+            conn.close()
+
+    def post_page(self, path, fields):
+        data = urllib.parse.urlencode(fields, doseq=True).encode("utf-8")
+        request = urllib.request.Request(self.url(path), data=data, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, exc.read().decode("utf-8")
+
+    def select(self, name, path="/new"):
+        """One named <select>, alone. There are two model menus on this page
+        and a model offered by one is not offered by the other, so an
+        assertion against the whole page cannot tell them apart."""
+        page = self.text(path)
+        found = re.search(
+            r'<select id="%s"[^>]*>.*?</select>' % re.escape(name), page, re.S
+        )
+        self.assertIsNotNone(found, f"no <select id={name}> on {path}")
+        return found.group(0)
+
+
+class TestPlannerMenu(PlannerMenuTestCase):
+    def test_the_menu_offers_every_vision_capable_model_on_the_node(self):
+        menu = self.select("planner")
+        for tag in ("gemma4:e4b", "gemma4:26b", "qwen3.5:9b"):
+            self.assertIn(f'<option value="{tag}"', menu)
+
+    def test_a_model_that_cannot_see_is_not_offered_as_a_planner(self):
+        menu = self.select("planner")
+        self.assertNotIn('value="qwen3-coder:30b-a3b-q4_K_M"', menu)
+        self.assertNotIn('value="nomic-embed-text:latest"', menu)
+
+    def test_a_model_that_leaves_the_node_is_grouped_apart_from_the_rest(self):
+        menu = self.select("planner")
+        self.assertIn('<optgroup label="on this node">', menu)
+        self.assertIn('<optgroup label="off this node">', menu)
+        here = menu.index('<optgroup label="on this node">')
+        away = menu.index('<optgroup label="off this node">')
+        self.assertLess(here, menu.index('value="gemma4:e4b"'))
+        self.assertLess(menu.index('value="gemma4:e4b"'), away)
+        # the cloud tag and the paid route are both in the second group, and
+        # the cloud one says where it goes
+        self.assertLess(away, menu.index('value="gemma4:31b-cloud"'))
+        self.assertLess(away, menu.index('value="paid"'))
+        self.assertIn("leaves this node", menu)
+
+    def test_the_menu_says_which_one_a_job_gets_by_default(self):
+        menu = self.select("planner")
+        self.assertIn("(default)", menu)
+        self.assertIn(f'<option value="{worker.DEFAULT_PLANNER_MODEL}" selected>', menu)
+
+    def test_a_label_carries_the_size_so_the_choice_has_a_cost(self):
+        menu = self.select("planner")
+        self.assertIn("8.0B", menu)
+        self.assertIn("8.9 GB", menu)
+
+    def test_the_chosen_model_is_what_the_job_is_queued_with(self):
+        before = self.queued_ids()
+        status, _ = self.post("/new", {
+            "prompt": "a lattice that leans toward the pointer",
+            "submitted_by": "student-three", "planner": "qwen3.5:9b",
+            "rules": "treatment", "publication": "hold", "max_attempts": "2",
+        })
+        self.assertEqual(303, status)
+        self.assertEqual("qwen3.5:9b", self.newest_planner(before))
+
+    def test_paid_still_reaches_the_column_as_paid(self):
+        before = self.queued_ids()
+        self.post("/new", {"prompt": "a paid plan", "submitted_by": "student-three",
+                           "planner": "paid"})
+        self.assertEqual("paid", self.newest_planner(before))
+
+    def test_local_still_means_the_workers_default(self):
+        """An old bookmark, an old saved default, a form with no planner field."""
+        before = self.queued_ids()
+        self.post("/new", {"prompt": "an unspecified plan",
+                           "submitted_by": "student-three", "planner": "local"})
+        self.assertEqual(worker.DEFAULT_PLANNER_MODEL, self.newest_planner(before))
+
+    def test_a_model_this_node_does_not_have_is_refused_without_writing(self):
+        before = self.queued_ids()
+        status, body = self.post_page("/new", {
+            "prompt": "planned by something imaginary",
+            "submitted_by": "student-three", "planner": "gpt-9:enormous",
+        })
+        self.assertEqual(400, status)
+        self.assertIn("is not a model this node offers", body)
+        self.assertEqual(before, self.queued_ids())
+
+    def test_a_model_that_cannot_see_is_refused_even_though_it_exists(self):
+        before = self.queued_ids()
+        status, body = self.post_page("/new", {
+            "prompt": "planned by the coder",
+            "submitted_by": "student-three",
+            "planner": "qwen3-coder:30b-a3b-q4_K_M",
+        })
+        self.assertEqual(400, status)
+        self.assertEqual(before, self.queued_ids())
+
+    def test_a_model_can_be_saved_as_the_pages_default(self):
+        status, body = self.post_page("/new/defaults", {
+            "action": "save", "planner": "gemma4:26b", "rules": "treatment",
+            "publication": "hold", "max_attempts": "3",
+        })
+        self.assertEqual(200, status)
+        self.assertIn("Saved as defaults — gemma4:26b", body)
+        self.assertIn('<option value="gemma4:26b" selected>', self.select("planner"))
+        conn = self.db()
+        try:
+            db.set_meta(conn, web.DEFAULTS_KEY, None)
+        finally:
+            conn.close()
+
+    def test_picking_a_parent_preselects_the_model_it_was_planned_with(self):
+        conn = self.db()
+        try:
+            job_id = db.enqueue(conn, "a line with a model", "student-two",
+                                planner="qwen3.5:9b")
+            db.transition(conn, job_id, "executing", executor="x")
+            db.transition(conn, job_id, "gating")
+            db.transition(conn, job_id, "held")
+            parent = db.create_entry(conn, job_id, "held", prompt="a line with a model",
+                                     planner="qwen3.5:9b", submitted_by="student-two")
+        finally:
+            conn.close()
+        self.assertIn('<option value="qwen3.5:9b" selected>',
+                      self.select("planner", f"/new?parent={parent}"))
+
+    def test_a_parent_planned_with_a_model_since_removed_falls_back(self):
+        """The select must never open on nothing, or on a silently other model."""
+        conn = self.db()
+        try:
+            job_id = db.enqueue(conn, "a line with an old model", "student-two",
+                                planner="gemma3:gone")
+            db.transition(conn, job_id, "executing", executor="x")
+            db.transition(conn, job_id, "gating")
+            db.transition(conn, job_id, "held")
+            parent = db.create_entry(conn, job_id, "held",
+                                     prompt="a line with an old model",
+                                     planner="gemma3:gone", submitted_by="student-two")
+        finally:
+            conn.close()
+        menu = self.select("planner", f"/new?parent={parent}")
+        self.assertNotIn('value="gemma3:gone"', menu)
+        self.assertIn(f'<option value="{worker.DEFAULT_PLANNER_MODEL}" selected>', menu)
+
+
+class TestExecutorMenu(PlannerMenuTestCase):
+    """The same menu over a different question: which model writes the code."""
+
+    def newest_executor(self, before):
+        conn = self.db()
+        try:
+            new = {job.id for job in db.list_jobs(conn, "queued")} - before
+            self.assertEqual(1, len(new))
+            return db.get_job(conn, new.pop()).executor
+        finally:
+            conn.close()
+
+    def test_the_menu_offers_every_model_that_can_complete(self):
+        menu = self.select("executor")
+        for tag in ("qwen3-coder:30b-a3b-q4_K_M", "gemma4:e4b", "qwen3.5:9b"):
+            self.assertIn(f'<option value="{tag}"', menu)
+
+    def test_a_model_that_can_only_embed_is_not_offered(self):
+        self.assertNotIn('value="nomic-embed-text:latest"', self.select("executor"))
+
+    def test_the_coder_is_the_one_a_job_gets_by_default(self):
+        menu = self.select("executor")
+        self.assertIn(f'<option value="{executor.DEFAULT_MODEL}" selected>', menu)
+        self.assertIn("(default)", menu)
+
+    def test_vision_is_named_here_because_here_it_is_news(self):
+        """The planner menu is all vision, so it says so on no row. This one is
+        not, so the row that can be shown a screenshot says so."""
+        menu = self.select("executor")
+        self.assertIn("vision", menu)
+        # ...and the coder, which cannot, does not claim it
+        coder = re.search(r'<option value="qwen3-coder[^>]*>([^<]*)<', menu).group(1)
+        self.assertNotIn("vision", coder)
+
+    def test_there_is_no_paid_executor(self):
+        """`needs` has no 'execute' value, so there is no state for a job whose
+        executor lives on the laptop."""
+        self.assertNotIn('value="paid"', self.select("executor"))
+
+    def test_the_chosen_model_is_what_the_job_is_queued_with(self):
+        before = self.queued_ids()
+        status, _ = self.post("/new", {
+            "prompt": "written by something else",
+            "submitted_by": "student-three", "executor": "qwen3.5:9b",
+        })
+        self.assertEqual(303, status)
+        self.assertEqual("qwen3.5:9b", self.newest_executor(before))
+
+    def test_local_still_means_the_workers_default(self):
+        before = self.queued_ids()
+        self.post("/new", {"prompt": "nobody chose", "submitted_by": "student-three",
+                           "executor": "local"})
+        self.assertEqual(executor.DEFAULT_MODEL, self.newest_executor(before))
+
+    def test_a_model_that_can_only_embed_is_refused_without_writing(self):
+        before = self.queued_ids()
+        status, body = self.post_page("/new", {
+            "prompt": "written by an embedding model",
+            "submitted_by": "student-three", "executor": "nomic-embed-text:latest",
+        })
+        self.assertEqual(400, status)
+        self.assertIn("is not a model this node offers as executor", body)
+        self.assertEqual(before, self.queued_ids())
+
+    def test_the_two_menus_are_refused_separately(self):
+        """The coder is a legal executor and an illegal planner; the reverse
+        holds for a small vision model that cannot write p5.js well, but that
+        one the operator is trusted with."""
+        before = self.queued_ids()
+        status, body = self.post_page("/new", {
+            "prompt": "the wrong way round", "submitted_by": "student-three",
+            "planner": "qwen3-coder:30b-a3b-q4_K_M", "executor": "gemma4:e4b",
+        })
+        self.assertEqual(400, status)
+        self.assertIn("as planner", body)
+        self.assertEqual(before, self.queued_ids())
+
+    def test_both_models_can_be_saved_as_the_pages_defaults(self):
+        status, body = self.post_page("/new/defaults", {
+            "action": "save", "planner": "gemma4:26b", "executor": "qwen3.5:9b",
+            "rules": "treatment", "publication": "hold", "max_attempts": "3",
+        })
+        self.assertEqual(200, status)
+        self.assertIn("gemma4:26b · qwen3.5:9b", body)
+        self.assertIn('<option value="qwen3.5:9b" selected>', self.select("executor"))
+        conn = self.db()
+        try:
+            db.set_meta(conn, web.DEFAULTS_KEY, None)
+        finally:
+            conn.close()
+
+    def test_picking_a_parent_preselects_both_models_it_was_made_with(self):
+        conn = self.db()
+        try:
+            job_id = db.enqueue(conn, "a line with two models", "student-two",
+                                planner="qwen3.5:9b", executor="gemma4:26b")
+            db.transition(conn, job_id, "executing")
+            db.transition(conn, job_id, "gating")
+            db.transition(conn, job_id, "held")
+            parent = db.create_entry(conn, job_id, "held",
+                                     prompt="a line with two models",
+                                     planner="qwen3.5:9b", executor="gemma4:26b",
+                                     submitted_by="student-two")
+        finally:
+            conn.close()
+        path = f"/new?parent={parent}"
+        self.assertIn('<option value="qwen3.5:9b" selected>',
+                      self.select("planner", path))
+        self.assertIn('<option value="gemma4:26b" selected>',
+                      self.select("executor", path))
+        # and the card says both, so the preset is visible rather than implied
+        self.assertIn("qwen3.5:9b · gemma4:26b", self.text(path))
+
+
+class TestPlannerMenuWithNoModelHost(PlannerMenuTestCase):
+    """Ollama down, or not there at all: the page is the page it always was."""
+
+    catalogue = []
+
+    def test_the_page_still_renders_with_the_workers_default(self):
+        menu = self.select("planner")
+        self.assertIn('<option value="local" selected>', menu)
+        self.assertIn(worker.DEFAULT_PLANNER_MODEL, menu)
+        self.assertIn("the model host did not answer", menu)
+        self.assertIn('<option value="paid"', menu)
+
+    def test_a_job_can_still_be_queued(self):
+        before = self.queued_ids()
+        status, _ = self.post("/new", {"prompt": "a plan with no menu",
+                                       "submitted_by": "student-three",
+                                       "planner": "local"})
+        self.assertEqual(303, status)
+        self.assertEqual(worker.DEFAULT_PLANNER_MODEL, self.newest_planner(before))
+
+    def test_a_tag_from_a_page_rendered_while_the_host_was_up_is_taken(self):
+        """The host blinked between the render and the press: the worker, not
+        this form, is the place that finds out the model is gone."""
+        before = self.queued_ids()
+        status, _ = self.post("/new", {"prompt": "a plan chosen a minute ago",
+                                       "submitted_by": "student-three",
+                                       "planner": "qwen3.5:9b"})
+        self.assertEqual(303, status)
+        self.assertEqual("qwen3.5:9b", self.newest_planner(before))
+
+    def test_junk_is_still_refused(self):
+        before = self.queued_ids()
+        status, _ = self.post_page("/new", {"prompt": "a plan by nonsense",
+                                            "submitted_by": "student-three",
+                                            "planner": "../../etc/passwd"})
+        self.assertEqual(400, status)
+        self.assertEqual(before, self.queued_ids())
 
 
 if __name__ == "__main__":

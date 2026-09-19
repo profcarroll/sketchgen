@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 from sketchgen import db  # noqa: E402
+from sketchgen import executor  # noqa: E402
 from sketchgen import lineage  # noqa: E402
 from sketchgen import planner  # noqa: E402
 from sketchgen import worker  # noqa: E402
@@ -521,6 +522,135 @@ class TestPaidPlanner(WorkerTestCase):
         self.assertEqual("a brief the stub planner wrote", job.brief)
         self.assertEqual(["motion(idle)", "responds(click)"], job.assertions)
         self.assertEqual(["executing", "gating", "held"], self.states)
+
+
+class TestTheJobsOwnPlannerModel(WorkerTestCase):
+    """``jobs.planner`` has said "a model id, or 'paid'" since migration 001.
+    Until 2026-09-19 only the 'paid' half was read; the New job page can now
+    name a model, so the model id half has to reach the call."""
+
+    def recording_planner(self):
+        seen = []
+
+        def plan(*, job, host, model, seed=1):
+            seen.append(model)
+            return planner.Plan(brief="a brief the stub planner wrote",
+                                assertions=["motion(idle)"],
+                                prompt_version="planner-v1", tokens={},
+                                durations={}, raw="")
+
+        plan.seen = seen
+        return plan
+
+    def test_the_model_the_job_names_is_the_model_that_is_called(self):
+        job_id = db.enqueue(self.conn, "planned by a model of its own", "octocat",
+                            planner="qwen3.5:9b")
+        plan = self.recording_planner()
+        self.assertEqual(0, self.make_worker(planner_fn=plan).run_once())
+
+        self.assertEqual(["qwen3.5:9b"], plan.seen)
+        self.assertEqual("qwen3.5:9b", db.get_job(self.conn, job_id).planner)
+
+    def test_the_model_the_job_names_is_the_model_the_entry_records(self):
+        job_id = db.enqueue(self.conn, "provenance, not a guess", "octocat",
+                            planner="qwen3.5:9b")
+        self.assertEqual(0, self.make_worker(
+            planner_fn=self.recording_planner()).run_once())
+        row = self.entries(job_id)[0]
+        self.assertEqual("qwen3.5:9b", row["planner"])
+
+    def test_the_activity_row_says_which_model_is_planning(self):
+        db.enqueue(self.conn, "say which one", "octocat", planner="qwen3.5:9b")
+        self.make_worker(planner_fn=self.recording_planner()).run_once()
+        row = next(r for r in self.activity_rows() if r["step"] == "planning")
+        self.assertEqual("qwen3.5:9b", row["model"])
+        self.assertIn("qwen3.5:9b", row["detail"])
+
+    def test_an_empty_column_still_means_the_workers_default(self):
+        db.enqueue(self.conn, "nobody chose", "octocat")
+        plan = self.recording_planner()
+        self.make_worker(planner_fn=plan).run_once()
+        self.assertEqual([worker.DEFAULT_PLANNER_MODEL], plan.seen)
+
+    def test_the_word_local_from_an_older_page_means_the_default_too(self):
+        db.enqueue(self.conn, "an old row", "octocat", planner="local")
+        plan = self.recording_planner()
+        self.make_worker(planner_fn=plan).run_once()
+        self.assertEqual([worker.DEFAULT_PLANNER_MODEL], plan.seen)
+
+    def test_paid_is_still_read_before_any_model_is_chosen(self):
+        job_id = db.enqueue(self.conn, "a paid plan", "octocat", planner="paid")
+        plan = self.recording_planner()
+        self.make_worker(planner_fn=plan).run_once()
+        self.assertEqual([], plan.seen)
+        self.assertEqual("needs-laptop", db.get_job(self.conn, job_id).state)
+
+
+class TestTheJobsOwnExecutorModel(WorkerTestCase):
+    """`jobs.executor` is a column migration 001 created and nothing ever wrote.
+    The New job page writes it now, so the execute step has to read it."""
+
+    def test_the_model_the_job_names_is_the_model_that_writes(self):
+        job_id = self.enqueue("written by a model of its own",
+                              executor="qwen3.5:9b")
+        run = self.make_worker(executor_fn=(stub := StubExecutor()))
+        self.assertEqual(0, run.run_once())
+        self.assertEqual("qwen3.5:9b", stub.calls[0]["model"])
+        self.assertEqual("qwen3.5:9b", self.attempts(job_id)[0].model)
+
+    def test_the_model_the_job_names_is_the_model_the_entry_records(self):
+        job_id = self.enqueue("provenance, not a guess", executor="qwen3.5:9b")
+        self.make_worker().run_once()
+        self.assertEqual("qwen3.5:9b", self.entries(job_id)[0]["executor"])
+
+    def test_the_activity_row_says_which_model_is_writing(self):
+        self.enqueue("say which one", executor="qwen3.5:9b")
+        self.make_worker().run_once()
+        row = next(r for r in self.activity_rows() if r["step"] == "writing")
+        self.assertEqual("qwen3.5:9b", row["model"])
+        self.assertIn("qwen3.5:9b", row["detail"])
+
+    def test_every_attempt_of_a_repair_uses_it_too(self):
+        job_id = self.enqueue(max_attempts=3, executor="qwen3.5:9b")
+        stub = StubExecutor(ok=[False, True])
+        self.make_worker(executor_fn=stub).run_once()
+        self.assertEqual(["qwen3.5:9b", "qwen3.5:9b"],
+                         [call["model"] for call in stub.calls])
+        self.assertEqual(["qwen3.5:9b", "qwen3.5:9b"],
+                         [row.model for row in self.attempts(job_id)])
+
+    def test_an_empty_column_still_means_the_workers_default(self):
+        self.enqueue("nobody chose")
+        run = self.make_worker(executor_fn=(stub := StubExecutor()))
+        run.run_once()
+        self.assertEqual(executor.DEFAULT_MODEL, stub.calls[0]["model"])
+
+    def test_the_word_local_from_an_older_page_means_the_default_too(self):
+        self.enqueue("an old row", executor="local")
+        run = self.make_worker(executor_fn=(stub := StubExecutor()))
+        run.run_once()
+        self.assertEqual(executor.DEFAULT_MODEL, stub.calls[0]["model"])
+
+    def test_the_two_models_are_read_from_their_own_columns(self):
+        """One job, two different models, neither borrowing the other's."""
+        # brief unset and assertions empty, so the planner really runs
+        job_id = self.enqueue("a job with both named", executor="qwen3.5:9b",
+                              brief=None, assertions=[])
+        seen = []
+
+        def plan(*, job, host, model, seed=1):
+            seen.append(model)
+            return planner.Plan(brief="a brief", assertions=["motion(idle)"],
+                                prompt_version="planner-v1", tokens={},
+                                durations={}, raw="")
+
+        stub = StubExecutor()
+        self.make_worker(planner_fn=plan, executor_fn=stub).run_once()
+        self.assertEqual([worker.DEFAULT_PLANNER_MODEL], seen)
+        self.assertEqual("qwen3.5:9b", stub.calls[0]["model"])
+        row = self.entries(job_id)[0]
+        self.assertEqual(worker.DEFAULT_PLANNER_MODEL, row["planner"])
+        self.assertEqual("qwen3.5:9b", row["executor"])
 
 
 class TestMalformedExecutorResponse(WorkerTestCase):
