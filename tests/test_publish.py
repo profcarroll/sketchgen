@@ -459,6 +459,14 @@ if __name__ == "__main__":
     unittest.main()
 
 
+def cross_a_second() -> None:
+    """Wait until the wall clock's second has ticked over. See the use below:
+    the property under test is only observable either side of a boundary."""
+    edge = int(time.time()) + 1
+    while time.time() < edge:
+        time.sleep(0.02)
+
+
 class PublishIndexTests(PublishTestCase):
     def test_publish_index_records_the_write_path_and_pushes(self):
         result = self.publish_cli("--by", "profcarroll")
@@ -476,12 +484,20 @@ class PublishIndexTests(PublishTestCase):
         self.assertNotEqual(before, sha)
         config = _json.loads((self.gallery / "config.json").read_text())
         self.assertEqual(config["write_path"], "https://writepath.example")
-        # A second run with nothing new is a no-op, not a commit.
+        # A second run with nothing new is a no-op, not a commit. Crossing a
+        # second boundary first is the point: "site unchanged" is read off a
+        # diff of the render against the checkout, so a render that is a
+        # function of the clock rather than of the database makes this commit
+        # and push a whole gallery for nothing. It used to, and because the
+        # two renders usually fell inside one second this assertion only said
+        # so on the runs where they happened not to — which is how a real bug
+        # spent months reading as a flaky test.
+        cross_a_second()
         sha2, why2 = publication.publish_index(
             self.conn, self.gallery, remote=str(self.bare),
             write_path="https://writepath.example/",
         )
-        self.assertIsNone(sha2)
+        self.assertIsNone(sha2, "a re-render with no new data committed anyway")
         self.assertEqual(why2, "site unchanged")
 
 

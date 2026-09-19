@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
@@ -31,6 +32,19 @@ from sketchgen import db  # noqa: E402
 from sketchgen import gallery  # noqa: E402
 from sketchgen import lineage  # noqa: E402
 from sketchgen.cli import gallery as cli_gallery  # noqa: E402
+
+
+def cross_a_second() -> None:
+    """Wait until the wall clock's second has ticked over.
+
+    A render is a function of the database, so two of them must agree whichever
+    seconds they fall in. Waiting here is the cheapest way to ask that on
+    purpose: the whole shape of the bug this guards was that it was invisible
+    inside one second.
+    """
+    edge = int(time.time()) + 1
+    while time.time() < edge:
+        time.sleep(0.02)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI = REPO_ROOT / "bin" / "sketchgen"
@@ -2568,23 +2582,39 @@ class DeterminismTests(GalleryTestCase):
         # call publish_index makes, not of a render with the clock held still.
         return gallery.render_all(self.conn, self.dest, self.config)
 
+    def files(self):
+        return {
+            path.relative_to(self.dest): path.read_bytes()
+            for path in sorted(self.dest.rglob("*"))
+            if path.is_file()
+        }
+
     def test_a_second_render_all_is_byte_identical(self):
         self.render()
-        first = {
-            path.relative_to(self.dest): path.read_bytes()
-            for path in sorted(self.dest.rglob("*"))
-            if path.is_file()
-        }
+        first = self.files()
+        cross_a_second()
         self.render()
-        second = {
-            path.relative_to(self.dest): path.read_bytes()
-            for path in sorted(self.dest.rglob("*"))
-            if path.is_file()
-        }
+        second = self.files()
         self.assertEqual(sorted(first), sorted(second))
         for name, data in first.items():
             with self.subTest(path=str(name)):
                 self.assertEqual(data, second[name])
+
+    def test_the_ledger_is_identical_across_a_second_boundary(self):
+        """The one question the old stamp could fail, asked so it cannot pass
+        by luck.
+
+        Two renders only ever differed when they fell either side of a second.
+        Back-to-back they almost never do, so a clock reintroduced here would
+        not fail this suite — it would make it flaky, which is the same bug
+        arriving in the same disguise. Crossing the boundary on purpose is
+        what turns "usually passes" into an assertion.
+        """
+        self.render()
+        first = (self.dest / "lineage.json").read_bytes()
+        cross_a_second()
+        self.render()
+        self.assertEqual(first, (self.dest / "lineage.json").read_bytes())
 
 
 class RenderAllRereadsTests(GalleryTestCase):
