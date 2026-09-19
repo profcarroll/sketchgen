@@ -68,6 +68,39 @@ so the control row still holds only the three values migration 001 allows;
 `sketchgen/worker.py`'s docstring says why. A job paused mid-repair is re-queued
 rather than stranded, so `db status` after a pause shows it back under `queued`.
 
+## Deploying a change
+
+The whole deploy is one script — pull, pause, re-install units, migrate,
+re-render the gallery, restart, resume:
+
+```
+ssh sld-cloud 'bash ~/sketchgen/app/update.sh'
+```
+
+Its slowest step is the gallery re-render (every entry page, minutes), and it is
+there for a reason: entry pages are written once by the publisher, so a change to
+`gallery.py`, a publisher template, or anything a generator writes onto a page
+reaches `index.html` but none of the entry pages without it.
+
+A change that touches **none of that** — the operator UI (`console.py`,
+`web.py`), a unit file, worker logic — does not need the render. Skip it:
+
+```
+ssh sld-cloud 'bash ~/sketchgen/app/update.sh --no-render'   # or SKETCHGEN_SKIP_RENDER=1
+```
+
+That still pulls, re-installs units, migrates, restarts and resumes — it only
+drops the gallery pull and render. When in doubt, leave it off: an unnecessary
+render costs minutes, a skipped necessary one ships stale pages. Restarting only
+the operator UI by hand, without pausing the worker, is smaller still:
+
+```
+ssh sld-cloud
+cd ~/sketchgen/app && git pull origin main
+.venv/bin/python3 bin/sketchgen install-unit          # picks up unit-file changes
+systemctl --user restart sketchgen-web.service
+```
+
 ## Watching one job
 
 ```

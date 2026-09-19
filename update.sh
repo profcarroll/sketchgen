@@ -6,19 +6,34 @@
 # or if this file is on the local machine:
 #   ssh sld-cloud 'bash -s' < update.sh
 #
+# Flags:
+#   --no-render   Skip steps 3 and 4 (the gallery pull and the full re-render).
+#                 Equivalent: SKETCHGEN_SKIP_RENDER=1. Use this ONLY when the
+#                 change does not touch gallery output — operator UI (console.py,
+#                 web.py), unit files, or worker logic. A change to gallery.py,
+#                 a publisher template, or anything a generator writes onto an
+#                 entry page MUST run the full render, because entry pages are
+#                 written once and nothing else re-renders them (see step 4). When
+#                 in doubt, leave it off: an unnecessary render costs minutes, a
+#                 skipped necessary one ships stale pages.
+#   --render      Force the render even if SKETCHGEN_SKIP_RENDER is set (default).
+#   -h, --help    Print this and exit.
+#
 # What it does, in order:
 #   1. Pulls the generator repo (~/sketchgen/app)
 #   1a. If that pull changed THIS script, hands over to the pulled copy
 #   1b. Pauses the generator, letting the attempt in flight finish
 #   2. Re-installs the unit files into ~/.config/systemd/user and reloads
 #   2b. Applies any pending database migration (db init)
-#   3. Pulls the gallery checkout (~/sketchgen/gallery)
+#   3. Pulls the gallery checkout (~/sketchgen/gallery)          [skipped by --no-render]
 #   4. Re-renders the index AND every entry page, commits and pushes — through
 #      publish-index, which holds the same checkout lock the publisher takes
+#                                                                 [skipped by --no-render]
 #   5. Restarts sketchgen-web and the resident generator onto the new code
 #   6. Resumes the generator (from a trap, so a failure resumes it too)
 #
-# Safe to run more than once; every step is idempotent.
+# Safe to run more than once; every step is idempotent. --no-render changes what
+# is deployed (it does not render), not whether a rerun is safe.
 #
 # It does NOT enable anything. Copying a unit is a code update; enabling one is a
 # decision about what this node does, and that stays a keystroke (see
@@ -39,6 +54,23 @@ dim()   { printf '\033[2m%s\033[0m\n' "$*"; }
 step() { printf '\n\033[1;36m→ %s\033[0m\n' "$*"; }
 
 die() { red "FAILED: $*" >&2; exit 1; }
+
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# --- Flags -------------------------------------------------------------------
+# SKETCHGEN_SKIP_RENDER is read first so the setting survives the step-1a
+# re-exec (env is exported; the flag is also carried on "$@"). --no-render and
+# --render then have the last word, in the order given.
+case "${SKETCHGEN_SKIP_RENDER:-}" in 1|yes|true|YES|Yes) SKIP_RENDER=yes ;; *) SKIP_RENDER=no ;; esac
+for arg in "$@"; do
+    case "$arg" in
+        --no-render) SKIP_RENDER=yes ;;
+        --render)    SKIP_RENDER=no ;;
+        -h|--help)   usage; exit 0 ;;
+        *)           die "unknown argument: $arg (try --help)" ;;
+    esac
+done
+export SKETCHGEN_SKIP_RENDER="$SKIP_RENDER"
 
 # --- The generator, which is hopefully running -------------------------------
 # The worker is resident on this node (sketchgen-worker.service, not the timer),
@@ -157,6 +189,12 @@ cd "$APP"
 "$VENV" bin/sketchgen db init --db "$DB" || die "db init (migrate) failed"
 green "database schema up to date"
 
+# --- 3 & 4. The gallery, unless --no-render ----------------------------------
+if [ "$SKIP_RENDER" = yes ]; then
+    step "Skipping the gallery pull and re-render (--no-render)"
+    dim "deploying on the assumption this change touches no entry page or the index"
+else
+
 # --- 3. Pull the gallery checkout --------------------------------------------
 step "Pulling gallery checkout (~/sketchgen/gallery)"
 cd "$GALLERY" || die "cannot cd to $GALLERY"
@@ -189,6 +227,7 @@ cd "$APP"
     --progress \
     || die "publish-index failed"
 green "gallery re-rendered and pushed"
+fi
 
 # --- 5. Restart the services so they run the code we just pulled --------------
 # The worker is the point of this step. On this node it is resident
