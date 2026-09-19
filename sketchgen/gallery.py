@@ -12,6 +12,8 @@ One entry row plus its attempt directory in, a directory of plain files out:
     <gallery>/index.html                 the grid (published entries)
     <gallery>/rejections.html            the gate's rejections, kept
     <gallery>/compare.html               the paired-judgment shell
+    <gallery>/kiosk.html                  the projector shell (spec kiosk.md)
+    <gallery>/kiosk.json                  every published entry, for the kiosk
     <gallery>/pairs.json                 balanced pairs to offer, and agent verdicts
     <gallery>/lineage.json               every entry's place in its line
     <gallery>/lines/<root>.html          one page per lineage line
@@ -38,12 +40,9 @@ and likes live behind the write path (packet 3.3) and are rendered by
 they are never folded into either score (spec §5).
 
 **The same database gives the same bytes.** No clock is read while rendering:
-every timestamp on a page comes from a row, and ``lineage.json``'s own
-``generated_utc`` is the newest of those rows (:func:`data_as_of`) rather than
-the time of day. A second ``render_all`` over an unchanged database rewrites
-every file identically, which is what makes the publisher's commit in packet
-3.2 mean something: ``publish_index`` reads "site unchanged" off a diff, so a
-render that is not reproducible is a publisher that pushes on every run.
+every timestamp on a page comes from a row. A second ``render_all`` over an
+unchanged database rewrites every file identically, which is what makes the
+publisher's commit in packet 3.2 mean something.
 
 Python 3.12, stdlib only: ``string.Template``, ``html``, ``json``.
 """
@@ -73,7 +72,6 @@ __all__ = [
     "Unsafe",
     "UnknownEntry",
     "guard",
-    "data_as_of",
     "render_all",
     "render_entry",
     "render_index",
@@ -498,11 +496,6 @@ LINEAGE_JSON_LIMIT = 100 * 1024
 #: What a root prompt shrinks to if the file ever crosses that line.
 LINEAGE_ROOT_PROMPT_CAP = 200
 
-#: ``lineage.json``'s stamp for a database with nothing in it to be as of. A
-#: constant rather than a clock, because an empty gallery has to render the
-#: same bytes twice as much as a full one does.
-NO_DATA_UTC = "1970-01-01T00:00:00Z"
-
 
 def _offplan(row: Any) -> list[str]:
     """The assertions the kept attempt missed, for an entry that still runs.
@@ -541,41 +534,6 @@ def _every_entry(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(conn.execute("SELECT * FROM entries ORDER BY id"))
 
 
-def data_as_of(conn: sqlite3.Connection) -> str:
-    """The newest row stamp behind ``lineage.json`` — this module's only clock,
-    and it is a row, not the time of day.
-
-    ``lineage.json`` is the one generated file with a timestamp of its own, and
-    until 2026-09-19 that timestamp was ``utc_now()`` at render time. That broke
-    this module's rule (see the module docstring): the same database stopped
-    giving the same bytes, because two renders a second apart differed in that
-    field and in nothing else. What it cost was the meaning of the publisher's
-    commit — ``publish_index`` decides "site unchanged" by diffing the render
-    against the checkout, so a re-render with no new data committed and pushed
-    a whole gallery to change one second. (It showed up as a 1-in-10 flake in
-    ``test_publish``: the two renders only differed when they happened to
-    straddle a second boundary.)
-
-    So the stamp comes from the rows the file is built from — every entry, and
-    the lineage links — and it answers the question a reader of the file
-    actually has, which is how fresh the *data* is rather than how recently
-    somebody ran the generator.
-
-    A state change that stamps no column (an archive, say) moves the file's
-    contents without moving this; the render still differs, so it is still
-    committed, and only the stamp stands still. The alternative — a clock — got
-    that one case right by getting every other case wrong.
-    """
-    newest = conn.execute(
-        "SELECT MAX(stamp) AS stamp FROM ("
-        "  SELECT MAX(created_utc) AS stamp FROM entries"
-        "  UNION ALL SELECT MAX(published_utc) FROM entries"
-        "  UNION ALL SELECT MAX(created_utc) FROM lineage"
-        ")"
-    ).fetchone()
-    return str(newest["stamp"]) if newest and newest["stamp"] else NO_DATA_UTC
-
-
 def _whole_forest(
     conn: sqlite3.Connection, ids: list[int]
 ) -> tuple[dict[int, int | None], dict[int, list[int]]]:
@@ -598,9 +556,33 @@ def _whole_forest(
     return parent, children
 
 
-def _lineage_index(
-    conn: sqlite3.Connection, generated_utc: str
-) -> dict[str, Any]:
+def _ledger_stamp(conn: sqlite3.Connection) -> str:
+    """The ledger's ``generated_utc``: the newest stamp the database holds.
+
+    Not the wall clock. The ledger is a rendering of the database as it stands,
+    so it is dated by the last thing the database recorded — an entry created
+    or published, a lineage row written — and the same database gives the same
+    bytes however many times it is rendered. That is what lets a re-render
+    that changed nothing be the no-op ``publish_index`` promises instead of a
+    commit that moves one timestamp. An empty gallery is dated by its schema:
+    the newest migration stamp, which every initialised database carries.
+    """
+    row = conn.execute(
+        """
+        SELECT MAX(stamp) FROM (
+            SELECT created_utc AS stamp FROM entries
+            UNION ALL SELECT published_utc FROM entries
+            UNION ALL SELECT created_utc FROM lineage
+            UNION ALL SELECT applied_utc FROM schema_version
+        )
+        """
+    ).fetchone()
+    stamp = row[0] if row is not None else None
+    # Unreachable on a migrated database; still no clock.
+    return str(stamp) if stamp else "1970-01-01T00:00:00Z"
+
+
+def _lineage_index(conn: sqlite3.Connection) -> dict[str, Any]:
     """The ledger's data file: every entry, its place in its line, one shape.
 
     The entry page carries its own ancestry as static HTML — it was true when
@@ -643,8 +625,13 @@ def _lineage_index(
                 item["submitted_by"] = row["submitted_by"]
                 item["strip"] = f"e/{entry_id}/strip.png"
                 item["root_prompt"] = root_prompt
+                # So a ledger tile the script paints routes a listening sketch to
+                # its own tab, the same as the server-rendered tiles do.
+                item["mic"] = _needs_mic(
+                    Path(row["source_dir"]) if row["source_dir"] else None
+                )
             entries[str(entry_id)] = item
-        return {"generated_utc": generated_utc, "entries": entries}
+        return {"generated_utc": _ledger_stamp(conn), "entries": entries}
 
     data = payload(None)
     if len(_lineage_bytes(data)) > LINEAGE_JSON_LIMIT:
@@ -737,6 +724,40 @@ def _statement(row: sqlite3.Row, source: Path | None) -> str:
             except OSError:  # pragma: no cover - unreadable statement
                 return ""
     return ""
+
+
+#: The one thing the kiosk cannot ask the sketch itself. Its frame is
+#: ``allow-scripts`` without ``allow-same-origin``, which is opaque by design,
+#: so there is no channel to read the canvas size over — and a fixed-size canvas
+#: in a stage-sized frame sits top-left, where p5 puts it. The generator can
+#: read the source, so the generator says (spec §4.3). Two integer literals and
+#: nothing else counts: a third argument is left outside the match, so
+#: ``createCanvas(800, 600, WEBGL)`` still gives a size, while ``windowWidth``,
+#: a variable or an expression gives none and the kiosk fills the stage.
+_CANVAS_RE = re.compile(r"createCanvas\(\s*(\d+)\s*,\s*(\d+)")
+
+
+def _canvas_size(row: sqlite3.Row, attempts: list[sqlite3.Row]) -> list[int] | None:
+    """``[width, height]`` from the sketch's own source, or ``None``.
+
+    The same file :func:`_write_entry` copies to ``e/<id>/sketch/sketch.js``,
+    read where it still lives — the attempt directory — so a manifest row and
+    the page's frame can never disagree about what is on screen.
+    """
+    source = _source_dir(row, attempts)
+    if source is None:
+        return None
+    path = source / "sketch.js"
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:  # pragma: no cover - unreadable sketch
+        return None
+    match = _CANVAS_RE.search(text)
+    if match is None:
+        return None
+    return [int(match.group(1)), int(match.group(2))]
 
 
 # ---------------------------------------------------------------------------
@@ -1481,23 +1502,67 @@ def _heavy_chip(heavy: dict[str, float | None]) -> str:
     return f'<span class="chip heavy">{_esc(text)}</span>'
 
 
+#: Microphone *input* — the one thing a sandboxed, opaque-origin sketch frame
+#: cannot do. A published sketch runs in an ``sandbox="allow-scripts"`` iframe with
+#: no ``allow="microphone"``, so ``getUserMedia`` is refused and a listening sketch
+#: reads a dead mic; it only works opened in its own top-level tab, where the
+#: Pages origin (https) is a secure context the browser will grant the mic. Making
+#: sound — ``p5.Oscillator``, ``loadSound`` — works in the frame after a click and
+#: is deliberately NOT matched here: only listening has to leave the page.
+_MIC_RE = re.compile(r"p5\.AudioIn|getUserMedia|mediaDevices")
+
+
+def _needs_mic(source: Path | None) -> bool:
+    """True when the sketch at ``source`` opens the microphone (see :data:`_MIC_RE`)."""
+    if source is None:
+        return False
+    text = ""
+    for name in ("sketch.js", "index.html"):
+        try:
+            text += (source / name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    return bool(_MIC_RE.search(text))
+
+
 def _frame(
     has_sketch: bool,
     title: str,
     *,
     heavy: dict[str, float | None] | None = None,
     has_strip: bool = False,
+    mic: bool = False,
 ) -> str:
     """The stage: an iframe that starts itself, or a frame that waits.
 
     A sketch the gate had to grind through does not get to start itself the
     moment somebody opens the page. It renders as the strip with a play button
     — the same run-in-place helper the ledger tiles use — and says why.
+
+    A microphone sketch never starts in the embedded frame at all: the mic is
+    refused an opaque, sandboxed origin, so the strip becomes a link that opens
+    the sketch in its own tab, where the origin is real and the browser can grant
+    it. Making sound is not this — see :data:`_MIC_RE`.
     """
     if not has_sketch:
         return (
             '<p class="none">The sketch source is not in this checkout, so there '
             "is nothing to run here.</p>"
+        )
+    if mic:
+        poster = (
+            f'<img src="strip.png" alt="four frames from {_esc(title)}">'
+            if has_strip else "<span data-play-label></span>"
+        )
+        return (
+            '<div class="stage-run stage-mic">\n'
+            '      <a class="play" href="sketch/" target="_blank" rel="noopener"'
+            f' aria-label="run {_esc(title)} in a new tab">{poster}'
+            '<span class="play-label">run in a tab ▸</span></a>\n'
+            '      <p class="run-note">This sketch listens to the microphone, which '
+            "a browser only opens for a page in its own tab — so it runs there, not "
+            "in this embedded frame.</p>\n"
+            "    </div>"
         )
     if heavy is not None and has_strip:
         return (
@@ -1538,7 +1603,7 @@ def _ledger_index(conn: sqlite3.Connection) -> dict[str, Any]:
     One producer, one vocabulary: a row the server draws and a row the script
     draws cannot disagree about a generation or a chip.
     """
-    return _lineage_index(conn, "")["entries"]
+    return _lineage_index(conn)["entries"]
 
 
 def _ledger_chain(index: dict[str, Any], entry_id: int) -> list[int]:
@@ -1608,10 +1673,11 @@ def _ledger_tile(entry_id: int, item: dict[str, Any] | None, width: str) -> str:
     """
     if not (item or {}).get("public"):
         return f'<div class="ledger-tile {width} blank" aria-hidden="true"></div>'
+    mic = ' data-run-mic="1"' if (item or {}).get("mic") else ""
     return (
         f'<div class="ledger-tile {width}">'
         f'<button type="button" class="play" data-play '
-        f'data-run-href="../{entry_id}/sketch/" '
+        f'data-run-href="../{entry_id}/sketch/"{mic} '
                 f'aria-label="run entry {entry_id}" data-run-name="entry {entry_id}">'
         f'<img src="../{entry_id}/strip.png" loading="lazy" '
         f'alt="the first frame of entry {entry_id}">'
@@ -2077,7 +2143,8 @@ def _write_entry(
         subtitle=_subtitle(revisions, meta),
         byline=_byline(row, meta),
         failed_note=failed_note,
-        frame=_frame(has_sketch, title, heavy=_heavy(meta), has_strip=has_strip),
+        frame=_frame(has_sketch, title, heavy=_heavy(meta), has_strip=has_strip,
+                     mic=has_sketch and _needs_mic(source)),
         seed=_dash(meta["seed"]),
         state_chip=_state_chip(row["state"]),
         brief=_paragraphs(str(row["brief"] or ""), "No brief was recorded for this job."),
@@ -2381,6 +2448,139 @@ def _offered_pairs(conn: sqlite3.Connection) -> list[dict[str, int]]:
     return pairs_mod.offer(conn)
 
 
+# ---------------------------------------------------------------------------
+# The kiosk (spec docs/plans/kiosk.md)
+#
+# One page that plays the published sketches one after another on a projector,
+# and one manifest behind it. The kiosk needs the prompt, brief, statement,
+# judgment and provenance of every published entry before it can order them,
+# and meta.json per entry is one request per entry — 222 of them before the
+# first sketch appears. So the generator serialises the values it has already
+# computed for meta.json and the cards a second time, into one file. Nothing
+# here is new logic; that is the point, because two files disagreeing about the
+# same entry is the failure this shape rules out.
+# ---------------------------------------------------------------------------
+
+#: What a manifest row takes straight from :func:`_meta`, by the same names.
+KIOSK_META_KEYS = (
+    "prompt",
+    "brief",
+    "statement",
+    "submitted_by",
+    "planner",
+    "executor",
+    "rules_file",
+    "attempts",
+    "seed",
+    "created_utc",
+    "published_utc",
+    "prompt_tokens",
+    "completion_tokens",
+    "wall_s",
+    "licence",
+)
+
+#: What it takes from meta.json's ``lineage`` block, flattened into the row:
+#: the kiosk's caption reads these four beside the prompt, and a nested object
+#: for four values would only be meta.json's shape worn for no reason.
+KIOSK_LINEAGE_KEYS = (
+    "generation",
+    "parent_entry_id",
+    "critique_by",
+    "root_entry_id",
+)
+
+#: The three of :func:`_standing`'s five the kiosk prints. ``rank`` and ``pool``
+#: are the card's business: they place a mark on a track, and the kiosk has no
+#: track.
+KIOSK_STANDING_KEYS = ("score", "n", "pct")
+
+
+def _kiosk_judgment(scores: dict, entry_id: int) -> dict[str, dict[str, dict]]:
+    """``{population: {question: {score, n, pct}}}``, missing where unjudged.
+
+    A population that has not judged this entry on this question is *absent* —
+    not ``null``, not zero. A score nobody voted on is not a low score, and an
+    ordering built over a zero would sink every unjudged entry to the bottom of
+    'most reviewed' as though the pool had spoken. The browser prints *no pairs
+    yet* for a missing key, as the entry page does.
+    """
+    out: dict[str, dict[str, dict]] = {}
+    for population, tables in scores.items():
+        by_question: dict[str, dict] = {}
+        for question, table in tables.items():
+            stand = _standing(table, entry_id)
+            if stand is None:
+                continue
+            by_question[question] = {key: stand[key] for key in KIOSK_STANDING_KEYS}
+        if by_question:
+            out[population] = by_question
+    return out
+
+
+def _kiosk_entry(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    config: Config,
+    parent: dict[int, int | None],
+    children: dict[int, list[int]],
+    scores: dict,
+) -> dict[str, Any]:
+    """One entry as the kiosk reads it: meta.json's values, plus where to run."""
+    entry_id = int(row["id"])
+    attempts = _attempt_rows(conn, int(row["job_id"]))
+    meta = _meta(conn, row, attempts, config, parent, children)
+    entry: dict[str, Any] = {"id": entry_id}
+    entry.update({key: meta[key] for key in KIOSK_META_KEYS})
+    entry.update({key: meta["lineage"][key] for key in KIOSK_LINEAGE_KEYS})
+    # Relative to the gallery root, as the compare shell's rows are: the kiosk
+    # page sits beside index.html and resolves them against the same base.
+    entry["sketch"] = f"e/{entry_id}/sketch/"
+    entry["source"] = f"e/{entry_id}/sketch/sketch.js"
+    entry["href"] = f"e/{entry_id}/"
+    canvas = _canvas_size(row, attempts)
+    if canvas is not None:
+        entry["canvas"] = canvas
+    entry["judgment"] = _kiosk_judgment(scores, entry_id)
+    return entry
+
+
+def _kiosk_manifest(
+    conn: sqlite3.Connection,
+    config: Config,
+    parent: dict[int, int | None],
+    children: dict[int, list[int]],
+) -> dict[str, Any]:
+    """``kiosk.json``: every published entry, in ascending id order.
+
+    Published entries only, the same rows the grid page gets. A projector in a
+    lobby shows the gallery, and the gallery is the published set — a kept
+    rejection has a page of its own and a reason printed on it, neither of which
+    survives being played for sixty seconds with no one at the keyboard.
+
+    The four Bradley–Terry tables are fitted once here and handed to every row:
+    the fit is over the whole pool, so doing it per entry would be slower and no
+    different. No clock is read and the order is total, so the same database
+    gives the same bytes.
+    """
+    scores = _all_scores(conn)
+    rows = sorted(_entries(conn, "published"), key=lambda row: int(row["id"]))
+    return {
+        "entries": [
+            _kiosk_entry(conn, row, config, parent, children, scores) for row in rows
+        ]
+    }
+
+
+def _kiosk_page(config: Config) -> str:
+    """The kiosk shell. No entry data: ``kiosk.js`` fetches ``kiosk.json``.
+
+    ``config`` is taken and unused, as the other page builders take it, so that
+    a future footer naming the write path is a change to this function alone.
+    """
+    return _template("kiosk.html").substitute(root="./", page_title="Sketchgen Kiosk")
+
+
 def _line_node(
     item: dict[str, Any],
     by_id: dict[int, sqlite3.Row],
@@ -2477,15 +2677,14 @@ def render_index(
     conn: sqlite3.Connection,
     dest_dir: str | Path,
     config: Config | None = None,
-    *,
-    generated_utc: str | None = None,
 ) -> list[Path]:
-    """Write the grid, the failures, compare, the line pages, assets and config.
+    """Write the grid, the failures, compare, the kiosk, the line pages, assets
+    and config.
 
-    ``generated_utc`` reaches only ``lineage.json``, whose shape the spec fixes
-    with that field in it. It defaults to :func:`data_as_of` — the newest row
-    behind the file, not the time of day — so that two renders of one database
-    are byte-identical; pass one to pin it. Every page is unaffected either way.
+    No clock is read: the same database gives the same bytes, which is what
+    lets ``publish_index`` tell a re-render that changed nothing from one that
+    did. ``lineage.json``'s ``generated_utc`` is the newest stamp the database
+    holds (:func:`_ledger_stamp`), not the time of the render.
     """
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
@@ -2543,10 +2742,17 @@ def render_index(
             + "\n",
         )
         written.write_text(
+            dest / "kiosk.json",
+            json.dumps(
+                _kiosk_manifest(conn, config, parent, children),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+        )
+        written.write_text(
             dest / "lineage.json",
-            _lineage_bytes(
-                _lineage_index(conn, generated_utc or data_as_of(conn))
-            ).decode("utf-8"),
+            _lineage_bytes(_lineage_index(conn)).decode("utf-8"),
         )
         # Every public entry, not just the published ones: a kept rejection's
         # entry page links here with ?a=<itself> and the page has to know that
@@ -2554,6 +2760,7 @@ def render_index(
         written.write_text(
             dest / "compare.html", _compare_page(conn, _public_rows(conn))
         )
+        written.write_text(dest / "kiosk.html", _kiosk_page(config))
         roots = sorted(
             {
                 _root_of(parent, entry_id)
@@ -2578,13 +2785,11 @@ def render_all(
     conn: sqlite3.Connection,
     dest_dir: str | Path,
     config: Config | None = None,
-    *,
-    generated_utc: str | None = None,
 ) -> list[Path]:
     """Every public entry, then the pages that index them."""
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
-    written = render_index(conn, dest, config, generated_utc=generated_utc)
+    written = render_index(conn, dest, config)
     for row in _public_rows(conn):
         written.append(render_entry(conn, int(row["id"]), dest, config))
     return written

@@ -91,8 +91,6 @@ In `sketchgen/gallery.py`, `_forest(conn, *, admit: int | None = None)` includes
 
 `render_index` writes `<gallery>/lineage.json` next to `pairs.json`. Client code paints the parts of the panel that change after an entry is published (siblings, children, state chips). Shape:
 
-`generated_utc` is **the newest row behind the file** — `gallery.data_as_of`, the max of `entries.created_utc`, `entries.published_utc` and `lineage.created_utc` — not the time the render ran. It was render time until 2026-09-19, which made this the one file a render could not reproduce; since `publish_index` reads "site unchanged" off a diff, that meant a re-render with no new data committed and pushed the whole gallery to change one second. The field answers "how fresh is this data", which is the question a reader of it has.
-
 ```json
 {
   "generated_utc": "2026-09-15T14:00:00Z",
@@ -124,7 +122,7 @@ In `sketchgen/gallery.py`, `_forest(conn, *, admit: int | None = None)` includes
 }
 ```
 
-Rules: every entry in the `entries` table appears, whatever its state, so generation counts add up. Non-public entries carry no `strip`, no `root_prompt`, no `submitted_by`. `public` is true for states in `PUBLIC_STATES` with `published_utc` set. `parent` comes from `_parent_of` regardless of the parent's state (this is the difference from `_forest`, which is for the site's tree pages and stays as it is). `root_prompt` is the prompt split at the first `REVISE_HEADING`. Keep it under 100 KB at 300 entries; if `critique` pushes it over, truncate `root_prompt` to 200 characters.
+Rules: `generated_utc` is the newest stamp the database holds (an entry's `created_utc` or `published_utc`, a lineage row's `created_utc`, the schema stamp for an empty gallery), not the wall clock: the same database gives the same bytes, so a re-render that changed nothing is the no-op `publish_index` promises rather than a commit that moves one timestamp. Every entry in the `entries` table appears, whatever its state, so generation counts add up. Non-public entries carry no `strip`, no `root_prompt`, no `submitted_by`. `public` is true for states in `PUBLIC_STATES` with `published_utc` set. `parent` comes from `_parent_of` regardless of the parent's state (this is the difference from `_forest`, which is for the site's tree pages and stays as it is). `root_prompt` is the prompt split at the first `REVISE_HEADING`. Keep it under 100 KB at 300 entries; if `critique` pushes it over, truncate `root_prompt` to 200 characters.
 
 ### 4.3 Split the prompt
 
