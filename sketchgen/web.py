@@ -2205,9 +2205,11 @@ def planner_selected(value: str, host: str | None = None) -> str:
     saved choice would quietly offer a different model than the one the job
     would have used.
     """
-    groups = planner_groups(host)
-    offered = [value for _, options in groups for value, _ in options]
-    for candidate in (planner_column(value) if value != PAID else PAID, value):
+    offered = [
+        option for _, options in planner_groups(host) for option, _ in options
+    ]
+    resolved = PAID if value == PAID else planner_column(value)
+    for candidate in (resolved, value):
         if candidate in offered:
             return candidate
     return offered[0] if offered else LOCAL
