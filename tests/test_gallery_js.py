@@ -157,6 +157,150 @@ setTimeout(function () {
 """
 
 
+#: The §6.2 harness: gallery.js on an entry page, with and without ``?kiosk``.
+#:
+#: The page is the markup ``entry.html`` writes — the hidden strip, the
+#: engagement section it anchors to, and the critique form when there is a
+#: write path — and the run reports what the strip did, what the address bar
+#: was left as, and what the view POST carried. Same stub DOM as the two
+#: harnesses above.
+SCANNER = """
+"use strict";
+
+const fs = require("fs");
+const vm = require("vm");
+const { makeWindow } = require(process.argv[2]);
+
+const SCRIPT = process.argv[3];
+const CASES = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+
+function el(document, parent, tag, attrs, text) {
+  const node = document.createElement(tag);
+  Object.keys(attrs || {}).forEach(function (name) {
+    if (name === "hidden") { node.hidden = attrs[name]; return; }
+    node.setAttribute(name, attrs[name]);
+  });
+  if (text !== undefined) { node.textContent = text; }
+  parent.appendChild(node);
+  return node;
+}
+
+function text(document, parent, value) {
+  parent.appendChild(document.createTextNode(value));
+}
+
+// The page entry.html writes, as far as §6.2 touches it — the strip's own
+// text nodes included, because the separator between the second verb and the
+// third is inside the span that may be removed and that is the whole point.
+function entryPage(document, withWritePath) {
+  const main = el(document, document.body, "main", {
+    class: "entry", "data-entry": "82"
+  });
+  const strip = el(document, main, "p", {
+    class: "scanned", "data-scanned": "", hidden: true
+  });
+  text(document, strip, "You scanned this from a projection. ");
+  el(document, strip, "a", { href: "../../compare.html?a=82" }, "Judge it against another");
+  text(document, strip, " \\u00b7 ");
+  el(document, strip, "a", { href: "#engagement" }, "Like it");
+  const revision = el(document, strip, "span", { "data-scanned-critique": "" });
+  text(document, revision, " \\u00b7 ");
+  el(document, revision, "a", { href: "#critique-text" }, "Ask for a revision");
+  text(document, strip, ".");
+  el(document, main, "section", { class: "engagement", id: "engagement" });
+  if (withWritePath) {
+    const form = el(document, main, "section", {
+      class: "panel critique-form", "data-critique": "82", hidden: true
+    });
+    el(document, form, "textarea", { id: "critique-text", "data-critique-text": "" });
+  }
+  return { main: main, strip: strip };
+}
+
+function run(one) {
+  const window = makeWindow();
+  const document = window.document;
+  const asked = [];
+  window.location.pathname = "/e/82/";
+  window.location.search = one.search;
+  const page = entryPage(document, one.writePath !== false);
+  window.SKETCHGEN_ROOT = "../../";
+  window.fetch = function (url, init) {
+    asked.push({ url: String(url), init: init || null });
+    if (String(url).indexOf("config.json") !== -1) {
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: function () {
+          return Promise.resolve({
+            write_path: one.writePath === false
+              ? "" : "https://write.example.invalid/api"
+          });
+        }
+      });
+    }
+    return Promise.reject(new Error("offline"));
+  };
+
+  vm.runInContext(fs.readFileSync(SCRIPT, "utf8"), vm.createContext({
+    window: window,
+    document: document,
+    fetch: window.fetch,
+    URLSearchParams: URLSearchParams,
+    Promise: Promise,
+    console: console,
+    Math: Math,
+    Number: Number,
+    String: String,
+    Object: Object,
+    Array: Array,
+    JSON: JSON,
+    parseInt: parseInt,
+    setTimeout: setTimeout
+  }), { filename: "gallery.js" });
+
+  return new Promise(function (resolve) {
+    // Two ticks: loadConfig() resolves on the first and sendView() runs on it.
+    setTimeout(function () {
+      const view = asked.filter(function (one) {
+        return one.url.indexOf("/view") !== -1;
+      })[0] || null;
+      resolve({
+        hidden: page.strip.hidden === true,
+        text: page.strip.textContent,
+        links: Array.prototype.map.call(
+          page.strip.querySelectorAll("a"),
+          function (a) { return a.getAttribute("href"); }
+        ),
+        address: window.history.lastUrl,
+        viewBody: view ? view.init.body : null
+      });
+    }, 0);
+  });
+}
+
+(async function () {
+  const out = [];
+  for (const one of CASES) { out.push(await run(one)); }
+  console.log(JSON.stringify(out));
+})();
+"""
+
+#: The searches §6.2 names, and one that must leave the strip alone.
+SCANS = [
+    {"search": "?kiosk"},
+    {"search": "?kiosk="},
+    {"search": "?kiosk=1"},
+    {"search": ""},
+    {"search": "?q=lines"},
+    # Another parameter alongside it: the strip fires and ?q survives.
+    {"search": "?kiosk&q=lines&sort=liked"},
+    # No write path, so the generator wrote no critique form and the third
+    # verb has nothing to point at.
+    {"search": "?kiosk", "writePath": False},
+]
+
+
 #: One sentence of critique per case, and the sentence the page must print for
 #: it. Whether each one *passes* is not written down here: it is taken from
 #: ``lineage.validate`` at run time, which is the whole point of the check.
@@ -277,6 +421,95 @@ class CritiqueValidatorTests(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("node"), "node is not installed")
+class ArrivedByScanTests(unittest.TestCase):
+    """The entry page's greeting for somebody who scanned a wall (qr.md §6.2)."""
+
+    @classmethod
+    def setUpClass(cls):
+        tmp = Path(tempfile.mkdtemp(prefix="sketchgen-scan-"))
+        cls.tmp = tmp
+        harness = tmp / "scanner.js"
+        harness.write_text(SCANNER, encoding="utf-8")
+        cases = tmp / "scans.json"
+        cases.write_text(json.dumps(SCANS), encoding="utf-8")
+        done = subprocess.run(
+            [shutil.which("node"), str(harness), str(DOM), str(SCRIPT), str(cases)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if done.returncode != 0:
+            raise AssertionError(done.stdout + done.stderr)
+        cls.runs = json.loads(done.stdout.strip().splitlines()[-1])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def run_for(self, search, **extra):
+        for case, result in zip(SCANS, self.runs):
+            if case["search"] == search and all(
+                case.get(key) == value for key, value in extra.items()
+            ):
+                return result
+        raise AssertionError(f"no run for {search!r}")
+
+    def test_every_shape_of_the_bare_key_counts(self):
+        # params.has, not params.get: a bare key parses to "", which is falsy,
+        # and a version of this that silently never fired would be worse than
+        # one that does not exist. A reader that normalises the key to
+        # ?kiosk=1 has to count too.
+        for search in ("?kiosk", "?kiosk=", "?kiosk=1"):
+            with self.subTest(search=search):
+                self.assertFalse(self.run_for(search)["hidden"])
+
+    def test_no_param_leaves_the_strip_hidden(self):
+        for search in ("", "?q=lines"):
+            with self.subTest(search=search):
+                self.assertTrue(self.run_for(search)["hidden"])
+        # And nothing is rewritten: a page nobody scanned keeps its address.
+        self.assertIsNone(self.run_for("?q=lines")["address"])
+
+    def test_the_strip_says_the_three_things_the_page_can_do(self):
+        run = self.run_for("?kiosk")
+        self.assertEqual(
+            "You scanned this from a projection. Judge it against another · "
+            "Like it · Ask for a revision.",
+            run["text"],
+        )
+        # The page's own controls, not new behaviour: a link to compare and
+        # two in-page anchors.
+        self.assertEqual(
+            ["../../compare.html?a=82", "#engagement", "#critique-text"],
+            run["links"],
+        )
+
+    def test_the_param_leaves_the_address_bar_and_the_others_survive(self):
+        # An address bar people copy from should not carry a projection's
+        # provenance, which is what claimTokenFromHash() says about the
+        # session token for the same reason.
+        self.assertEqual("/e/82/", self.run_for("?kiosk")["address"])
+        both = self.run_for("?kiosk&q=lines&sort=liked")
+        self.assertFalse(both["hidden"])
+        self.assertEqual("/e/82/?q=lines&sort=liked", both["address"])
+
+    def test_a_verb_the_gallery_cannot_honour_is_not_offered(self):
+        # No write path, so no critique form on the page at all: the third
+        # link and its separator go rather than pointing at nothing.
+        run = self.run_for("?kiosk", writePath=False)
+        self.assertFalse(run["hidden"])
+        self.assertEqual(
+            "You scanned this from a projection. Judge it against another · Like it.",
+            run["text"],
+        )
+        self.assertEqual(["../../compare.html?a=82", "#engagement"], run["links"])
+
+    def test_the_view_post_is_the_same_body_with_or_without_the_param(self):
+        # This packet adds no field to the write path (§6.2, §9). The signal
+        # is in the URL; recording it is a full-stack packet and not this one.
+        self.assertEqual('{"entry_id":82}', self.run_for("?kiosk")["viewBody"])
+        self.assertEqual('{"entry_id":82}', self.run_for("")["viewBody"])
+
+
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
 class KioskTests(unittest.TestCase):
     """kiosk.js, run for real against the DOM contract (spec §5).
 
@@ -335,7 +568,7 @@ class KioskTests(unittest.TestCase):
         fell_back = self.report["noWritePath"]
         self.assertTrue(fell_back["status"].startswith("1 of 3 · newest"))
         self.assertEqual(
-            "kiosk.html?order=newest&every=60&show=prompt,authors,generation,views,likes",
+            "kiosk.html?order=newest&every=60&show=prompt,authors,generation,views,likes,qr",
             fell_back["launch"],
         )
         self.assertIn("newest first", fell_back["current"])
@@ -512,7 +745,7 @@ class KioskTests(unittest.TestCase):
         self.assertEqual("45 s", settings["every"])
         self.assertIn("most liked", settings["order"])
         self.assertEqual(2, settings["overlaysOn"])
-        self.assertEqual("2 of 13 on", settings["count"])
+        self.assertEqual("2 of 14 on", settings["count"])
 
     def test_an_acting_key_writes_both_the_address_bar_and_storage(self):
         settings = self.report["settings"]
@@ -521,7 +754,7 @@ class KioskTests(unittest.TestCase):
             "/kiosk.html?order=liked&every=45&show=prompt,code", settings["address"]
         )
         self.assertEqual(
-            {"every": 45, "order": "liked", "show": {"prompt": True, "code": True}},
+            {"v": 2, "every": 45, "order": "liked", "show": {"prompt": True, "code": True}},
             settings["stored"],
         )
 
@@ -590,6 +823,96 @@ class KioskTests(unittest.TestCase):
         # "written in 0.0 s" would be a claim about how long the executor took.
         self.assertEqual(["written in —"], self.report["unjudged"]["facts"])
 
+    # ---- the QR overlay (qr.md §5) ---------------------------------------
+
+    def test_the_code_is_on_by_default_and_the_launch_link_says_so(self):
+        # A projection nobody can act on is a screensaver (qr.md §1.7), so
+        # this is the one overlay whose default is the point of the packet.
+        code = self.report["qr"]
+        self.assertEqual(1, code["onByDefault"]["images"])
+        self.assertIn("qr", code["launch"].split("show=")[1].split(","))
+
+    def test_the_menu_lists_fourteen_overlays_and_counts_them(self):
+        code = self.report["qr"]
+        self.assertEqual(14, code["menuRows"])
+        self.assertEqual("6 of 14 on", code["menuCount"])
+
+    def test_the_image_is_the_manifest_s_kiosk_code_and_is_decorative(self):
+        # The path comes from the manifest and is never assembled in the
+        # script, and it is the -kiosk file: the manifest is read by one page
+        # and that page is the projection (§4).
+        code = self.report["qr"]
+        self.assertEqual("./e/33/qr-kiosk.svg", code["onByDefault"]["src"])
+        # alt="" because the URL is printed as text right underneath: a screen
+        # reader that announced "QR code" and stopped would be worse (§1.10).
+        self.assertEqual("", code["onByDefault"]["alt"])
+
+    def test_the_three_lines_are_the_ones_section_five_three_fixes(self):
+        # The printed URL is the clean one — the code beside it holds ?kiosk
+        # and the line does not, because typing is not scanning (§1.8).
+        self.assertEqual(
+            [
+                "scan to open #33",
+                "profcarroll.github.io/sketchgen-gallery/e/33/",
+                "judge it · like it · ask for a revision",
+            ],
+            self.report["qr"]["onByDefault"]["lines"],
+        )
+
+    def test_it_swaps_with_the_entry_and_never_leaves_two(self):
+        after = self.report["qr"]["afterAdvance"]
+        self.assertEqual(1, after["images"])
+        self.assertEqual("./e/22/qr-kiosk.svg", after["src"])
+        self.assertEqual("scan to open #22", after["lines"][0])
+
+    def test_q_toggles_it_with_the_menu_open(self):
+        code = self.report["qr"]
+        self.assertEqual(0, code["toggledOff"]["images"])
+        self.assertEqual(1, code["toggledOn"]["images"])
+
+    def test_h_takes_it_away_with_everything_else(self):
+        # on() already gates on state.hideAll, and an empty caption has to
+        # stay genuinely empty or the scrim never lifts off the stage.
+        hidden = self.report["qr"]["hidden"]
+        self.assertEqual(0, hidden["images"])
+        self.assertEqual("", hidden["caption"])
+
+    def test_an_explicit_show_list_does_not_get_the_default_thrown_in(self):
+        # ?show=prompt is an explicit list (kiosk.md §1.8), so it turns the
+        # code off along with everything else it does not name.
+        self.assertEqual(0, self.report["qrElsewhere"]["explicit"]["images"])
+
+    def test_with_no_write_path_the_code_shows_and_the_third_line_does_not(self):
+        # All three verbs are the write path. A projection that invites a
+        # stranger to do something the gallery cannot accept is worse than one
+        # that only shows the URL (§5.3).
+        offline = self.report["qrElsewhere"]["offline"]
+        self.assertEqual(1, offline["images"])
+        self.assertEqual(
+            [
+                "scan to open #33",
+                "profcarroll.github.io/sketchgen-gallery/e/33/",
+            ],
+            offline["lines"],
+        )
+
+    def test_a_projector_configured_before_this_packet_gets_the_code(self):
+        # The stored show map cannot mention a key that did not exist when it
+        # was written, so without the migration those rooms come back with the
+        # code off and nobody at the keyboard (§5.1).
+        migration = self.report["migration"]
+        self.assertEqual(
+            "kiosk.html?order=newest&every=60&show=prompt,qr", migration["migrated"]
+        )
+        self.assertEqual(2, migration["stamped"]["v"])
+
+    def test_the_stamp_stops_the_migration_running_twice(self):
+        # Somebody who turned the code off after the migration keeps it off.
+        self.assertEqual(
+            "kiosk.html?order=newest&every=60&show=prompt",
+            self.report["migration"]["stays"],
+        )
+
 
 def _without_comments(source: str) -> str:
     """kiosk.js with its comments taken out, so the bans below hold on code.
@@ -646,6 +969,17 @@ class KioskScriptTextTests(unittest.TestCase):
         # The same line gallery.js holds: a lookbehind is a syntax error in a
         # browser too old for it, and a syntax error here is a black screen.
         self.assertNotIn("(?<", self.code)
+
+    def test_it_never_fetches_a_qr_code(self):
+        # The code beside each sketch is an <img src> the browser loads and
+        # caches, pointing at a file render_index already wrote (qr.md §1.9,
+        # §5.4). This file encodes nothing and asks for nothing.
+        for call in re.findall(r"fetch\(([^)]*)", self.code):
+            self.assertNotIn("qr", call, call)
+        self.assertNotIn("encodeURIComponent(entry.url", self.code)
+        # And it adds no parameter to anything: the only "?kiosk" in the
+        # gallery is in the payload the generator encoded.
+        self.assertNotIn("?kiosk", self.code)
 
     def test_it_is_es5_like_the_rest_of_the_gallery(self):
         # No build step means the file is the file the browser gets.

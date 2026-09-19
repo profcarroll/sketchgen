@@ -27,6 +27,9 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from test_qr import decode  # noqa: E402
 
 from sketchgen import db  # noqa: E402
 from sketchgen import gallery  # noqa: E402
@@ -622,6 +625,38 @@ class EntryPageTests(GalleryTestCase):
         self.assertIn(f'href="../{self.ids[0]}/"', child)
         self.assertIn(f'href="../{self.ids[1]}/"', self.page)
         self.assertIn(f"lines/{self.ids[0]}.html", self.page)
+
+    # ---- the page's own QR code and the scan strip (qr.md §6) ------------
+
+    def test_the_source_panel_shows_the_entry_s_own_clean_code(self):
+        # Relative, because the file sits in this directory; the clean one,
+        # never the kiosk's; and once, because there is one code on this page.
+        self.assertEqual(1, self.page.count('src="qr.svg"'))
+        self.assertNotIn("qr-kiosk.svg", self.page)
+        url = self.config.entry_url(self.entry_id)
+        self.assertIn(f'<a href="{url}">{url}</a>', self.page)
+        self.assertIn("Scan to open this entry on a phone", self.page)
+
+    def test_the_code_is_decorative_because_the_url_is_printed_beside_it(self):
+        # A screen reader that announced "QR code" and stopped would be worse
+        # than one that reads the link (§1.10).
+        figure = self.page.split('<figure class="qr">')[1].split("</figure>")[0]
+        self.assertIn('alt=""', figure)
+
+    def test_the_scan_strip_is_written_hidden_and_links_the_page_s_controls(self):
+        self.assertIn("<p class=\"scanned\" data-scanned hidden>", self.page)
+        self.assertIn("You scanned this from a projection.", self.page)
+        self.assertIn(f'<a href="../../compare.html?a={self.entry_id}">', self.page)
+        self.assertIn('<a href="#engagement">Like it</a>', self.page)
+        self.assertIn('<a href="#critique-text">Ask for a revision</a>', self.page)
+        # The anchors point at things this page actually has.
+        self.assertIn('<section class="engagement" id="engagement">', self.page)
+        self.assertIn('id="critique-text"', self.page)
+
+    def test_without_the_param_the_page_is_what_it_was_plus_the_figure(self):
+        # Nothing about the strip is conditional in the generator: it is
+        # markup, hidden, and only gallery.js ever reveals it.
+        self.assertIn("hidden>You scanned", self.page)
 
 
 class MetaTests(GalleryTestCase):
@@ -2224,6 +2259,10 @@ class KioskManifestTests(GalleryTestCase):
         "source",
         "href",
         "judgment",
+        # qr.md §4 adds these two: the path of the entry's kiosk code, and the
+        # clean URL the kiosk prints under it.
+        "qr",
+        "url",
     }
 
     def test_render_index_writes_the_page_and_the_manifest(self):
@@ -2283,6 +2322,31 @@ class KioskManifestTests(GalleryTestCase):
         for name, entry_id in (("root", self.ids[0]), ("child", self.ids[1])):
             with self.subTest(entry=name):
                 self.assertEqual(self.SPEC_2_KEYS, set(rows[entry_id]) - {"canvas"})
+
+    def test_every_row_names_its_kiosk_code_and_its_clean_url(self):
+        # The manifest is read by one page and that page is the projection, so
+        # the path it carries is the -kiosk code. The url beside it is the
+        # clean one, because that is what the kiosk *prints* under the code
+        # and not what the code holds (qr.md §4, §5.3).
+        rows = self.rows()
+        for name, entry_id in (("root", self.ids[0]), ("child", self.ids[1])):
+            with self.subTest(entry=name):
+                row = rows[entry_id]
+                self.assertEqual(f"e/{entry_id}/qr-kiosk.svg", row["qr"])
+                self.assertEqual(
+                    f"https://profcarroll.github.io/sketchgen-gallery/e/{entry_id}/",
+                    row["url"],
+                )
+                self.assertNotIn("kiosk", row["url"])
+                # And the file that path names is actually there.
+                self.assertTrue((self.dest / row["qr"]).is_file())
+
+    def test_the_url_is_the_same_string_meta_json_publishes(self):
+        entry_id = self.ids[0]
+        meta = json.loads(
+            (self.dest / "e" / str(entry_id) / "meta.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(meta["source"]["entry"], self.rows()[entry_id]["url"])
 
     def test_a_root_says_so_with_nulls_and_a_child_names_its_parent(self):
         one, two, _ = self.ids
@@ -2411,6 +2475,157 @@ class KioskCanvasTests(GalleryTestCase):
     def test_whitespace_between_the_literals_is_allowed(self):
         self.assertEqual(
             [1024, 768], self.sketch_says("createCanvas(  1024 ,\n    768 )")["canvas"]
+        )
+
+
+class EntryQrCodeTests(GalleryTestCase):
+    """``e/<id>/qr.svg`` and ``e/<id>/qr-kiosk.svg`` (qr.md §4, §7).
+
+    The two files go in beside ``meta.json`` for every entry with a page, and
+    ``render_index`` writes them rather than ``render_entry``: they depend on
+    the entry's id and on ``config.gallery_url`` and on nothing else about the
+    entry, which is what lets a deploy pick them up without re-rendering 222
+    entry pages.
+
+    Every assertion about what a code *holds* goes through the decoder in
+    ``test_qr.py`` — the same walk a phone makes — rather than through the
+    encoder, so a code that is written correctly and encoded wrongly fails
+    here too.
+    """
+
+    def codes(self, entry_id):
+        return (
+            self.dest / "e" / str(entry_id) / "qr.svg",
+            self.dest / "e" / str(entry_id) / "qr-kiosk.svg",
+        )
+
+    def test_render_index_alone_writes_both_for_every_public_entry(self):
+        # render_index, not render_all: this is what update.sh runs on every
+        # deploy, and it is the whole of what the kiosk needs.
+        gallery.render_index(self.conn, self.dest, self.config)
+        for entry_id in self.ids:
+            for path in self.codes(entry_id):
+                with self.subTest(file=str(path.relative_to(self.dest))):
+                    self.assertTrue(path.is_file())
+
+    def test_render_all_writes_them_too(self):
+        self.render()
+        for entry_id in self.ids:
+            for path in self.codes(entry_id):
+                self.assertTrue(path.is_file(), str(path))
+
+    def test_a_kept_rejection_gets_them_and_a_held_entry_does_not(self):
+        # Both kinds of public entry have a page that links the file; a held
+        # entry has no directory at all, and publication holds for a person.
+        _one, two, kept = self.ids
+        held = add_child(self.conn, self.tmp, two, state="held")
+        self.render()
+        for path in self.codes(kept):
+            self.assertTrue(path.is_file(), f"kept rejection {kept}")
+        for path in self.codes(held):
+            self.assertFalse(path.exists(), f"held entry {held}")
+        self.assertFalse((self.dest / "e" / str(held)).exists())
+
+    def test_both_files_pass_the_guard(self):
+        self.render()
+        gallery.guard(self.dest)
+
+    def test_each_code_holds_its_own_entry_s_url_and_nothing_else(self):
+        self.render()
+        for entry_id in self.ids:
+            clean, kiosk = self.codes(entry_id)
+            url = self.config.entry_url(entry_id)
+            with self.subTest(entry=entry_id):
+                self.assertEqual(url, decode(clean.read_text(encoding="utf-8")))
+                self.assertEqual(
+                    url + "?kiosk", decode(kiosk.read_text(encoding="utf-8"))
+                )
+
+    def test_the_entry_page_s_code_carries_no_param(self):
+        # Someone scanning a laptop on a lectern did not scan a projection,
+        # and the param would be a lie in the only place the difference is
+        # measurable (§6.1).
+        self.render()
+        for entry_id in self.ids:
+            payload = decode(self.codes(entry_id)[0].read_text(encoding="utf-8"))
+            self.assertNotIn("?", payload)
+            self.assertNotIn("kiosk", payload)
+
+    def test_the_two_files_differ(self):
+        self.render()
+        for entry_id in self.ids:
+            clean, kiosk = self.codes(entry_id)
+            self.assertNotEqual(clean.read_bytes(), kiosk.read_bytes())
+
+    def test_a_different_gallery_url_gives_different_codes(self):
+        self.render()
+        was = {
+            entry_id: self.codes(entry_id)[0].read_bytes() for entry_id in self.ids
+        }
+        elsewhere = gallery.Config(
+            write_path=self.config.write_path,
+            gallery_url="https://example.invalid/elsewhere/",
+        )
+        gallery.render_all(self.conn, self.dest, elsewhere)
+        for entry_id in self.ids:
+            clean, kiosk = self.codes(entry_id)
+            with self.subTest(entry=entry_id):
+                self.assertNotEqual(was[entry_id], clean.read_bytes())
+                self.assertEqual(
+                    f"https://example.invalid/elsewhere/e/{entry_id}/",
+                    decode(clean.read_text(encoding="utf-8")),
+                )
+                self.assertEqual(
+                    f"https://example.invalid/elsewhere/e/{entry_id}/?kiosk",
+                    decode(kiosk.read_text(encoding="utf-8")),
+                )
+
+    def test_two_renders_of_one_database_write_identical_bytes(self):
+        # Determinism is a property of this packet and not an aspiration: no
+        # clock, no randomness, sorted iteration.
+        self.render()
+        first = {
+            entry_id: [path.read_bytes() for path in self.codes(entry_id)]
+            for entry_id in self.ids
+        }
+        cross_a_second()
+        self.render()
+        for entry_id in self.ids:
+            self.assertEqual(
+                first[entry_id],
+                [path.read_bytes() for path in self.codes(entry_id)],
+                f"entry {entry_id}",
+            )
+
+    def test_every_code_in_this_gallery_is_the_same_size(self):
+        # §1.5's budget, where it actually matters: a code that changes size
+        # as the slideshow advances reads as a bug, and a version bump costs
+        # about a tenth of the distance a phone scans from.
+        self.render()
+        boxes = set()
+        for entry_id in self.ids:
+            for path in self.codes(entry_id):
+                boxes.add(
+                    re.search(
+                        r'viewBox="([^"]+)"', path.read_text(encoding="utf-8")
+                    ).group(1)
+                )
+        self.assertEqual({"0 0 41 41"}, boxes)
+
+    def test_a_gallery_url_too_long_to_encode_refuses_the_whole_render(self):
+        # TooLong is a ValueError, so it comes out of render_index the way
+        # Unsafe does and _Written.undo() puts the checkout back.
+        self.render()
+        before = sorted(
+            str(path.relative_to(self.dest)) for path in self.dest.rglob("*")
+        )
+        huge = gallery.Config(gallery_url="https://" + "n" * 120 + ".invalid/")
+        with self.assertRaises(ValueError) as caught:
+            gallery.render_index(self.conn, self.dest, huge)
+        self.assertIn("version 6 at level M holds 106", str(caught.exception))
+        self.assertEqual(
+            before,
+            sorted(str(path.relative_to(self.dest)) for path in self.dest.rglob("*")),
         )
 
 

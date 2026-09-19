@@ -207,6 +207,28 @@ table.fields th, table.fields td {
 }
 table.fields th { color: var(--ink-soft); font-weight: 500; white-space: nowrap; width: 11rem; }
 
+/* The entry's own QR code, at the foot of the Source panel (qr.md §6.1). The
+ * white tile is not decoration: this theme is dark, and a transparent code on
+ * a dark ground is an inverted code that scanners differ on. */
+.qr { align-items: center; display: flex; gap: 1rem; margin: 1rem 0 0; }
+.qr img { background: #fff; border-radius: 0.4rem; display: block; padding: 0.5rem; }
+.qr figcaption { color: var(--ink-soft); font-size: 0.85rem; word-break: break-word; }
+
+/* The strip gallery.js reveals for somebody who arrived by scanning a
+ * projection (§6.2). It is a table of contents for a page a stranger has
+ * thirty seconds of patience for, and it links to controls this page already
+ * has; hidden until the script sees ?kiosk, and nothing in it is built from
+ * a URL parameter. */
+.scanned {
+  background: var(--chip);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 0.9rem;
+  margin: 0 0 1rem;
+  padding: 0.7rem 1rem;
+}
+.scanned[hidden] { display: none; }
+
 /* The filters fold away: <details> collapsed until someone opens it, or until
  * gallery.js sees a filter in the URL. A block, not a flex row, because a
  * summary is only reliably a disclosure while it is its parent's first flow
@@ -813,11 +835,16 @@ body.kiosk .status .hint { margin-left: 1em; }
 body.kiosk .status .hint kbd { font-size: 0.7rem; padding: 0 0.35em; }
 
 /* ---- caption block over the bottom of the stage ---- */
+/* Two parts side by side (qr.md §5.2): the words, and the QR block. A row
+ * rather than a second box overlaid on the stage, so that nothing can ever
+ * sit on top of anything — the caption already has the scrim, is already
+ * pointer-events: none, and is already the thing H hides. */
 body.kiosk .caption {
+  align-items: flex-end;
   background: linear-gradient(to top, var(--scrim-soft), rgba(5, 6, 8, 0));
   bottom: 0;
-  display: grid;
-  gap: 0.45rem;
+  display: flex;
+  gap: 2rem;
   left: 0;
   max-width: 62rem;
   padding: 3rem 2rem 1.5rem;
@@ -826,6 +853,30 @@ body.kiosk .caption {
   right: 0;
 }
 body.kiosk .caption:empty { display: none; }
+body.kiosk .caption .words { display: grid; flex: 1 1 auto; gap: 0.45rem; min-width: 0; }
+body.kiosk .caption .qr { display: grid; flex: 0 0 auto; gap: 0.3rem; }
+
+/* A phone reads a code from roughly ten times its width. At 13vh on a
+ * two-metre projection the tile is about 25 cm, so this works from two or
+ * three metres and not from the back of a lecture hall — which is why the URL
+ * is printed as text under it as well. Aim the projector accordingly. */
+body.kiosk .caption .qr .code {
+  background: #fff;
+  border-radius: 0.4rem;
+  display: block;
+  height: auto;
+  padding: 0.6rem;
+  width: clamp(7rem, 13vh, 12rem);
+}
+body.kiosk .caption .qr p {
+  color: var(--ink-soft);
+  font-size: 0.8rem;
+  letter-spacing: 0.03em;
+  margin: 0;
+  max-width: 13rem;
+  overflow-wrap: anywhere;
+}
+body.kiosk .caption .qr .scan { color: var(--ink); }
 body.kiosk .prompt {
   font-size: clamp(1.25rem, 2.6vw, 2.2rem);
   font-weight: 500;
@@ -1108,6 +1159,10 @@ body.kiosk .welcome .go:hover { border-color: var(--accent); outline: none; }
     width: 100%;
   }
   body.kiosk .caption { padding: 2rem 1rem 1rem; }
+  /* Stacked, the code goes above the words rather than after them: a
+   * phone-shaped screen would otherwise push it off the bottom, and the code
+   * is the one thing on this page a stranger can act on. */
+  body.kiosk .caption { flex-direction: column-reverse; align-items: stretch; }
   body.kiosk .menu {
     bottom: 1rem;
     grid-template-columns: 1fr;

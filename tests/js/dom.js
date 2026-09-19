@@ -186,6 +186,16 @@ function parseAttributes(blob) {
   return attrs;
 }
 
+/* The HTML elements that never have a closing tag. The kiosk's caption writes
+ * an <img> for the QR code (qr.md §5.3) and a parser that pushed it onto the
+ * stack would swallow everything after it. Only the ones a browser actually
+ * treats as void: an unknown tag still has to be closed, as it does in a
+ * browser, so a typo in the script is still a loud failure here. */
+const VOID_TAGS = [
+  "area", "base", "br", "col", "embed", "hr", "img", "input",
+  "link", "meta", "source", "track", "wbr"
+];
+
 function parseHTML(html, into) {
   const stack = [into];
   let rest = String(html);
@@ -201,7 +211,7 @@ function parseHTML(html, into) {
         const el = new Element(match[1]);
         parseAttributes(match[2]).forEach(function (pair) { el.setAttribute(pair[0], pair[1]); });
         stack[stack.length - 1].appendChild(el);
-        if (!match[3]) { stack.push(el); }
+        if (!match[3] && VOID_TAGS.indexOf(el.tagName) === -1) { stack.push(el); }
       } else {
         throw new Error("dom.js cannot parse innerHTML at: " + rest.slice(0, 40));
       }

@@ -64,6 +64,8 @@ const ENTRIES = [
     sketch: "e/11/sketch/",
     source: "e/11/sketch/sketch.js",
     href: "e/11/",
+    qr: "e/11/qr-kiosk.svg",
+    url: "https://profcarroll.github.io/sketchgen-gallery/e/11/",
     canvas: [800, 600],
     judgment: {
       human: { look: { score: 2.1, n: 2, pct: 0.9 }, brief: { score: 1.8, n: 2, pct: 0.7 } },
@@ -94,6 +96,8 @@ const ENTRIES = [
     sketch: "e/22/sketch/",
     source: "e/22/sketch/sketch.js",
     href: "e/22/",
+    qr: "e/22/qr-kiosk.svg",
+    url: "https://profcarroll.github.io/sketchgen-gallery/e/22/",
     judgment: {
       human: { look: { score: 1.0, n: 1, pct: 0.5 }, brief: { score: 1.1, n: 1, pct: 0.55 } },
       agent: { look: { score: 0.9, n: 1, pct: 0.4 }, brief: { score: 0.8, n: 1, pct: 0.45 } }
@@ -123,6 +127,8 @@ const ENTRIES = [
     sketch: "e/33/sketch/",
     source: "e/33/sketch/sketch.js",
     href: "e/33/",
+    qr: "e/33/qr-kiosk.svg",
+    url: "https://profcarroll.github.io/sketchgen-gallery/e/33/",
     canvas: [400, 400],
     judgment: {
       human: { look: { score: 1.5, n: 3, pct: 0.6 }, brief: { score: 1.4, n: 3, pct: 0.3 } },
@@ -541,9 +547,11 @@ async function settings() {
 }
 
 /* A stored setup with no URL to override it, and then a URL that overrides
- * half of it: a parameter beats storage, storage beats the default (§1.8). */
+ * half of it: a parameter beats storage, storage beats the default (§1.8).
+ * Stored at the current settings version, so this run is precedence alone and
+ * the migration below is tested where it belongs. */
 async function precedence() {
-  const stored = JSON.stringify({ every: 120, order: "oldest", show: { brief: true } });
+  const stored = JSON.stringify({ v: 2, every: 120, order: "oldest", show: { brief: true } });
   const first = await load({ search: "", stored: stored });
   await quiet();
   const fromStorage = first.document.getElementById("launch").textContent;
@@ -606,6 +614,97 @@ async function noWritePath() {
     launch: document.getElementById("launch").textContent,
     current: document.querySelector("#m-orders li.current").textContent,
     stored: JSON.parse(window.localStorage.getItem("sketchgen-kiosk") || "null")
+  };
+}
+
+/* ---- the QR overlay (qr.md §5) --------------------------------------------- */
+
+function codes(document) { return document.querySelectorAll(".caption .qr img"); }
+
+function qrBlock(document) {
+  const image = codes(document);
+  return {
+    images: image.length,
+    src: image.length ? image[0].getAttribute("src") : null,
+    alt: image.length ? image[0].getAttribute("alt") : null,
+    lines: Array.prototype.map.call(
+      document.querySelectorAll(".caption .qr p"),
+      function (p) { return p.textContent; }
+    )
+  };
+}
+
+/* On by default, one image at a time, and it swaps with the entry. */
+async function qr() {
+  const { document, tock } = await started({});
+  const onByDefault = qrBlock(document);
+  const launch = document.getElementById("launch").textContent;
+  const menuCount = document.getElementById("m-count").textContent;
+  const menuRows = document.querySelectorAll("#m-overlays li").length;
+
+  press(document, "ArrowRight");            // opens the menu
+  press(document, "ArrowRight");            // and now advances
+  tock(FADE);
+  const afterAdvance = qrBlock(document);
+  press(document, "Escape");
+
+  press(document, "z");                     // opens the menu
+  press(document, "Q");                     // Q toggles it off
+  const toggledOff = qrBlock(document);
+  press(document, "q");                     // and the lowercase key back on
+  const toggledOn = qrBlock(document);
+
+  press(document, "H");                     // H hides every overlay
+  const hidden = {
+    images: codes(document).length,
+    caption: document.getElementById("caption").innerHTML
+  };
+
+  return {
+    onByDefault: onByDefault,
+    launch: launch,
+    menuCount: menuCount,
+    menuRows: menuRows,
+    afterAdvance: afterAdvance,
+    toggledOff: toggledOff,
+    toggledOn: toggledOn,
+    hidden: hidden
+  };
+}
+
+/* An explicit ?show= is an explicit list (§1.8): naming one overlay turns the
+ * others off, the default included. And with no write path the third line —
+ * three verbs that are all the write path — is not printed at all (§5.3). */
+async function qrElsewhere() {
+  const explicit = await started({ search: "?show=prompt" });
+  const alone = qrBlock(explicit.document);
+  const offline = await started({ search: "?show=qr", writePath: null });
+  return { explicit: alone, offline: qrBlock(offline.document) };
+}
+
+/* A projector configured before the QR overlay existed has a stored blob that
+ * cannot mention it. It comes back with the code on, and stamped (§5.1). */
+async function migration() {
+  const old = JSON.stringify({ every: 60, order: "newest", show: { prompt: true } });
+  const before = await load({ stored: old });
+  await quiet();
+  const migrated = before.document.getElementById("launch").textContent;
+  before.document.getElementById("go").click();
+  await quiet();
+  press(before.document, "z");
+  press(before.document, "p");
+  press(before.document, "p");
+  const stamped = JSON.parse(before.window.localStorage.getItem("sketchgen-kiosk"));
+
+  // And somebody who turned it off after the migration keeps it off: the
+  // stamp is what stops the migration running twice.
+  const current = JSON.stringify({ v: 2, every: 60, order: "newest", show: { prompt: true } });
+  const after = await load({ stored: current });
+  await quiet();
+  return {
+    migrated: migrated,
+    stamped: stamped,
+    stays: after.document.getElementById("launch").textContent
   };
 }
 
@@ -763,6 +862,9 @@ async function main() {
     paused: await paused(),
     random: await random(),
     fitting: await fitting(),
+    qr: await qr(),
+    qrElsewhere: await qrElsewhere(),
+    migration: await migration(),
     starting: await starting(),
     source: { chars: SOURCE.length, bytes: Buffer.byteLength(SOURCE, "utf8") }
   };

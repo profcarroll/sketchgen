@@ -215,6 +215,8 @@ from it; say so in a comment.
 Modifier chords are ignored, so a browser shortcut stays a browser shortcut. Every acting key
 repaints the menu, restarts its 8 s timer, and persists (§1.8).
 
+Amended by `docs/plans/qr.md`: `Q` toggles a QR code of the entry's URL, on by default.
+
 ### 4.2 Sequence and timer
 
 - `sequence(order)` returns entry ids from the manifest: the seven comparators from `gallery.js`
