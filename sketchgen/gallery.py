@@ -284,11 +284,18 @@ class Config:
     ``/counts``, ``/like``, ``/vote`` and ``/login`` hang off it. It is empty
     until that service exists, and ``gallery.js`` renders an em dash and a
     disabled like button when it is.
+
+    ``kiosk_views`` is whether a sketch played on the projector counts as a
+    view (docs/plans/kiosk-views.md §3.3). It lives here rather than in the
+    pipeline because the write path has no switch of its own to turn it off
+    with: this one is a line in the gallery checkout's ``config.json``, which
+    ``load`` reads back and ``render-index`` leaves as it found it.
     """
 
     write_path: str = ""
     gallery_url: str = DEFAULT_GALLERY_URL
     repository: str = DEFAULT_REPOSITORY
+    kiosk_views: bool = True
 
     @classmethod
     def load(cls, dest_dir: str | Path) -> "Config":
@@ -306,6 +313,10 @@ class Config:
             write_path=str(data.get("write_path") or ""),
             gallery_url=str(data.get("gallery_url") or DEFAULT_GALLERY_URL),
             repository=str(data.get("repository") or DEFAULT_REPOSITORY),
+            # Absent is on. A gallery whose config.json predates the kiosk
+            # counts its views, which is the state every checkout is in the
+            # first time this runs.
+            kiosk_views=data.get("kiosk_views") is not False,
         )
 
     def to_json(self) -> str:
@@ -315,6 +326,7 @@ class Config:
                     "write_path": self.write_path,
                     "gallery_url": self.gallery_url,
                     "repository": self.repository,
+                    "kiosk_views": self.kiosk_views,
                 },
                 indent=2,
                 sort_keys=True,
