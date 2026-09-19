@@ -122,7 +122,7 @@ In `sketchgen/gallery.py`, `_forest(conn, *, admit: int | None = None)` includes
 }
 ```
 
-Rules: every entry in the `entries` table appears, whatever its state, so generation counts add up. Non-public entries carry no `strip`, no `root_prompt`, no `submitted_by`. `public` is true for states in `PUBLIC_STATES` with `published_utc` set. `parent` comes from `_parent_of` regardless of the parent's state (this is the difference from `_forest`, which is for the site's tree pages and stays as it is). `root_prompt` is the prompt split at the first `REVISE_HEADING`. Keep it under 100 KB at 300 entries; if `critique` pushes it over, truncate `root_prompt` to 200 characters.
+Rules: `generated_utc` is the newest stamp the database holds (an entry's `created_utc` or `published_utc`, a lineage row's `created_utc`, the schema stamp for an empty gallery), not the wall clock: the same database gives the same bytes, so a re-render that changed nothing is the no-op `publish_index` promises rather than a commit that moves one timestamp. Every entry in the `entries` table appears, whatever its state, so generation counts add up. Non-public entries carry no `strip`, no `root_prompt`, no `submitted_by`. `public` is true for states in `PUBLIC_STATES` with `published_utc` set. `parent` comes from `_parent_of` regardless of the parent's state (this is the difference from `_forest`, which is for the site's tree pages and stays as it is). `root_prompt` is the prompt split at the first `REVISE_HEADING`. Keep it under 100 KB at 300 entries; if `critique` pushes it over, truncate `root_prompt` to 200 characters.
 
 ### 4.3 Split the prompt
 
