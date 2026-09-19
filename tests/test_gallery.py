@@ -18,9 +18,11 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
@@ -31,6 +33,19 @@ from sketchgen import db  # noqa: E402
 from sketchgen import gallery  # noqa: E402
 from sketchgen import lineage  # noqa: E402
 from sketchgen.cli import gallery as cli_gallery  # noqa: E402
+
+
+def cross_a_second() -> None:
+    """Wait until the wall clock's second has ticked over.
+
+    A render is supposed to be a function of the database, so two of them must
+    agree whichever seconds they fall in. Waiting here is the cheapest way to
+    ask that on purpose rather than one run in ten — the whole shape of the
+    bug this guards was that it was invisible inside one second.
+    """
+    edge = int(time.time()) + 1
+    while time.time() < edge:
+        time.sleep(0.02)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI = REPO_ROOT / "bin" / "sketchgen"
@@ -2187,31 +2202,88 @@ class GuardTests(GalleryTestCase):
 class DeterminismTests(GalleryTestCase):
 
     def render(self):
-        # lineage.json carries a generated_utc, the one clock a render reads.
-        # Pinning it here is what lets this test ask the question it means to
-        # ask — does the same database give the same bytes — rather than
-        # whether the two renders fell in the same second.
-        return gallery.render_all(
-            self.conn, self.dest, self.config, generated_utc="2026-09-14T04:02:11Z"
-        )
+        """Nothing pinned. This test used to pass ``generated_utc`` so that the
+        two renders could not differ in ``lineage.json``, which is the one file
+        that *did* differ: the guard was turned off against the only thing it
+        needed to guard. Now the stamp comes from a row like every other
+        timestamp here, so the real question can be asked."""
+        return gallery.render_all(self.conn, self.dest, self.config)
+
+    def files(self):
+        return {
+            path.relative_to(self.dest): path.read_bytes()
+            for path in sorted(self.dest.rglob("*"))
+            if path.is_file()
+        }
 
     def test_a_second_render_all_is_byte_identical(self):
         self.render()
-        first = {
-            path.relative_to(self.dest): path.read_bytes()
-            for path in sorted(self.dest.rglob("*"))
-            if path.is_file()
-        }
+        first = self.files()
+        cross_a_second()
         self.render()
-        second = {
-            path.relative_to(self.dest): path.read_bytes()
-            for path in sorted(self.dest.rglob("*"))
-            if path.is_file()
-        }
+        second = self.files()
         self.assertEqual(sorted(first), sorted(second))
         for name, data in first.items():
             with self.subTest(path=str(name)):
                 self.assertEqual(data, second[name])
+
+    def test_the_stamped_file_is_identical_across_a_second_boundary(self):
+        """The 1-in-10 failure in test_publish, as a question asked on purpose.
+
+        Two renders only ever differed when they fell either side of a second,
+        so the bug hid from a test that asked the question and lost the coin
+        toss. Crossing the boundary deliberately is what turns a flake into an
+        assertion.
+        """
+        self.render()
+        first = (self.dest / "lineage.json").read_bytes()
+        cross_a_second()
+        self.render()
+        self.assertEqual(first, (self.dest / "lineage.json").read_bytes())
+
+
+class DataAsOfTests(GalleryTestCase):
+    """``generated_utc`` is a row, not the time of day."""
+
+    def test_it_is_the_newest_stamp_behind_the_file(self):
+        newest = self.conn.execute(
+            "SELECT MAX(stamp) AS s FROM ("
+            "  SELECT MAX(created_utc) AS stamp FROM entries"
+            "  UNION ALL SELECT MAX(published_utc) FROM entries"
+            "  UNION ALL SELECT MAX(created_utc) FROM lineage)"
+        ).fetchone()["s"]
+        self.assertEqual(newest, gallery.data_as_of(self.conn))
+
+    def test_the_file_carries_it(self):
+        self.render()
+        data = json.loads((self.dest / "lineage.json").read_text(encoding="utf-8"))
+        self.assertEqual(gallery.data_as_of(self.conn), data["generated_utc"])
+
+    def test_it_moves_when_the_data_does(self):
+        before = gallery.data_as_of(self.conn)
+        self.conn.execute(
+            "UPDATE entries SET published_utc = ? WHERE id = ?",
+            ("2099-01-01T00:00:00Z", self.ids[0]),
+        )
+        self.assertEqual("2099-01-01T00:00:00Z", gallery.data_as_of(self.conn))
+        self.assertNotEqual(before, gallery.data_as_of(self.conn))
+
+    def test_a_database_with_nothing_in_it_still_has_a_fixed_stamp(self):
+        """An empty gallery has to render the same bytes twice too, and there
+        is no row to read — so it is a constant, not a clock."""
+        empty = sqlite3.connect(":memory:")
+        empty.row_factory = sqlite3.Row
+        empty.executescript(
+            "CREATE TABLE entries (id INTEGER PRIMARY KEY, created_utc TEXT, "
+            "published_utc TEXT);"
+            "CREATE TABLE lineage (child_entry_id INTEGER PRIMARY KEY, "
+            "created_utc TEXT);"
+        )
+        self.addCleanup(empty.close)
+        self.assertEqual(gallery.NO_DATA_UTC, gallery.data_as_of(empty))
+        self.assertRegex(
+            gallery.data_as_of(empty), r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
+        )
 
 
 class RenderAllRereadsTests(GalleryTestCase):

@@ -38,9 +38,12 @@ and likes live behind the write path (packet 3.3) and are rendered by
 they are never folded into either score (spec §5).
 
 **The same database gives the same bytes.** No clock is read while rendering:
-every timestamp on a page comes from a row. A second ``render_all`` over an
-unchanged database rewrites every file identically, which is what makes the
-publisher's commit in packet 3.2 mean something.
+every timestamp on a page comes from a row, and ``lineage.json``'s own
+``generated_utc`` is the newest of those rows (:func:`data_as_of`) rather than
+the time of day. A second ``render_all`` over an unchanged database rewrites
+every file identically, which is what makes the publisher's commit in packet
+3.2 mean something: ``publish_index`` reads "site unchanged" off a diff, so a
+render that is not reproducible is a publisher that pushes on every run.
 
 Python 3.12, stdlib only: ``string.Template``, ``html``, ``json``.
 """
@@ -57,7 +60,6 @@ from pathlib import Path
 from string import Template
 from typing import Any, Iterable
 
-from . import db as db_mod
 from . import pairs as pairs_mod
 from . import lineage
 
@@ -71,6 +73,7 @@ __all__ = [
     "Unsafe",
     "UnknownEntry",
     "guard",
+    "data_as_of",
     "render_all",
     "render_entry",
     "render_index",
@@ -495,6 +498,11 @@ LINEAGE_JSON_LIMIT = 100 * 1024
 #: What a root prompt shrinks to if the file ever crosses that line.
 LINEAGE_ROOT_PROMPT_CAP = 200
 
+#: ``lineage.json``'s stamp for a database with nothing in it to be as of. A
+#: constant rather than a clock, because an empty gallery has to render the
+#: same bytes twice as much as a full one does.
+NO_DATA_UTC = "1970-01-01T00:00:00Z"
+
 
 def _offplan(row: Any) -> list[str]:
     """The assertions the kept attempt missed, for an entry that still runs.
@@ -531,6 +539,41 @@ def _is_public(row: Any) -> bool:
 
 def _every_entry(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(conn.execute("SELECT * FROM entries ORDER BY id"))
+
+
+def data_as_of(conn: sqlite3.Connection) -> str:
+    """The newest row stamp behind ``lineage.json`` — this module's only clock,
+    and it is a row, not the time of day.
+
+    ``lineage.json`` is the one generated file with a timestamp of its own, and
+    until 2026-09-19 that timestamp was ``utc_now()`` at render time. That broke
+    this module's rule (see the module docstring): the same database stopped
+    giving the same bytes, because two renders a second apart differed in that
+    field and in nothing else. What it cost was the meaning of the publisher's
+    commit — ``publish_index`` decides "site unchanged" by diffing the render
+    against the checkout, so a re-render with no new data committed and pushed
+    a whole gallery to change one second. (It showed up as a 1-in-10 flake in
+    ``test_publish``: the two renders only differed when they happened to
+    straddle a second boundary.)
+
+    So the stamp comes from the rows the file is built from — every entry, and
+    the lineage links — and it answers the question a reader of the file
+    actually has, which is how fresh the *data* is rather than how recently
+    somebody ran the generator.
+
+    A state change that stamps no column (an archive, say) moves the file's
+    contents without moving this; the render still differs, so it is still
+    committed, and only the stamp stands still. The alternative — a clock — got
+    that one case right by getting every other case wrong.
+    """
+    newest = conn.execute(
+        "SELECT MAX(stamp) AS stamp FROM ("
+        "  SELECT MAX(created_utc) AS stamp FROM entries"
+        "  UNION ALL SELECT MAX(published_utc) FROM entries"
+        "  UNION ALL SELECT MAX(created_utc) FROM lineage"
+        ")"
+    ).fetchone()
+    return str(newest["stamp"]) if newest and newest["stamp"] else NO_DATA_UTC
 
 
 def _whole_forest(
@@ -2439,10 +2482,10 @@ def render_index(
 ) -> list[Path]:
     """Write the grid, the failures, compare, the line pages, assets and config.
 
-    ``generated_utc`` is the one clock this module reads, and it reaches only
-    ``lineage.json``, whose shape the spec fixes with that field in it. Pass a
-    stamp to keep a render byte-identical to another one; every page is
-    unaffected either way.
+    ``generated_utc`` reaches only ``lineage.json``, whose shape the spec fixes
+    with that field in it. It defaults to :func:`data_as_of` — the newest row
+    behind the file, not the time of day — so that two renders of one database
+    are byte-identical; pass one to pin it. Every page is unaffected either way.
     """
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
@@ -2502,7 +2545,7 @@ def render_index(
         written.write_text(
             dest / "lineage.json",
             _lineage_bytes(
-                _lineage_index(conn, generated_utc or db_mod.utc_now())
+                _lineage_index(conn, generated_utc or data_as_of(conn))
             ).decode("utf-8"),
         )
         # Every public entry, not just the published ones: a kept rejection's

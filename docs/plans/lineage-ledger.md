@@ -91,6 +91,8 @@ In `sketchgen/gallery.py`, `_forest(conn, *, admit: int | None = None)` includes
 
 `render_index` writes `<gallery>/lineage.json` next to `pairs.json`. Client code paints the parts of the panel that change after an entry is published (siblings, children, state chips). Shape:
 
+`generated_utc` is **the newest row behind the file** — `gallery.data_as_of`, the max of `entries.created_utc`, `entries.published_utc` and `lineage.created_utc` — not the time the render ran. It was render time until 2026-09-19, which made this the one file a render could not reproduce; since `publish_index` reads "site unchanged" off a diff, that meant a re-render with no new data committed and pushed the whole gallery to change one second. The field answers "how fresh is this data", which is the question a reader of it has.
+
 ```json
 {
   "generated_utc": "2026-09-15T14:00:00Z",
