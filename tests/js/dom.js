@@ -118,6 +118,12 @@ function styleOf(el) {
     get(target, prop) {
       if (typeof prop !== "string") { return undefined; }
       if (prop === "setProperty") { return setProperty; }
+      if (prop === "getPropertyValue") {
+        return function (name) {
+          var found = parseStyle(el.getAttribute("style"))[name];
+          return found === undefined ? "" : found;
+        };
+      }
       if (prop === "removeProperty") {
         return function (name) {
           const declarations = parseStyle(el.getAttribute("style"));
@@ -232,9 +238,11 @@ class Element {
     this.parentNode = null;
     this.listeners = {};
     this.hidden = false;
-    // Node lays nothing out, so every box is zero. A script that divides by a
-    // dimension has to cope with a stage it cannot measure anyway: that is a
-    // hidden element in a browser too.
+    // Node lays nothing out, so every box starts at zero: a script that
+    // divides by a dimension has to cope with an element it cannot measure,
+    // which is a hidden element in a browser too. They are plain properties
+    // so a test can say how big a box is — set stage.clientWidth and
+    // clientHeight and the fitting arithmetic becomes checkable.
     this.clientWidth = 0;
     this.clientHeight = 0;
     this.scrollHeight = 0;

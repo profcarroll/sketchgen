@@ -25,10 +25,13 @@
  * evaluate sketch source; touch a localStorage key other than sketchgen-kiosk;
  * or hold more than one iframe at a time.
  *
- * base() and loadConfig() are copied from gallery.js rather than shared with
- * it. gallery.js is one IIFE and exports nothing, and twenty duplicated lines
- * cost less than a global would: this page loads both scripts, but kiosk.js
- * asks nothing of gallery.js and still works if it is absent (spec §4).
+ * This is the only script the page loads. gallery.js is not on it: its ready()
+ * asks /me for the signed-in viewer, and a projector in a lobby has no viewer
+ * to name and no business sending a credentialed request all day. So base()
+ * and loadConfig() are copied from it — twenty duplicated lines, rather than
+ * a shared global or a second script whose other five jobs all write.
+ * window.SKETCHGEN_ROOT, set inline by the template, is the only thing this
+ * file reads that it did not put there itself.
  *
  * Vanilla, ES5, no build step, no framework, no web font, nothing from a CDN.
  */
@@ -70,6 +73,11 @@
 
   /* gallery.py's NO_PAIRS. A score nobody voted on is not a low score. */
   var NO_PAIRS = "no pairs yet";
+
+  /* Said on the start card, in place of its last line, when there is no
+   * manifest to play. One sentence, because a projector is read at a
+   * distance by somebody who did not set it up. */
+  var CANNOT_LOAD = "Could not load the gallery's list of sketches.";
 
   /* The grid's seven orders, in the grid's order: the 1-7 keys index this
    * list and S walks it. */
@@ -143,6 +151,19 @@
     return typeof value === "number" ? Number(value).toLocaleString() : "—";
   }
 
+  /* One decimal and a unit, or the same em dash: a wall time the database does
+   * not have is not zero seconds, and "written in 0.0 s" would be a claim. */
+  function secs(value) {
+    return typeof value === "number" ? value.toFixed(1) + " s" : "—";
+  }
+
+  /* The code heading says bytes, so it counts bytes rather than characters: a
+   * sketch with an em dash in a comment is longer than its length says. ES5
+   * has no TextEncoder to lean on, and this is the round trip that works. */
+  function byteLength(text) {
+    return unescape(encodeURIComponent(String(text))).length;
+  }
+
   function ready(fn) {
     if (document.readyState !== "loading") { fn(); }
     else { document.addEventListener("DOMContentLoaded", fn); }
@@ -161,14 +182,22 @@
       .catch(function () { config = {}; return config; });
   }
 
+  /* Unlike loadConfig, this one lets a failure through. A missing config.json
+   * is a gallery with no write path, which is a state this page knows how to
+   * be in; a missing kiosk.json is nothing to play, and the card has to say
+   * so rather than hand over a black screen. */
+  /* no-store for the same reason config.json has it: render_index rewrites
+   * this file on every deploy, and the one page that must not show a stale
+   * list is the one nobody reloads. A projector is opened once and left for
+   * days; a cached manifest would keep playing the gallery as it was the
+   * morning it was switched on. */
   function loadManifest() {
-    return fetch(ROOT + "kiosk.json")
+    return fetch(ROOT + "kiosk.json", { cache: "no-store" })
       .then(function (response) { return response.json(); })
       .then(function (data) {
         ENTRIES = (data && data.entries) || [];
         return ENTRIES;
-      })
-      .catch(function () { ENTRIES = []; return ENTRIES; });
+      });
   }
 
   /* ---- views and likes -------------------------------------------------- */
@@ -421,9 +450,6 @@
     var at;
     var by = null;
     for (at = 0; at < ENTRIES.length; at += 1) { seats.push(at); }
-    // Without a write path there are no likes to sort on, and an order that
-    // is every entry tied at zero is not an order (spec §4.2).
-    if (order === "liked" && !base()) { order = "newest"; }
     if (order === "random") { return shuffle(seats); }
     if (order === "oldest") { by = byOldest; }
     else if (order === "liked") { by = byLikes; }
@@ -435,6 +461,21 @@
     return seats;
   }
 
+  /* Without a write path there are no likes to sort on, and an order that is
+   * every entry tied at zero is not an order (spec §4.2). The fallback lands
+   * in state rather than only in the sequence, so the status line, the menu's
+   * current row and the launch link all name the order that is really
+   * playing: a projector that says "liked" while playing newest is lying
+   * about what the room is looking at. */
+  function settleOrder() {
+    if (state.order === "liked" && !base()) {
+      state.order = "newest";
+      // The stored setup and the address bar named an order this gallery
+      // cannot play. Leave them naming the one it can.
+      persist();
+    }
+  }
+
   /* Changing the order keeps the sketch that is on screen on screen, and
    * re-seats it where the new order puts it. */
   function reorder(order) {
@@ -442,7 +483,8 @@
     var id = showing ? showing.id : null;
     var at;
     state.order = order;
-    state.seq = sequence(order);
+    settleOrder();
+    state.seq = sequence(state.order);
     state.i = 0;
     for (at = 0; at < state.seq.length; at += 1) {
       if (ENTRIES[state.seq[at]].id === id) { state.i = at; break; }
@@ -554,7 +596,7 @@
     var revised;
     var html = "";
     if (on("prompt")) {
-      html += "<h1 class=\"prompt\"><span class=\"num\">#" + entry.id + "</span>" +
+      html += "<h1 class=\"prompt\"><span class=\"num\">#" + esc(entry.id) + "</span>" +
         esc(parts.root) + "</h1>";
       if (parts.revisions.length) {
         revised = parts.revisions.length === 1
@@ -568,12 +610,12 @@
         "</span> · planned by <span>" + esc(entry.planner) +
         "</span> · written by <span>" + esc(entry.executor) + "</span> under the " +
         esc(entry.rules_file) + " rules" +
-        (entry.attempts > 1 ? ", gate passed on attempt " + entry.attempts : "") + "</p>";
+        (entry.attempts > 1 ? ", gate passed on attempt " + esc(entry.attempts) : "") + "</p>";
     }
     if (on("generation")) {
-      facts.push("<li class=\"gen\"><b>generation " + entry.generation + "</b>" +
+      facts.push("<li class=\"gen\"><b>generation " + esc(entry.generation) + "</b>" +
         (entry.parent_entry_id
-          ? " · revised from #" + entry.parent_entry_id +
+          ? " · revised from #" + esc(entry.parent_entry_id) +
             (entry.critique_by ? " after a critique by " + esc(entry.critique_by) : "")
           : " · a root") + "</li>");
     }
@@ -585,7 +627,7 @@
         num(entry.completion_tokens) + "</b> completion tokens</li>");
     }
     if (on("seconds")) {
-      facts.push("<li>written in <b>" + Number(entry.wall_s).toFixed(1) + " s</b></li>");
+      facts.push("<li>written in <b>" + secs(entry.wall_s) + "</b></li>");
     }
     if (on("licence")) { facts.push("<li><b>" + esc(entry.licence) + "</b></li>"); }
     if (facts.length) { html += "<ul class=\"facts\">" + facts.join("") + "</ul>"; }
@@ -614,7 +656,7 @@
     var html = [];
     var at;
     $("codefile").textContent = "e/" + entry.id + "/sketch/sketch.js · " +
-      num(source.length) + " bytes, unedited";
+      num(byteLength(source)) + " bytes, unedited";
     for (at = 0; at < lines.length; at += 1) {
       html.push("<span class=\"ln\">" + (at + 1) + "</span>" + esc(lines[at]));
     }
@@ -741,14 +783,33 @@
     paintStatus();
   }
 
-  /* Move by one, with the fade: the timer's end, and manual next/previous.
-   * A random sequence is reshuffled when it wraps, so a day-long run is not
-   * one permutation. */
+  /* A fresh permutation every time a random sequence wraps, so a day-long run
+   * is not one order repeated. If the new one opens on the sketch that is
+   * still on the stage, move it out of the way: the wrap would otherwise fade
+   * out of a sketch and back into the same one, which reads as a stall rather
+   * than as a shuffle. */
+  function reshuffled() {
+    var seats = sequence("random");
+    var showing = current();
+    var pick;
+    var held;
+    if (showing && seats.length > 1 && ENTRIES[seats[0]].id === showing.id) {
+      pick = 1 + Math.floor(Math.random() * (seats.length - 1));
+      held = seats[0];
+      seats[0] = seats[pick];
+      seats[pick] = held;
+    }
+    return seats;
+  }
+
+  /* Move by one, with the fade: the timer's end, and manual next/previous. */
   function go(to) {
     var len = state.seq.length;
     var stage = $("stage");
     if (!len) { return; }
-    if (state.order === "random" && to >= len) { state.seq = sequence("random"); }
+    // reshuffled() reads the sketch on screen, so it runs before the sequence
+    // it is replacing is thrown away.
+    if (state.order === "random" && to >= len) { state.seq = reshuffled(); }
     state.i = ((to % len) + len) % len;
     state.elapsed = 0;
     stage.classList.add("fading");
@@ -851,6 +912,7 @@
   /* ---- start ------------------------------------------------------------ */
 
   function play() {
+    settleOrder();
     state.seq = sequence(state.order);
     state.i = 0;
     state.playing = true;
@@ -861,16 +923,43 @@
     window.setTimeout(openMenu, START_MENU_MS);
   }
 
-  var loaded = null;
+  /* The card waits for the manifest rather than the other way round.
+   *
+   * Taking the click first and fetching afterwards is how a projector on a
+   * slow or dead network ends up showing a black screen that answers no key:
+   * the card is gone, nothing is playing, and because nothing is playing the
+   * key handler returns without even opening the menu. So the button is dead
+   * until there is something to play, and says which of the two it is. */
+  function waitToStart() {
+    var button = $("go");
+    button.disabled = true;
+    button.textContent = "loading…";
+  }
+
+  function offerStart() {
+    var button = $("go");
+    button.disabled = false;
+    button.textContent = "Start";
+  }
+
+  function cannotStart() {
+    // In place of the card's last line, which explains the click it is no
+    // longer worth making.
+    var note = document.querySelector(".welcome .note");
+    $("go").disabled = true;
+    $("go").textContent = "Start";
+    if (note) { note.textContent = CANNOT_LOAD; }
+  }
 
   function wireStart() {
     $("go").addEventListener("click", function () {
-      // Hide the card on the click itself: that press is the gesture the
-      // browser wants before it will run audio or go full screen, and it must
-      // not be spent waiting for a fetch.
+      // The manifest is already in hand, so this click only starts: it is
+      // spent on the gesture the browser wants before it will run audio or go
+      // full screen, and on nothing else.
+      if (!ENTRIES.length) { return; }
       $("welcome").hidden = true;
       document.body.classList.add("playing");
-      loaded.then(play);
+      play();
     });
   }
 
@@ -893,12 +982,25 @@
     window.addEventListener("resize", function () { window.setTimeout(fitFrame, 60); });
     wireIdle();
     wireStart();
-    loaded = Promise.all([loadManifest(), loadConfig()]).then(function () {
+    waitToStart();
+    // Both files are asked for on load, not on the click: the card is the
+    // wait, so that the click is not.
+    Promise.all([loadManifest(), loadConfig()]).then(function () {
+      // An empty gallery is nothing to play, and says so rather than starting
+      // into a black screen.
+      if (!ENTRIES.length) { cannotStart(); return; }
       loadCounts();
       // Ten minutes: a projector runs all day, and a like recorded at noon
       // should show up before the room empties.
       window.setInterval(loadCounts, COUNTS_EVERY_MS);
+      // The write path is known now, so an order that needs one can be
+      // settled before anybody reads the menu.
+      settleOrder();
       paintMenu();
+      paintStatus();
+      offerStart();
+    }).catch(function () {
+      cannotStart();
     });
   });
 })();
