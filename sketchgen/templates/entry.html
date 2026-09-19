@@ -23,7 +23,8 @@
     $frame
     <p class="stage-meta">seed $seed · entry $entry_id · $state_chip · the gate ran this page with the seeds fixed and the clock frozen</p>
   </section>
-  <section class="engagement">
+  <p class="scanned" data-scanned hidden>You scanned this from a projection. <a href="$compare_href">Judge it against another</a> · <a href="#engagement">Like it</a><span data-scanned-critique> · <a href="#critique-text">Ask for a revision</a></span>.</p>
+  <section class="engagement" id="engagement">
     <p class="counts"><span class="count" data-count="views">—</span> views · <span class="count" data-count="likes">—</span> likes</p>
     <p class="actions">
       <button type="button" class="like" data-like="$entry_id" disabled>like</button>
@@ -65,6 +66,10 @@
     <table class="fields">
       $source_rows
     </table>
+    <figure class="qr">
+      <img src="qr.svg" alt="" width="132" height="132">
+      <figcaption>Scan to open this entry on a phone · <a href="$entry_url">$entry_url</a></figcaption>
+    </figure>
   </section>
   <section class="panel">
     $lineage
