@@ -322,10 +322,105 @@ class KioskTests(unittest.TestCase):
 
     def test_liked_falls_back_to_newest_with_no_write_path(self):
         # No write path, no likes: every entry tied at zero is not an order.
-        self.assertEqual(33, self.report["noWritePath"]["entry"])
+        fell_back = self.report["noWritePath"]
+        self.assertEqual(33, fell_back["entry"])
         self.assertEqual(
-            ["generation 1 · a root", "— views", "— likes"],
-            self.report["noWritePath"]["facts"],
+            ["generation 1 · a root", "— views", "— likes"], fell_back["facts"]
+        )
+
+    def test_the_fallback_is_what_every_label_says_too(self):
+        # A projector that plays newest while saying "liked" is lying about
+        # what the room is looking at, so the fallback lands in the state and
+        # not only in the sequence.
+        fell_back = self.report["noWritePath"]
+        self.assertTrue(fell_back["status"].startswith("1 of 3 · newest"))
+        self.assertEqual(
+            "kiosk.html?order=newest&every=60&show=prompt,authors,generation,views,likes",
+            fell_back["launch"],
+        )
+        self.assertIn("newest first", fell_back["current"])
+        self.assertEqual("newest", fell_back["stored"]["order"])
+
+    # ---- the playback timer (§4.2) ---------------------------------------
+
+    def test_the_progress_line_is_elapsed_over_every(self):
+        timer = self.report["timer"]
+        self.assertEqual("25%", timer["quarter"]["width"])
+        self.assertEqual("50%", timer["half"]["width"])
+
+    def test_it_advances_by_itself_after_every_seconds(self):
+        timer = self.report["timer"]
+        # Sixty seconds in, the fade has started but the sketch has not changed.
+        self.assertEqual(33, timer["atTheEnd"]["entry"])
+        self.assertEqual(1, timer["atTheEnd"]["frames"])
+        # 420 ms later it is the next one, and still only one frame.
+        self.assertEqual(22, timer["afterTheFade"]["entry"])
+        self.assertEqual(1, timer["afterTheFade"]["frames"])
+        self.assertEqual("./e/22/sketch/", timer["afterTheFade"]["src"])
+
+    def test_a_paused_run_does_not_advance(self):
+        paused = self.report["paused"]
+        # Four minutes of frames at sixty seconds each, and nothing moves.
+        self.assertEqual(paused["before"], paused["after"])
+        self.assertEqual(1, paused["frames"])
+        self.assertTrue(paused["widthHeld"], "the progress line stops too")
+        self.assertEqual("progress paused", paused["pausedClass"])
+        self.assertEqual("paused", paused["pauseState"])
+        self.assertTrue(paused["status"].startswith("paused · 1 of 3"))
+
+    def test_random_reshuffles_on_the_wrap_and_never_repeats_across_it(self):
+        random = self.report["random"]
+        self.assertEqual(41, len(random["seen"]))
+        # A wrap that seats the sketch already on the stage fades out of it and
+        # back into it, which reads as a stall rather than as a shuffle.
+        self.assertEqual(0, random["repeats"])
+        # Twelve wraps that all dealt the same lap would not be a shuffle.
+        self.assertGreater(random["laps"], 1)
+
+    def test_a_fixed_canvas_is_scaled_to_fit_and_a_window_sized_one_is_not(self):
+        fitting = self.report["fitting"]
+        # 800x600 on a 1600x900 stage: limited by height, so 1.5.
+        self.assertEqual(11, fitting["fixed"]["entry"])
+        self.assertEqual("1200px", fitting["fixed"]["w"])
+        self.assertEqual("900px", fitting["fixed"]["h"])
+        # No canvas in the manifest, nothing said about the frame: the CSS
+        # default fills the stage, which is what a window-sized sketch wants.
+        self.assertEqual(22, fitting["windowSized"]["entry"])
+        self.assertEqual("", fitting["windowSized"]["w"])
+        self.assertEqual("", fitting["windowSized"]["h"])
+        self.assertIsNone(fitting["windowSized"]["style"])
+
+    # ---- the start card (§1.7) -------------------------------------------
+
+    def test_the_button_waits_for_the_manifest(self):
+        starting = self.report["starting"]
+        self.assertTrue(starting["beforeAnything"]["disabled"])
+        self.assertEqual("loading…", starting["beforeAnything"]["label"])
+        self.assertTrue(starting["loaded"]["welcomeUp"], "the card waits for the click")
+        self.assertFalse(starting["loaded"]["disabled"])
+        self.assertEqual("Start", starting["loaded"]["label"])
+
+    def test_a_manifest_that_never_arrives_says_so_on_the_card(self):
+        # Taking the click and fetching afterwards is how a projector ends up
+        # black and deaf: card gone, nothing playing, and because nothing is
+        # playing the key handler returns without even opening the menu.
+        starting = self.report["starting"]
+        self.assertTrue(starting["failed"]["welcomeUp"])
+        self.assertTrue(starting["failed"]["disabled"])
+        self.assertEqual(
+            "Could not load the gallery's list of sketches.",
+            starting["failed"]["note"],
+        )
+        self.assertTrue(starting["afterAClick"]["welcomeUp"], "the click does nothing")
+        self.assertFalse(starting["afterAClick"]["playing"])
+        self.assertEqual(0, starting["afterAClick"]["frames"])
+        self.assertTrue(starting["menuStillShut"])
+
+    def test_an_empty_gallery_is_nothing_to_play(self):
+        self.assertTrue(self.report["starting"]["empty"]["disabled"])
+        self.assertEqual(
+            "Could not load the gallery's list of sketches.",
+            self.report["starting"]["empty"]["note"],
         )
 
     # ---- the keys (§4.1) -------------------------------------------------
@@ -377,8 +472,14 @@ class KioskTests(unittest.TestCase):
 
     def test_the_code_column_names_the_file_its_size_and_that_it_is_unedited(self):
         frame = self.report["frame"]
-        self.assertEqual("e/33/sketch/sketch.js · 47 bytes, unedited", frame["codeHeading"])
-        self.assertEqual(3, frame["codeLines"])
+        self.assertEqual("e/33/sketch/sketch.js · 78 bytes, unedited", frame["codeHeading"])
+        self.assertEqual(4, frame["codeLines"])
+
+    def test_the_heading_counts_bytes_and_not_characters(self):
+        # The fixture's source has an em dash in a comment, so the two differ.
+        source = self.report["source"]
+        self.assertNotEqual(source["chars"], source["bytes"])
+        self.assertIn(f"{source['bytes']} bytes", self.report["frame"]["codeHeading"])
 
     def test_it_asks_for_nothing_but_the_five_things_it_may_ask_for(self):
         asked = self.report["frame"]["asked"]
@@ -393,8 +494,13 @@ class KioskTests(unittest.TestCase):
         )
 
     def test_no_request_carries_a_method_credentials_or_headers(self):
-        # config.json's cache: "no-store" is the only option any call passes.
-        self.assertEqual([[], ["cache"], [], [], []], self.report["frame"]["inits"])
+        # cache: "no-store" on the two files the generator rewrites is the only
+        # option any call passes. Nothing names a method, credentials or a
+        # header, because every one of those would be a request this page has
+        # no business making.
+        self.assertEqual(
+            [["cache"], ["cache"], [], [], []], self.report["frame"]["inits"]
+        )
 
     # ---- settings (§1.8) -------------------------------------------------
 
@@ -479,6 +585,10 @@ class KioskTests(unittest.TestCase):
         self.assertEqual("no pairs yet", unjudged["agent"])
         # No score, no square: one coordinate is not a point.
         self.assertEqual("", unjudged["humanQuad"])
+
+    def test_a_missing_wall_time_is_an_em_dash_and_not_zero_seconds(self):
+        # "written in 0.0 s" would be a claim about how long the executor took.
+        self.assertEqual(["written in —"], self.report["unjudged"]["facts"])
 
 
 def _without_comments(source: str) -> str:

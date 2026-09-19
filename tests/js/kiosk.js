@@ -137,7 +137,9 @@ const COUNTS = {
   33: { views: 900, likes: 2 }
 };
 
-const SOURCE = "function setup() {\n  createCanvas(800, 600);\n}\n";
+// The em dash is the point: the code heading says bytes, and this source is
+// three bytes longer than it is characters long.
+const SOURCE = "function setup() {\n  // a field — of slow lines\n  createCanvas(800, 600);\n}\n";
 
 /* ---- the page, from the DOM contract -------------------------------------- */
 
@@ -284,6 +286,12 @@ function load(options) {
   kioskPage(document);
   window.SKETCHGEN_ROOT = "./";
   if (opts.stored) { window.localStorage.setItem("sketchgen-kiosk", opts.stored); }
+  // Node lays nothing out, so a test that wants the frame fitted says how big
+  // the stage is.
+  if (opts.stage) {
+    document.getElementById("stage").clientWidth = opts.stage[0];
+    document.getElementById("stage").clientHeight = opts.stage[1];
+  }
 
   // Every request the script made, in order, so a test can assert on what it
   // asked for as well as on what it did with the answer.
@@ -291,10 +299,17 @@ function load(options) {
   window.fetch = function (url, init) {
     asked.push({ url: String(url), init: init || null });
     if (String(url).indexOf("kiosk.json") !== -1) {
+      // A manifest that never arrives is the case the start card exists for.
+      if (opts.manifest === "reject") { return Promise.reject(new Error("offline")); }
+      if (opts.manifest === "empty") { return answer({ entries: [] }); }
       const entries = JSON.parse(JSON.stringify(ENTRIES));
-      // One run asks what an entry nobody has compared looks like.
-      if (opts.unjudged) {
-        entries.forEach(function (entry) { delete entry.judgment; });
+      // One run asks what a row the database has less of looks like: nobody
+      // has compared it, and nothing timed the executor that wrote it.
+      if (opts.sparse) {
+        entries.forEach(function (entry) {
+          delete entry.judgment;
+          entry.wall_s = null;
+        });
       }
       return answer({ entries: entries });
     }
@@ -323,8 +338,14 @@ function load(options) {
   window.setInterval = function () { return 0; };
   window.clearInterval = function () {};
 
+  // One clock for both queues. window.step advances it and runs the animation
+  // frames dom.js is holding — a frame registered by one of those callbacks
+  // lands in the next batch, as a browser's would — and then whatever timeouts
+  // that took us past. So a test that wants N frames calls this N times, and
+  // the playback timer, which counts rAF deltas, can be driven a frame at a
+  // time without any wall clock being involved.
   function tock(ms) {
-    window.clock += ms || 0;
+    window.step(ms || 0);
     const due = pending
       .filter(function (one) { return one.at <= window.clock; })
       .sort(function (a, b) { return a.at - b.at; });
@@ -349,7 +370,8 @@ function load(options) {
     parseInt: parseInt,
     parseFloat: parseFloat,
     isNaN: isNaN,
-    encodeURIComponent: encodeURIComponent
+    encodeURIComponent: encodeURIComponent,
+    unescape: unescape
   }), { filename: "kiosk.js" });
 
   return { window, document, asked, tock };
@@ -560,20 +582,170 @@ async function revised() {
 }
 
 async function unjudged() {
-  const { document } = await started({ search: "?show=judgment", unjudged: true });
+  const { document } = await started({ search: "?show=judgment,seconds", sparse: true });
   return {
     human: document.getElementById("j-human").textContent,
     humanQuad: document.getElementById("q-human").textContent,
-    agent: document.getElementById("j-agent").textContent
+    agent: document.getElementById("j-agent").textContent,
+    facts: Array.prototype.map.call(document.querySelectorAll(".facts li"), function (li) {
+      return li.textContent;
+    })
   };
 }
 
 async function noWritePath() {
-  const { document } = await started({ search: "?order=liked", writePath: null });
+  const { document, window } = await started({ search: "?order=liked", writePath: null });
   const facts = Array.prototype.map.call(document.querySelectorAll(".facts li"), function (li) {
     return li.textContent;
   });
-  return { entry: showing(document), facts: facts };
+  return {
+    entry: showing(document),
+    facts: facts,
+    // What it plays and what it says it is playing must be the same word.
+    status: document.getElementById("status").textContent,
+    launch: document.getElementById("launch").textContent,
+    current: document.querySelector("#m-orders li.current").textContent,
+    stored: JSON.parse(window.localStorage.getItem("sketchgen-kiosk") || "null")
+  };
+}
+
+/* ---- the playback timer, a frame at a time --------------------------------- */
+
+function progress(document) {
+  const bar = document.getElementById("progress");
+  return { width: bar.style.width, className: bar.className };
+}
+
+/* every=60: two fifteen-second frames are a quarter and then a half. */
+async function timer() {
+  const { document, tock } = await started({ search: "?order=newest&every=60" });
+  const start = { entry: showing(document), progress: progress(document) };
+  tock(15000);
+  const quarter = progress(document);
+  tock(15000);
+  const half = progress(document);
+
+  // Thirty more seconds is the whole sixty: it advances on its own, with the
+  // same fade a keypress gets, and still only one frame on the stage.
+  tock(30000);
+  const atTheEnd = { entry: showing(document), frames: frames(document).length };
+  tock(FADE);
+  const afterTheFade = {
+    entry: showing(document),
+    frames: frames(document).length,
+    src: frames(document)[0].getAttribute("src"),
+    progress: progress(document)
+  };
+  return { start, quarter, half, atTheEnd, afterTheFade };
+}
+
+async function paused() {
+  const { document, tock } = await started({ search: "?order=newest&every=60" });
+  const before = showing(document);
+  tock(15000);                           // a quarter of the way in
+  press(document, "z");                  // opens the menu
+  press(document, " ");                  // and now pauses
+  tock(0);                               // one frame, so the bar is painted paused
+  const bar = progress(document);
+  // Four minutes at sixty seconds each would be four sketches if it were running.
+  for (let step = 0; step < 4; step += 1) { tock(60000); tock(FADE); }
+  return {
+    before: before,
+    after: showing(document),
+    frames: frames(document).length,
+    pausedClass: progress(document).className,
+    widthHeld: progress(document).width === bar.width,
+    pauseState: document.getElementById("m-pause-state").textContent,
+    status: document.getElementById("status").textContent
+  };
+}
+
+/* A random sequence reshuffles when it wraps, and never wraps onto the sketch
+ * that is already on the stage. Forty advances over three entries is a dozen
+ * wraps, which is enough for a repeat to show up if one can. */
+async function random() {
+  const { document, tock } = await started({ search: "?order=random" });
+  const seen = [showing(document)];
+  for (let step = 0; step < 40; step += 1) {
+    press(document, "z");
+    press(document, "ArrowRight");
+    tock(FADE);
+    seen.push(showing(document));
+    press(document, "Escape");
+  }
+  const repeats = seen.filter(function (id, at) { return at > 0 && id === seen[at - 1]; });
+  // Every three advances is one lap; two different laps prove it reshuffles.
+  const laps = {};
+  for (let at = 0; at + 3 <= seen.length; at += 3) { laps[seen.slice(at, at + 3).join(",")] = true; }
+  return { seen: seen, repeats: repeats.length, laps: Object.keys(laps).length };
+}
+
+/* An 800x600 canvas on a 1600x900 stage is scaled by 1.5, and a sketch that
+ * sizes itself to the window leaves the stage to say how big it is. */
+async function fitting() {
+  const { document, tock } = await started({ search: "?order=oldest", stage: [1600, 900] });
+  const stage = document.getElementById("stage");
+  const fixed = {
+    entry: showing(document),
+    w: stage.style.getPropertyValue("--frame-w"),
+    h: stage.style.getPropertyValue("--frame-h")
+  };
+  press(document, "z");
+  press(document, "ArrowRight");
+  tock(FADE);
+  return {
+    fixed: fixed,
+    windowSized: {
+      entry: showing(document),
+      w: stage.style.getPropertyValue("--frame-w"),
+      h: stage.style.getPropertyValue("--frame-h"),
+      style: stage.getAttribute("style")
+    }
+  };
+}
+
+/* ---- the start card holds the click until there is something to play ------- */
+
+function card(document) {
+  const button = document.getElementById("go");
+  return {
+    welcomeUp: document.getElementById("welcome").hidden === false,
+    disabled: button.disabled === true,
+    label: button.textContent,
+    note: document.querySelector(".welcome .note").textContent,
+    frames: frames(document).length,
+    playing: document.body.className.indexOf("playing") !== -1
+  };
+}
+
+async function starting() {
+  const waiting = await load({});
+  const beforeAnything = card(waiting.document);
+  await quiet();
+  const loaded = card(waiting.document);
+
+  const broken = await load({ manifest: "reject" });
+  await quiet();
+  const failed = card(broken.document);
+  // The click must do nothing at all: no hidden card, no black screen.
+  broken.document.getElementById("go").click();
+  await quiet();
+  const afterAClick = card(broken.document);
+  // And the keyboard must still be inert rather than half-alive.
+  press(broken.document, "ArrowRight");
+  const menuAfterAKey = broken.document.getElementById("menu").hidden;
+
+  const none = await load({ manifest: "empty" });
+  await quiet();
+
+  return {
+    beforeAnything: beforeAnything,
+    loaded: loaded,
+    failed: failed,
+    afterAClick: afterAClick,
+    menuStillShut: menuAfterAKey === true,
+    empty: card(none.document)
+  };
 }
 
 async function main() {
@@ -586,7 +758,13 @@ async function main() {
     words: await words(),
     revised: await revised(),
     unjudged: await unjudged(),
-    noWritePath: await noWritePath()
+    noWritePath: await noWritePath(),
+    timer: await timer(),
+    paused: await paused(),
+    random: await random(),
+    fitting: await fitting(),
+    starting: await starting(),
+    source: { chars: SOURCE.length, bytes: Buffer.byteLength(SOURCE, "utf8") }
   };
   console.log(JSON.stringify(report));
   process.exit(0);
