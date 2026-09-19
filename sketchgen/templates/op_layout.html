@@ -291,13 +291,18 @@ iframe.preview {
    once. The poster is the strip the gate saw; the frame is built by
    PREVIEW_SCRIPT on a click and removed on stop. */
 .preview-run { position: relative; display: inline-block; max-width: 100%; }
-.preview-run button.play {
+.preview-run button.play, .preview-run a.play {
   display: block; padding: 0; border: 1px solid var(--line); border-radius: 5px;
   background: #000; cursor: pointer; overflow: hidden; line-height: 0;
-  max-width: 100%;
+  max-width: 100%; text-decoration: none;
 }
-.preview-run button.play img { display: block; max-width: 100%; border: 0;
-                               border-radius: 4px; }
+.preview-run button.play img, .preview-run a.play img {
+  display: block; max-width: 100%; border: 0; border-radius: 4px; }
+/* A microphone sketch opens in its own tab (the sandboxed frame cannot reach the
+   mic), so its poster is an anchor, not a play button; the accent border marks
+   it as leaving the page rather than running in place. */
+.preview-mic a.play { border-color: var(--accent); }
+.mic-note { color: var(--accent); }
 .preview-run .no-still {
   display: block; padding: 28px 16px; color: var(--dim); font-size: 12px;
   line-height: 1.4;
@@ -425,7 +430,8 @@ button.link:hover { border: 0; }
 .card .id .dim { font-size: 12px; }
 /* The poster fills the card; the cost chip sits under it, not a line away. */
 .card .preview-run { display: block; }
-.card .preview-run button.play, .card .preview-run button.play img { width: 100%; }
+.card .preview-run button.play, .card .preview-run button.play img,
+.card .preview-run a.play, .card .preview-run a.play img { width: 100%; }
 .card .preview-run + p { margin: 6px 0 0; }
 .card .prompt { margin: 10px 0 0; font-weight: 600; }
 .card .rev { margin: 4px 0 0; font-style: italic; }

@@ -18,7 +18,6 @@ import json
 import os
 import re
 import shutil
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -38,10 +37,10 @@ from sketchgen.cli import gallery as cli_gallery  # noqa: E402
 def cross_a_second() -> None:
     """Wait until the wall clock's second has ticked over.
 
-    A render is supposed to be a function of the database, so two of them must
-    agree whichever seconds they fall in. Waiting here is the cheapest way to
-    ask that on purpose rather than one run in ten — the whole shape of the
-    bug this guards was that it was invisible inside one second.
+    A render is a function of the database, so two of them must agree whichever
+    seconds they fall in. Waiting here is the cheapest way to ask that on
+    purpose: the whole shape of the bug this guards was that it was invisible
+    inside one second.
     """
     edge = int(time.time()) + 1
     while time.time() < edge:
@@ -490,6 +489,8 @@ class TreeTests(GalleryTestCase):
             f"e/{three}/index.html",
             "rejections.html",
             "index.html",
+            "kiosk.html",
+            "kiosk.json",
             "lineage.json",
             f"lines/{one}.html",
         ]
@@ -736,6 +737,27 @@ class LineageJsonTests(GalleryTestCase):
             sorted(self.entries),
         )
 
+    def test_the_stamp_is_the_newest_stamp_in_the_database_not_the_clock(self):
+        # publish_index re-renders the site and commits only if bytes changed;
+        # a stamp taken from the clock made every re-render a commit. This one
+        # is the last thing the database recorded, so it moves only when the
+        # database does.
+        newest = self.conn.execute(
+            "SELECT MAX(stamp) FROM ("
+            "  SELECT created_utc AS stamp FROM entries"
+            "  UNION ALL SELECT published_utc FROM entries"
+            "  UNION ALL SELECT created_utc FROM lineage)"
+        ).fetchone()[0]
+        self.assertEqual(newest, self.data["generated_utc"])
+        later = "2031-01-01T00:00:00Z"
+        self.conn.execute(
+            "UPDATE entries SET published_utc = ? WHERE id = ?", (later, self.ids[0])
+        )
+        self.conn.commit()
+        self.render()
+        data = json.loads((self.dest / "lineage.json").read_text(encoding="utf-8"))
+        self.assertEqual(later, data["generated_utc"])
+
     def test_every_entry_is_here_whatever_its_state(self):
         # including the held child, which is on no page of the site at all
         self.assertIn(str(self.held), self.entries)
@@ -792,7 +814,7 @@ class LineageJsonTests(GalleryTestCase):
         self.conn.execute(
             "UPDATE entries SET prompt = ? WHERE id = ?", (composed, self.ids[1])
         )
-        data = gallery._lineage_index(self.conn, "2026-09-14T04:02:11Z")
+        data = gallery._lineage_index(self.conn)
         self.assertEqual(
             "a cityscape from sunrise to sunset",
             data["entries"][str(self.ids[1])]["root_prompt"],
@@ -814,7 +836,7 @@ class LineageJsonTests(GalleryTestCase):
         limit = gallery.LINEAGE_JSON_LIMIT
         gallery.LINEAGE_JSON_LIMIT = 4_000
         self.addCleanup(setattr, gallery, "LINEAGE_JSON_LIMIT", limit)
-        data = gallery._lineage_index(self.conn, "2026-09-14T04:02:11Z")
+        data = gallery._lineage_index(self.conn)
         for entry_id in (*self.ids, self.third):
             self.assertEqual(
                 gallery.LINEAGE_ROOT_PROMPT_CAP,
@@ -2146,6 +2168,359 @@ class EntryCompassTests(GalleryTestCase):
                 self.assertNotIn('class="quads"', page)
 
 
+# ---------------------------------------------------------------------------
+# The kiosk (docs/plans/kiosk.md §5)
+# ---------------------------------------------------------------------------
+
+
+class KioskManifestTests(GalleryTestCase):
+    """``kiosk.json``: what a projector is handed before the first sketch.
+
+    The manifest is a second serialisation of values meta.json and the cards
+    already carry, so what these tests are really asking is whether the second
+    copy can disagree with the first — by carrying an entry the grid does not,
+    by inventing a zero where a population has not voted, or by coming out
+    differently on a second render of the same rows.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.render()
+
+    def manifest(self):
+        return json.loads((self.dest / "kiosk.json").read_text(encoding="utf-8"))
+
+    def rows(self):
+        return {int(entry["id"]): entry for entry in self.manifest()["entries"]}
+
+    def judge(self, question, kind, judge_id, a, b, choice):
+        db.record_judgment(self.conn, a, b, kind, judge_id, question, choice)
+
+    #: Every key spec §2 names, written out rather than imported so that the
+    #: test is a check on the shape and not a restatement of it. ``canvas`` is
+    #: absent from the list on purpose: it is the one optional key.
+    SPEC_2_KEYS = {
+        "id",
+        "prompt",
+        "brief",
+        "statement",
+        "submitted_by",
+        "planner",
+        "executor",
+        "rules_file",
+        "attempts",
+        "seed",
+        "created_utc",
+        "published_utc",
+        "prompt_tokens",
+        "completion_tokens",
+        "wall_s",
+        "licence",
+        "generation",
+        "parent_entry_id",
+        "critique_by",
+        "root_entry_id",
+        "sketch",
+        "source",
+        "href",
+        "judgment",
+    }
+
+    def test_render_index_writes_the_page_and_the_manifest(self):
+        for name in ("kiosk.html", "kiosk.json"):
+            with self.subTest(file=name):
+                self.assertTrue((self.dest / name).is_file())
+
+    def test_render_index_alone_writes_them_too(self):
+        # render_all is render_index plus the entry directories; a node that
+        # only re-indexes must still get the kiosk.
+        shutil.rmtree(self.dest)
+        self.dest.mkdir()
+        gallery.render_index(self.conn, self.dest, self.config)
+        for name in ("kiosk.html", "kiosk.json"):
+            with self.subTest(file=name):
+                self.assertTrue((self.dest / name).is_file())
+
+    def test_both_files_pass_the_guard(self):
+        # The read-only guard walks every text file in the checkout, which is
+        # the form that would catch a manifest smuggling a mail address out of
+        # a statement or a brief.
+        gallery.guard(self.dest)
+
+    def test_a_statement_with_an_email_in_it_refuses_the_whole_render(self):
+        # The manifest carries the statement verbatim, so it is one more file
+        # personal data could reach the public repository through.
+        self.conn.execute(
+            "UPDATE entries SET statement = ? WHERE id = ?",
+            ("Ask nobody@example.invalid what it means.", self.ids[0]),
+        )
+        self.conn.commit()
+        with self.assertRaises(gallery.Unsafe) as caught:
+            gallery.render_index(self.conn, self.dest, self.config)
+        self.assertIn("email-shaped string", str(caught.exception))
+
+    def test_only_published_entries_are_in_it(self):
+        one, two, kept = self.ids
+        held = add_child(self.conn, self.tmp, two, state="held")
+        self.render()
+        ids = [int(entry["id"]) for entry in self.manifest()["entries"]]
+        self.assertEqual([one, two], ids)
+        self.assertNotIn(kept, ids)
+        self.assertNotIn(held, ids)
+
+    def test_the_entries_are_in_ascending_id_order(self):
+        # _entries returns created_utc order; the manifest promises id order,
+        # because the browser's tie-breaks are by id and a stable file is
+        # easier to diff.
+        third = add_child(self.conn, self.tmp, self.ids[0], state="published")
+        self.render()
+        ids = [int(entry["id"]) for entry in self.manifest()["entries"]]
+        self.assertEqual(sorted(ids), ids)
+        self.assertIn(third, ids)
+
+    def test_every_spec_key_is_present_for_a_root_and_for_a_child(self):
+        rows = self.rows()
+        for name, entry_id in (("root", self.ids[0]), ("child", self.ids[1])):
+            with self.subTest(entry=name):
+                self.assertEqual(self.SPEC_2_KEYS, set(rows[entry_id]) - {"canvas"})
+
+    def test_a_root_says_so_with_nulls_and_a_child_names_its_parent(self):
+        one, two, _ = self.ids
+        rows = self.rows()
+        self.assertIsNone(rows[one]["parent_entry_id"])
+        self.assertIsNone(rows[one]["critique_by"])
+        self.assertEqual(1, rows[one]["generation"])
+        self.assertEqual(one, rows[one]["root_entry_id"])
+        self.assertEqual(one, rows[two]["parent_entry_id"])
+        self.assertEqual("gemma4:e4b", rows[two]["critique_by"])
+        self.assertEqual(2, rows[two]["generation"])
+        self.assertEqual(one, rows[two]["root_entry_id"])
+
+    def test_the_provenance_is_the_same_values_meta_json_carries(self):
+        one = self.ids[0]
+        meta = json.loads(
+            (self.dest / "e" / str(one) / "meta.json").read_text(encoding="utf-8")
+        )
+        row = self.rows()[one]
+        for key in gallery.KIOSK_META_KEYS:
+            with self.subTest(key=key):
+                self.assertEqual(meta[key], row[key])
+
+    def test_where_to_run_it_and_where_to_read_it(self):
+        one = self.ids[0]
+        row = self.rows()[one]
+        self.assertEqual(f"e/{one}/sketch/", row["sketch"])
+        self.assertEqual(f"e/{one}/sketch/sketch.js", row["source"])
+        self.assertEqual(f"e/{one}/", row["href"])
+        # and all three are really there, relative to the gallery root
+        self.assertTrue((self.dest / row["source"]).is_file())
+        self.assertTrue((self.dest / row["href"] / "index.html").is_file())
+
+    def test_an_unjudged_population_is_absent_not_zero(self):
+        """A score nobody voted on is not a low score (spec §2).
+
+        The fixture holds no judgments at all, so both populations are missing;
+        seeding one human pair on one question brings ``human`` back with that
+        question alone, and leaves ``agent`` away.
+        """
+        one, two, _ = self.ids
+        self.assertEqual({}, self.rows()[one]["judgment"])
+        self.judge("look", "human", "profcarroll", one, two, "A")
+        self.render()
+        judgment = self.rows()[one]["judgment"]
+        self.assertNotIn("agent", judgment)
+        self.assertEqual({"look"}, set(judgment["human"]))
+
+    def test_a_judged_entry_carries_score_n_and_pct_and_nothing_else(self):
+        one, two, _ = self.ids
+        for question in ("look", "brief"):
+            self.judge(question, "human", "profcarroll", one, two, "A")
+            self.judge(question, "agent", "qwen3.5:4b", one, two, "B")
+        self.render()
+        rows = self.rows()
+        for entry_id in (one, two):
+            for population in ("human", "agent"):
+                for question in ("look", "brief"):
+                    with self.subTest(entry=entry_id, population=population,
+                                      question=question):
+                        cell = rows[entry_id]["judgment"][population][question]
+                        # rank and pool place a mark on a card's track; the
+                        # kiosk has no track, so they are dropped
+                        self.assertEqual({"score", "n", "pct"}, set(cell))
+                        self.assertEqual(1, cell["n"])
+        # and the numbers are the ones the cards were drawn from
+        scores = gallery._all_scores(self.conn)
+        stand = gallery._standing(scores["human"]["look"], one)
+        self.assertEqual(stand["score"], rows[one]["judgment"]["human"]["look"]["score"])
+        self.assertEqual(stand["pct"], rows[one]["judgment"]["human"]["look"]["pct"])
+
+    def test_a_second_render_gives_the_same_bytes(self):
+        # No clock is read and the order is total, which is what lets the
+        # publisher's commit mean something.
+        first = (self.dest / "kiosk.json").read_bytes()
+        self.render()
+        self.assertEqual(first, (self.dest / "kiosk.json").read_bytes())
+
+
+class KioskCanvasTests(GalleryTestCase):
+    """The one thing the kiosk cannot ask the sketch itself (spec §4.3).
+
+    The frame is ``allow-scripts`` without ``allow-same-origin`` and therefore
+    opaque, so a fixed-size canvas would sit top-left in a stage-sized frame
+    with nothing to centre it. The generator reads the source instead. Each
+    case here rewrites the attempt directory's own ``sketch.js`` — the file
+    ``_write_entry`` copies — and asks what the manifest then says.
+    """
+
+    def sketch_says(self, call):
+        """The manifest row for entry one, with its sketch rewritten to ``call``."""
+        one = self.ids[0]
+        row = self.conn.execute(
+            "SELECT source_dir FROM entries WHERE id = ?", (one,)
+        ).fetchone()
+        (Path(row["source_dir"]) / "sketch.js").write_text(
+            "function setup() {\n  %s;\n}\nfunction draw() { background(0); }\n" % call,
+            encoding="utf-8",
+        )
+        self.render()
+        entries = json.loads(
+            (self.dest / "kiosk.json").read_text(encoding="utf-8")
+        )["entries"]
+        return next(entry for entry in entries if int(entry["id"]) == one)
+
+    def test_two_integer_literals_give_a_size(self):
+        self.assertEqual([800, 600], self.sketch_says("createCanvas(800, 600)")["canvas"])
+
+    def test_a_third_argument_does_not_take_the_size_away(self):
+        # 27 of the 222 published sketches are WEBGL; they have a size like
+        # any other and the regex stops before the third argument.
+        self.assertEqual(
+            [640, 480], self.sketch_says("createCanvas(640, 480, WEBGL)")["canvas"]
+        )
+
+    def test_a_window_sized_sketch_has_no_key_at_all(self):
+        # Absent, not null and not zero: no key is what tells the browser to
+        # let the frame fill the stage.
+        self.assertNotIn(
+            "canvas", self.sketch_says("createCanvas(windowWidth, windowHeight)")
+        )
+
+    def test_variables_are_not_a_size(self):
+        self.assertNotIn("canvas", self.sketch_says("createCanvas(w, h)"))
+
+    def test_whitespace_between_the_literals_is_allowed(self):
+        self.assertEqual(
+            [1024, 768], self.sketch_says("createCanvas(  1024 ,\n    768 )")["canvas"]
+        )
+
+
+class KioskPageTests(GalleryTestCase):
+    """``kiosk.html`` is a shell, and the nav that reaches it.
+
+    The page carries no entry data by design: ``kiosk.js`` fetches
+    ``kiosk.json``, so a gallery of 222 entries does not put 222 prompts into
+    every projector's first paint, and the page never goes stale between an
+    entry landing and the next full render.
+    """
+
+    #: Verbatim from docs/plans/kiosk-mockup/kiosk.html. The copy is the visual
+    #: spec's, and the start card is the only copy in the page a person reads
+    #: before anything runs.
+    START_CARD = (
+        "sketchgen · kiosk",
+        "Sketches from the gallery play one after another, full screen.",
+        "Press any key at any time for the controls.",
+        "Start",
+        "This first press is the one gesture the browser needs before it will "
+        "run audio or go full screen.",
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.render()
+        self.kiosk = (self.dest / "kiosk.html").read_text(encoding="utf-8")
+
+    def test_the_start_card_says_what_the_mockup_says(self):
+        for line in self.START_CARD:
+            with self.subTest(line=line):
+                self.assertIn(line, self.kiosk)
+
+    def test_the_page_carries_no_entry_data(self):
+        self.assertNotIn("data-entry", self.kiosk)
+        self.assertNotIn("sketchgen-entries", self.kiosk)
+        for row in self.conn.execute("SELECT prompt FROM entries"):
+            with self.subTest(prompt=row["prompt"][:32]):
+                self.assertNotIn(str(row["prompt"]), self.kiosk)
+
+    def test_exactly_one_kiosk_script_tag(self):
+        scripts = [
+            attrs.get("src", "")
+            for tag, attrs in elements(self.kiosk)
+            if tag == "script" and attrs.get("src")
+        ]
+        # kiosk.js alone. gallery.js would bring the session line, but its
+        # ready() also asks the write path /me with the viewer's cookie and
+        # bearer token on every load, and a projector has no business sending
+        # either: nothing is fetched but kiosk.json, config.json, /counts and
+        # the frames (spec §1.11). kiosk.js carries its own copy of base().
+        self.assertEqual(["./assets/kiosk.js"], scripts)
+        # No p5 and no kiosk-data.js: the mockup loads both because an artefact
+        # cannot frame the gallery, and the real page frames it (spec §1.4).
+        self.assertNotIn("p5.min.js", self.kiosk)
+        self.assertNotIn("kiosk-data.js", self.kiosk)
+
+    def test_the_body_is_the_kiosk_from_load(self):
+        # The CSS hangs the whole layout off body.kiosk; adding the class in
+        # script would show the gallery's own page first and then repaint.
+        self.assertIn('<body class="kiosk">', self.kiosk)
+
+    def test_the_menu_note_describes_the_live_page_not_the_mockup(self):
+        # The mockup's numbers are invented and its note says so. Here they
+        # are real, and a play is still never a view (spec §1.5).
+        self.assertIn(
+            "Views and likes are live from the write path; a play here is "
+            "never counted as a view.",
+            self.kiosk,
+        )
+        self.assertNotIn("example numbers", self.kiosk)
+
+    def test_the_page_parses(self):
+        self.assertEqual([], balance_errors(self.dest / "kiosk.html"))
+
+    def test_every_page_links_to_the_kiosk_after_compare(self):
+        one = self.ids[0]
+        pages = [
+            "index.html",
+            "rejections.html",
+            "compare.html",
+            "kiosk.html",
+            f"e/{one}/index.html",
+            f"lines/{one}.html",
+        ]
+        for name in pages:
+            with self.subTest(page=name):
+                page = (self.dest / name).read_text(encoding="utf-8")
+                nav = page.split('<p class="nav">')[1].split("</p>")[0]
+                self.assertLess(nav.index("compare.html"), nav.index("kiosk.html"))
+                self.assertIn(">kiosk</a>", nav)
+
+    def test_the_kiosk_marks_itself_current_and_no_other_page_does(self):
+        one = self.ids[0]
+        nav = self.kiosk.split('<p class="nav">')[1].split("</p>")[0]
+        self.assertIn('kiosk.html" aria-current="page"', nav)
+        for name in ("index.html", "compare.html", f"e/{one}/index.html"):
+            with self.subTest(page=name):
+                page = (self.dest / name).read_text(encoding="utf-8")
+                other = page.split('<p class="nav">')[1].split("</p>")[0]
+                self.assertNotIn("aria-current", other)
+
+    def test_a_line_page_reaches_the_kiosk_from_one_level_down(self):
+        # lines/<root>.html renders with root="../"; a kiosk link that forgot
+        # it would 404 from there and nowhere else.
+        line = (self.dest / "lines" / f"{self.ids[0]}.html").read_text(encoding="utf-8")
+        self.assertIn('href="../kiosk.html"', line)
+
+
 class GuardTests(GalleryTestCase):
 
     def test_an_email_in_a_statement_is_refused_and_nothing_is_left(self):
@@ -2202,11 +2577,9 @@ class GuardTests(GalleryTestCase):
 class DeterminismTests(GalleryTestCase):
 
     def render(self):
-        """Nothing pinned. This test used to pass ``generated_utc`` so that the
-        two renders could not differ in ``lineage.json``, which is the one file
-        that *did* differ: the guard was turned off against the only thing it
-        needed to guard. Now the stamp comes from a row like every other
-        timestamp here, so the real question can be asked."""
+        # Nothing is pinned: a render reads no clock, so this asks the real
+        # question — does the same database give the same bytes — of the same
+        # call publish_index makes, not of a render with the clock held still.
         return gallery.render_all(self.conn, self.dest, self.config)
 
     def files(self):
@@ -2227,63 +2600,21 @@ class DeterminismTests(GalleryTestCase):
             with self.subTest(path=str(name)):
                 self.assertEqual(data, second[name])
 
-    def test_the_stamped_file_is_identical_across_a_second_boundary(self):
-        """The 1-in-10 failure in test_publish, as a question asked on purpose.
+    def test_the_ledger_is_identical_across_a_second_boundary(self):
+        """The one question the old stamp could fail, asked so it cannot pass
+        by luck.
 
-        Two renders only ever differed when they fell either side of a second,
-        so the bug hid from a test that asked the question and lost the coin
-        toss. Crossing the boundary deliberately is what turns a flake into an
-        assertion.
+        Two renders only ever differed when they fell either side of a second.
+        Back-to-back they almost never do, so a clock reintroduced here would
+        not fail this suite — it would make it flaky, which is the same bug
+        arriving in the same disguise. Crossing the boundary on purpose is
+        what turns "usually passes" into an assertion.
         """
         self.render()
         first = (self.dest / "lineage.json").read_bytes()
         cross_a_second()
         self.render()
         self.assertEqual(first, (self.dest / "lineage.json").read_bytes())
-
-
-class DataAsOfTests(GalleryTestCase):
-    """``generated_utc`` is a row, not the time of day."""
-
-    def test_it_is_the_newest_stamp_behind_the_file(self):
-        newest = self.conn.execute(
-            "SELECT MAX(stamp) AS s FROM ("
-            "  SELECT MAX(created_utc) AS stamp FROM entries"
-            "  UNION ALL SELECT MAX(published_utc) FROM entries"
-            "  UNION ALL SELECT MAX(created_utc) FROM lineage)"
-        ).fetchone()["s"]
-        self.assertEqual(newest, gallery.data_as_of(self.conn))
-
-    def test_the_file_carries_it(self):
-        self.render()
-        data = json.loads((self.dest / "lineage.json").read_text(encoding="utf-8"))
-        self.assertEqual(gallery.data_as_of(self.conn), data["generated_utc"])
-
-    def test_it_moves_when_the_data_does(self):
-        before = gallery.data_as_of(self.conn)
-        self.conn.execute(
-            "UPDATE entries SET published_utc = ? WHERE id = ?",
-            ("2099-01-01T00:00:00Z", self.ids[0]),
-        )
-        self.assertEqual("2099-01-01T00:00:00Z", gallery.data_as_of(self.conn))
-        self.assertNotEqual(before, gallery.data_as_of(self.conn))
-
-    def test_a_database_with_nothing_in_it_still_has_a_fixed_stamp(self):
-        """An empty gallery has to render the same bytes twice too, and there
-        is no row to read — so it is a constant, not a clock."""
-        empty = sqlite3.connect(":memory:")
-        empty.row_factory = sqlite3.Row
-        empty.executescript(
-            "CREATE TABLE entries (id INTEGER PRIMARY KEY, created_utc TEXT, "
-            "published_utc TEXT);"
-            "CREATE TABLE lineage (child_entry_id INTEGER PRIMARY KEY, "
-            "created_utc TEXT);"
-        )
-        self.addCleanup(empty.close)
-        self.assertEqual(gallery.NO_DATA_UTC, gallery.data_as_of(empty))
-        self.assertRegex(
-            gallery.data_as_of(empty), r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
-        )
 
 
 class RenderAllRereadsTests(GalleryTestCase):
@@ -2355,6 +2686,15 @@ class CommandLineTests(GalleryTestCase):
                 result = self.run_cli(name, "--help")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("--gallery-dir", result.stdout)
+
+    def test_render_index_help_names_the_files_it_writes(self):
+        # The help is the only place an operator reads the file list, and a
+        # deploy that does not know kiosk.json is written cannot know to pull
+        # the gallery checkout before the next publish.
+        result = self.run_cli("render-index", "--help")
+        for name in ("kiosk.html", "kiosk.json"):
+            with self.subTest(file=name):
+                self.assertIn(name, result.stdout)
 
     def test_render_all_writes_the_site(self):
         result = self.run_cli(
@@ -2867,6 +3207,63 @@ class PublishRejectedTests(GalleryTestCase):
         result = self.run_cli("--help")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--dry-run", result.stdout)
+
+
+class MicSketchTests(GalleryTestCase):
+    """A listening sketch runs in its own tab, not the sandboxed frame.
+
+    The published sketch iframe is sandbox="allow-scripts" — an opaque origin
+    with no allow="microphone" — so getUserMedia is refused and a mic sketch
+    reads a dead mic in the embed. It only works in its own top-level tab, where
+    the Pages origin is a secure context, so the stage and the ledger tiles route
+    it there. Making sound is unaffected: it plays in the frame after a click.
+    """
+
+    MIC_JS = (
+        "function setup(){ createCanvas(windowWidth, windowHeight);\n"
+        "  let mic = new p5.AudioIn(); mic.start(); }\n"
+        "function draw(){ background(0); }\n"
+    )
+
+    def _make_mic(self, entry_id):
+        src = self.conn.execute(
+            "SELECT source_dir FROM entries WHERE id = ?", (entry_id,)
+        ).fetchone()["source_dir"]
+        path = Path(src)
+        (path / "sketch.js").write_text(self.MIC_JS, encoding="utf-8")
+        return path
+
+    def test_the_stage_of_a_mic_entry_opens_a_tab_not_an_embed(self):
+        one = self.ids[0]
+        self._make_mic(one)
+        gallery.render_all(self.conn, self.dest, self.config)
+        page = (self.dest / "e" / str(one) / "index.html").read_text(encoding="utf-8")
+        self.assertIn("stage-mic", page)
+        self.assertIn('href="sketch/" target="_blank"', page)
+        self.assertIn("listens to the microphone", page)
+        # never the self-starting embed for this one
+        self.assertNotIn('<iframe class="sketch"', page)
+
+    def test_lineage_json_marks_a_mic_entry_and_leaves_others_alone(self):
+        one = self.ids[0]
+        self._make_mic(one)
+        gallery.render_all(self.conn, self.dest, self.config)
+        entries = json.loads(
+            (self.dest / "lineage.json").read_text(encoding="utf-8")
+        )["entries"]
+        self.assertTrue(entries[str(one)]["mic"])
+        # a published sibling that only draws stays false
+        self.assertFalse(entries[str(self.ids[1])].get("mic", False))
+
+    def test_needs_mic_catches_listening_and_ignores_making_sound(self):
+        src = self._make_mic(self.ids[0])
+        self.assertTrue(gallery._needs_mic(src))
+        (src / "sketch.js").write_text(
+            "function setup(){ let o = new p5.Oscillator('sine'); o.start(); }\n",
+            encoding="utf-8",
+        )
+        self.assertFalse(gallery._needs_mic(src))
+        self.assertFalse(gallery._needs_mic(None))
 
 
 if __name__ == "__main__":

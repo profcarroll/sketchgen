@@ -489,8 +489,9 @@ class PublishIndexTests(PublishTestCase):
         # diff of the render against the checkout, so a render that is a
         # function of the clock rather than of the database makes this commit
         # and push a whole gallery for nothing. It used to, and because the
-        # two renders usually fell inside one second this test only said so
-        # about one run in ten.
+        # two renders usually fell inside one second this assertion only said
+        # so on the runs where they happened not to — which is how a real bug
+        # spent months reading as a flaky test.
         cross_a_second()
         sha2, why2 = publication.publish_index(
             self.conn, self.gallery, remote=str(self.bare),

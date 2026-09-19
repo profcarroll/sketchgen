@@ -422,6 +422,29 @@ def ratio_bar(doc: Any, num: str, den: str, css_class: str = "") -> str:
     )
 
 
+def _free_tier_note(doc: Any) -> str:
+    """The storage meter's tail: what dropping to the Always Free allowance
+    would cost in models. A list of names can't go through :func:`field`, so
+    this is rendered server-side and refreshed with the page, not per poll."""
+    cost = _dig(doc, "node.disk_gb.cost") or {}
+    over = cost.get("over_free_tier_gb")
+    budget = cost.get("free_tier_model_gb")
+    if over is None or budget is None:
+        return "free-tier impact unknown"
+    if not over:
+        return f"models fit the {budget:.0f} GB free-tier budget"
+    drops = cost.get("would_drop") or []
+    names = ", ".join(
+        f"{esc(str(d.get('name')))} ({float(d.get('size_gb') or 0):.1f} GB)"
+        for d in drops
+    )
+    tail = f" — would drop {names}" if names else ""
+    return (
+        f"drop to free tier caps models at {budget:.0f} GB, "
+        f"{over:.1f} GB over{tail}"
+    )
+
+
 def _parse_utc(stamp: str | None) -> datetime | None:
     if not stamp:
         return None
@@ -1767,13 +1790,37 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
                 ratio_bar(doc, "node.swap_mb.used", "node.swap_mb.total"),
             ),
             _meter(
-                "disk",
+                "boot disk",
                 f"{field(doc, 'node.disk_gb.used', 'f1')} used, "
                 f"{field(doc, 'node.disk_gb.free', 'f1')} free of "
                 f"{field(doc, 'node.disk_gb.total', 'f1')} GB — "
-                f"{field(doc, 'node.disk_gb.models', 'f1')} models, "
                 f"{field(doc, 'node.disk_gb.chromium', 'f1')} chromium",
                 ratio_bar(doc, "node.disk_gb.used", "node.disk_gb.total"),
+            ),
+            _meter(
+                "model volume",
+                f"{field(doc, 'node.disk_gb.models', 'f1')} of models — "
+                f"{field(doc, 'node.disk_gb.model_volume.used', 'f1')} used, "
+                f"{field(doc, 'node.disk_gb.model_volume.free', 'f1')} free of "
+                f"{field(doc, 'node.disk_gb.model_volume.total', 'f1')} GB",
+                ratio_bar(
+                    doc,
+                    "node.disk_gb.model_volume.used",
+                    "node.disk_gb.model_volume.total",
+                ),
+            ),
+            _meter(
+                "storage $",
+                f"{field(doc, 'node.disk_gb.cost.block_gb', 'f1')} GB block · "
+                f"${field(doc, 'node.disk_gb.cost.usd_month', 'f2')}/mo "
+                f"({field(doc, 'node.disk_gb.cost.billable_gb', 'f1')} GB over "
+                f"{field(doc, 'node.disk_gb.cost.free_tier_gb', 'f1')} free) — "
+                + esc(_free_tier_note(doc)),
+                ratio_bar(
+                    doc,
+                    "node.disk_gb.cost.billable_gb",
+                    "node.disk_gb.cost.block_gb",
+                ),
             ),
             _meter(
                 "load",
@@ -2719,6 +2766,29 @@ def has_preview(app: App, job_id: int, attempt_n: int) -> bool:
     return (attempt_dir(app, job_id, attempt_n) / "index.html").is_file()
 
 
+#: Microphone *input* — the one thing a sandboxed, opaque-origin preview iframe
+#: cannot do. `getUserMedia` is refused without a real origin and an
+#: `allow="microphone"` grant, and `sandbox="allow-scripts"` gives neither, so a
+#: listening sketch reads a dead mic in every embedded frame and only works in
+#: its own top-level tab (http://localhost and 127.0.0.1 are secure contexts, so
+#: the operator's own preview URL opens there with a real mic). Producing sound —
+#: `p5.Oscillator`, `loadSound` — is deliberately NOT here: it plays in place
+#: after an in-canvas click, so it keeps the ordinary run-in-page button.
+_MIC_RE = re.compile(r"p5\.AudioIn|getUserMedia|mediaDevices")
+
+
+def needs_microphone(app: App, job_id: int, attempt_n: int) -> bool:
+    """True when this attempt's source opens the microphone (see :data:`_MIC_RE`)."""
+    directory = attempt_dir(app, job_id, attempt_n)
+    text = ""
+    for name in ("sketch.js", "index.html"):
+        try:
+            text += (directory / name).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    return bool(_MIC_RE.search(text))
+
+
 def _poster_url(app: App, job_id: int, attempt_n: int) -> str | None:
     """The still the play button is drawn on: the strip, else the last frame.
 
@@ -2805,22 +2875,42 @@ def preview_frame(
         if poster else
         '<span class="no-still">no frame on disk</span>'
     )
-    tab = (
-        f' <a href="{esc(url)}" target="_blank" rel="noopener">open in a tab ↗</a>'
-        if tab_link
-        else ""
-    )
-    frame = (
-        f'<div class="preview-run" data-preview data-src="{esc(url)}" '
-        f'data-label="{esc(label)}" data-w="{PREVIEW_W}" data-h="{PREVIEW_H}">'
-        f'<button type="button" class="play" data-play '
-        f'aria-label="run {esc(label)}">{still}'
-        f'<span class="play-label" data-play-label>run ▸</span></button>'
-        f"</div>"
-        f'<p class="dim" style="font-size:12px">'
-        f"{cost_chip(report)}{tab}"
-        f"</p>"
-    )
+    # A microphone sketch cannot run in the sandboxed frame this page builds:
+    # the mic is refused an opaque origin, so an embedded run shows a dead canvas
+    # and reads as a broken sketch. For those the tab IS the run — the poster is
+    # a link, not a play button, and the mic note stands where the tab anchor
+    # otherwise would. The tab link is unconditional here (tab_link is about the
+    # convenience anchor beside an ordinary run; this is the only way to run it).
+    if needs_microphone(app, job_id, attempt_n):
+        frame = (
+            f'<div class="preview-run preview-mic">'
+            f'<a class="play" href="{esc(url)}" target="_blank" rel="noopener" '
+            f'aria-label="run {esc(label)} in a tab">{still}'
+            f'<span class="play-label">run in a tab ▸</span></a>'
+            f"</div>"
+            f'<p class="dim" style="font-size:12px">'
+            f"{cost_chip(report)}"
+            f' · <span class="mic-note">microphone sketch — the embedded '
+            f"frame can't reach the mic, so it runs only in its own tab</span>"
+            f"</p>"
+        )
+    else:
+        tab = (
+            f' <a href="{esc(url)}" target="_blank" rel="noopener">open in a tab ↗</a>'
+            if tab_link
+            else ""
+        )
+        frame = (
+            f'<div class="preview-run" data-preview data-src="{esc(url)}" '
+            f'data-label="{esc(label)}" data-w="{PREVIEW_W}" data-h="{PREVIEW_H}">'
+            f'<button type="button" class="play" data-play '
+            f'aria-label="run {esc(label)}">{still}'
+            f'<span class="play-label" data-play-label>run ▸</span></button>'
+            f"</div>"
+            f'<p class="dim" style="font-size:12px">'
+            f"{cost_chip(report)}{tab}"
+            f"</p>"
+        )
     if summary is None:
         return frame
     return (
