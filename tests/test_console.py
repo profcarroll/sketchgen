@@ -452,5 +452,74 @@ class TestActivity(ConsoleTestCase):
         self.assertIn("qwen3-coder:30b · job 1, attempt 1 of 3", text)
 
 
+class TestStorage(unittest.TestCase):
+    """The two-volume storage block and its free-tier arithmetic, as pure
+    functions: nothing here mounts a disk or calls Ollama."""
+
+    CATALOG = [
+        {"name": "big", "size_gb": 20.0},
+        {"name": "mid", "size_gb": 10.0},
+        {"name": "small", "size_gb": 4.0},
+    ]
+
+    def test_disk_block_carries_both_volumes_and_a_cost_block(self):
+        block = console._disk_block([])
+        for key in ("total", "used", "free", "models", "chromium",
+                    "model_volume", "cost"):
+            self.assertIn(key, block)
+        self.assertEqual(
+            {"total", "used", "free", "separate"}, set(block["model_volume"])
+        )
+        self.assertEqual(
+            {"block_gb", "free_tier_gb", "billable_gb", "rate_usd_gb_month",
+             "usd_month", "free_tier_model_gb", "over_free_tier_gb", "would_drop"},
+            set(block["cost"]),
+        )
+        self.assertIsInstance(block["cost"]["would_drop"], list)
+
+    def test_free_tier_drops_takes_the_fewest_largest_first(self):
+        # 20 alone is short of 22; 20 + 10 clears it — two models, largest first.
+        drops = console._free_tier_drops(self.CATALOG, need_gb=22.0)
+        self.assertEqual(["big", "mid"], [d["name"] for d in drops])
+
+    def test_free_tier_drops_is_empty_when_nothing_must_go_or_no_catalogue(self):
+        self.assertEqual([], console._free_tier_drops(self.CATALOG, need_gb=0.0))
+        self.assertEqual([], console._free_tier_drops(None, need_gb=50.0))
+
+    def test_cost_sums_both_block_volumes_only_when_they_are_separate(self):
+        sep = console._storage_cost(
+            140.0, {"total": 150.0, "separate": True},
+            models_gb=91.0, catalog=self.CATALOG,
+        )
+        self.assertEqual(290.0, sep["block_gb"])          # 140 boot + 150 volume
+        self.assertEqual(90.0, sep["billable_gb"])        # 290 - 200 free tier
+        self.assertEqual(
+            round(90.0 * console.STORAGE_RATE_USD_GB_MONTH, 2), sep["usd_month"]
+        )
+        self.assertEqual(60.0, sep["free_tier_model_gb"])  # 200 - 140 boot
+        self.assertEqual(31.0, sep["over_free_tier_gb"])   # 91 models - 60 budget
+        self.assertEqual(
+            ["big", "mid", "small"], [d["name"] for d in sep["would_drop"]]
+        )
+        # The same disk is one block volume: the model dir is not counted twice.
+        same = console._storage_cost(
+            140.0, {"total": 140.0, "separate": False},
+            models_gb=10.0, catalog=self.CATALOG,
+        )
+        self.assertEqual(140.0, same["block_gb"])
+        self.assertEqual(0.0, same["billable_gb"])
+        self.assertEqual(0.0, same["usd_month"])
+        self.assertEqual([], same["would_drop"])
+
+    def test_cost_is_none_safe_when_the_boot_total_is_unknown(self):
+        cost = console._storage_cost(
+            None, {"total": None, "separate": False}, models_gb=None, catalog=None
+        )
+        self.assertIsNone(cost["block_gb"])
+        self.assertIsNone(cost["usd_month"])
+        self.assertIsNone(cost["over_free_tier_gb"])
+        self.assertEqual([], cost["would_drop"])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
