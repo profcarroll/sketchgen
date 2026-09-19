@@ -492,11 +492,15 @@ def register(top: argparse._SubParsersAction) -> None:
 
     index = top.add_parser(
         "render-index",
-        help="render index.html, failed.html, compare.html, lines/, assets/, config.json",
+        help=(
+            "render index.html, failed.html, compare.html, kiosk.html, "
+            "kiosk.json, lines/, assets/, config.json"
+        ),
         description=(
             "Render everything that is not an entry directory: the gallery grid, "
-            "the kept failures, the compare shell, one page per lineage line, the "
-            "stylesheet and script, and config.json with the write-path and "
+            "the kept failures, the compare shell, the kiosk.html shell and the "
+            "kiosk.json manifest behind it, one page per lineage line, the "
+            "stylesheet and scripts, and config.json with the write-path and "
             "gallery URLs."
         ),
     )
