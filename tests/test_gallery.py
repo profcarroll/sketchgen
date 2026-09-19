@@ -1147,6 +1147,38 @@ class IndexTests(GalleryTestCase):
         self.assertEqual(
             config["repository"], "https://github.com/profcarroll/sketchgen-gallery"
         )
+        # The kiosk counts unless somebody says otherwise, and the saying is
+        # this line (docs/plans/kiosk-views.md §3.3).
+        self.assertIs(True, config["kiosk_views"])
+
+    def test_the_kiosk_switch_round_trips_a_render(self):
+        # It is the only lever there is: the write path has no switch of its
+        # own, so turning the projector's views off means editing this file in
+        # the gallery checkout. A render that dropped the line, or read it as
+        # a string and called it true, would turn them back on silently.
+        dest = self.tmp / "switched"
+        dest.mkdir()
+        (dest / "config.json").write_text(
+            json.dumps({"write_path": "https://write.example.invalid/api",
+                        "kiosk_views": False}),
+            encoding="utf-8",
+        )
+        loaded = gallery.Config.load(dest)
+        self.assertIs(False, loaded.kiosk_views)
+        gallery.render_index(self.conn, dest, loaded)
+        after = json.loads((dest / "config.json").read_text(encoding="utf-8"))
+        self.assertIs(False, after["kiosk_views"])
+
+    def test_a_config_written_before_the_kiosk_counts(self):
+        # Absent is on. Every checkout is in this state the first time the
+        # field ships, and none of them should go quiet.
+        dest = self.tmp / "older"
+        dest.mkdir()
+        (dest / "config.json").write_text(
+            json.dumps({"write_path": "https://write.example.invalid/api"}),
+            encoding="utf-8",
+        )
+        self.assertIs(True, gallery.Config.load(dest).kiosk_views)
 
     def test_the_line_page_shows_the_whole_line(self):
         line = (self.dest / "lines" / f"{self.ids[0]}.html").read_text(encoding="utf-8")
@@ -2476,13 +2508,17 @@ class KioskPageTests(GalleryTestCase):
 
     def test_the_menu_note_describes_the_live_page_not_the_mockup(self):
         # The mockup's numbers are invented and its note says so. Here they
-        # are real, and a play is still never a view (spec §1.5).
+        # are real, and so is the view a sketch earns by staying on the stage
+        # (docs/plans/kiosk-views.md §3.1). The note is the only place the
+        # room is told that, so it is pinned here: kiosk.js can stop counting
+        # without anybody noticing, but it cannot stop saying so.
         self.assertIn(
-            "Views and likes are live from the write path; a play here is "
-            "never counted as a view.",
+            "Views and likes are live from the write path; a sketch counts as "
+            "a view once it has been on screen for ten seconds.",
             self.kiosk,
         )
         self.assertNotIn("example numbers", self.kiosk)
+        self.assertNotIn("never counted as a view", self.kiosk)
 
     def test_the_page_parses(self):
         self.assertEqual([], balance_errors(self.dest / "kiosk.html"))
