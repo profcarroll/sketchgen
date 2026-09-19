@@ -307,6 +307,7 @@ def spawn(
     submitted_by: str,
     max_depth: int = DEFAULT_MAX_DEPTH,
     planner: str | None = None,
+    executor: str | None = None,
     rules_file: str | None = None,
     publication: str = "hold",
 ) -> int | None:
@@ -322,9 +323,12 @@ def spawn(
     ``needs='review'``, so the line stops until a person moves it
     (DECIDE[lineage-depth]).
 
-    ``planner`` and ``rules_file`` default to the parent's, so a line stays a
-    fair comparison with itself: the rules file is a variable the gallery
-    measures (spec §9) and changing it silently mid-line would spoil it.
+    ``planner``, ``executor`` and ``rules_file`` default to the parent's, so a
+    line stays a fair comparison with itself: the rules file is a variable the
+    gallery measures (spec §9) and changing it silently mid-line would spoil
+    it. The two model columns joined that rule on 2026-09-19, when the New job
+    page began letting an operator choose them — a child written by a different
+    model than its parent is a revision of nothing.
     """
     text = " ".join((critique or "").split())
     if not text:
@@ -351,6 +355,7 @@ def spawn(
         "critique_by": by,
         "publication": "hold" if at_limit else publication,
         "planner": planner if planner is not None else parent["planner"],
+        "executor": executor if executor is not None else parent["executor"],
         "rules_file": rules_file if rules_file is not None else parent["rules_file"],
     }
     if at_limit:

@@ -122,9 +122,10 @@ from dataclasses import field as dataclass_field
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, NamedTuple
 
 from sketchgen import db
+from sketchgen import executor
 from sketchgen import lineage
 from sketchgen import models
 from sketchgen import planner
@@ -2131,71 +2132,122 @@ MODEL_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,110}$")
 PAID_CHOICE = (PAID, "paid — the laptop claims it (needs-laptop)")
 
 
-def planner_models(host: str | None = None) -> list[models.Model]:
-    """The models this node could plan with: the vision-capable ones.
+class ModelMenu(NamedTuple):
+    """One "which model" select on the New job page.
+
+    The planner's and the executor's are the same menu over different
+    questions, so they are the same code over a different descriptor: which
+    capability a model needs to be offered, which model a job gets when nobody
+    chooses, what is worth saying on each row, and what sits under *off this
+    node* besides the proxied models.
+    """
+
+    #: The form field and the ``jobs`` column, which are the same word.
+    field: str
+    #: What a model must be able to do to appear. See :mod:`sketchgen.models`.
+    capability: str
+    #: Reads ``worker.DEFAULT_PLANNER_MODEL`` or ``executor.DEFAULT_MODEL`` when
+    #: it is asked rather than when this module is imported, so the menu follows
+    #: a worker configured with something else.
+    default: Callable[[], str]
+    #: Capabilities worth naming on a row. A menu filtered to vision does not
+    #: name vision on every row; one filtered to completion does.
+    mention: tuple[str, ...]
+    #: Choices under *off this node* that are not models — ``paid`` for the
+    #: planner, nothing for the executor (there is no ``needs='execute'``).
+    off_node: tuple[tuple[str, str], ...]
+    #: How the refusal sentence describes what the menu wanted.
+    wanted: str
+
+
+PLANNER_MENU = ModelMenu(
+    field="planner",
+    capability=models.PLANNER_CAPABILITY,
+    default=lambda: worker.DEFAULT_PLANNER_MODEL,
+    # Every row is vision-capable by construction, so saying so on every row is
+    # width spent on nothing. ``audio`` is worth the space: one model has it.
+    mention=("audio",),
+    off_node=(PAID_CHOICE,),
+    wanted="vision-capable models, or paid",
+)
+
+EXECUTOR_MENU = ModelMenu(
+    field="executor",
+    capability=models.EXECUTOR_CAPABILITY,
+    default=lambda: executor.DEFAULT_MODEL,
+    # Here vision IS news: it says which model could be shown the gate's
+    # screenshot rather than the text of build_evidence().
+    mention=("vision", "audio"),
+    off_node=(),
+    wanted="models that can complete",
+)
+
+
+def menu_models(menu: ModelMenu, host: str | None = None) -> list[models.Model]:
+    """The models this node could run this step with.
 
     Empty when the model host does not answer, which is not an error — see
-    :func:`planner_groups` for what the page shows then.
+    :func:`menu_groups` for what the page shows then.
     """
     return models.with_capability(
-        models.catalogue(host or OLLAMA_HOST), models.PLANNER_CAPABILITY
+        models.catalogue(host or OLLAMA_HOST), menu.capability
     )
 
 
-def planner_groups(host: str | None = None) -> list[tuple[str, list[tuple[str, str]]]]:
-    """The planner menu, as ``(group label, [(value, label), …])``.
+def menu_groups(
+    menu: ModelMenu, host: str | None = None
+) -> list[tuple[str, list[tuple[str, str]]]]:
+    """The menu, as ``(group label, [(value, label), …])``.
 
     Two groups, because the difference between them is the one an operator has
     to see before they press Queue: a model on this node costs electricity and
     nothing else, and a model *proxied* by this node — a ``-cloud`` tag, or the
-    ``paid`` route — sends the prompt off the box. The gallery's headline
-    numbers (0 API calls, $0.006 a sketch) are true of the first group only.
+    planner's ``paid`` route — sends the prompt off the box. The gallery's
+    headline numbers (0 API calls, $0.006 a sketch) are true of the first group
+    only.
 
     With no answer from the model host the first group holds one entry, the
     worker's configured default, which is exactly the choice this page offered
     before it could ask.
     """
-    found = planner_models(host)
+    default = menu.default()
+    found = menu_models(menu, host)
     # The worker's default is always offered, even if it fails the capability
     # filter: it is the model a job gets when nobody chooses, so a menu that
     # cannot express it is a menu that cannot say what the page is about to do.
-    if found and not any(model.name == worker.DEFAULT_PLANNER_MODEL for model in found):
+    if found and not any(model.name == default for model in found):
         fallback = next(
             (model for model in models.catalogue(host or OLLAMA_HOST)
-             if model.name == worker.DEFAULT_PLANNER_MODEL),
+             if model.name == default),
             None,
         )
         if fallback is not None:
             found = [fallback] + found
-    # Every row in this menu is vision-capable by construction, so saying so on
-    # every row is width spent on nothing. ``audio`` is worth the space: one
-    # model has it.
     here = [
         (model.name,
-         models.label(model, default=worker.DEFAULT_PLANNER_MODEL,
-                      mention=("audio",)))
+         models.label(model, default=default, mention=menu.mention))
         for model in found
         if not model.remote
     ]
     if not here:
         here = [(
             LOCAL,
-            f"local — {worker.DEFAULT_PLANNER_MODEL} (the model host did not "
-            "answer; this is the worker's default)",
+            f"local — {default} (the model host did not answer; this is the "
+            "worker's default)",
         )]
     away = [
         (model.name,
-         models.label(model, mention=("audio",)) + " — ollama.com, leaves this node")
+         models.label(model, mention=menu.mention) + " — ollama.com, leaves this node")
         for model in found
         if model.remote
     ]
     return [
         ("on this node", here),
-        ("off this node", away + [PAID_CHOICE]),
+        ("off this node", away + list(menu.off_node)),
     ]
 
 
-def planner_selected(value: str, host: str | None = None) -> str:
+def menu_selected(menu: ModelMenu, value: str, host: str | None = None) -> str:
     """Which option the select should open on, given what the form carries.
 
     The form may carry ``local`` — from the built-in defaults, a saved default
@@ -2206,53 +2258,94 @@ def planner_selected(value: str, host: str | None = None) -> str:
     would have used.
     """
     offered = [
-        option for _, options in planner_groups(host) for option, _ in options
+        option for _, options in menu_groups(menu, host) for option, _ in options
     ]
-    resolved = PAID if value == PAID else planner_column(value)
+    resolved = PAID if value == PAID else menu_column(menu, value)
     for candidate in (resolved, value):
         if candidate in offered:
             return candidate
     return offered[0] if offered else LOCAL
 
 
-def planner_values(host: str | None = None) -> set[str]:
-    """Every value the planner select can carry, for the validator."""
-    values = {LOCAL, PAID}
-    for _, options in planner_groups(host):
-        values.update(value for value, _ in options)
+def menu_values(menu: ModelMenu, host: str | None = None) -> set[str]:
+    """Every value this select can carry, for the validator."""
+    values = {LOCAL, PAID} if menu.off_node else {LOCAL}
+    for _, options in menu_groups(menu, host):
+        values.update(option for option, _ in options)
     return values
 
 
-def check_planner(value: str, host: str | None = None) -> str:
-    """The planner form value, or raise ValueError with the page's sentence.
+def check_menu(menu: ModelMenu, value: str, host: str | None = None) -> str:
+    """The form value, or raise ValueError with the sentence the page shows.
 
     A tag that is not in the catalogue is refused — unless there is no
     catalogue, because the host blinked between the render and the press. Then
-    a well-formed tag is taken at its word: the worker checks it against the
-    real Ollama at plan time and fails the job with a sentence naming the
-    model, which is a better place for that news than a refused form.
+    a well-formed tag is taken at its word: the worker hands it to the real
+    Ollama and fails the job with a sentence naming the model, which is a
+    better place for that news than a refused form.
     """
     if not value:
         return LOCAL
-    known = planner_values(host)
-    if value in known:
+    if value in menu_values(menu, host):
         return value
-    if not planner_models(host) and MODEL_TAG_RE.match(value):
+    if not menu_models(menu, host) and MODEL_TAG_RE.match(value):
         return value
     raise ValueError(
-        f"{value} is not a model this node offers as a planner — pick one from "
-        "the menu (vision-capable models, or paid)"
+        f"{value} is not a model this node offers as {menu.field} — pick one "
+        f"from the menu ({menu.wanted})"
     )
 
 
-def planner_column(value: str) -> str:
-    """The planner form value as the ``jobs.planner`` column wants it: ``paid``,
-    or the model tag itself. ``local`` is resolved here and nowhere else."""
-    if value == PAID:
+def menu_column(menu: ModelMenu, value: str) -> str:
+    """The form value as the ``jobs`` column wants it: ``paid``, or the model
+    tag itself. ``local`` is resolved here and nowhere else."""
+    if value == PAID and menu.off_node:
         return PAID
     if value in ("", LOCAL):
-        return worker.DEFAULT_PLANNER_MODEL
+        return menu.default()
     return value
+
+
+# The two menus, by the name the rest of the module calls them.
+
+def planner_groups(host: str | None = None) -> list[tuple[str, list[tuple[str, str]]]]:
+    return menu_groups(PLANNER_MENU, host)
+
+
+def planner_values(host: str | None = None) -> set[str]:
+    return menu_values(PLANNER_MENU, host)
+
+
+def planner_selected(value: str, host: str | None = None) -> str:
+    return menu_selected(PLANNER_MENU, value, host)
+
+
+def check_planner(value: str, host: str | None = None) -> str:
+    return check_menu(PLANNER_MENU, value, host)
+
+
+def planner_column(value: str) -> str:
+    return menu_column(PLANNER_MENU, value)
+
+
+def executor_groups(host: str | None = None) -> list[tuple[str, list[tuple[str, str]]]]:
+    return menu_groups(EXECUTOR_MENU, host)
+
+
+def executor_values(host: str | None = None) -> set[str]:
+    return menu_values(EXECUTOR_MENU, host)
+
+
+def executor_selected(value: str, host: str | None = None) -> str:
+    return menu_selected(EXECUTOR_MENU, value, host)
+
+
+def check_executor(value: str, host: str | None = None) -> str:
+    return check_menu(EXECUTOR_MENU, value, host)
+
+
+def executor_column(value: str) -> str:
+    return menu_column(EXECUTOR_MENU, value)
 
 
 RULES_CHOICES = (
@@ -2315,7 +2408,8 @@ def _chips(picked: set[str], size_w: str, size_h: str) -> str:
 #: shows again after "Forget them".
 DEFAULTS_KEY = "new_job_defaults"
 BUILTIN_DEFAULTS: dict[str, Any] = {
-    "planner": "local",
+    "planner": LOCAL,
+    "executor": LOCAL,
     "rules": "treatment",
     "publication": "hold",
     "max_attempts": "3",
@@ -2367,6 +2461,7 @@ def defaults_from(form: dict[str, list[str]]) -> dict[str, Any]:
         return (values[0] if values else default).strip()
 
     planner_choice = check_planner(one("planner", LOCAL))
+    executor_choice = check_executor(one("executor", LOCAL))
     rules = one("rules", "treatment")
     if rules not in {value for value, _ in RULES_CHOICES}:
         raise ValueError("rules must be control, treatment or random")
@@ -2383,6 +2478,7 @@ def defaults_from(form: dict[str, list[str]]) -> dict[str, Any]:
         raise ValueError("size(w,h) needs two whole numbers")
     return {
         "planner": planner_choice,
+        "executor": executor_choice,
         "rules": rules,
         "publication": publication,
         "max_attempts": raw_attempts,
@@ -2399,8 +2495,9 @@ def save_defaults(conn: sqlite3.Connection, form: dict[str, list[str]]) -> str:
     db.set_meta(conn, DEFAULTS_KEY, json.dumps(doc))
     words = ", ".join(doc["assert"]) or "none"
     return (
-        f"Saved as defaults — {doc['planner']} · {doc['rules']} · "
-        f"{doc['publication']} · {doc['max_attempts']} attempts · assertions: {words}"
+        f"Saved as defaults — {doc['planner']} · {doc['executor']} · "
+        f"{doc['rules']} · {doc['publication']} · {doc['max_attempts']} "
+        f"attempts · assertions: {words}"
     )
 
 
@@ -2410,19 +2507,25 @@ def clear_defaults(conn: sqlite3.Connection) -> str:
     return "Forgot the saved defaults — the page shows the built-in ones again"
 
 
-def _planner_word(value: str | None) -> str:
-    """An entry's or job's ``planner`` column as a value this form can carry.
+def _model_word(value: str | None) -> str:
+    """An entry's or job's ``planner``/``executor`` column as a value this form
+    can carry.
 
-    The column holds ``paid`` or a model tag (migration 001). Until the menu
-    listed real tags this collapsed everything that was not ``paid`` into
-    ``local``; now the tag is the answer, so picking a parent preselects the
-    model that parent was planned with and a line stays a comparison with
-    itself. A row from before any model was recorded still says ``local``.
+    Both columns hold a model tag, and ``planner`` may hold ``paid``
+    (migration 001). Until the menus listed real tags this collapsed everything
+    that was not ``paid`` into ``local``; now the tag is the answer, so picking
+    a parent preselects the models that parent was made with and a line stays a
+    comparison with itself. A row from before any model was recorded still says
+    ``local``.
     """
     text = (value or "").strip()
     if text == PAID:
         return PAID
     return text or LOCAL
+
+
+#: The old name, kept because the parent card and picker read it as one.
+_planner_word = _model_word
 
 
 def _spawnable_rows(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
@@ -2447,7 +2550,7 @@ def _parent_card(app: App, conn: sqlite3.Connection, parent_id: int | None) -> s
         return (
             '<p class="help" id="parent-card">none — a fresh root. Pick one below '
             "and the job is a child of it: the queue and the job page say so, and "
-            "planner and rules are preset from it so the line stays a fair "
+            "its models and rules are preset from it so the line stays a fair "
             "comparison with itself.</p>"
         )
     row = db.get_entry(conn, parent_id)
@@ -2472,7 +2575,8 @@ def _parent_card(app: App, conn: sqlite3.Connection, parent_id: int | None) -> s
         f"{_entry_image(app, row)}"
         f'<div><p class="meta"><a href="/entry/{parent_id}">entry {parent_id}</a> '
         f'<span class="pill {esc(state)}">{esc(state_label(state))}</span> '
-        f'<span class="dim">generation {generation} · {_planner_word(row["planner"])} · '
+        f'<span class="dim">generation {generation} · '
+        f'{esc(_model_word(row["planner"]))} · {esc(_model_word(row["executor"]))} · '
         f'{esc(row["rules_file"] or "—")} · {esc(row["submitted_by"] or "—")}</span></p>'
         f'<p class="prompt">{esc(root or "—")}</p>{revision}'
         '<p class="help"><button type="button" class="link" id="use-parent-prompt">'
@@ -2502,7 +2606,8 @@ def _parent_picker(app: App, conn: sqlite3.Connection, chosen: int | None) -> st
             f'<a class="pick{" on" if entry_id == chosen else ""}" '
             f'href="/new?parent={entry_id}" data-parent="{entry_id}" '
             f'data-state="{esc(state_label(state))}" data-state-class="{esc(state)}" '
-            f'data-planner="{_planner_word(row["planner"])}" '
+            f'data-planner="{esc(_model_word(row["planner"]))}" '
+            f'data-executor="{esc(_model_word(row["executor"]))}" '
             f'data-rules="{esc(row["rules_file"] or "")}" data-prompt="{esc(root)}">'
             f'{thumb}<span class="n">{entry_id}</span>'
             f'<span class="pill {esc(state)}">{esc(state_label(state))}</span>'
@@ -2644,6 +2749,9 @@ def new_page(
         planner_options=_grouped_options(
             planner_groups(), planner_selected(one("planner", LOCAL))
         ),
+        executor_options=_grouped_options(
+            executor_groups(), executor_selected(one("executor", LOCAL))
+        ),
         chips=_chips(picked, one("size_w", "400"), one("size_h", "400")),
         rules_options=_options(RULES_CHOICES, one("rules", "treatment")),
         publication_options=_options(PUBLICATION_CHOICES, one("publication", "hold")),
@@ -2659,8 +2767,8 @@ def form_from_query(
     """What a link into /new asks the form to start with.
 
     ``?parent=<id>`` fills the parent and — as :func:`sketchgen.lineage.spawn`
-    does — presets planner and rules from that entry, so a line stays a fair
-    comparison with itself unless the operator changes them on purpose.
+    does — presets planner, executor and rules from that entry, so a line stays
+    a fair comparison with itself unless the operator changes them on purpose.
     ``?prompt=`` fills the prompt: the recent-prompts list and anything else
     that wants to hand a sentence to this page.
     """
@@ -2670,11 +2778,14 @@ def form_from_query(
         form["parent_entry_id"] = [parent]
         row = db.get_entry(conn, int(parent))
         if row is not None and row["state"] in lineage.SPAWNABLE:
-            # Only preset a model the menu still offers: a parent planned with
-            # a tag since removed from the node would otherwise select nothing.
-            word = _planner_word(row["planner"])
-            if word in planner_values():
-                form["planner"] = [word]
+            # Only preset a model the menu still offers: a parent made with a
+            # tag since removed from the node would otherwise select nothing.
+            planned = _model_word(row["planner"])
+            if planned in planner_values():
+                form["planner"] = [planned]
+            written = _model_word(row["executor"])
+            if written in executor_values():
+                form["executor"] = [written]
             if row["rules_file"] in {value for value, _ in RULES_CHOICES}:
                 form["rules"] = [str(row["rules_file"])]
     prompt = (query.get("prompt") or [""])[0]
@@ -2734,6 +2845,7 @@ def create_job(conn: sqlite3.Connection, form: dict[str, list[str]]) -> tuple[in
             "hyphens, nothing else (course policy: no personal data)"
         )
     planner_choice = check_planner(one("planner", LOCAL))
+    executor_choice = check_executor(one("executor", LOCAL))
     rules = one("rules", "treatment")
     if rules not in {value for value, _ in RULES_CHOICES}:
         raise ValueError("rules must be control, treatment or random")
@@ -2766,6 +2878,7 @@ def create_job(conn: sqlite3.Connection, form: dict[str, list[str]]) -> tuple[in
 
     options: dict[str, Any] = {
         "planner": planner_column(planner_choice),
+        "executor": executor_column(executor_choice),
         "rules_file": rules,
         "publication": publication,
         "max_attempts": int(raw_attempts),
@@ -5427,15 +5540,17 @@ NEW_JOB_SCRIPT = r"""<script>
     parentBox.value = row.dataset.parent;
     document.querySelectorAll(".pick.on").forEach(function (el) { el.classList.remove("on"); });
     row.classList.add("on");
-    var planner = form.querySelector("[name=planner]");
     var rules = form.querySelector("[name=rules]");
-    // Only if the menu still has it: the parent may have been planned with a
-    // model since removed from the node, and setting an absent value on a
-    // <select> selects nothing at all — a blank box where a model should be.
-    if (planner && row.dataset.planner &&
-        planner.querySelector("option[value=\"" + row.dataset.planner + "\"]")) {
-      planner.value = row.dataset.planner;
+    // Only if the menu still has it: the parent may have been made with a model
+    // since removed from the node, and setting an absent value on a <select>
+    // selects nothing at all — a blank box where a model should be.
+    function preset(name, want) {
+      var box = form.querySelector("[name=" + name + "]");
+      if (!box || !want) { return; }
+      if (box.querySelector("option[value=\"" + want + "\"]")) { box.value = want; }
     }
+    preset("planner", row.dataset.planner);
+    preset("executor", row.dataset.executor);
     if (rules && row.dataset.rules) { rules.value = row.dataset.rules; }
     if (card) {
       var img = row.querySelector("img");
@@ -5443,7 +5558,8 @@ NEW_JOB_SCRIPT = r"""<script>
       card.innerHTML = (img ? "<img src=\"" + img.getAttribute("src") + "\" alt=\"frame strip\">" : "") +
         "<div><p class=\"meta\"><a href=\"/entry/" + row.dataset.parent + "\">entry " + row.dataset.parent +
         "</a> <span class=\"pill " + row.dataset.stateClass + "\">" + row.dataset.state + "</span>" +
-        " <span class=\"dim\">" + row.dataset.planner + " · " + (row.dataset.rules || "—") + "</span></p>" +
+        " <span class=\"dim\">" + row.dataset.planner + " · " + (row.dataset.executor || "—") +
+        " · " + (row.dataset.rules || "—") + "</span></p>" +
         "<p class=\"prompt\"></p><p class=\"help\"><button type=\"button\" class=\"link\" id=\"use-parent-prompt\">use its prompt</button>" +
         " as the starting point, or write a fresh one.</p></div>";
       card.querySelector(".prompt").textContent = row.dataset.prompt;
