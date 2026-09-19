@@ -126,6 +126,7 @@ from typing import Any, Callable, Iterable
 
 from sketchgen import db
 from sketchgen import lineage
+from sketchgen import models
 from sketchgen import planner
 from sketchgen import worker
 
@@ -2108,10 +2109,150 @@ def queue_page(conn: sqlite3.Connection, doc: dict[str, Any], control) -> str:
 # The new-job form
 # ---------------------------------------------------------------------------
 
-PLANNER_CHOICES = (
-    ("local", f"local — {worker.DEFAULT_PLANNER_MODEL}"),
-    ("paid", "paid — the laptop claims it (needs-laptop)"),
-)
+#: The Ollama this page asks what models exist. Same default and same
+#: environment variable as the worker's, because it is the same Ollama: a UI
+#: offering a model the worker cannot reach would be a menu of lies.
+OLLAMA_HOST = models.DEFAULT_HOST
+
+#: The planner choice that means "whatever the worker is configured with". It
+#: was the only local choice until 2026-09-19 and is still what a saved default,
+#: a ``?parent=`` preset or an old bookmark carries, so it is accepted on the
+#: way in and resolved to a real tag before it reaches the database. It is
+#: rendered as an option only when the model host cannot be asked for the
+#: real ones.
+LOCAL = "local"
+PAID = "paid"
+
+#: An Ollama model tag, for the case where the host cannot be reached to check
+#: the name against the real list. Deliberately narrow: this is the last thing
+#: between a form field and a column the worker will hand to a model host.
+MODEL_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,110}$")
+
+PAID_CHOICE = (PAID, "paid — the laptop claims it (needs-laptop)")
+
+
+def planner_models(host: str | None = None) -> list[models.Model]:
+    """The models this node could plan with: the vision-capable ones.
+
+    Empty when the model host does not answer, which is not an error — see
+    :func:`planner_groups` for what the page shows then.
+    """
+    return models.with_capability(
+        models.catalogue(host or OLLAMA_HOST), models.PLANNER_CAPABILITY
+    )
+
+
+def planner_groups(host: str | None = None) -> list[tuple[str, list[tuple[str, str]]]]:
+    """The planner menu, as ``(group label, [(value, label), …])``.
+
+    Two groups, because the difference between them is the one an operator has
+    to see before they press Queue: a model on this node costs electricity and
+    nothing else, and a model *proxied* by this node — a ``-cloud`` tag, or the
+    ``paid`` route — sends the prompt off the box. The gallery's headline
+    numbers (0 API calls, $0.006 a sketch) are true of the first group only.
+
+    With no answer from the model host the first group holds one entry, the
+    worker's configured default, which is exactly the choice this page offered
+    before it could ask.
+    """
+    found = planner_models(host)
+    # The worker's default is always offered, even if it fails the capability
+    # filter: it is the model a job gets when nobody chooses, so a menu that
+    # cannot express it is a menu that cannot say what the page is about to do.
+    if found and not any(model.name == worker.DEFAULT_PLANNER_MODEL for model in found):
+        fallback = next(
+            (model for model in models.catalogue(host or OLLAMA_HOST)
+             if model.name == worker.DEFAULT_PLANNER_MODEL),
+            None,
+        )
+        if fallback is not None:
+            found = [fallback] + found
+    # Every row in this menu is vision-capable by construction, so saying so on
+    # every row is width spent on nothing. ``audio`` is worth the space: one
+    # model has it.
+    here = [
+        (model.name,
+         models.label(model, default=worker.DEFAULT_PLANNER_MODEL,
+                      mention=("audio",)))
+        for model in found
+        if not model.remote
+    ]
+    if not here:
+        here = [(
+            LOCAL,
+            f"local — {worker.DEFAULT_PLANNER_MODEL} (the model host did not "
+            "answer; this is the worker's default)",
+        )]
+    away = [
+        (model.name,
+         models.label(model, mention=("audio",)) + " — ollama.com, leaves this node")
+        for model in found
+        if model.remote
+    ]
+    return [
+        ("on this node", here),
+        ("off this node", away + [PAID_CHOICE]),
+    ]
+
+
+def planner_selected(value: str, host: str | None = None) -> str:
+    """Which option the select should open on, given what the form carries.
+
+    The form may carry ``local`` — from the built-in defaults, a saved default
+    or an old bookmark — where the menu now lists real tags. Resolving it here
+    rather than leaving it unmatched matters: a ``<select>`` with nothing
+    selected opens on its *first* option, so a page that could not match the
+    saved choice would quietly offer a different model than the one the job
+    would have used.
+    """
+    groups = planner_groups(host)
+    offered = [value for _, options in groups for value, _ in options]
+    for candidate in (planner_column(value) if value != PAID else PAID, value):
+        if candidate in offered:
+            return candidate
+    return offered[0] if offered else LOCAL
+
+
+def planner_values(host: str | None = None) -> set[str]:
+    """Every value the planner select can carry, for the validator."""
+    values = {LOCAL, PAID}
+    for _, options in planner_groups(host):
+        values.update(value for value, _ in options)
+    return values
+
+
+def check_planner(value: str, host: str | None = None) -> str:
+    """The planner form value, or raise ValueError with the page's sentence.
+
+    A tag that is not in the catalogue is refused — unless there is no
+    catalogue, because the host blinked between the render and the press. Then
+    a well-formed tag is taken at its word: the worker checks it against the
+    real Ollama at plan time and fails the job with a sentence naming the
+    model, which is a better place for that news than a refused form.
+    """
+    if not value:
+        return LOCAL
+    known = planner_values(host)
+    if value in known:
+        return value
+    if not planner_models(host) and MODEL_TAG_RE.match(value):
+        return value
+    raise ValueError(
+        f"{value} is not a model this node offers as a planner — pick one from "
+        "the menu (vision-capable models, or paid)"
+    )
+
+
+def planner_column(value: str) -> str:
+    """The planner form value as the ``jobs.planner`` column wants it: ``paid``,
+    or the model tag itself. ``local`` is resolved here and nowhere else."""
+    if value == PAID:
+        return PAID
+    if value in ("", LOCAL):
+        return worker.DEFAULT_PLANNER_MODEL
+    return value
+
+
 RULES_CHOICES = (
     ("treatment", "treatment — the rules the course teaches"),
     ("control", "control — the A/B control file"),
@@ -2129,6 +2270,19 @@ def _options(choices: Iterable[tuple[str, str]], selected: str) -> str:
         f'{" selected" if value == selected else ""}>{esc(label)}</option>'
         for value, label in choices
     )
+
+
+def _grouped_options(
+    groups: Iterable[tuple[str, Iterable[tuple[str, str]]]], selected: str
+) -> str:
+    """The same as :func:`_options`, under ``<optgroup>`` labels. Empty groups
+    are dropped rather than rendered as an empty heading."""
+    out = []
+    for group, options in groups:
+        rendered = _options(options, selected)
+        if rendered:
+            out.append(f'<optgroup label="{esc(group)}">{rendered}</optgroup>')
+    return "".join(out)
 
 
 def _chips(picked: set[str], size_w: str, size_h: str) -> str:
@@ -2210,9 +2364,7 @@ def defaults_from(form: dict[str, list[str]]) -> dict[str, Any]:
         values = form.get(name) or []
         return (values[0] if values else default).strip()
 
-    planner_choice = one("planner", "local")
-    if planner_choice not in {value for value, _ in PLANNER_CHOICES}:
-        raise ValueError("planner must be local or paid")
+    planner_choice = check_planner(one("planner", LOCAL))
     rules = one("rules", "treatment")
     if rules not in {value for value, _ in RULES_CHOICES}:
         raise ValueError("rules must be control, treatment or random")
@@ -2257,8 +2409,18 @@ def clear_defaults(conn: sqlite3.Connection) -> str:
 
 
 def _planner_word(value: str | None) -> str:
-    """An entry's or job's ``planner`` column as the form's two-way choice."""
-    return "paid" if (value or "") == "paid" else "local"
+    """An entry's or job's ``planner`` column as a value this form can carry.
+
+    The column holds ``paid`` or a model tag (migration 001). Until the menu
+    listed real tags this collapsed everything that was not ``paid`` into
+    ``local``; now the tag is the answer, so picking a parent preselects the
+    model that parent was planned with and a line stays a comparison with
+    itself. A row from before any model was recorded still says ``local``.
+    """
+    text = (value or "").strip()
+    if text == PAID:
+        return PAID
+    return text or LOCAL
 
 
 def _spawnable_rows(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
@@ -2477,7 +2639,9 @@ def new_page(
         parent_entry_id=esc(parent_raw),
         parent_card=_parent_card(app, conn, parent_id),
         parent_picker=_parent_picker(app, conn, parent_id),
-        planner_options=_options(PLANNER_CHOICES, one("planner", "local")),
+        planner_options=_grouped_options(
+            planner_groups(), planner_selected(one("planner", LOCAL))
+        ),
         chips=_chips(picked, one("size_w", "400"), one("size_h", "400")),
         rules_options=_options(RULES_CHOICES, one("rules", "treatment")),
         publication_options=_options(PUBLICATION_CHOICES, one("publication", "hold")),
@@ -2504,7 +2668,11 @@ def form_from_query(
         form["parent_entry_id"] = [parent]
         row = db.get_entry(conn, int(parent))
         if row is not None and row["state"] in lineage.SPAWNABLE:
-            form["planner"] = [_planner_word(row["planner"])]
+            # Only preset a model the menu still offers: a parent planned with
+            # a tag since removed from the node would otherwise select nothing.
+            word = _planner_word(row["planner"])
+            if word in planner_values():
+                form["planner"] = [word]
             if row["rules_file"] in {value for value, _ in RULES_CHOICES}:
                 form["rules"] = [str(row["rules_file"])]
     prompt = (query.get("prompt") or [""])[0]
@@ -2563,9 +2731,7 @@ def create_job(conn: sqlite3.Connection, form: dict[str, list[str]]) -> tuple[in
             "submitted by must be a GitHub username — letters, digits and "
             "hyphens, nothing else (course policy: no personal data)"
         )
-    planner_choice = one("planner", "local")
-    if planner_choice not in {value for value, _ in PLANNER_CHOICES}:
-        raise ValueError("planner must be local or paid")
+    planner_choice = check_planner(one("planner", LOCAL))
     rules = one("rules", "treatment")
     if rules not in {value for value, _ in RULES_CHOICES}:
         raise ValueError("rules must be control, treatment or random")
@@ -2597,9 +2763,7 @@ def create_job(conn: sqlite3.Connection, form: dict[str, list[str]]) -> tuple[in
         raise ValueError(problem)
 
     options: dict[str, Any] = {
-        "planner": (
-            "paid" if planner_choice == "paid" else worker.DEFAULT_PLANNER_MODEL
-        ),
+        "planner": planner_column(planner_choice),
         "rules_file": rules,
         "publication": publication,
         "max_attempts": int(raw_attempts),
@@ -5263,7 +5427,13 @@ NEW_JOB_SCRIPT = r"""<script>
     row.classList.add("on");
     var planner = form.querySelector("[name=planner]");
     var rules = form.querySelector("[name=rules]");
-    if (planner && row.dataset.planner) { planner.value = row.dataset.planner; }
+    // Only if the menu still has it: the parent may have been planned with a
+    // model since removed from the node, and setting an absent value on a
+    // <select> selects nothing at all — a blank box where a model should be.
+    if (planner && row.dataset.planner &&
+        planner.querySelector("option[value=\"" + row.dataset.planner + "\"]")) {
+      planner.value = row.dataset.planner;
+    }
     if (rules && row.dataset.rules) { rules.value = row.dataset.rules; }
     if (card) {
       var img = row.querySelector("img");
