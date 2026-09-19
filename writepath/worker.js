@@ -39,6 +39,10 @@ const STATE_COOKIE = "sg_state";
 const SESSION_SECONDS = 30 * 24 * 60 * 60; // 30 days
 const STATE_SECONDS = 600;
 const VIEW_WINDOW_MS = 60_000;
+// What may ask /view for a view. The kiosk is anonymous and de-duplicated by
+// nothing here — it restrains itself instead (docs/plans/kiosk-views.md §2) —
+// so this set is a label on the count, not a permission.
+const VIEW_SOURCES = new Set(["entry", "kiosk"]);
 const PULL_LIMIT = 500;
 const QUESTIONS = new Set(["brief", "look"]);
 const CHOICES = new Set(["A", "B", "tie"]);
@@ -84,10 +88,15 @@ export const SQL = {
     "VALUES (?, ?, ?, ?, ?) " +
     "ON CONFLICT(entry_id, username) " +
     "DO UPDATE SET active = excluded.active, updated_utc = excluded.updated_utc",
+  // The kiosk's bind is 1 or 0, so one statement serves both callers and the
+  // two columns cannot drift: every kiosk view is a view, and `count` stays
+  // the total /counts and /pull report.
   bumpView:
-    "INSERT INTO views (entry_id, count, updated_utc) VALUES (?, 1, ?) " +
+    "INSERT INTO views (entry_id, count, kiosk_count, updated_utc) VALUES (?, 1, ?, ?) " +
     "ON CONFLICT(entry_id) " +
-    "DO UPDATE SET count = views.count + 1, updated_utc = excluded.updated_utc",
+    "DO UPDATE SET count = views.count + 1, " +
+    "kiosk_count = views.kiosk_count + excluded.kiosk_count, " +
+    "updated_utc = excluded.updated_utc",
   lastSeen:
     "SELECT seen_utc FROM view_log WHERE session_hash = ? AND entry_id = ?",
   touchSeen:
@@ -695,6 +704,15 @@ async function routeView(request, env, username, sessionValue) {
   if (!body) return json({ error: "bad json" }, 400, request, env);
   const entryId = body.entry_id;
   if (!isEntryId(entryId)) return json({ error: "entry_id must be an entry id" }, 400, request, env);
+  // Where the view came from. Absent is the entry page, so nothing that
+  // already posts here changes; the kiosk names itself so that the projector's
+  // views stay separable from the ones a person clicked (see schema.sql).
+  // Named rather than free text: an open field here would be a column of
+  // whatever anybody felt like sending.
+  const source = body.source === undefined || body.source === null ? "entry" : body.source;
+  if (!VIEW_SOURCES.has(source)) {
+    return json({ error: "source must be entry or kiosk" }, 400, request, env);
+  }
 
   const now = Date.now();
   const stamp = utcNow(now);
@@ -711,7 +729,7 @@ async function routeView(request, env, username, sessionValue) {
     }
     await env.DB.prepare(SQL.touchSeen).bind(key, entryId, stamp).run();
   }
-  await env.DB.prepare(SQL.bumpView).bind(entryId, stamp).run();
+  await env.DB.prepare(SQL.bumpView).bind(entryId, source === "kiosk" ? 1 : 0, stamp).run();
   return json({ ok: true, counted: true }, 200, request, env);
 }
 
