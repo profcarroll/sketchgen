@@ -9,8 +9,11 @@
  * Two things are faked so the run is deterministic rather than slow. The
  * timers are a queue this file steps by hand, so the 420 ms fade between
  * sketches and the 8 s menu timeout cost nothing and never race; and fetch
- * answers the four requests the script is allowed to make — kiosk.json,
- * config.json, /counts and one sketch's source — from fixtures.
+ * answers the five requests the script is allowed to make — kiosk.json,
+ * config.json, /counts, one sketch's source, and the one write it is allowed,
+ * POST /view — from fixtures. Every one of them is kept in `asked`, with the
+ * init it was called with, because what the script posted is as much of the
+ * behaviour as what it drew.
  *
  * Prints one JSON object on the last line, which tests/test_gallery_js.py
  * asserts over; exits non-zero with a stack on a failure.
@@ -263,7 +266,7 @@ function kioskPage(document) {
     ]),
     el(document, "footer", {}, [
       el(document, "p", {}, [el(document, "code", { id: "launch" })]),
-      el(document, "p", { id: "m-note", text: "Views and likes are live from the write path; a play here is never counted as a view." })
+      el(document, "p", { id: "m-note", text: "Views and likes are live from the write path; a sketch counts as a view once it has been on screen for ten seconds." })
     ])
   ]));
 
@@ -320,9 +323,13 @@ function load(options) {
       return answer({ entries: entries });
     }
     if (String(url).indexOf("config.json") !== -1) {
-      return answer({ write_path: opts.writePath === null ? "" : "https://write.example.invalid/api" });
+      const config = { write_path: opts.writePath === null ? "" : "https://write.example.invalid/api" };
+      // Absent is on, which is what a gallery that predates the kiosk sends.
+      if (opts.kioskViews === false) { config.kiosk_views = false; }
+      return answer(config);
     }
     if (String(url).indexOf("/counts") !== -1) { return answer({ counts: COUNTS }); }
+    if (String(url).indexOf("/view") !== -1) { return answer({ ok: true, counted: true }); }
     if (/sketch\.js$/.test(String(url))) { return answer(null, SOURCE); }
     return Promise.reject(new Error("offline: " + url));
   };
@@ -407,6 +414,25 @@ function showing(document) {
 }
 
 function frames(document) { return document.querySelectorAll("iframe.sketch"); }
+
+/* Every write the script made, in order, unpacked. A POST that is not a view
+ * would land here too, which is the point: the run asserts on the whole list,
+ * not on the views in it. */
+function posted(asked) {
+  return asked
+    .filter(function (one) { return one.init && one.init.method; })
+    .map(function (one) {
+      return {
+        url: one.url,
+        method: one.init.method,
+        body: JSON.parse(one.init.body),
+        // The tests read this back to prove it stayed absent: a projector
+        // that presented an identity would be filing every sketch it played
+        // under whoever last signed in on that machine.
+        keys: Object.keys(one.init).sort()
+      };
+    });
+}
 
 async function started(options) {
   const world = await load(options);
@@ -847,6 +873,108 @@ async function starting() {
   };
 }
 
+/* The write (docs/plans/kiosk-views.md §3), which is the only one this script
+ * is allowed to make and the one with nothing downstream to catch a mistake:
+ * /view de-duplicates a signed-in viewer and the projector signs nobody in,
+ * so a view posted per frame would be a view posted per frame. */
+async function views() {
+  /* Ten seconds of a sixty-second slot, and not a frame before. */
+  const dwelled = await started({ search: "?order=newest&every=60" });
+  const seat = showing(dwelled.document);
+  dwelled.tock(9000);
+  const atNine = posted(dwelled.asked).length;
+  dwelled.tock(1000);
+  const atTen = posted(dwelled.asked);
+
+  /* Six hundred more frames on the same seat. One view, still: the flag is
+   * set before the request goes out, so no frame can post a second. */
+  for (let step = 0; step < 600; step += 1) { dwelled.tock(16); }
+  const afterSixHundredFrames = posted(dwelled.asked).length;
+
+  /* A sketch somebody skipped past was never on screen for ten seconds. */
+  const skipped = await started({ search: "?order=newest&every=60" });
+  const passedBy = showing(skipped.document);
+  skipped.tock(4000);
+  press(skipped.document, "ArrowRight");   // opens the menu
+  press(skipped.document, "ArrowRight");   // and now it acts
+  skipped.tock(FADE);
+  press(skipped.document, "Escape");
+  const afterASkip = { entry: passedBy, now: showing(skipped.document), posts: posted(skipped.asked).length };
+
+  /* Ten seconds of playing, not ten seconds of wall clock. */
+  const held = await started({ search: "?order=newest&every=60" });
+  held.tock(9000);
+  press(held.document, "z");               // opens the menu
+  press(held.document, " ");               // and now pauses
+  held.tock(600000);                       // ten minutes of a paused room
+  const whilePaused = posted(held.asked).length;
+  // The menu timed out somewhere in those ten minutes, so this is two presses
+  // again: one to bring it back, one to play.
+  press(held.document, "z");
+  press(held.document, " ");
+  held.tock(1000);                         // the tenth second, at last
+  const afterResuming = posted(held.asked).length;
+
+  /* A fifteen-second slot is shorter than the threshold and still counts. */
+  const quick = await started({ search: "?order=newest&every=15" });
+  quick.tock(15000);
+  const shortSlot = posted(quick.asked).length;
+
+  /* Eight hours of playing with nobody in the room. The sketches keep going;
+   * the counting does not, until somebody turns up. */
+  const empty = await started({ search: "?order=newest&every=600" });
+  for (let step = 0; step < 60; step += 1) { empty.tock(600000); empty.tock(FADE); }
+  const unattended = posted(empty.asked).length;
+  const stillPlaying = frames(empty.document).length;
+  press(empty.document, "z");              // somebody is here
+  press(empty.document, "Escape");
+  empty.tock(600000);
+  empty.tock(FADE);
+  const afterSomebodyArrives = posted(empty.asked).length;
+
+  /* The two switches, and a gallery with nowhere to post. */
+  const byUrl = await started({ search: "?order=newest&every=60&views=0" });
+  byUrl.tock(60000);
+  byUrl.tock(FADE);
+  byUrl.tock(60000);
+  press(byUrl.document, "z");              // an acting key rewrites the address bar
+  press(byUrl.document, "]");
+  const off = {
+    posts: posted(byUrl.asked).length,
+    link: byUrl.document.getElementById("launch").textContent,
+    // persist() rewrote the address bar when ] acted. If views=0 is not in
+    // what it wrote, the next acting key turns the counting back on.
+    bar: byUrl.window.history.lastUrl
+  };
+
+  const byConfig = await started({ search: "?order=newest&every=60", kioskViews: false });
+  byConfig.tock(60000);
+  byConfig.tock(FADE);
+  const configOff = posted(byConfig.asked).length;
+
+  const nowhere = await started({ search: "?order=newest&every=60", writePath: null });
+  nowhere.tock(60000);
+  nowhere.tock(FADE);
+  const noWritePath = posted(nowhere.asked).length;
+
+  return {
+    seat: seat,
+    atNine: atNine,
+    atTen: atTen,
+    afterSixHundredFrames: afterSixHundredFrames,
+    afterASkip: afterASkip,
+    whilePaused: whilePaused,
+    afterResuming: afterResuming,
+    shortSlot: shortSlot,
+    unattended: unattended,
+    stillPlaying: stillPlaying,
+    afterSomebodyArrives: afterSomebodyArrives,
+    off: off,
+    configOff: configOff,
+    noWritePathPosts: noWritePath
+  };
+}
+
 async function main() {
   const report = {
     orders: await orders(),
@@ -866,6 +994,7 @@ async function main() {
     qrElsewhere: await qrElsewhere(),
     migration: await migration(),
     starting: await starting(),
+    views: await views(),
     source: { chars: SOURCE.length, bytes: Buffer.byteLength(SOURCE, "utf8") }
   };
   console.log(JSON.stringify(report));

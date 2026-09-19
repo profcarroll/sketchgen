@@ -52,10 +52,17 @@ an IIFE, `"use strict"`, ES5 syntax, no build step, comments that say why.
    artifact cannot frame the gallery. A sketch's own key handlers therefore never see a kiosk key
    and a kiosk key never reaches a sketch, which is the behaviour the mockup fakes by dropping
    `keyPressed`.
-5. **A kiosk play is not a view.** `sendView()` is scoped to `main.entry` and stays so. One
+5. **A kiosk play is not a view.** ~~`sendView()` is scoped to `main.entry` and stays so. One
    screen left running would add a view a minute to whatever sorts first and bend the "most
    liked" and "most reviewed" neighbourhoods without a person choosing anything. The kiosk reads
-   `/counts`; it never POSTs.
+   `/counts`; it never POSTs.~~
+
+   **Reversed 19 September 2026 by the instructor, after using it. A kiosk play is a view**, on
+   three conditions, and `docs/plans/kiosk-views.md` is the packet. The reason given above does
+   not hold — no sort and no judge reads views, so nothing about the measurement or the
+   neighbourhoods moves. The reason that does hold is elsewhere: `/view` de-duplicates a
+   signed-in viewer and nothing else, and the kiosk signs nobody in, so the only restraint on it
+   is the one `kiosk.js` keeps for itself.
 6. **The first key only opens the menu.** A bumped keyboard must not skip a sketch. While the
    menu is open, keys act; it closes on `Esc` or after 8 s without a key. The status line's hint
    `any key · controls` is the only affordance and it is deliberately faint.
@@ -85,7 +92,8 @@ an IIFE, `"use strict"`, ES5 syntax, no build step, comments that say why.
     light mode. `body.kiosk` sets the ground explicitly and every colour is a token.
 
 Still the instructor's to overrule before work starts: the eight-second menu timeout in 6, and
-whether a kiosk play should count as a view in 5.
+whether a kiosk play should count as a view in 5. *(The second of those was confirmed as written,
+then reversed after the kiosk had been used in a room — see 5.)*
 
 ## 2. `kiosk.json`
 
@@ -273,8 +281,12 @@ The caption's contents follow the mockup's `paint()` exactly, string for string:
 
 ### 4.5 What `kiosk.js` must not do
 
-POST anything. Read `document.cookie`. Evaluate sketch source. Touch `localStorage` keys other
-than `sketchgen-kiosk`. Hold more than one iframe at a time.
+~~POST anything.~~ Write anything but the one view of §1.5 as amended — one `POST <base>/view`,
+after ten playing seconds on a seat, once per seat, and not at all once the room has gone eight
+hours without a key or a mouse. Read `document.cookie`. Present an identity of any kind: `/counts`
+is a public read and `/view` takes an anonymous write, and a projector that presented one would
+file every sketch it played under whoever last signed in on that machine. Evaluate sketch source.
+Touch `localStorage` keys other than `sketchgen-kiosk`. Hold more than one iframe at a time.
 
 ## 5. Acceptance
 
@@ -303,8 +315,10 @@ where node is absent):
   leaves exactly one iframe in the document.
 - `?order=liked&every=45&show=prompt,code` on load sets the state, and the launch link in the
   menu footer prints that string back.
-- No `fetch` call in the script is a POST (assert on the text of the file, as the suite already
-  reads scripts as text).
+- ~~No `fetch` call in the script is a POST~~ Exactly one `fetch` call in the script is a POST and
+  its URL is `base() + "/view"` (assert on the text of the file, as the suite already reads
+  scripts as text), and none of them carries a credential. The behaviour behind it is
+  `docs/plans/kiosk-views.md` §4.
 
 ## 6. Running it
 
