@@ -721,6 +721,27 @@ class LineageJsonTests(GalleryTestCase):
             sorted(self.entries),
         )
 
+    def test_the_stamp_is_the_newest_stamp_in_the_database_not_the_clock(self):
+        # publish_index re-renders the site and commits only if bytes changed;
+        # a stamp taken from the clock made every re-render a commit. This one
+        # is the last thing the database recorded, so it moves only when the
+        # database does.
+        newest = self.conn.execute(
+            "SELECT MAX(stamp) FROM ("
+            "  SELECT created_utc AS stamp FROM entries"
+            "  UNION ALL SELECT published_utc FROM entries"
+            "  UNION ALL SELECT created_utc FROM lineage)"
+        ).fetchone()[0]
+        self.assertEqual(newest, self.data["generated_utc"])
+        later = "2031-01-01T00:00:00Z"
+        self.conn.execute(
+            "UPDATE entries SET published_utc = ? WHERE id = ?", (later, self.ids[0])
+        )
+        self.conn.commit()
+        self.render()
+        data = json.loads((self.dest / "lineage.json").read_text(encoding="utf-8"))
+        self.assertEqual(later, data["generated_utc"])
+
     def test_every_entry_is_here_whatever_its_state(self):
         # including the held child, which is on no page of the site at all
         self.assertIn(str(self.held), self.entries)
@@ -777,7 +798,7 @@ class LineageJsonTests(GalleryTestCase):
         self.conn.execute(
             "UPDATE entries SET prompt = ? WHERE id = ?", (composed, self.ids[1])
         )
-        data = gallery._lineage_index(self.conn, "2026-09-14T04:02:11Z")
+        data = gallery._lineage_index(self.conn)
         self.assertEqual(
             "a cityscape from sunrise to sunset",
             data["entries"][str(self.ids[1])]["root_prompt"],
@@ -799,7 +820,7 @@ class LineageJsonTests(GalleryTestCase):
         limit = gallery.LINEAGE_JSON_LIMIT
         gallery.LINEAGE_JSON_LIMIT = 4_000
         self.addCleanup(setattr, gallery, "LINEAGE_JSON_LIMIT", limit)
-        data = gallery._lineage_index(self.conn, "2026-09-14T04:02:11Z")
+        data = gallery._lineage_index(self.conn)
         for entry_id in (*self.ids, self.third):
             self.assertEqual(
                 gallery.LINEAGE_ROOT_PROMPT_CAP,
@@ -2187,13 +2208,10 @@ class GuardTests(GalleryTestCase):
 class DeterminismTests(GalleryTestCase):
 
     def render(self):
-        # lineage.json carries a generated_utc, the one clock a render reads.
-        # Pinning it here is what lets this test ask the question it means to
-        # ask — does the same database give the same bytes — rather than
-        # whether the two renders fell in the same second.
-        return gallery.render_all(
-            self.conn, self.dest, self.config, generated_utc="2026-09-14T04:02:11Z"
-        )
+        # Nothing is pinned: a render reads no clock, so this asks the real
+        # question — does the same database give the same bytes — of the same
+        # call publish_index makes, not of a render with the clock held still.
+        return gallery.render_all(self.conn, self.dest, self.config)
 
     def test_a_second_render_all_is_byte_identical(self):
         self.render()

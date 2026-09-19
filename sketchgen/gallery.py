@@ -57,7 +57,6 @@ from pathlib import Path
 from string import Template
 from typing import Any, Iterable
 
-from . import db as db_mod
 from . import pairs as pairs_mod
 from . import lineage
 
@@ -555,9 +554,33 @@ def _whole_forest(
     return parent, children
 
 
-def _lineage_index(
-    conn: sqlite3.Connection, generated_utc: str
-) -> dict[str, Any]:
+def _ledger_stamp(conn: sqlite3.Connection) -> str:
+    """The ledger's ``generated_utc``: the newest stamp the database holds.
+
+    Not the wall clock. The ledger is a rendering of the database as it stands,
+    so it is dated by the last thing the database recorded — an entry created
+    or published, a lineage row written — and the same database gives the same
+    bytes however many times it is rendered. That is what lets a re-render
+    that changed nothing be the no-op ``publish_index`` promises instead of a
+    commit that moves one timestamp. An empty gallery is dated by its schema:
+    the newest migration stamp, which every initialised database carries.
+    """
+    row = conn.execute(
+        """
+        SELECT MAX(stamp) FROM (
+            SELECT created_utc AS stamp FROM entries
+            UNION ALL SELECT published_utc FROM entries
+            UNION ALL SELECT created_utc FROM lineage
+            UNION ALL SELECT applied_utc FROM schema_version
+        )
+        """
+    ).fetchone()
+    stamp = row[0] if row is not None else None
+    # Unreachable on a migrated database; still no clock.
+    return str(stamp) if stamp else "1970-01-01T00:00:00Z"
+
+
+def _lineage_index(conn: sqlite3.Connection) -> dict[str, Any]:
     """The ledger's data file: every entry, its place in its line, one shape.
 
     The entry page carries its own ancestry as static HTML — it was true when
@@ -606,7 +629,7 @@ def _lineage_index(
                     Path(row["source_dir"]) if row["source_dir"] else None
                 )
             entries[str(entry_id)] = item
-        return {"generated_utc": generated_utc, "entries": entries}
+        return {"generated_utc": _ledger_stamp(conn), "entries": entries}
 
     data = payload(None)
     if len(_lineage_bytes(data)) > LINEAGE_JSON_LIMIT:
@@ -1544,7 +1567,7 @@ def _ledger_index(conn: sqlite3.Connection) -> dict[str, Any]:
     One producer, one vocabulary: a row the server draws and a row the script
     draws cannot disagree about a generation or a chip.
     """
-    return _lineage_index(conn, "")["entries"]
+    return _lineage_index(conn)["entries"]
 
 
 def _ledger_chain(index: dict[str, Any], entry_id: int) -> list[int]:
@@ -2485,15 +2508,13 @@ def render_index(
     conn: sqlite3.Connection,
     dest_dir: str | Path,
     config: Config | None = None,
-    *,
-    generated_utc: str | None = None,
 ) -> list[Path]:
     """Write the grid, the failures, compare, the line pages, assets and config.
 
-    ``generated_utc`` is the one clock this module reads, and it reaches only
-    ``lineage.json``, whose shape the spec fixes with that field in it. Pass a
-    stamp to keep a render byte-identical to another one; every page is
-    unaffected either way.
+    No clock is read: the same database gives the same bytes, which is what
+    lets ``publish_index`` tell a re-render that changed nothing from one that
+    did. ``lineage.json``'s ``generated_utc`` is the newest stamp the database
+    holds (:func:`_ledger_stamp`), not the time of the render.
     """
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
@@ -2552,9 +2573,7 @@ def render_index(
         )
         written.write_text(
             dest / "lineage.json",
-            _lineage_bytes(
-                _lineage_index(conn, generated_utc or db_mod.utc_now())
-            ).decode("utf-8"),
+            _lineage_bytes(_lineage_index(conn)).decode("utf-8"),
         )
         # Every public entry, not just the published ones: a kept rejection's
         # entry page links here with ?a=<itself> and the page has to know that
@@ -2586,13 +2605,11 @@ def render_all(
     conn: sqlite3.Connection,
     dest_dir: str | Path,
     config: Config | None = None,
-    *,
-    generated_utc: str | None = None,
 ) -> list[Path]:
     """Every public entry, then the pages that index them."""
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
-    written = render_index(conn, dest, config, generated_utc=generated_utc)
+    written = render_index(conn, dest, config)
     for row in _public_rows(conn):
         written.append(render_entry(conn, int(row["id"]), dest, config))
     return written
