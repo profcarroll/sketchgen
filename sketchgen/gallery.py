@@ -12,6 +12,8 @@ One entry row plus its attempt directory in, a directory of plain files out:
     <gallery>/index.html                 the grid (published entries)
     <gallery>/rejections.html            the gate's rejections, kept
     <gallery>/compare.html               the paired-judgment shell
+    <gallery>/kiosk.html                  the projector shell (spec kiosk.md)
+    <gallery>/kiosk.json                  every published entry, for the kiosk
     <gallery>/pairs.json                 balanced pairs to offer, and agent verdicts
     <gallery>/lineage.json               every entry's place in its line
     <gallery>/lines/<root>.html          one page per lineage line
@@ -722,6 +724,40 @@ def _statement(row: sqlite3.Row, source: Path | None) -> str:
             except OSError:  # pragma: no cover - unreadable statement
                 return ""
     return ""
+
+
+#: The one thing the kiosk cannot ask the sketch itself. Its frame is
+#: ``allow-scripts`` without ``allow-same-origin``, which is opaque by design,
+#: so there is no channel to read the canvas size over — and a fixed-size canvas
+#: in a stage-sized frame sits top-left, where p5 puts it. The generator can
+#: read the source, so the generator says (spec §4.3). Two integer literals and
+#: nothing else counts: a third argument is left outside the match, so
+#: ``createCanvas(800, 600, WEBGL)`` still gives a size, while ``windowWidth``,
+#: a variable or an expression gives none and the kiosk fills the stage.
+_CANVAS_RE = re.compile(r"createCanvas\(\s*(\d+)\s*,\s*(\d+)")
+
+
+def _canvas_size(row: sqlite3.Row, attempts: list[sqlite3.Row]) -> list[int] | None:
+    """``[width, height]`` from the sketch's own source, or ``None``.
+
+    The same file :func:`_write_entry` copies to ``e/<id>/sketch/sketch.js``,
+    read where it still lives — the attempt directory — so a manifest row and
+    the page's frame can never disagree about what is on screen.
+    """
+    source = _source_dir(row, attempts)
+    if source is None:
+        return None
+    path = source / "sketch.js"
+    if not path.is_file():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:  # pragma: no cover - unreadable sketch
+        return None
+    match = _CANVAS_RE.search(text)
+    if match is None:
+        return None
+    return [int(match.group(1)), int(match.group(2))]
 
 
 # ---------------------------------------------------------------------------
@@ -2412,6 +2448,139 @@ def _offered_pairs(conn: sqlite3.Connection) -> list[dict[str, int]]:
     return pairs_mod.offer(conn)
 
 
+# ---------------------------------------------------------------------------
+# The kiosk (spec docs/plans/kiosk.md)
+#
+# One page that plays the published sketches one after another on a projector,
+# and one manifest behind it. The kiosk needs the prompt, brief, statement,
+# judgment and provenance of every published entry before it can order them,
+# and meta.json per entry is one request per entry — 222 of them before the
+# first sketch appears. So the generator serialises the values it has already
+# computed for meta.json and the cards a second time, into one file. Nothing
+# here is new logic; that is the point, because two files disagreeing about the
+# same entry is the failure this shape rules out.
+# ---------------------------------------------------------------------------
+
+#: What a manifest row takes straight from :func:`_meta`, by the same names.
+KIOSK_META_KEYS = (
+    "prompt",
+    "brief",
+    "statement",
+    "submitted_by",
+    "planner",
+    "executor",
+    "rules_file",
+    "attempts",
+    "seed",
+    "created_utc",
+    "published_utc",
+    "prompt_tokens",
+    "completion_tokens",
+    "wall_s",
+    "licence",
+)
+
+#: What it takes from meta.json's ``lineage`` block, flattened into the row:
+#: the kiosk's caption reads these four beside the prompt, and a nested object
+#: for four values would only be meta.json's shape worn for no reason.
+KIOSK_LINEAGE_KEYS = (
+    "generation",
+    "parent_entry_id",
+    "critique_by",
+    "root_entry_id",
+)
+
+#: The three of :func:`_standing`'s five the kiosk prints. ``rank`` and ``pool``
+#: are the card's business: they place a mark on a track, and the kiosk has no
+#: track.
+KIOSK_STANDING_KEYS = ("score", "n", "pct")
+
+
+def _kiosk_judgment(scores: dict, entry_id: int) -> dict[str, dict[str, dict]]:
+    """``{population: {question: {score, n, pct}}}``, missing where unjudged.
+
+    A population that has not judged this entry on this question is *absent* —
+    not ``null``, not zero. A score nobody voted on is not a low score, and an
+    ordering built over a zero would sink every unjudged entry to the bottom of
+    'most reviewed' as though the pool had spoken. The browser prints *no pairs
+    yet* for a missing key, as the entry page does.
+    """
+    out: dict[str, dict[str, dict]] = {}
+    for population, tables in scores.items():
+        by_question: dict[str, dict] = {}
+        for question, table in tables.items():
+            stand = _standing(table, entry_id)
+            if stand is None:
+                continue
+            by_question[question] = {key: stand[key] for key in KIOSK_STANDING_KEYS}
+        if by_question:
+            out[population] = by_question
+    return out
+
+
+def _kiosk_entry(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    config: Config,
+    parent: dict[int, int | None],
+    children: dict[int, list[int]],
+    scores: dict,
+) -> dict[str, Any]:
+    """One entry as the kiosk reads it: meta.json's values, plus where to run."""
+    entry_id = int(row["id"])
+    attempts = _attempt_rows(conn, int(row["job_id"]))
+    meta = _meta(conn, row, attempts, config, parent, children)
+    entry: dict[str, Any] = {"id": entry_id}
+    entry.update({key: meta[key] for key in KIOSK_META_KEYS})
+    entry.update({key: meta["lineage"][key] for key in KIOSK_LINEAGE_KEYS})
+    # Relative to the gallery root, as the compare shell's rows are: the kiosk
+    # page sits beside index.html and resolves them against the same base.
+    entry["sketch"] = f"e/{entry_id}/sketch/"
+    entry["source"] = f"e/{entry_id}/sketch/sketch.js"
+    entry["href"] = f"e/{entry_id}/"
+    canvas = _canvas_size(row, attempts)
+    if canvas is not None:
+        entry["canvas"] = canvas
+    entry["judgment"] = _kiosk_judgment(scores, entry_id)
+    return entry
+
+
+def _kiosk_manifest(
+    conn: sqlite3.Connection,
+    config: Config,
+    parent: dict[int, int | None],
+    children: dict[int, list[int]],
+) -> dict[str, Any]:
+    """``kiosk.json``: every published entry, in ascending id order.
+
+    Published entries only, the same rows the grid page gets. A projector in a
+    lobby shows the gallery, and the gallery is the published set — a kept
+    rejection has a page of its own and a reason printed on it, neither of which
+    survives being played for sixty seconds with no one at the keyboard.
+
+    The four Bradley–Terry tables are fitted once here and handed to every row:
+    the fit is over the whole pool, so doing it per entry would be slower and no
+    different. No clock is read and the order is total, so the same database
+    gives the same bytes.
+    """
+    scores = _all_scores(conn)
+    rows = sorted(_entries(conn, "published"), key=lambda row: int(row["id"]))
+    return {
+        "entries": [
+            _kiosk_entry(conn, row, config, parent, children, scores) for row in rows
+        ]
+    }
+
+
+def _kiosk_page(config: Config) -> str:
+    """The kiosk shell. No entry data: ``kiosk.js`` fetches ``kiosk.json``.
+
+    ``config`` is taken and unused, as the other page builders take it, so that
+    a future footer naming the write path is a change to this function alone.
+    """
+    return _template("kiosk.html").substitute(root="./", page_title="Sketchgen Kiosk")
+
+
 def _line_node(
     item: dict[str, Any],
     by_id: dict[int, sqlite3.Row],
@@ -2509,7 +2678,8 @@ def render_index(
     dest_dir: str | Path,
     config: Config | None = None,
 ) -> list[Path]:
-    """Write the grid, the failures, compare, the line pages, assets and config.
+    """Write the grid, the failures, compare, the kiosk, the line pages, assets
+    and config.
 
     No clock is read: the same database gives the same bytes, which is what
     lets ``publish_index`` tell a re-render that changed nothing from one that
@@ -2572,6 +2742,15 @@ def render_index(
             + "\n",
         )
         written.write_text(
+            dest / "kiosk.json",
+            json.dumps(
+                _kiosk_manifest(conn, config, parent, children),
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+        )
+        written.write_text(
             dest / "lineage.json",
             _lineage_bytes(_lineage_index(conn)).decode("utf-8"),
         )
@@ -2581,6 +2760,7 @@ def render_index(
         written.write_text(
             dest / "compare.html", _compare_page(conn, _public_rows(conn))
         )
+        written.write_text(dest / "kiosk.html", _kiosk_page(config))
         roots = sorted(
             {
                 _root_of(parent, entry_id)
