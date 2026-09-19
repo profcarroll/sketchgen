@@ -24,10 +24,29 @@
     },
     "disk_gb": {
       "total": 139.7,
-      "used": 107.8,
-      "free": 31.9,
-      "models": 71.94,
-      "chromium": 0.96
+      "used": 41.0,
+      "free": 99.0,
+      "models": 91.0,
+      "chromium": 0.96,
+      "model_volume": {
+        "total": 147.9,
+        "used": 91.0,
+        "free": 50.0,
+        "separate": true
+      },
+      "cost": {
+        "block_gb": 287.6,
+        "free_tier_gb": 200.0,
+        "billable_gb": 87.6,
+        "rate_usd_gb_month": 0.0255,
+        "usd_month": 2.23,
+        "free_tier_model_gb": 60.3,
+        "over_free_tier_gb": 30.7,
+        "would_drop": [
+          {"name": "qwen3-coder:30b-a3b-q4_K_M", "size_gb": 20.51},
+          {"name": "gemma4:26b", "size_gb": 18.0}
+        ]
+      }
     },
     "top": [
       {"pid": 1188, "cpu_pct": 389.4, "mem_pct": 22.1, "cmd": "ollama runner --model /usr/share/ollama/.ollama/…"},
