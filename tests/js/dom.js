@@ -256,6 +256,32 @@ class Element {
     this.clientWidth = 0;
     this.clientHeight = 0;
     this.scrollHeight = 0;
+    // The sheets on the swipe page only take a drag-to-close from the top of
+    // their own scroll, so they read this before they start following a
+    // finger. Nothing lays out here, so it starts at the top and stays there
+    // unless a test says otherwise.
+    this.scrollTop = 0;
+  }
+
+  /* Pointer capture, as a pair of no-ops. swipe.js captures the pointer on
+   * pointerdown so that a drag which leaves the shield still ends on it; node
+   * has no pointer to capture, and a test dispatches the whole sequence at the
+   * element anyway, so there is nothing for these to do but exist. */
+  setPointerCapture() {}
+  releasePointerCapture() {}
+
+  /* The nearest ancestor-or-self matching the selector, including this one.
+   * The swipe page delegates the settings sheet's order rows and its sign-in
+   * offer to the container, which is how a list repainted from innerHTML keeps
+   * working without rewiring every row. */
+  closest(selector) {
+    var parts = parse(selector);
+    var walk = this;
+    while (walk && walk.nodeType === 1) {
+      if (matches(walk, parts)) { return walk; }
+      walk = walk.parentNode;
+    }
+    return null;
   }
 
   get className() { return this.attributes["class"] || ""; }
@@ -362,7 +388,27 @@ class Element {
   }
 
   click() {
-    (this.listeners.click || []).forEach(function (fn) { fn({ preventDefault: function () {} }); });
+    const el = this;
+    (this.listeners.click || []).forEach(function (fn) {
+      // target as well as preventDefault: a delegating handler reads it, and a
+      // click on the element itself is its own target in a browser too.
+      fn({ target: el, preventDefault: function () {} });
+    });
+  }
+
+  /* One event at one element, with the fields the test wants on it. There is
+   * no bubbling here and none is wanted: a test that means to exercise a
+   * delegating handler dispatches at the container with the real target on the
+   * event, which is what a browser would have handed it. Pointer events come
+   * through here too — pointerdown, pointermove, pointerup — with clientX,
+   * clientY and pointerId, because the swipe page's six gestures are pointer
+   * events and there is no other way to drive them. */
+  dispatch(name, event) {
+    const detail = event || {};
+    if (detail.target === undefined) { detail.target = this; }
+    if (detail.preventDefault === undefined) { detail.preventDefault = function () {}; }
+    (this.listeners[name] || []).forEach(function (fn) { fn(detail); });
+    return detail;
   }
 }
 
@@ -377,6 +423,9 @@ class Document extends Element {
   constructor() {
     super("#document");
     this.readyState = "complete";
+    // A tab nobody is looking at counts no views on the swipe page, so a test
+    // that wants that case sets this to "hidden".
+    this.visibilityState = "visible";
     // A page has these two whatever else it has; kiosk.js puts a class on the
     // body and asks the root element about full screen.
     this.documentElement = new Element("html");
@@ -418,6 +467,13 @@ function makeWindow() {
     },
     // Nothing in a test reaches the network: the page must stand up anyway.
     fetch: function () { return Promise.reject(new Error("offline")); },
+    // Enough of a navigator for the swipe page's hold, which buzzes a phone
+    // that can be buzzed. Every call is kept, so a test can say the hold did
+    // it and the other five gestures did not.
+    navigator: {
+      buzzed: [],
+      vibrate: function (ms) { window.navigator.buzzed.push(ms); return true; }
+    },
     listeners: {},
     addEventListener: function (name, fn) {
       (window.listeners[name] = window.listeners[name] || []).push(fn);
