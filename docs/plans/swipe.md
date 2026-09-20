@@ -200,7 +200,8 @@ matching names are what makes that a mechanical change.
 
 Reads: `config.json` (`cache: "no-store"`, for `write_path`), `swipe.json` (`no-store`),
 `/counts?entries=…` in batches of `COUNTS_BATCH = 100`, `/me` once at start, `e/<id>/meta.json`
-when a sheet needs it (cached per id for the page's life), `pairs.json` on the first judge. Writes,
+when a sheet needs it (cached per id for the page's life), `pairs.json` on the first judge, and
+`GET /logout` on sign-out (as `gallery.js` does: the Worker's cookie goes with the token). Writes,
 each with `authHeaders` (§4.6) and `credentials: "include"`: `POST /view` (§4.7), `POST /like`
 (§4.6), `POST /vote` (§4.5). Nothing else, and the acceptance test pins the list (§6).
 
@@ -322,7 +323,8 @@ it has been on screen for ten seconds.*; the launch link for the current order a
 the gallery and the kiosk.
 
 **Sign in** (`sheet-signin`). Opened by a like or a vote while signed out, never otherwise. Heading
-*Sign in to like it* or *Sign in to record it*; the sentence about GitHub login; one button, *Sign
+*Sign in to like it* or *Sign in to record it* (*Sign in with GitHub* from the settings sheet's own
+row); the sentence about GitHub login; one button, *Sign
 in with GitHub*, which writes the return note (§5) and goes to `base() + "/login"`; one quiet
 button, *not now*. Declined, a like does nothing and a vote stays noted on the sheet.
 
@@ -427,8 +429,11 @@ what the gestures need and nothing more — `setPointerCapture` and `releasePoin
   under ten seconds posts none; a hidden tab (`document.visibilityState` stubbed) posts none.
 - With no `write_path`, no request to `base()` is made at all.
 - The set of URLs in `asked` whose `init.method` is `POST` is a subset of `{/view, /like, /vote}`,
-  asserted over the whole run; and, over the comment-stripped text of `swipe.js`, exactly three
-  `fetch(` calls carry `method:` and their URLs are `base() + "/view"`, `"/like"`, `"/vote"`.
+  asserted over the whole run; over the comment-stripped text of `swipe.js`, exactly three
+  `fetch(` calls carry `method:` and their URLs are `base() + "/view"`, `"/like"`, `"/vote"`; and
+  the set of every `base() + "/…"` literal in the file is exactly `/counts, /me, /logout, /login,
+  /view, /like, /vote` — a request the page makes to the Worker that is not one of those is a bug
+  whatever its method.
 - `swipe.js`'s text names no `localStorage` key other than the three of §4.8, and never writes
   `sketchgen_session` except in `writeToken`.
 - `gallery.js`: with `#session=tok` in the location and the return note set to

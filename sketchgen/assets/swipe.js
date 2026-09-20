@@ -837,7 +837,9 @@
     $("status").innerHTML = "<b>" + (state.i + 1) + "</b> of " +
       num(ENTRIES.length) + " · " + esc(state.order);
     // With nowhere to post a like, the heart is a control that cannot act.
-    $("heart").hidden = !base();
+    // setAttribute, not .hidden: the heart is an <svg>, and SVGElement has no
+    // hidden property to reflect — the assignment would be a silent expando.
+    if (base()) { $("heart").removeAttribute("hidden"); } else { $("heart").setAttribute("hidden", ""); }
     paintLiked();
   }
 
@@ -877,6 +879,9 @@
     closeSheets();
     $(id).classList.add("open");
     $("dim").classList.add("open");
+    // The judge sheet is half height so the stage stays visible above it and
+    // the pair can be watched in turn; a scrim over both sides defeats that.
+    $("dim").style.background = id === "sheet-judge" ? "transparent" : "";
   }
 
   function wireSheets() {
@@ -944,8 +949,7 @@
     var fields;
     $("i-title").textContent = "#" + entry.id + " · " + parts.root;
     $("i-sub").textContent = parts.revisions.length
-      ? "Revised " + parts.revisions.length +
-        (parts.revisions.length === 1 ? " time" : " times") + ", latest: " +
+      ? (parts.revisions.length === 1 ? "Revised once" : "Revised " + parts.revisions.length + " times") + ", latest: " +
         parts.revisions[parts.revisions.length - 1]
       : "A root prompt, unrevised.";
     $("i-brief").textContent = (meta && meta.brief) || "";
@@ -1224,7 +1228,7 @@
     var at;
     var order;
     if (!$("s-orders")) { return; }
-    $("s-place").textContent = "Sketch " + (state.i + 1) + " of " + num(ENTRIES.length) + ".";
+    $("s-place").textContent = "Sketch " + (state.i + 1) + " of " + num(ENTRIES.length);
     for (at = 0; at < ORDERS.length; at += 1) {
       order = ORDERS[at];
       rows.push("<li><button type=\"button\" data-order=\"" + order.key +
@@ -1269,7 +1273,7 @@
       var target = event && event.target;
       if (!target) { return; }
       if (target.id === "s-out") { signOut(); }
-      if (target.id === "s-in") { askSignIn("Sign in to like it"); }
+      if (target.id === "s-in") { askSignIn("Sign in with GitHub"); }
     });
   }
 
@@ -1461,6 +1465,9 @@
   function onDown(event) {
     var shield = $("shield");
     if (!state.started || anySheet() || state.touching) { return; }
+    // One finger at a time: a second pointerdown must not replace a gesture
+    // whose hold timer is still live, or the timer reads the new press.
+    if (gesture) { return; }
     if (shield.setPointerCapture) { shield.setPointerCapture(event.pointerId); }
     gesture = {
       x: event.clientX, y: event.clientY, t: now(),
@@ -1501,12 +1508,22 @@
     }
   }
 
+  function abandon(event) {
+    if (!gesture || event.pointerId !== gesture.id) { return; }
+    window.clearTimeout(gesture.hold);
+    gesture = null;
+    $("cue-like").style.opacity = "";
+    $("cue-judge").style.opacity = "";
+    $("cue-like").style.transform = "";
+    $("cue-judge").style.transform = "";
+    settle();
+  }
+
   function release(event) {
     var shield = $("shield");
     var done;
     var dt;
     var vy;
-    if (shield.releasePointerCapture) { shield.releasePointerCapture(event.pointerId); }
     if (!gesture || event.pointerId !== gesture.id) { return; }
     done = gesture;
     gesture = null;
@@ -1549,7 +1566,10 @@
     shield.addEventListener("pointerdown", onDown);
     shield.addEventListener("pointermove", onMove);
     shield.addEventListener("pointerup", release);
-    shield.addEventListener("pointercancel", release);
+    // A cancel is the browser taking the gesture — an edge swipe, the
+    // notification shade, a second finger — and is never a decision: the
+    // stage settles and nothing acts, however far the finger had gone.
+    shield.addEventListener("pointercancel", abandon);
     // The caption is under the shield and takes no pointer events, so this
     // never fires from a finger; it is kept for a keyboard or an assistive
     // click on the element itself. The finger's path is onCaption() above.

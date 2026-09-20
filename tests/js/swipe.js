@@ -298,7 +298,7 @@ function swipePage(document) {
   body.appendChild(el(document, "button", {
     class: "status", id: "status", type: "button", "aria-label": "this page"
   }));
-  body.appendChild(el(document, "span", { class: "heart", id: "heart", "aria-hidden": "true" }));
+  body.appendChild(el(document, "svg", { class: "heart", id: "heart", "aria-hidden": "true" }));
   body.appendChild(el(document, "div", { class: "caption", id: "caption" }));
   body.appendChild(el(document, "p", { class: "toast", id: "toast", role: "status" }));
   body.appendChild(el(document, "button", {
@@ -1047,7 +1047,10 @@ async function offline() {
   const world = await started({ search: "?order=newest", writePath: null });
   const start = {
     caption: world.document.getElementById("caption").textContent,
-    heartHidden: world.document.getElementById("heart").hidden
+    // An attribute, not the property: the template's heart is an <svg>.
+    heartHidden: (function (heart) {
+      var v = heart.getAttribute("hidden"); return v !== null && v !== undefined;
+    }(world.document.getElementById("heart")))
   };
   drag(world, 100, 0);
   await quiet();

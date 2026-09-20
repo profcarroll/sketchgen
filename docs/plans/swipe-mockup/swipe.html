@@ -658,7 +658,7 @@ code { font-family: var(--mono); font-size: 0.85em; }
     var counts = COUNTS[e.id] || {};
     var html = "<p class=\"prompt\"><span class=\"num\">#" + e.id + "</span>" + esc(parts.root) + "</p>";
     if (parts.revisions.length) {
-      html += "<p class=\"revisions\"><b>revised " + parts.revisions.length + (parts.revisions.length === 1 ? " time" : " times") + ", latest:</b> " + esc(parts.revisions[parts.revisions.length - 1]) + "</p>";
+      html += "<p class=\"revisions\"><b>" + (parts.revisions.length === 1 ? "revised once" : "revised " + parts.revisions.length + " times") + ", latest:</b> " + esc(parts.revisions[parts.revisions.length - 1]) + "</p>";
     }
     html += "<p class=\"authors\">Prompted by <span>" + esc(e.submitted_by) + "</span> · planned by <span>" + esc(e.planner) + "</span> · written by <span>" + esc(e.executor) + "</span> under the " + esc(e.rules_file) + " rules" + (e.attempts > 1 ? ", gate passed on attempt " + e.attempts : "") + "</p>";
     html += "<ul class=\"facts\"><li class=\"gen\"><b>generation " + e.generation + "</b></li>";
@@ -675,7 +675,7 @@ code { font-family: var(--mono); font-size: 0.85em; }
   function paintInfo(e) {
     var parts = promptParts(e.prompt);
     $("i-title").textContent = "#" + e.id + " · " + parts.root;
-    $("i-sub").textContent = parts.revisions.length ? "Revised " + parts.revisions.length + (parts.revisions.length === 1 ? " time" : " times") + ", latest: " + parts.revisions[parts.revisions.length - 1] : "A root prompt, unrevised.";
+    $("i-sub").textContent = parts.revisions.length ? (parts.revisions.length === 1 ? "Revised once" : "Revised " + parts.revisions.length + " times") + ", latest: " + parts.revisions[parts.revisions.length - 1] : "A root prompt, unrevised.";
     $("i-brief").textContent = e.brief;
     $("i-by").textContent = e.executor;
     $("i-statement").textContent = e.statement;
