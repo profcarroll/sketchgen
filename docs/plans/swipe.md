@@ -180,7 +180,8 @@ the moment the start card is dismissed (`body.swipe.playing .bar { display: none
 The stage layout, for the CSS (the mockup's `.phone` rules are the reference and are lifted into
 `gallery.css` under `/* ---- swipe ---- */`, `.phone` renamed `body.swipe`, `position: absolute`
 becoming `fixed`, tokens the kiosk's): the stage fills the viewport and centres the frame; the shield
-is over it at `z-index: 3`; the cues at 4; the status line, heart and caption at 4–5; the toast and
+is over it at `z-index: 3` with the caption under it at 2; the cues at 4; the status line and heart at
+5; the toast and
 the pill at 8; the dim at 9 and the sheets at 10; the start card at 20. The caption's scrim is deep
 enough to read over a white canvas — a third of the gallery is light. `body.swipe` sets
 `touch-action: none` and `overscroll-behavior: none`, so no swipe becomes a scroll or a
@@ -251,9 +252,13 @@ element still ends. The constants, from the mockup, and they are the spec:
 While a vertical drag is live the stage follows the finger at 0.6; while a horizontal one is live
 the stage follows at 0.35 and the cue on that side grows from 0 to 1 over `COMMIT_H`. On release:
 
-- **no axis**, inside the tap bounds — toggle the words: `body.swipe.quiet` hides the caption, the
-  status line and the heart, and shows them again. A tap on the caption itself is not a shield
-  event (the caption is above the shield) and opens `sheet-info`.
+- **no axis**, inside the tap bounds — if the words are up and the point is inside the caption's
+  box (`getBoundingClientRect`, read at the tap), open `sheet-info`; otherwise toggle the words:
+  `body.swipe.quiet` hides the caption, the status line and the heart, and shows them again. The
+  caption sits **under** the shield with `pointer-events: none`, so the shield sees every tap and
+  routes it, and a swipe that starts on the words is still a swipe. (The mockup's first draft had
+  the caption above the shield; on a phone that ate the swipes a thumb starts in the bottom
+  third, which is where the caption is.)
 - **no axis**, held past `HOLD_MS` — the shield lifts (`body.swipe.touching`), the caption goes
   quiet, the pill appears, and `navigator.vibrate(12)` where it exists. A hold that never moved is
   never a tap: the hold timer clears the gesture before release can read it.

@@ -255,6 +255,10 @@ class Element {
     // clientHeight and the fitting arithmetic becomes checkable.
     this.clientWidth = 0;
     this.clientHeight = 0;
+    // And a box, for the one script that hit-tests a tap against an element
+    // (swipe.js onCaption). Zero everywhere until a test sets `rect`, so a
+    // tap at any real coordinate lands outside it by default.
+    this.rect = null;
     this.scrollHeight = 0;
     // The sheets on the swipe page only take a drag-to-close from the top of
     // their own scroll, so they read this before they start following a
@@ -381,6 +385,10 @@ class Element {
     this.childNodes.forEach(function (child) { child.parentNode = null; });
     this.childNodes = [];
     if (value !== "") { this.appendChild(new Text(value)); }
+  }
+
+  getBoundingClientRect() {
+    return this.rect || { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0 };
   }
 
   addEventListener(name, fn) {

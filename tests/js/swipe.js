@@ -583,11 +583,12 @@ function drag(world, dx, dy, ms) {
 
 /* A release inside 10 px and 300 ms. No clock is stepped at all, so it is
  * inside both bounds by construction. */
-function tap(world) {
+function tap(world, x, y) {
   const shield = world.document.getElementById("shield");
   const id = (pointer += 1);
-  shield.dispatch("pointerdown", { pointerId: id, clientX: 200, clientY: 420 });
-  shield.dispatch("pointerup", { pointerId: id, clientX: 200, clientY: 420 });
+  const at = { clientX: x === undefined ? 200 : x, clientY: y === undefined ? 420 : y };
+  shield.dispatch("pointerdown", { pointerId: id, clientX: at.clientX, clientY: at.clientY });
+  shield.dispatch("pointerup", { pointerId: id, clientX: at.clientX, clientY: at.clientY });
 }
 
 /* A press that does not move for HOLD_MS. The hold timer clears the gesture,
@@ -779,10 +780,18 @@ async function tapAndHold() {
   drag(world, 0, -80);
   world.tock(LEAVE);
 
-  // A tap on the caption is not a shield event: it opens all of the words.
-  world.document.getElementById("caption").click();
+  // The caption sits under the shield: a tap that lands in its box opens all
+  // of the words, and one above it toggles them. The box is the test's to
+  // set; the phone's bottom third, as on a 375×812 screen.
+  world.document.getElementById("caption").rect =
+    { left: 0, top: 700, right: 375, bottom: 812, width: 375, height: 112 };
+  tap(world, 100, 750);
   await quiet();
   const sheet = openSheetId(world.document);
+  world.document.querySelector("#sheet-info [data-close]").click();
+  const closedAgain = openSheetId(world.document);
+  tap(world, 100, 200);
+  const aboveToggles = classes(world.document);
 
   return {
     before: before,
@@ -792,7 +801,9 @@ async function tapAndHold() {
     heldEntry: stillHere,
     given: given,
     movedAfter: showing(world.document),
-    captionOpens: sheet
+    captionOpens: sheet,
+    closedAgain: closedAgain,
+    aboveToggles: aboveToggles
   };
 }
 

@@ -1317,7 +1317,10 @@ body.swipe .status, body.swipe .caption { transition: opacity 200ms ease; }
 
 /* ---- the caption: prompt, authors, facts, under a scrim ---- */
 body.swipe .caption {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 4;
+  /* Under the shield (z 3), and no pointer events: a thumb starts most
+   * swipes in the bottom third of the screen, which is where this is, and
+   * the shield hit-tests a tap against this box to open the words. */
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 2; pointer-events: none;
   padding: 4.5rem 1.1rem 1.5rem; padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
   /* Deep enough to read over a white canvas: a third of the gallery's sketches
    * are light, and a scrim that only works on black is a caption that only

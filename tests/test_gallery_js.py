@@ -1288,7 +1288,14 @@ class SwipeTests(unittest.TestCase):
         self.assertEqual(22, held["movedAfter"])
 
     def test_a_tap_on_the_caption_opens_the_words_rather_than_hiding_them(self):
+        # Through the shield, not on the caption: the caption sits under it so
+        # a swipe that starts on the words is still a swipe (a thumb starts
+        # most of them there), and the shield hit-tests the tap instead.
         self.assertEqual("sheet-info", self.report["tapAndHold"]["captionOpens"])
+
+    def test_a_tap_above_the_caption_toggles_the_words_instead(self):
+        self.assertIsNone(self.report["tapAndHold"]["closedAgain"])
+        self.assertIn("quiet", self.report["tapAndHold"]["aboveToggles"])
 
     # ---- a like (§4.6) ---------------------------------------------------
 

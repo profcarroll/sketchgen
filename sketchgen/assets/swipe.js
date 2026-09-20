@@ -1421,6 +1421,15 @@
     else { document.body.classList.add("quiet"); }
   }
 
+  /* Whether a point is inside the caption's box. getBoundingClientRect is
+   * read at the tap, not cached: the caption's height changes with every
+   * seat. A hidden caption (quiet) has no box worth honouring, and the
+   * caller checks that first. */
+  function onCaption(x, y) {
+    var box = $("caption").getBoundingClientRect();
+    return x >= box.left && x <= box.right && y >= box.top && y <= box.bottom;
+  }
+
   function toggleWords() {
     state.words = !state.words;
     paintQuiet();
@@ -1510,7 +1519,13 @@
     if (!done.axis) {
       settle();
       if (Math.abs(done.dx) < TAP_MOVE && Math.abs(done.dy) < TAP_MOVE && dt < TAP_MS) {
-        toggleWords();
+        // The caption sits under the shield, so the shield sees every tap and
+        // routes the ones that land on the words: open all of them rather
+        // than hide the few that are up. Under, not over, because a thumb
+        // starts most swipes in the bottom third of a phone, which is exactly
+        // where the caption is, and a caption above the shield ate them.
+        if (state.words && !state.touching && onCaption(done.x, done.y)) { openInfo(); }
+        else { toggleWords(); }
       }
       return;
     }
@@ -1535,8 +1550,9 @@
     shield.addEventListener("pointermove", onMove);
     shield.addEventListener("pointerup", release);
     shield.addEventListener("pointercancel", release);
-    // The caption is above the shield, so a tap on it is not a shield event:
-    // it opens all of the words rather than hiding the few that are up.
+    // The caption is under the shield and takes no pointer events, so this
+    // never fires from a finger; it is kept for a keyboard or an assistive
+    // click on the element itself. The finger's path is onCaption() above.
     $("caption").addEventListener("click", function () {
       if (state.words && !state.touching) { openInfo(); }
     });
