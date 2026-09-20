@@ -14,6 +14,8 @@ One entry row plus its attempt directory in, a directory of plain files out:
     <gallery>/compare.html               the paired-judgment shell
     <gallery>/kiosk.html                  the projector shell (spec kiosk.md)
     <gallery>/kiosk.json                  every published entry, for the kiosk
+    <gallery>/swipe.html                  the phone shell (spec swipe.md)
+    <gallery>/swipe.json                  the same entries, without the prose
     <gallery>/pairs.json                 balanced pairs to offer, and agent verdicts
     <gallery>/lineage.json               every entry's place in its line
     <gallery>/lines/<root>.html          one page per lineage line
@@ -2538,6 +2540,31 @@ def _kiosk_judgment(scores: dict, entry_id: int) -> dict[str, dict[str, dict]]:
     return out
 
 
+def _manifest_base(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    config: Config,
+    parent: dict[int, int | None],
+    children: dict[int, list[int]],
+) -> dict[str, Any]:
+    """Everything both manifests read off one entry, computed once.
+
+    ``kiosk.json`` and ``swipe.json`` are two serialisations of the same row,
+    written in the same pass (swipe.md §2). :func:`_meta` walks the attempt
+    rows, reads the statement off disk and fits the lineage; :func:`_canvas_size`
+    and :func:`_needs_mic` each read the sketch source. Doing that twice per
+    entry would double the cost of a 910-entry render for two files that must
+    agree by construction, so the shared half is built here and handed to both.
+    """
+    attempts = _attempt_rows(conn, int(row["job_id"]))
+    return {
+        "entry_id": int(row["id"]),
+        "meta": _meta(conn, row, attempts, config, parent, children),
+        "canvas": _canvas_size(row, attempts),
+        "mic": _needs_mic(_source_dir(row, attempts)),
+    }
+
+
 def _kiosk_entry(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2545,11 +2572,13 @@ def _kiosk_entry(
     parent: dict[int, int | None],
     children: dict[int, list[int]],
     scores: dict,
+    base: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """One entry as the kiosk reads it: meta.json's values, plus where to run."""
-    entry_id = int(row["id"])
-    attempts = _attempt_rows(conn, int(row["job_id"]))
-    meta = _meta(conn, row, attempts, config, parent, children)
+    if base is None:
+        base = _manifest_base(conn, row, config, parent, children)
+    entry_id = base["entry_id"]
+    meta = base["meta"]
     entry: dict[str, Any] = {"id": entry_id}
     entry.update({key: meta[key] for key in KIOSK_META_KEYS})
     entry.update({key: meta["lineage"][key] for key in KIOSK_LINEAGE_KEYS})
@@ -2565,11 +2594,137 @@ def _kiosk_entry(
     # publishes as source.entry. It is what the kiosk *prints* under the code
     # (§5.3), for somebody typing it, and typing is not scanning.
     entry["url"] = config.entry_url(entry_id)
-    canvas = _canvas_size(row, attempts)
-    if canvas is not None:
-        entry["canvas"] = canvas
+    if base["canvas"] is not None:
+        entry["canvas"] = base["canvas"]
     entry["judgment"] = _kiosk_judgment(scores, entry_id)
     return entry
+
+
+# ---------------------------------------------------------------------------
+# Swipe mode (spec docs/plans/swipe.md)
+#
+# The phone's manifest, and the shell that reads it. swipe.json is the kiosk's
+# manifest with the long prose taken out: kiosk.json is 2.8 MB because it
+# carries every brief and statement in the gallery, and the swipe page shows
+# one of each at a time and fetches e/<id>/meta.json when the words sheet
+# opens. Same rows, same fit, same pass, so the two files can never disagree
+# about an entry (spec §1.2).
+# ---------------------------------------------------------------------------
+
+#: What a swipe row takes straight from :func:`_meta`. The caption prints all
+#: seven; ``brief``, ``statement``, ``seed``, ``created_utc``, the two token
+#: counts, ``wall_s`` and ``licence`` are the words sheet's, and the words
+#: sheet has meta.json.
+SWIPE_META_KEYS = (
+    "prompt",
+    "submitted_by",
+    "planner",
+    "executor",
+    "rules_file",
+    "attempts",
+    "published_utc",
+)
+
+#: Three of the kiosk's four lineage keys. ``root_entry_id`` is the kiosk's
+#: 'the root of this line' overlay; the swipe caption prints the generation and
+#: the words sheet prints the parent and its critic, and neither walks to a
+#: root.
+SWIPE_LINEAGE_KEYS = ("generation", "parent_entry_id", "critique_by")
+
+#: ``responds(click)`` → ``click``. The gate's assertion vocabulary is the only
+#: place the generator can learn that a sketch has something to give a finger,
+#: and the caption says so — *responds to touch · hold to try* — because the
+#: shield means nobody finds out by accident (spec §4.4).
+_RESPONDS_RE = re.compile(r"responds\((\w+)\)")
+
+
+def _responds(assertions: Iterable[str]) -> list[str]:
+    """The ``<what>`` of every ``responds(<what>)`` assertion, in order."""
+    out: list[str] = []
+    for assertion in assertions:
+        match = _RESPONDS_RE.search(str(assertion))
+        if match is not None:
+            out.append(match.group(1))
+    return out
+
+
+def _swipe_entry(
+    conn: sqlite3.Connection,
+    row: sqlite3.Row,
+    config: Config,
+    parent: dict[int, int | None],
+    children: dict[int, list[int]],
+    scores: dict,
+    base: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """One entry as the phone reads it: the caption's values, and where to run.
+
+    Every value here is one :func:`_kiosk_entry` already computes, minus the
+    prose and plus three the kiosk has no use for: what the sketch responds to,
+    whether it listens, and the path of its meta.json.
+    """
+    if base is None:
+        base = _manifest_base(conn, row, config, parent, children)
+    entry_id = base["entry_id"]
+    meta = base["meta"]
+    entry: dict[str, Any] = {"id": entry_id}
+    entry.update({key: meta[key] for key in SWIPE_META_KEYS})
+    entry.update({key: meta["lineage"][key] for key in SWIPE_LINEAGE_KEYS})
+    # Absent when there are none, as ``canvas`` is: a sketch that has nothing
+    # to give a finger should not be told to hold, and an empty list in the
+    # row is one more thing for the script to remember to test for.
+    responds = _responds(meta["assertions"])
+    if responds:
+        entry["responds"] = responds
+    # A listening sketch is framed like any other — the frame is opaque and the
+    # mic is refused it, so it runs deaf, and the caption says to open the
+    # entry page instead. Skipping it would make the feed lie about the size of
+    # the gallery (spec §2).
+    if base["mic"]:
+        entry["mic"] = True
+    if base["canvas"] is not None:
+        entry["canvas"] = base["canvas"]
+    entry["judgment"] = _kiosk_judgment(scores, entry_id)
+    # Relative to the gallery root, as the kiosk's are. ``meta`` is the file
+    # the words sheet and the judge sheet fetch: a path from the manifest,
+    # never assembled in the script, as ``qr`` is for the kiosk.
+    entry["sketch"] = f"e/{entry_id}/sketch/"
+    entry["meta"] = f"e/{entry_id}/meta.json"
+    entry["href"] = f"e/{entry_id}/"
+    entry["url"] = config.entry_url(entry_id)
+    return entry
+
+
+def _manifests(
+    conn: sqlite3.Connection,
+    config: Config,
+    parent: dict[int, int | None],
+    children: dict[int, list[int]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``(kiosk.json, swipe.json)`` over one pass of the published rows.
+
+    Published entries only, the same rows the grid page gets. A projector in a
+    lobby shows the gallery, and the gallery is the published set — a kept
+    rejection has a page of its own and a reason printed on it, neither of which
+    survives being played for sixty seconds with no one at the keyboard; the
+    phone's feed is the same set for the same reason.
+
+    The four Bradley–Terry tables are fitted once here and handed to every row:
+    the fit is over the whole pool, so doing it per entry would be slower and no
+    different. Both manifests come out of one :func:`_manifest_base` per entry,
+    so the second file costs a dict and not a second read of the database and
+    the disk. No clock is read and the order is total, so the same database
+    gives the same bytes.
+    """
+    scores = _all_scores(conn)
+    rows = sorted(_entries(conn, "published"), key=lambda row: int(row["id"]))
+    kiosk: list[dict[str, Any]] = []
+    swipe: list[dict[str, Any]] = []
+    for row in rows:
+        base = _manifest_base(conn, row, config, parent, children)
+        kiosk.append(_kiosk_entry(conn, row, config, parent, children, scores, base))
+        swipe.append(_swipe_entry(conn, row, config, parent, children, scores, base))
+    return {"entries": kiosk}, {"entries": swipe}
 
 
 def _kiosk_manifest(
@@ -2578,25 +2733,18 @@ def _kiosk_manifest(
     parent: dict[int, int | None],
     children: dict[int, list[int]],
 ) -> dict[str, Any]:
-    """``kiosk.json``: every published entry, in ascending id order.
+    """``kiosk.json``: every published entry, in ascending id order."""
+    return _manifests(conn, config, parent, children)[0]
 
-    Published entries only, the same rows the grid page gets. A projector in a
-    lobby shows the gallery, and the gallery is the published set — a kept
-    rejection has a page of its own and a reason printed on it, neither of which
-    survives being played for sixty seconds with no one at the keyboard.
 
-    The four Bradley–Terry tables are fitted once here and handed to every row:
-    the fit is over the whole pool, so doing it per entry would be slower and no
-    different. No clock is read and the order is total, so the same database
-    gives the same bytes.
-    """
-    scores = _all_scores(conn)
-    rows = sorted(_entries(conn, "published"), key=lambda row: int(row["id"]))
-    return {
-        "entries": [
-            _kiosk_entry(conn, row, config, parent, children, scores) for row in rows
-        ]
-    }
+def _swipe_manifest(
+    conn: sqlite3.Connection,
+    config: Config,
+    parent: dict[int, int | None],
+    children: dict[int, list[int]],
+) -> dict[str, Any]:
+    """``swipe.json``: the same entries, in the same order, without the prose."""
+    return _manifests(conn, config, parent, children)[1]
 
 
 def _kiosk_page(config: Config) -> str:
@@ -2606,6 +2754,15 @@ def _kiosk_page(config: Config) -> str:
     a future footer naming the write path is a change to this function alone.
     """
     return _template("kiosk.html").substitute(root="./", page_title="Sketchgen Kiosk")
+
+
+def _swipe_page(config: Config) -> str:
+    """The swipe shell. No entry data: ``swipe.js`` fetches ``swipe.json``.
+
+    ``config`` is taken and unused, as :func:`_kiosk_page` takes it and for the
+    same reason.
+    """
+    return _template("swipe.html").substitute(root="./", page_title="Sketchgen Swipe")
 
 
 def _line_node(
@@ -2705,8 +2862,8 @@ def render_index(
     dest_dir: str | Path,
     config: Config | None = None,
 ) -> list[Path]:
-    """Write the grid, the failures, compare, the kiosk, the line pages, assets
-    and config.
+    """Write the grid, the failures, compare, the kiosk, the swipe page, the
+    line pages, assets and config.
 
     No clock is read: the same database gives the same bytes, which is what
     lets ``publish_index`` tell a re-render that changed nothing from one that
@@ -2768,14 +2925,17 @@ def render_index(
             )
             + "\n",
         )
+        # One pass over the published rows for both files: they are two
+        # serialisations of the same entries and must never disagree about one
+        # (swipe.md §1.2).
+        kiosk_manifest, swipe_manifest = _manifests(conn, config, parent, children)
         written.write_text(
             dest / "kiosk.json",
-            json.dumps(
-                _kiosk_manifest(conn, config, parent, children),
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
+            json.dumps(kiosk_manifest, indent=2, sort_keys=True) + "\n",
+        )
+        written.write_text(
+            dest / "swipe.json",
+            json.dumps(swipe_manifest, indent=2, sort_keys=True) + "\n",
         )
         written.write_text(
             dest / "lineage.json",
@@ -2788,6 +2948,7 @@ def render_index(
             dest / "compare.html", _compare_page(conn, _public_rows(conn))
         )
         written.write_text(dest / "kiosk.html", _kiosk_page(config))
+        written.write_text(dest / "swipe.html", _swipe_page(config))
         roots = sorted(
             {
                 _root_of(parent, entry_id)

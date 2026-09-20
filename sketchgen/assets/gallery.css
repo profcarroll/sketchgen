@@ -1195,3 +1195,360 @@ body.kiosk .welcome .go:hover { border-color: var(--accent); outline: none; }
     overflow: auto;
   }
 }
+
+/* ---- swipe ----------------------------------------------------------------
+ *
+ * swipe.html and nothing else: every rule below is scoped to body.swipe, which
+ * only that page carries, so none of it reaches the grid, an entry page, the
+ * compare page or the kiosk. The stylesheet is the mockup's
+ * (docs/plans/swipe-mockup/swipe.html) lifted whole, with its .phone renamed
+ * body.swipe — on a phone the mockup already drops the device frame and goes
+ * fixed to the viewport, and that is the only state the real page has — and its
+ * `position: absolute` layers made `position: fixed`, because they hang off the
+ * viewport here rather than off a 24.5rem box in the middle of a document.
+ *
+ * Selectors the gallery already spends elsewhere — .stage, .caption, .status,
+ * .score, .note, .card, .close, .links — are the mockup's unchanged; scoping is
+ * what keeps them apart, exactly as it does for the kiosk block above.
+ *
+ * One theme, on purpose (spec §1.13): a sketch on black has no light mode. The
+ * palette is the kiosk's, set on body.swipe rather than on :root so
+ * prefers-color-scheme cannot undo it.
+ *
+ * The exception is .swipe-offer, at the bottom: it belongs to the grid, which
+ * is the one page that offers this one.
+ */
+
+body.swipe {
+  --ground: #050608;
+  --ink: #ecedef;
+  --ink-soft: #a3a9b8;
+  --ink-faint: #6b7180;
+  --accent: #8fabff;
+  --agent: #e0a85a;
+  --line: rgba(236, 237, 239, 0.14);
+  --scrim: rgba(5, 6, 8, 0.82);
+  --scrim-soft: rgba(5, 6, 8, 0.55);
+  --key-ground: rgba(236, 237, 239, 0.09);
+  --panel: #14161a;
+  --chip: #262b33;
+  --shadow: none;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 16px;
+  line-height: 1.4;
+  margin: 0;
+  overflow: hidden;
+  padding: 0 1.25rem;
+  /* No swipe becomes a scroll and no pull becomes a refresh: the gestures are
+   * the page's, and a browser that takes one of them takes the whole feed. */
+  touch-action: none;
+  overscroll-behavior: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+body.swipe a { color: var(--accent); }
+body.swipe button { font: inherit; }
+
+/* The bars are in the DOM so the page is still the gallery with JavaScript off
+ * and so a viewer knows where they are; the start card covers them, and the
+ * moment it is dismissed they go (spec §3). */
+body.swipe.playing .bar { display: none; }
+
+/* ---- the stage: the sketch, fitted, and the shield over it ---- */
+/* .stage is a panel on the entry page — a bordered box with a shadow and a
+ * rem of padding. Here it is the whole screen and nothing else, so the panel
+ * is reset rather than renamed, as the kiosk block does for the same four
+ * selectors. */
+body.swipe .stage {
+  background: none; border: 0; border-radius: 0; box-shadow: none; margin: 0; padding: 0;
+  position: fixed; inset: 0; display: grid; place-items: center; overflow: hidden;
+  will-change: transform;
+}
+body.swipe .stage canvas { display: block; }
+body.swipe .stage.snap { transition: transform 220ms cubic-bezier(0.2, 0.7, 0.2, 1); }
+body.swipe .stage.leave { transition: transform 160ms cubic-bezier(0.4, 0, 1, 1); }
+/* A finger that lands on the frame belongs to the frame, and there is no
+ * channel to ask for it back (spec §1.4), so this takes every touch. */
+body.swipe .shield { position: fixed; inset: 0; z-index: 3; cursor: grab; }
+body.swipe .shield:active { cursor: grabbing; }
+body.swipe.touching .shield { pointer-events: none; }
+
+/* ---- the two cues that grow under a horizontal drag ---- */
+body.swipe .cue {
+  position: fixed; top: 50%; z-index: 4; transform: translateY(-50%) scale(0.85); opacity: 0;
+  pointer-events: none; display: grid; place-items: center; gap: 0.3rem;
+  transition: opacity 120ms, transform 120ms;
+}
+body.swipe .cue svg { width: 4.2rem; height: 4.2rem; filter: drop-shadow(0 2px 14px rgba(0, 0, 0, 0.7)); }
+body.swipe .cue span {
+  font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink);
+  text-shadow: 0 1px 8px rgba(0, 0, 0, 0.8);
+}
+body.swipe .cue.like { left: 1.4rem; }
+body.swipe .cue.judge { right: 1.4rem; }
+body.swipe .cue.like svg { fill: var(--accent); }
+body.swipe .cue.judge svg { fill: none; stroke: var(--ink); stroke-width: 2; }
+body.swipe .cue.burst { animation: swipe-burst 700ms ease-out forwards; }
+@keyframes swipe-burst {
+  0% { opacity: 1; transform: translateY(-50%) scale(1); }
+  100% { opacity: 0; transform: translateY(-50%) scale(1.7); }
+}
+
+/* ---- status line, top left; the heart, top right ---- */
+body.swipe .status {
+  position: fixed; top: 0.9rem; left: 1.1rem; z-index: 5; margin: 0;
+  font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint);
+  font-variant-numeric: tabular-nums; text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
+  background: none; border: 0; padding: 0.4rem 0; cursor: pointer;
+}
+body.swipe .status b { font-weight: 500; color: var(--ink-soft); }
+body.swipe .heart {
+  position: fixed; top: 0.9rem; right: 1.1rem; z-index: 5; width: 1.5rem; height: 1.5rem;
+  fill: none; stroke: var(--ink-faint); stroke-width: 1.6; opacity: 0.8;
+  filter: drop-shadow(0 1px 6px rgba(0, 0, 0, 0.8)); transition: opacity 200ms;
+}
+body.swipe.liked .heart { fill: var(--accent); stroke: var(--accent); opacity: 1; }
+body.swipe.quiet .status, body.swipe.quiet .heart, body.swipe.quiet .caption { opacity: 0; }
+body.swipe .status, body.swipe .caption { transition: opacity 200ms ease; }
+
+/* ---- the caption: prompt, authors, facts, under a scrim ---- */
+body.swipe .caption {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 4;
+  padding: 4.5rem 1.1rem 1.5rem; padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
+  /* Deep enough to read over a white canvas: a third of the gallery's sketches
+   * are light, and a scrim that only works on black is a caption that only
+   * works sometimes. */
+  background: linear-gradient(to top, rgba(5, 6, 8, 0.94) 0%, rgba(5, 6, 8, 0.8) 55%, rgba(5, 6, 8, 0) 100%);
+  display: grid; gap: 0.35rem; cursor: pointer;
+}
+body.swipe .caption .prompt {
+  margin: 0; font-size: 1.2rem; line-height: 1.22; font-weight: 500; text-wrap: balance;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 2px 14px rgba(0, 0, 0, 0.8);
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
+body.swipe .caption .prompt .num {
+  color: var(--ink-faint); font-weight: 400; margin-right: 0.4em; font-variant-numeric: tabular-nums;
+}
+body.swipe .caption .revisions {
+  margin: 0; font-size: 0.85rem; color: var(--ink-soft);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+body.swipe .caption .revisions b { font-weight: 500; color: var(--ink); }
+body.swipe .caption .authors { margin: 0; font-size: 0.82rem; color: var(--ink-soft); }
+body.swipe .caption .authors span { color: var(--ink); }
+body.swipe .caption .facts {
+  margin: 0.15rem 0 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap;
+  gap: 0.25rem 0.9rem; font-size: 0.74rem; letter-spacing: 0.03em; color: var(--ink-soft);
+  font-variant-numeric: tabular-nums;
+}
+body.swipe .caption .facts b { font-weight: 500; color: var(--ink); }
+body.swipe .caption .facts .gen b { color: var(--accent); }
+body.swipe .caption .facts .touch { color: var(--agent); }
+body.swipe .caption .more {
+  margin: 0; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint);
+}
+
+/* ---- a toast for the one-line answers ---- */
+body.swipe .toast {
+  position: fixed; left: 50%; bottom: 7.5rem; z-index: 8; transform: translateX(-50%) translateY(6px);
+  background: var(--scrim); border: 1px solid var(--line); border-radius: 999px; padding: 0.4rem 0.9rem;
+  font-size: 0.82rem; color: var(--ink); opacity: 0; pointer-events: none; white-space: nowrap;
+  transition: opacity 160ms, transform 160ms;
+}
+body.swipe .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* ---- the pill that says the sketch has the touch, and gives it back ---- */
+body.swipe .touching-pill {
+  position: fixed; left: 50%; bottom: 1.4rem; z-index: 8; transform: translateX(-50%);
+  background: var(--scrim); border: 1px solid var(--agent); border-radius: 999px; padding: 0.5rem 1rem;
+  font-size: 0.82rem; color: var(--ink); cursor: pointer; display: none; white-space: nowrap;
+}
+body.swipe .touching-pill b { color: var(--agent); font-weight: 500; }
+body.swipe.touching .touching-pill { display: block; }
+body.swipe.touching .caption,
+body.swipe.touching .status,
+body.swipe.touching .heart { opacity: 0; pointer-events: none; }
+
+/* ---- the sheets: words, judge, settings, sign in ---- */
+body.swipe .dim { position: fixed; inset: 0; z-index: 9; background: rgba(5, 6, 8, 0.35); display: none; }
+body.swipe .sheet {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 10; max-height: 86%;
+  background: var(--panel); border-top: 1px solid var(--line); border-radius: 1.2rem 1.2rem 0 0;
+  padding: 0.6rem 1.1rem 1.4rem; padding-bottom: max(1.4rem, env(safe-area-inset-bottom));
+  overflow: hidden auto; scrollbar-width: none; display: none;
+  /* The one place a finger may scroll: the sheets are documents, the feed is
+   * not. */
+  touch-action: pan-y;
+  transform: translateY(0); transition: transform 220ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+body.swipe .sheet.open, body.swipe .dim.open { display: block; }
+/* Half height, so the stage stays visible above it while a pair is judged. */
+body.swipe .sheet.judge { max-height: 58%; }
+body.swipe .sheet .grip {
+  width: 2.4rem; height: 4px; border-radius: 2px; background: var(--line); margin: 0 auto 0.8rem;
+}
+body.swipe .sheet .close {
+  position: absolute; top: 0.7rem; right: 0.8rem; background: var(--key-ground); border: 0; color: var(--ink);
+  width: 1.9rem; height: 1.9rem; border-radius: 50%; cursor: pointer; font-size: 0.95rem;
+}
+body.swipe .sheet h2 {
+  margin: 0 0 0.3rem; font-size: 1.1rem; font-weight: 600; line-height: 1.25;
+  padding-right: 2.2rem; text-wrap: balance;
+}
+body.swipe .sheet h3 {
+  margin: 1.1rem 0 0.25rem; font-size: 0.72rem; font-weight: 500; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--ink-faint);
+}
+body.swipe .sheet p { margin: 0.25rem 0; font-size: 0.92rem; }
+body.swipe .sheet .note { font-size: 0.76rem; color: var(--ink-faint); }
+body.swipe .sheet .links {
+  display: flex; flex-wrap: wrap; gap: 0.3rem 1.2rem; margin-top: 1rem; font-size: 0.9rem;
+}
+body.swipe .sheet .pop {
+  display: grid; grid-template-columns: 4.6rem 1fr; gap: 0.1rem 0.7rem; align-items: baseline; margin: 0.35rem 0;
+}
+body.swipe .sheet .pop-label { font-size: 0.74rem; letter-spacing: 0.06em; text-transform: uppercase; }
+body.swipe .sheet .human .pop-label { color: var(--accent); }
+body.swipe .sheet .agent .pop-label { color: var(--agent); }
+/* .score is a chip on the entry page; here it is one line of a two-line block. */
+body.swipe .sheet .score {
+  background: none; border-radius: 0; padding: 0;
+  font-size: 0.98rem; font-variant-numeric: tabular-nums;
+}
+body.swipe .sheet .quad { grid-column: 2; font-size: 0.82rem; color: var(--ink-soft); }
+body.swipe .sheet .fields {
+  margin: 0.2rem 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 0.9rem; font-size: 0.85rem;
+}
+body.swipe .sheet .fields dt { color: var(--ink-faint); margin: 0; }
+body.swipe .sheet .fields dd { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+body.swipe .sheet .big {
+  display: block; width: 100%; margin-top: 0.9rem; padding: 0.7rem 1rem; border-radius: 8px;
+  background: var(--accent); color: var(--ground); border: 0; font-weight: 600; cursor: pointer;
+}
+body.swipe .sheet .quiet-btn {
+  display: block; width: 100%; margin-top: 0.5rem; padding: 0.6rem; background: none; border: 0;
+  color: var(--ink-soft); cursor: pointer;
+}
+
+/* ---- the judge sheet: two tiles, one of them playing on the stage above ---- */
+/* .pair, .question, .ask, .side-label and .side-brief are the compare page's,
+ * which this sheet is a phone-sized restatement of; the values differ and the
+ * names are kept, because the two are the same two questions. */
+body.swipe .pair {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; margin: 0.6rem 0 0;
+}
+body.swipe .tile {
+  text-align: left; background: var(--chip); border: 2px solid transparent; border-radius: 8px;
+  padding: 0.6rem 0.7rem; color: var(--ink); cursor: pointer;
+}
+body.swipe .tile[aria-pressed="true"] { border-color: var(--ink); }
+body.swipe .tile .side-label {
+  display: flex; justify-content: space-between; font-weight: 600; font-size: 1rem; margin: 0 0 0.2rem;
+}
+body.swipe .tile .side-label small {
+  font-weight: 400; font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint);
+}
+body.swipe .tile[aria-pressed="true"] .side-label small { color: var(--accent); }
+/* The brief and nothing else: B's prompt, authors and counts would anchor the
+ * answer the sheet is asking for (spec §4.5). */
+body.swipe .tile .side-brief {
+  margin: 0; font-size: 0.78rem; color: var(--ink-soft); line-height: 1.35;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
+body.swipe .question { border: 0; padding: 0; margin: 0.9rem 0 0; }
+body.swipe .question .ask { margin: 0 0 0.35rem; font-size: 0.92rem; font-weight: 400; }
+body.swipe .question .choices { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.4rem; margin: 0; }
+body.swipe .question .choices button {
+  padding: 0.55rem; border-radius: 8px; border: 1px solid var(--line); background: var(--key-ground);
+  color: var(--ink); cursor: pointer; font-weight: 500;
+}
+body.swipe .question .choices button[aria-pressed="true"] {
+  background: var(--ink); color: var(--ground); border-color: var(--ink);
+}
+body.swipe .question .answered {
+  margin: 0.3rem 0 0; font-size: 0.76rem; color: var(--ink-faint); min-height: 1em;
+}
+/* .reveal is a panel on the compare page and a rule under the questions here. */
+body.swipe .reveal {
+  background: none; border: 0; border-radius: 0; box-shadow: none;
+  border-top: 1px solid var(--line); margin: 1rem 0 0; padding: 0.6rem 0 0;
+}
+body.swipe .reveal[hidden] { display: none; }
+body.swipe .reveal .verdict { font-size: 0.85rem; margin: 0.2rem 0; }
+body.swipe .reveal .verdict b { color: var(--agent); font-weight: 500; }
+body.swipe .reveal .after { display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem; margin-top: 0.8rem; }
+body.swipe .reveal .after button {
+  padding: 0.6rem; border-radius: 8px; border: 1px solid var(--line); background: var(--key-ground);
+  color: var(--ink); cursor: pointer;
+}
+
+/* ---- settings: the order rows, the session, the launch link ---- */
+body.swipe .orders { list-style: none; margin: 0.2rem 0 0; padding: 0; display: grid; gap: 0.15rem; }
+body.swipe .orders button {
+  width: 100%; text-align: left; display: flex; justify-content: space-between; align-items: baseline;
+  background: none; border: 0; color: var(--ink-soft); padding: 0.45rem 0.2rem;
+  border-bottom: 1px solid var(--line); cursor: pointer;
+}
+body.swipe .orders button[aria-current="true"] { color: var(--ink); }
+body.swipe .orders button[aria-current="true"] .state { color: var(--accent); }
+body.swipe .orders .state { font-size: 0.74rem; color: var(--ink-faint); }
+body.swipe .session-row { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+body.swipe .session-row button {
+  background: none; border: 0; color: var(--accent); cursor: pointer; padding: 0; font-size: 0.9rem;
+}
+body.swipe .launch {
+  font-family: var(--mono); font-size: 0.78rem; color: var(--ink-soft); word-break: break-all;
+}
+
+/* ---- the start card: the one gesture ---- */
+body.swipe .welcome {
+  position: fixed; inset: 0; z-index: 20; display: grid; place-items: center;
+  background: var(--ground); padding: 1.5rem;
+}
+body.swipe .welcome[hidden] { display: none; }
+/* .card is the grid's card above, which is a panel with a border and a shadow.
+ * Here it is the start card and it is nothing but text on the ground. */
+body.swipe .welcome .card {
+  background: none; border: 0; border-radius: 0; box-shadow: none; overflow: visible;
+  padding: 0; max-width: 20rem; text-align: center;
+}
+body.swipe .welcome h1 { font-size: 1.2rem; font-weight: 500; margin: 0 0 0.4rem; }
+body.swipe .welcome p { color: var(--ink-soft); margin: 0.3rem 0; font-size: 0.95rem; }
+body.swipe .welcome .how {
+  list-style: none; margin: 1rem 0 0; padding: 0; display: grid; gap: 0.3rem; text-align: left; font-size: 0.9rem;
+}
+body.swipe .welcome .how li {
+  display: grid; grid-template-columns: 5.4rem 1fr; gap: 0.6rem; align-items: baseline;
+}
+body.swipe .welcome .how b {
+  font-weight: 500; color: var(--accent); letter-spacing: 0.04em; font-size: 0.8rem; text-transform: uppercase;
+}
+body.swipe .welcome .go {
+  margin-top: 1.3rem; display: inline-block; padding: 0.65rem 1.5rem; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--key-ground); color: var(--ink); cursor: pointer;
+}
+body.swipe .welcome .go:focus-visible,
+body.swipe .welcome .go:hover { border-color: var(--accent); outline: none; }
+body.swipe .welcome .note { margin-top: 1rem; font-size: 0.78rem; color: var(--ink-faint); }
+
+@media (prefers-reduced-motion: reduce) {
+  body.swipe .stage,
+  body.swipe .sheet,
+  body.swipe .toast,
+  body.swipe .cue,
+  body.swipe .caption,
+  body.swipe .status { transition: none !important; animation: none !important; }
+}
+
+/* The grid's offer, and the only swipe rule that is not scoped to the page.
+ * Hidden on a laptop, where the grid is the better page and a swipe is a drag;
+ * shown at phone width, where it is the better page. The grid offers it and
+ * never imposes it: nothing redirects (spec, "what it never does"). */
+.swipe-offer { display: none; }
+@media (max-width: 40rem) {
+  .swipe-offer { display: block; margin: 0 0 1rem; }
+}
