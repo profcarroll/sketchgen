@@ -1213,7 +1213,7 @@ async function signin() {
   await quiet();
   const asked = openSheetId(document);
   document.getElementById("si-go").click();
-  const note = world.window.localStorage.getItem("sketchgen-swipe-return");
+  const note = world.window.localStorage.getItem("sketchgen-return");
   const went = world.window.location.href;
 
   // Declined, a like does nothing at all.

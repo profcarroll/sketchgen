@@ -18,10 +18,11 @@
  * fragment, lives in this origin's localStorage, and rides back as a bearer
  * header. See "the session" below for why a cookie cannot do this job.
  *
- * Two keys in this origin's localStorage, and only one of them is this file's:
- * sketchgen_session, which it owns, and sketchgen-swipe-return, which swipe.js
- * writes and this file only ever reads — a one-shot note saying the sign-in
- * started on swipe.html and should end there (swipe.md §5).
+ * Two keys in this origin's localStorage: sketchgen_session, which this file
+ * owns, and sketchgen-return, a one-shot note naming the page the sign-in
+ * started on so that it can end there instead of at the front page. swipe.js
+ * writes that note (swipe.md §5) and so does this file on an entry page
+ * (qr.md §6.3); this file is its only reader, in either case.
  *
  * Until that service exists, config.json carries an empty write_path: every
  * count stays an em dash, the like button stays disabled, and the compare page
@@ -106,15 +107,20 @@
     return !!token;
   }
 
-  var SWIPE_RETURN_KEY = "sketchgen-swipe-return";
+  /* Named for what it is now that the entry page writes it too: the note is
+   * nobody's page in particular. One note written by the previous deploy's
+   * swipe.js is simply orphaned under the old name and never read — worst
+   * case, one visitor is not carried back to swipe.html, once. */
+  var RETURN_KEY = "sketchgen-return";
 
-  /* Coming back to the swipe page after signing in (swipe.md §5).
+  /* Coming back to the page the sign-in started on (swipe.md §5, qr.md §6.3).
    *
    * <write_path>/callback returns to the gallery's front page and only there,
-   * so a visitor who started on swipe.html lands here instead. Rather than
-   * teach the Worker a return path — a column on the OAuth state table and a
-   * deploy — swipe.js leaves a note in storage on its way to /login and this
-   * reads it on the way back. One extra hop, no Worker change.
+   * so a visitor who started on swipe.html — or on the sketch they scanned off
+   * a wall — lands here instead. Rather than teach the Worker a return path — a
+   * column on the OAuth state table and a deploy — the page they left leaves a
+   * note in storage on its way to /login and this reads it on the way back.
+   * One extra hop, no Worker change.
    *
    * A note in storage is not evidence of anything, so three rules, and each
    * one is a way for it not to be trusted:
@@ -126,19 +132,59 @@
    *   claimTokenFromHash() took one out of the fragment, so a stale note can
    *   never redirect somebody who typed the front page's address;
    *
-   *   only to this page's own swipe.html — the pattern allows that filename
-   *   and a query of plain characters, nothing more, so nothing in storage can
-   *   send a visitor to another origin, another path, or a javascript: URL.
+   *   only to a page of this gallery — the pattern allows swipe.html or an
+   *   entry's own directory, each with a query of plain characters, and
+   *   nothing else, so nothing in storage can send a visitor to another
+   *   origin, up out of the gallery, or to a javascript: URL. It stays one
+   *   anchored expression over a closed alphabet because that, and not the
+   *   writers, is what makes the read safe.
    *
    * Anything else is dropped unread. */
   function returnFromSignIn() {
     var note;
     try {
-      note = window.localStorage.getItem(SWIPE_RETURN_KEY) || "";
-      window.localStorage.removeItem(SWIPE_RETURN_KEY);
+      note = window.localStorage.getItem(RETURN_KEY) || "";
+      window.localStorage.removeItem(RETURN_KEY);
     } catch (err) { return; /* private mode: there was no note to begin with */ }
-    if (!/^swipe\.html(\?[A-Za-z0-9=&_.-]*)?$/.test(note)) { return; }
+    if (!/^(?:swipe\.html|e\/[0-9]{1,6}\/)(?:\?[A-Za-z0-9=&_.-]*)?$/.test(note)) { return; }
     window.location.replace(ROOT + note);
+  }
+
+  /* And writing that note on an entry page (qr.md §6.3).
+   *
+   * A stranger who scanned a projection is standing on e/<id>/ with two
+   * offers of a sign-in in front of them — the like button's and the critique
+   * form's, the same href on both; the composer's third is the index's own.
+   * Before this, every one of them came back to the index, and somebody who
+   * has to find the sketch again mostly does not.
+   *
+   * So it wires every [data-login] on the page rather than the one it can
+   * name: paintSession() already treats them as a set, and a fix that reached
+   * only the first would strand whoever signed in from the other.
+   *
+   * The path is built from the id in main.entry[data-entry] and never from
+   * window.location, so nothing anyone puts in the address bar can shape where
+   * a later load is sent. ?kiosk is read off the strip rather than off
+   * location.search — greetAScan() has already taken the param out of the bar
+   * by the time anybody clicks — so the greeting they arrived with is still
+   * there when they come back.
+   *
+   * Best effort, and deliberately: private mode throws, and a note that does
+   * not get written must cost a visitor the return and never the sign-in, so
+   * the navigation the anchor was already going to make happens regardless. */
+  function noteTheWayBack() {
+    var main = document.querySelector("main.entry[data-entry]");
+    var id = main ? String(main.getAttribute("data-entry") || "") : "";
+    if (!/^[0-9]{1,6}$/.test(id)) { return; }
+    Array.prototype.forEach.call(document.querySelectorAll("[data-login]"), function (login) {
+      login.addEventListener("click", function () {
+        var strip = document.querySelector("[data-scanned]");
+        var scanned = !!strip && strip.hidden !== true;
+        try {
+          window.localStorage.setItem(RETURN_KEY, "e/" + id + "/" + (scanned ? "?kiosk" : ""));
+        } catch (err) { /* private mode: the sign-in works, the sketch is lost */ }
+      });
+    });
   }
 
   /* The one place a request's headers are built. The like button and the
@@ -1593,12 +1639,15 @@
   ready(function () {
     // First, before any request: the token /callback handed back in the
     // fragment, stored for this origin and stripped from the address bar. A
-    // load that claimed one may be somebody on their way back to the swipe
-    // page, and no other load is (swipe.md §5).
+    // load that claimed one may be somebody on their way back to the page
+    // they signed in from, and no other load is (swipe.md §5, qr.md §6.3).
     if (claimTokenFromHash()) { returnFromSignIn(); }
     // And the other parameter this page takes out of the address bar as soon
     // as it has read it: the projection's ?kiosk (qr.md §6.2).
     greetAScan();
+    // Which is why this comes after it: the way back is written on a click,
+    // and by then the strip is the only record that ?kiosk was ever there.
+    noteTheWayBack();
     var sort = currentSort();
     if (sort !== DEFAULT_SORT) { carrySort(sort); }
     // Before applyFilters: this is what fills the box from ?q=, and the grid's
