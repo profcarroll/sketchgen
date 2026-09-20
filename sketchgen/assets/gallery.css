@@ -1266,6 +1266,11 @@ body.swipe.playing .bar { display: none; }
 body.swipe .stage {
   background: none; border: 0; border-radius: 0; box-shadow: none; margin: 0; padding: 0;
   position: fixed; inset: 0; display: grid; place-items: center; overflow: hidden;
+  /* One track the size of the stage, not an implicit one the size of the
+   * unscaled frame: an 800 px frame in an 800 px track centres in the track,
+   * and the track starts at the left edge, so the sketch sat off to the
+   * right. The kiosk's stage is a track of its room's grid and never met this. */
+  grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr);
   will-change: transform;
 }
 body.swipe .stage canvas { display: block; }
