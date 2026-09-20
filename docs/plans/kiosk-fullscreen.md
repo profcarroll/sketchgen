@@ -29,9 +29,10 @@ So a fitted frame fitted nothing. Measured in Chrome against the real gallery, e
 
 The rest of that 900×900 frame was the frame's own black. On a 1920×1080 projector a 400×400
 sketch was a postage stamp with an off-centre black surround, and the bigger the projector the
-smaller it got. **72 of the 222 published entries — a third of the gallery — call `createCanvas()`
-with two literals**, most often `800×600` (42) or `600×600` (19), because that is what the prompt
-asked for. The other 150 size themselves to the window and were always full screen.
+smaller it got. **299 of the 863 published entries — 35 % of the gallery — call `createCanvas()`
+with two literals**, most often `800×600` (144), `600×600` (81) or `400×400` (39), because that is
+what the prompt asked for. The other 564 size themselves to the window and were always full
+screen. (Counted from the live `kiosk.json`, not from a local checkout, which is stale.)
 
 A canvas *larger* than the stage was cropped by the same mechanism, silently: entry 215
 (`1024×1024`) lost everything past 900 px.

@@ -130,8 +130,8 @@
   /* How a sketch that asked for a size is put on the stage. The Z key walks
    * this list and the launch link's size= names one (kiosk-fullscreen.md §2).
    *
-   * Roughly a third of the published gallery calls createCanvas() with two
-   * literals, most often 400x400 or 800x600, because that is what the prompt
+   * A third of the published gallery — 299 of 863 — calls createCanvas() with
+   * two literals, most often 800x600 or 600x600, because that is what the prompt
    * asked for. A p5 canvas is exactly the size it was made and does not grow
    * with its frame, so on a projector those sketches were a postage stamp in
    * the corner of a black screen. `native` keeps the size the sketch asked
