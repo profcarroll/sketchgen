@@ -134,6 +134,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import platform
 import random
 import shutil
 import signal
@@ -805,9 +806,20 @@ def node_shape() -> str:
     """The machine this entry was made on, as one string for the gallery.
 
     ``SKETCHGEN_SHAPE`` wins when it is set; otherwise the core count and
-    MemTotal are read and formatted the way the dossiers name the node. The
+    MemTotal are read and reported against the machine architecture. The
     tenancy's trial ends about 10/1 and 16/96 becomes 4/24 (spec §9) — the
     entry has to say which one made it, or the timings in it mean nothing.
+
+    That last sentence is why this no longer hard-codes ``VM.Standard.A1.Flex``.
+    Only the node itself can say it is an OCI shape, and it says so through
+    IMDS -> ``meta.node_shape`` (see :func:`sketchgen.cli.billing.node_identity`);
+    a shape name asserted from a core count is a guess wearing a fact's clothes.
+    It was wrong twice over: on the Windows/WSL node it stamped an Ampere ARM
+    shape onto an x86_64 desktop, and on any OCI shape that is not A1 it would
+    have misnamed that one too. Off OCI the honest answer is what is observable.
+    Set ``SKETCHGEN_SHAPE`` on a node whose GPU or host RAM is the thing that
+    makes its timings mean anything — WSL reports its own RAM share, not the
+    host's, so the bare numbers understate the machine.
     """
     override = os.environ.get("SKETCHGEN_SHAPE")
     if override:
@@ -825,7 +837,7 @@ def node_shape() -> str:
                     break
     except (OSError, ValueError, IndexError):  # pragma: no cover - non-Linux
         gib = 0
-    return f"VM.Standard.A1.Flex {cores}/{gib}"
+    return f"{platform.machine()} {cores}/{gib}"
 
 
 def brief_with_evidence(brief: str, evidence: str | None) -> str:
