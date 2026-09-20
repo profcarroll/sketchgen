@@ -157,13 +157,16 @@ code { font-family: var(--mono); font-size: 0.85em; }
 
 /* the caption: prompt, authors, facts, under a scrim; a tap on it opens the words */
 .caption {
-  position: absolute; left: 0; right: 0; bottom: 0; z-index: 4;
+  /* Under the shield, and no pointer events: a thumb starts most swipes in
+     the bottom third of the screen, which is where this is. The shield
+     hit-tests a tap against this box to open the words. */
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 2; pointer-events: none;
   padding: 4.5rem 1.1rem 1.5rem; padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
   /* Deep enough to read over a white canvas: a third of the gallery's sketches
      are light, and a scrim that only works on black is a caption that only
      works sometimes. */
   background: linear-gradient(to top, rgba(5, 6, 8, 0.94) 0%, rgba(5, 6, 8, 0.8) 55%, rgba(5, 6, 8, 0) 100%);
-  display: grid; gap: 0.35rem; cursor: pointer;
+  display: grid; gap: 0.35rem;
 }
 .caption .prompt {
   margin: 0; font-size: 1.2rem; line-height: 1.22; font-weight: 500; text-wrap: balance;
@@ -655,7 +658,7 @@ code { font-family: var(--mono); font-size: 0.85em; }
     var counts = COUNTS[e.id] || {};
     var html = "<p class=\"prompt\"><span class=\"num\">#" + e.id + "</span>" + esc(parts.root) + "</p>";
     if (parts.revisions.length) {
-      html += "<p class=\"revisions\"><b>revised " + parts.revisions.length + (parts.revisions.length === 1 ? " time" : " times") + ", latest:</b> " + esc(parts.revisions[parts.revisions.length - 1]) + "</p>";
+      html += "<p class=\"revisions\"><b>" + (parts.revisions.length === 1 ? "revised once" : "revised " + parts.revisions.length + " times") + ", latest:</b> " + esc(parts.revisions[parts.revisions.length - 1]) + "</p>";
     }
     html += "<p class=\"authors\">Prompted by <span>" + esc(e.submitted_by) + "</span> · planned by <span>" + esc(e.planner) + "</span> · written by <span>" + esc(e.executor) + "</span> under the " + esc(e.rules_file) + " rules" + (e.attempts > 1 ? ", gate passed on attempt " + e.attempts : "") + "</p>";
     html += "<ul class=\"facts\"><li class=\"gen\"><b>generation " + e.generation + "</b></li>";
@@ -672,7 +675,7 @@ code { font-family: var(--mono); font-size: 0.85em; }
   function paintInfo(e) {
     var parts = promptParts(e.prompt);
     $("i-title").textContent = "#" + e.id + " · " + parts.root;
-    $("i-sub").textContent = parts.revisions.length ? "Revised " + parts.revisions.length + (parts.revisions.length === 1 ? " time" : " times") + ", latest: " + parts.revisions[parts.revisions.length - 1] : "A root prompt, unrevised.";
+    $("i-sub").textContent = parts.revisions.length ? (parts.revisions.length === 1 ? "Revised once" : "Revised " + parts.revisions.length + " times") + ", latest: " + parts.revisions[parts.revisions.length - 1] : "A root prompt, unrevised.";
     $("i-brief").textContent = e.brief;
     $("i-by").textContent = e.executor;
     $("i-statement").textContent = e.statement;
@@ -875,7 +878,11 @@ code { font-family: var(--mono); font-size: 0.85em; }
     var dt = Date.now() - done.t;
     if (!done.axis) {
       settle();
-      if (Math.abs(done.dx) < TAP_MOVE && Math.abs(done.dy) < TAP_MOVE && dt < TAP_MS) { toggleWords(); }
+      if (Math.abs(done.dx) < TAP_MOVE && Math.abs(done.dy) < TAP_MOVE && dt < TAP_MS) {
+        var box = caption.getBoundingClientRect();
+        if (state.words && done.x >= box.left && done.x <= box.right && done.y >= box.top && done.y <= box.bottom) { openSheet("sheet-info"); }
+        else { toggleWords(); }
+      }
       return;
     }
     if (done.axis === "y") {

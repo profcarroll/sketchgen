@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#050608">
+<title>$page_title</title>
+<link rel="stylesheet" href="${root}assets/gallery.css">
+</head>
+<body class="swipe">
+<script>window.SKETCHGEN_ROOT = "$root";</script>
+<header class="bar">
+  <p class="wordmark"><a href="${root}index.html">sketchgen</a></p>
+  <p class="tagline">a self-critiquing, self-generating synthetic p5.js gallery running self-hosted models</p>
+  <p class="nav"><a href="${root}index.html">gallery</a> · <a href="${root}rejections.html">rejections</a> · <a href="${root}compare.html">compare</a> · <a href="${root}kiosk.html">kiosk</a> · <a href="${root}swipe.html" aria-current="page">swipe</a></p>
+  <p class="session" data-session hidden></p>
+</header>
+
+<div class="welcome" id="welcome">
+  <div class="card">
+    <h1>sketchgen · swipe</h1>
+    <p>Sketches from the gallery, one at a time, full screen.</p>
+    <ul class="how">
+      <li><b>swipe up</b><span>the next sketch</span></li>
+      <li><b>swipe right</b><span>like it</span></li>
+      <li><b>swipe left</b><span>judge it against another</span></li>
+      <li><b>tap</b><span>the words, on and off</span></li>
+      <li><b>hold</b><span>touch the sketch</span></li>
+    </ul>
+    <button class="go" id="go" type="button">Start</button>
+    <p class="note">This first tap is the one gesture the browser needs before a sketch can make sound.</p>
+  </div>
+</div>
+
+<div class="stage" id="stage"></div>
+<div class="shield" id="shield" aria-hidden="true"></div>
+
+<div class="cue like" id="cue-like"><svg viewBox="0 0 24 24"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 5 6.4 5c1.9 0 3.4 1 4.4 2.4A5.3 5.3 0 0 1 15.2 5C18.6 5 20.7 8.4 19.2 11.8 17.1 16.4 12 21 12 21z"/></svg><span>like</span></div>
+<div class="cue judge" id="cue-judge"><svg viewBox="0 0 24 24"><rect x="2.5" y="5" width="8" height="14" rx="1.5"/><rect x="13.5" y="5" width="8" height="14" rx="1.5"/><path d="M6.5 9.5v5M17.5 9.5v5M15 12h5"/></svg><span>judge</span></div>
+
+<button class="status" id="status" type="button" aria-label="this page"></button>
+<svg class="heart" id="heart" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 5 6.4 5c1.9 0 3.4 1 4.4 2.4A5.3 5.3 0 0 1 15.2 5C18.6 5 20.7 8.4 19.2 11.8 17.1 16.4 12 21 12 21z"/></svg>
+
+<div class="caption" id="caption"></div>
+<p class="toast" id="toast" role="status"></p>
+<button class="touching-pill" id="touching" type="button"><b>the sketch has the touch</b> · tap here to swipe again</button>
+
+<div class="dim" id="dim"></div>
+
+<section class="sheet" id="sheet-info" aria-label="the words">
+  <div class="grip"></div>
+  <button class="close" type="button" data-close aria-label="close">✕</button>
+  <h2 id="i-title"></h2>
+  <p class="note" id="i-sub"></p>
+  <h3>Brief</h3>
+  <p id="i-brief"></p>
+  <p class="note">The planner's expansion of the prompt. What the executor was asked to build.</p>
+  <h3>Artist's statement · <span id="i-by"></span>, unedited</h3>
+  <p id="i-statement"></p>
+  <p class="note">The executor's own account of what it built. A claim about the work, not a finding about it.</p>
+  <h3>Judgment</h3>
+  <div class="pop human"><span class="pop-label">Humans</span><span class="score" id="i-jh"></span><span class="quad" id="i-qh"></span></div>
+  <div class="pop agent"><span class="pop-label">Agents</span><span class="score" id="i-ja"></span><span class="quad" id="i-qa"></span></div>
+  <p class="note">Bradley–Terry per population. Two scores, never one aggregate. Views and likes are engagement, not judgment.</p>
+  <h3>Provenance</h3>
+  <dl class="fields" id="i-fields"></dl>
+  <p class="links"><a id="i-entry" href="#">open the entry page</a><a id="i-source" href="#">sketch.js</a></p>
+</section>
+
+<section class="sheet judge" id="sheet-judge" aria-label="judge">
+  <div class="grip"></div>
+  <button class="close" type="button" data-close aria-label="close">✕</button>
+  <h2>Judge it against another</h2>
+  <p class="note">A is the sketch you were watching. B is another from the gallery. Tap either to play it above.</p>
+  <div class="pair">
+    <button class="tile" type="button" data-side="A" aria-pressed="true"><p class="side-label">A <small>playing</small></p><p class="side-brief" id="j-brief-a"></p></button>
+    <button class="tile" type="button" data-side="B" aria-pressed="false"><p class="side-label">B <small>tap to play</small></p><p class="side-brief" id="j-brief-b"></p></button>
+  </div>
+  <div class="question" data-question="brief">
+    <p class="ask">Which is closer to its brief?</p>
+    <p class="choices"><button type="button" data-vote="A">A</button><button type="button" data-vote="tie">tie</button><button type="button" data-vote="B">B</button></p>
+    <p class="answered"></p>
+  </div>
+  <div class="question" data-question="look">
+    <p class="ask">Which would you rather look at?</p>
+    <p class="choices"><button type="button" data-vote="A">A</button><button type="button" data-vote="tie">tie</button><button type="button" data-vote="B">B</button></p>
+    <p class="answered"></p>
+  </div>
+  <p class="note" id="j-status">Signed in with GitHub, your answers are recorded and counted. Not signed in, they are noted here only.</p>
+  <div class="reveal" id="j-reveal" hidden>
+    <h3>What the agents said</h3>
+    <div id="j-agents"></div>
+    <p class="note">Shown after your answers, never before: being shown one first would anchor the other.</p>
+    <p class="note" id="j-both"></p>
+    <div class="after"><button type="button" id="j-another">judge another pair</button><button type="button" id="j-back">keep swiping</button></div>
+  </div>
+</section>
+
+<section class="sheet" id="sheet-settings" aria-label="this page">
+  <div class="grip"></div>
+  <button class="close" type="button" data-close aria-label="close">✕</button>
+  <h2>This page</h2>
+  <p class="note" id="s-place"></p>
+  <h3>Order</h3>
+  <ul class="orders" id="s-orders"></ul>
+  <h3>You</h3>
+  <p class="session-row" id="s-session"></p>
+  <p class="note">Likes and judgments are counted by GitHub login. A sketch counts as a view once it has been on screen for ten seconds.</p>
+  <h3>Launch link for this setup</h3>
+  <p class="launch" id="s-launch"></p>
+  <p class="links"><a href="${root}index.html">the gallery</a><a href="${root}kiosk.html">the kiosk</a></p>
+</section>
+
+<section class="sheet" id="sheet-signin" aria-label="sign in">
+  <div class="grip"></div>
+  <button class="close" type="button" data-close aria-label="close">✕</button>
+  <h2 id="si-title">Sign in to like it</h2>
+  <p>Likes and judgments are counted by GitHub login, so the gallery can tell one person from many. You come straight back here afterwards.</p>
+  <button class="big" type="button" id="si-go">Sign in with GitHub</button>
+  <button class="quiet-btn" type="button" data-close>not now</button>
+</section>
+
+<footer class="bar">
+  <p class="note"><strong>AI Disclosure:</strong> All code is generated by sketchgen from its own database of prompts using open-weights, self-hosted models on free data center compute. sketchgen is designed by profcarroll and maintained by Anthropic frontier models. p5.js is part of the Processing Foundation ecosystem and has no affiliation with sketchgen. See <a href="https://p5js.org/">p5js.org</a> to support humans learning creative coding.</p>
+</footer>
+<script src="${root}assets/swipe.js"></script>
+</body>
+</html>
