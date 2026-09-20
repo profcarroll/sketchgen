@@ -1149,5 +1149,164 @@ class KioskScriptTextTests(unittest.TestCase):
         self.assertIsNone(re.search(r"\b(?:let|const)\s+\w+\s*=", self.code))
 
 
+#: The swipe spec §5 harness: gallery.js on the gallery's front page, which is
+#: where <write_path>/callback lands everybody, with a fragment and a note in
+#: storage. The run reports what the session key holds afterwards, whether the
+#: note survived, and where the page meant to send the visitor.
+RETURNER = """
+"use strict";
+
+const fs = require("fs");
+const vm = require("vm");
+const { makeWindow } = require(process.argv[2]);
+
+const SCRIPT = process.argv[3];
+const CASES = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
+
+const RETURN_KEY = "sketchgen-swipe-return";
+const SESSION_KEY = "sketchgen_session";
+
+// The front page is bare here on purpose: nothing §5 does needs a card, a
+// filter or a form, and a page with none of them proves it asks for none.
+// Offline, so config.json answers nothing and no request goes anywhere.
+function run(one) {
+  const window = makeWindow();
+  const document = window.document;
+  window.location.pathname = "/";
+  window.location.search = "";
+  window.location.hash = one.hash || "";
+  if (one.note !== undefined) { window.localStorage.setItem(RETURN_KEY, one.note); }
+  window.SKETCHGEN_ROOT = "./";
+  window.fetch = function () { return Promise.reject(new Error("offline")); };
+
+  vm.runInContext(fs.readFileSync(SCRIPT, "utf8"), vm.createContext({
+    window: window,
+    document: document,
+    fetch: window.fetch,
+    URLSearchParams: URLSearchParams,
+    Promise: Promise,
+    console: console,
+    Math: Math,
+    Number: Number,
+    String: String,
+    Object: Object,
+    Array: Array,
+    JSON: JSON,
+    parseInt: parseInt,
+    setTimeout: setTimeout
+  }), { filename: "gallery.js" });
+
+  return new Promise(function (resolve) {
+    // A tick, so that a redirect the script only reached after loadConfig
+    // would still be seen. It does not: §5 runs in ready(), before any fetch.
+    setTimeout(function () {
+      resolve({
+        token: window.localStorage.getItem(SESSION_KEY),
+        note: window.localStorage.getItem(RETURN_KEY),
+        replaced: window.location.lastReplaced,
+        address: window.history.lastUrl
+      });
+    }, 0);
+  });
+}
+
+(async function () {
+  const out = [];
+  for (const one of CASES) { out.push(await run(one)); }
+  console.log(JSON.stringify(out));
+})();
+"""
+
+#: The note swipe.js writes, and the three arrivals §6 names: the one that
+#: redirects, the one with no fragment behind it, and the ones whose note is
+#: not a swipe page's address.
+RETURN_NOTE = "swipe.html?order=newest&at=5"
+
+RETURNS = [
+    # Signed in and on the way back.
+    {"hash": "#session=tok", "note": RETURN_NOTE},
+    # A note left over from some earlier visit, and nobody signing in.
+    {"note": RETURN_NOTE},
+    # Notes that are not this gallery's swipe page. Each one is a way storage
+    # could try to steer a visitor if the pattern were any looser.
+    {"hash": "#session=tok", "note": "https://elsewhere.example/"},
+    {"hash": "#session=tok", "note": "//elsewhere.example/"},
+    {"hash": "#session=tok", "note": "javascript:alert(1)"},
+    {"hash": "#session=tok", "note": "../../swipe.html"},
+    {"hash": "#session=tok", "note": "swipe.html?at=5#session=stolen"},
+    {"hash": "#session=tok", "note": "kiosk.html"},
+]
+
+
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+class ReturnFromSignInTests(unittest.TestCase):
+    """Coming back to the swipe page after a sign-in (swipe.md §5, §6).
+
+    The Worker's /callback returns to the gallery's front page and only there,
+    so swipe.js leaves a note in storage before it goes and gallery.js reads
+    it once on the way back. The three rules — consumed once, only in the load
+    that claimed a token, only to swipe.html — are each one case here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        tmp = Path(tempfile.mkdtemp(prefix="sketchgen-return-"))
+        cls.tmp = tmp
+        harness = tmp / "returner.js"
+        harness.write_text(RETURNER, encoding="utf-8")
+        cases = tmp / "returns.json"
+        cases.write_text(json.dumps(RETURNS), encoding="utf-8")
+        done = subprocess.run(
+            [shutil.which("node"), str(harness), str(DOM), str(SCRIPT), str(cases)],
+            capture_output=True, text=True, timeout=60,
+        )
+        if done.returncode != 0:
+            raise AssertionError(done.stdout + done.stderr)
+        cls.runs = json.loads(done.stdout.strip().splitlines()[-1])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def run_for(self, note, fragment=""):
+        for case, result in zip(RETURNS, self.runs):
+            if case["note"] == note and case.get("hash", "") == fragment:
+                return result
+        raise AssertionError(f"no run for {note!r}")
+
+    def test_a_claimed_token_sends_the_visitor_back_and_eats_the_note(self):
+        run = self.run_for(RETURN_NOTE, "#session=tok")
+        self.assertEqual("tok", run["token"])
+        # ROOT + the note, and ROOT on the front page is "./".
+        self.assertEqual("./" + RETURN_NOTE, run["replaced"])
+        # Consumed once: a second load of this page finds nothing to act on.
+        self.assertIsNone(run["note"])
+        # And the token still leaves the address bar on the way past.
+        self.assertEqual("/", run["address"])
+
+    def test_a_note_with_no_fragment_behind_it_redirects_nobody(self):
+        # The rule that matters most: a stale note must never take somebody
+        # who typed the front page's address somewhere they did not ask for.
+        run = self.run_for(RETURN_NOTE)
+        self.assertIsNone(run["replaced"])
+        self.assertIsNone(run["token"])
+        # Not read, so not consumed: the next real sign-in still honours it.
+        self.assertEqual(RETURN_NOTE, run["note"])
+
+    def test_a_note_that_is_not_this_page_s_swipe_html_is_dropped(self):
+        for case in RETURNS:
+            note = case["note"]
+            if note == RETURN_NOTE:
+                continue
+            with self.subTest(note=note):
+                run = self.run_for(note, "#session=tok")
+                self.assertIsNone(run["replaced"], note)
+                # Removed all the same: a note this file will not act on is
+                # not a note worth keeping.
+                self.assertIsNone(run["note"], note)
+                # The sign-in itself still worked.
+                self.assertEqual("tok", run["token"])
+
+
 if __name__ == "__main__":
     unittest.main()

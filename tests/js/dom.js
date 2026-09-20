@@ -397,7 +397,14 @@ function makeWindow() {
   var frames = [];
   var window = {
     document: document,
-    location: { hash: "", search: "", pathname: "/e/82/" },
+    // replace() records where the page meant to send somebody and goes
+    // nowhere, as history.replaceState below does: node has no address bar to
+    // follow it with, and a test that wants to know reads it back.
+    location: {
+      hash: "", search: "", pathname: "/e/82/",
+      lastReplaced: null,
+      replace: function (url) { window.location.lastReplaced = String(url); }
+    },
     // Records what it was handed as well as doing nothing with it, so a test
     // can read back the address bar the script means to leave behind.
     history: {
