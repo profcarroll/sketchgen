@@ -209,11 +209,23 @@ function entryPage(document, withWritePath) {
   text(document, revision, " \\u00b7 ");
   el(document, revision, "a", { href: "#critique-text" }, "Ask for a revision");
   text(document, strip, ".");
-  el(document, main, "section", { class: "engagement", id: "engagement" });
+  const engagement = el(document, main, "section", {
+    class: "engagement", id: "engagement"
+  });
+  // The like button's offer of a sign-in, which §6.3 has to wire without
+  // taking the href paintSession() puts on it.
+  el(document, engagement, "a", {
+    class: "login", "data-login": "", href: "../../index.html"
+  }, "sign in with GitHub to like");
   if (withWritePath) {
     const form = el(document, main, "section", {
       class: "panel critique-form", "data-critique": "82", hidden: true
     });
+    // And the critique form's, so that the pair proves paintSession() is not
+    // the only thing on the page that iterates all of them.
+    el(document, form, "a", {
+      class: "login", "data-login": "", href: "../../index.html"
+    }, "Sign in with GitHub");
     el(document, form, "textarea", { id: "critique-text", "data-critique-text": "" });
   }
   return { main: main, strip: strip };
@@ -261,6 +273,26 @@ function run(one) {
     setTimeout: setTimeout
   }), { filename: "gallery.js" });
 
+  // Every sign-in offer on the page, clicked one at a time with storage
+  // wiped between them, so the answer says which anchor wrote what rather
+  // than only that something did (§6.3). The href is read afterwards
+  // because the note must not cost the sign-in it rides along with.
+  function signIn(document, window) {
+    const out = [];
+    Array.prototype.forEach.call(
+      document.querySelectorAll("[data-login]"),
+      function (anchor) {
+        window.localStorage.removeItem("sketchgen-return");
+        anchor.click();
+        out.push({
+          note: window.localStorage.getItem("sketchgen-return"),
+          href: anchor.getAttribute("href")
+        });
+      }
+    );
+    return out;
+  }
+
   return new Promise(function (resolve) {
     // Two ticks: loadConfig() resolves on the first and sendView() runs on it.
     setTimeout(function () {
@@ -275,7 +307,8 @@ function run(one) {
           function (a) { return a.getAttribute("href"); }
         ),
         address: window.history.lastUrl,
-        viewBody: view ? view.init.body : null
+        viewBody: view ? view.init.body : null,
+        logins: one.signIn ? signIn(document, window) : null
       });
     }, 0);
   });
@@ -300,6 +333,10 @@ SCANS = [
     # No write path, so the generator wrote no critique form and the third
     # verb has nothing to point at.
     {"search": "?kiosk", "writePath": False},
+    # Signed out and leaving for GitHub, from a scan and from a plain visit
+    # (§6.3). The note differs by one parameter and nothing else.
+    {"search": "?kiosk", "signIn": True},
+    {"search": "", "signIn": True},
 ]
 
 
@@ -503,6 +540,31 @@ class ArrivedByScanTests(unittest.TestCase):
             run["text"],
         )
         self.assertEqual(["../../compare.html?a=82", "#engagement"], run["links"])
+
+    def test_a_scan_leaves_a_note_saying_where_to_come_back_to(self):
+        # Both offers of a sign-in write it, and both write the same thing:
+        # the entry's own directory, built from data-entry and not from the
+        # address bar, with the greeting the scanner arrived with still on it
+        # so the page reads the same when they land (qr.md §6.3).
+        for one in self.run_for("?kiosk", signIn=True)["logins"]:
+            self.assertEqual("e/82/?kiosk", one["note"])
+            # And the sign-in itself is untouched: the note rides along with
+            # the navigation the anchor was already going to make.
+            self.assertEqual("https://write.example.invalid/api/login", one["href"])
+
+    def test_a_visitor_who_did_not_scan_is_carried_back_without_the_greeting(self):
+        # ?kiosk is a claim about how somebody arrived, so it goes on the note
+        # only when the strip that says so is actually up.
+        for one in self.run_for("", signIn=True)["logins"]:
+            self.assertEqual("e/82/", one["note"])
+            self.assertEqual("https://write.example.invalid/api/login", one["href"])
+
+    def test_the_note_is_written_by_every_offer_of_a_sign_in(self):
+        # Two on an entry page with a write path — the like button's and the
+        # critique form's; the composer's is the index's alone (_composer()).
+        # A fix that wired only the first would strand whoever signed in from
+        # the other, so the count is asserted and not assumed.
+        self.assertEqual(2, len(self.run_for("?kiosk", signIn=True)["logins"]))
 
     def test_the_view_post_is_the_same_body_with_or_without_the_param(self):
         # This packet adds no field to the write path (§6.2, §9). The signal
@@ -1740,13 +1802,13 @@ class SwipeScriptTextTests(unittest.TestCase):
             {
                 "SETTINGS_KEY": "sketchgen-swipe",
                 "STORAGE_KEY": "sketchgen_session",
-                "RETURN_KEY": "sketchgen-swipe-return",
+                "RETURN_KEY": "sketchgen-return",
             },
             names,
         )
         # And no fourth key anywhere in the file, named or spelled out.
         self.assertEqual(
-            {"sketchgen-swipe", "sketchgen_session", "sketchgen-swipe-return"},
+            {"sketchgen-swipe", "sketchgen_session", "sketchgen-return"},
             set(re.findall(r'"(sketchgen[-_][a-z-]+)"', self.code)),
         )
 
@@ -1795,7 +1857,7 @@ const { makeWindow } = require(process.argv[2]);
 const SCRIPT = process.argv[3];
 const CASES = JSON.parse(fs.readFileSync(process.argv[4], "utf8"));
 
-const RETURN_KEY = "sketchgen-swipe-return";
+const RETURN_KEY = "sketchgen-return";
 const SESSION_KEY = "sketchgen_session";
 
 // The front page is bare here on purpose: nothing §5 does needs a card, a
@@ -1854,12 +1916,23 @@ function run(one) {
 #: not a swipe page's address.
 RETURN_NOTE = "swipe.html?order=newest&at=5"
 
+#: The notes an entry page writes (qr.md §6.3): the sketch a scanner signed in
+#: from, and the same one with the greeting they arrived with still on it.
+ENTRY_NOTE = "e/93/"
+ENTRY_KIOSK_NOTE = "e/93/?kiosk"
+
+#: Every note the reader must act on. Everything else in RETURNS is a refusal.
+HONOURED = (RETURN_NOTE, ENTRY_NOTE, ENTRY_KIOSK_NOTE)
+
 RETURNS = [
     # Signed in and on the way back.
     {"hash": "#session=tok", "note": RETURN_NOTE},
     # A note left over from some earlier visit, and nobody signing in.
     {"note": RETURN_NOTE},
-    # Notes that are not this gallery's swipe page. Each one is a way storage
+    # The same trip, begun on a sketch somebody scanned off a wall.
+    {"hash": "#session=tok", "note": ENTRY_NOTE},
+    {"hash": "#session=tok", "note": ENTRY_KIOSK_NOTE},
+    # Notes that are not a page of this gallery. Each one is a way storage
     # could try to steer a visitor if the pattern were any looser.
     {"hash": "#session=tok", "note": "https://elsewhere.example/"},
     {"hash": "#session=tok", "note": "//elsewhere.example/"},
@@ -1867,17 +1940,31 @@ RETURNS = [
     {"hash": "#session=tok", "note": "../../swipe.html"},
     {"hash": "#session=tok", "note": "swipe.html?at=5#session=stolen"},
     {"hash": "#session=tok", "note": "kiosk.html"},
+    # And the same six shapes again wearing an entry's clothes, because the
+    # directory the pattern now admits is the half of it that is new.
+    {"hash": "#session=tok", "note": "https://elsewhere.example/e/93/"},
+    {"hash": "#session=tok", "note": "//elsewhere.example/e/93/"},
+    {"hash": "#session=tok", "note": "javascript:alert(1)//e/93/"},
+    {"hash": "#session=tok", "note": "../e/93/"},
+    {"hash": "#session=tok", "note": "e/93/../../"},
+    {"hash": "#session=tok", "note": "e\\93\\"},
+    {"hash": "#session=tok", "note": "e/93/#session=stolen"},
+    # A directory, not a file under one: the pattern ends where the id's
+    # slash does, so nothing chooses which file in the entry to open.
+    {"hash": "#session=tok", "note": "e/93/meta.json"},
+    {"hash": "#session=tok", "note": "e/93"},
 ]
 
 
 @unittest.skipUnless(shutil.which("node"), "node is not installed")
 class ReturnFromSignInTests(unittest.TestCase):
-    """Coming back to the swipe page after a sign-in (swipe.md §5, §6).
+    """Coming back to the page a sign-in started on (swipe.md §5, §6; qr.md §6.3).
 
     The Worker's /callback returns to the gallery's front page and only there,
-    so swipe.js leaves a note in storage before it goes and gallery.js reads
-    it once on the way back. The three rules — consumed once, only in the load
-    that claimed a token, only to swipe.html — are each one case here.
+    so the page the visitor left leaves a note in storage before it goes and
+    gallery.js reads it once on the way back. The three rules — consumed once,
+    only in the load that claimed a token, only to a page of this gallery —
+    are each one case here.
     """
 
     @classmethod
@@ -1925,10 +2012,26 @@ class ReturnFromSignInTests(unittest.TestCase):
         # Not read, so not consumed: the next real sign-in still honours it.
         self.assertEqual(RETURN_NOTE, run["note"])
 
-    def test_a_note_that_is_not_this_page_s_swipe_html_is_dropped(self):
+    def test_a_scanner_comes_back_to_the_sketch_and_not_the_index(self):
+        # The bug this fixes: three sign-in links on e/93/, all of them
+        # returning somebody to the front page of a gallery they reached by
+        # pointing a phone at a wall (qr.md §6.3).
+        run = self.run_for(ENTRY_NOTE, "#session=tok")
+        self.assertEqual("tok", run["token"])
+        self.assertEqual("./" + ENTRY_NOTE, run["replaced"])
+        self.assertIsNone(run["note"])
+
+    def test_the_greeting_they_arrived_with_survives_the_sign_in(self):
+        # ?kiosk rides on the note, so the strip is back up when they land and
+        # the page reads the way it did before they left.
+        run = self.run_for(ENTRY_KIOSK_NOTE, "#session=tok")
+        self.assertEqual("./" + ENTRY_KIOSK_NOTE, run["replaced"])
+        self.assertIsNone(run["note"])
+
+    def test_a_note_that_is_not_a_page_of_this_gallery_is_dropped(self):
         for case in RETURNS:
             note = case["note"]
-            if note == RETURN_NOTE:
+            if note in HONOURED:
                 continue
             with self.subTest(note=note):
                 run = self.run_for(note, "#session=tok")

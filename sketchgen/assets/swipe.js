@@ -55,7 +55,7 @@
  * What it must never do (spec §4.8), and what the tests hold it to: advance
  * on its own; count a view before ten seconds; hold more than one iframe,
  * postMessage to a frame, or evaluate sketch source; touch storage beyond
- * sketchgen-swipe, the shared sketchgen_session and sketchgen-swipe-return,
+ * sketchgen-swipe, the shared sketchgen_session and sketchgen-return,
  * which it only ever writes; read document.cookie; show B's prompt, authors,
  * counts or verdicts before both questions are answered; open the sign-in
  * sheet before the visitor has done something that needs one; or send a
@@ -75,10 +75,15 @@
    * shared on purpose — it is the gallery's session and this page is the
    * gallery — and RETURN_KEY is the note the front page reads once after a
    * sign-in and sends the visitor back here with (§5). This file only ever
-   * writes that last one; gallery.js is the only reader. */
+   * writes that last one; gallery.js is the only reader.
+   *
+   * The note is no longer this page's alone — an entry page writes one too
+   * (qr.md §6.3) — so it is sketchgen-return and not sketchgen-swipe-return.
+   * A note left under the old name by the deploy before this one is orphaned
+   * and never read: worst case one visitor is not carried back here, once. */
   var SETTINGS_KEY = "sketchgen-swipe";
   var STORAGE_KEY = "sketchgen_session";
-  var RETURN_KEY = "sketchgen-swipe-return";
+  var RETURN_KEY = "sketchgen-return";
 
   /* The stored settings blob's shape. One key in it so far, and a version
    * anyway: the kiosk learned what an unversioned blob costs. */
