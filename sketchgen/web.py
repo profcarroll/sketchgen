@@ -110,6 +110,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import string
 import subprocess
@@ -1774,31 +1775,66 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
             f"{field(doc, path, 'pct')}</div>"
         )
 
-    meters = "".join(
-        [
+    # What the card shows depends on what the node is. A cloud VM is billed by
+    # the hour and by the provisioned gigabyte, so its storage costs money and
+    # belongs on the page; a desk with a GPU in it is not, and the meter that
+    # priced this node's 1 TB at $20.58/mo was quoting Oracle's block-volume
+    # rate for a disk that was bought once. The GPU is the mirror image: it is
+    # the only thing that explains a local node's timings, and no OCI A1 shape
+    # has one. Neither is a default to be overridden -- each is shown where it
+    # means something and left out where it does not.
+    kind = _dig(doc, "node.kind", "local")
+    is_cloud = kind == "cloud"
+
+    meter_list: list[str] = []
+
+    if _dig(doc, "node.gpu.vram_mb.total") is not None:
+        meter_list.append(
             _meter(
-                "memory",
-                f"{field(doc, 'node.mem_mb.used', 'gb')} used + "
-                f"{field(doc, 'node.mem_mb.cache', 'gb')} cache of "
-                f"{field(doc, 'node.mem_mb.total', 'gb')} GB, "
-                f"{field(doc, 'node.mem_mb.available', 'gb')} available",
-                ratio_bar(doc, "node.mem_mb.used", "node.mem_mb.total")
-                + ratio_bar(doc, "node.mem_mb.cache", "node.mem_mb.total", "cache"),
-            ),
-            _meter(
-                "swap",
-                f"{field(doc, 'node.swap_mb.used', 'gb')} of "
-                f"{field(doc, 'node.swap_mb.total', 'gb')} GB",
-                ratio_bar(doc, "node.swap_mb.used", "node.swap_mb.total"),
-            ),
-            _meter(
-                "boot disk",
-                f"{field(doc, 'node.disk_gb.used', 'f1')} used, "
-                f"{field(doc, 'node.disk_gb.free', 'f1')} free of "
-                f"{field(doc, 'node.disk_gb.total', 'f1')} GB — "
-                f"{field(doc, 'node.disk_gb.chromium', 'f1')} chromium",
-                ratio_bar(doc, "node.disk_gb.used", "node.disk_gb.total"),
-            ),
+                "gpu",
+                f"{field(doc, 'node.gpu.vram_mb.used', 'gb')} of "
+                f"{field(doc, 'node.gpu.vram_mb.total', 'gb')} GB VRAM, "
+                f"{field(doc, 'node.gpu.util_pct', 'pct')} busy — "
+                f"{field(doc, 'node.gpu.name')}",
+                ratio_bar(doc, "node.gpu.vram_mb.used", "node.gpu.vram_mb.total"),
+            )
+        )
+
+    meter_list.append(
+        _meter(
+            "memory",
+            f"{field(doc, 'node.mem_mb.used', 'gb')} used + "
+            f"{field(doc, 'node.mem_mb.cache', 'gb')} cache of "
+            f"{field(doc, 'node.mem_mb.total', 'gb')} GB, "
+            f"{field(doc, 'node.mem_mb.available', 'gb')} available",
+            ratio_bar(doc, "node.mem_mb.used", "node.mem_mb.total")
+            + ratio_bar(doc, "node.mem_mb.cache", "node.mem_mb.total", "cache"),
+        )
+    )
+    meter_list.append(
+        _meter(
+            "swap",
+            f"{field(doc, 'node.swap_mb.used', 'gb')} of "
+            f"{field(doc, 'node.swap_mb.total', 'gb')} GB",
+            ratio_bar(doc, "node.swap_mb.used", "node.swap_mb.total"),
+        )
+    )
+    meter_list.append(
+        _meter(
+            "boot disk",
+            f"{field(doc, 'node.disk_gb.used', 'f1')} used, "
+            f"{field(doc, 'node.disk_gb.free', 'f1')} free of "
+            f"{field(doc, 'node.disk_gb.total', 'f1')} GB — "
+            f"{field(doc, 'node.disk_gb.chromium', 'f1')} chromium",
+            ratio_bar(doc, "node.disk_gb.used", "node.disk_gb.total"),
+        )
+    )
+
+    # Only a real second filesystem. The collector already decides this; when
+    # the blobs sit on the boot disk the meter was four dashes and a bar that
+    # could not move.
+    if _dig(doc, "node.disk_gb.model_volume.separate") is True:
+        meter_list.append(
             _meter(
                 "model volume",
                 f"{field(doc, 'node.disk_gb.models', 'f1')} of models — "
@@ -1810,7 +1846,20 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
                     "node.disk_gb.model_volume.used",
                     "node.disk_gb.model_volume.total",
                 ),
-            ),
+            )
+        )
+    elif _dig(doc, "node.disk_gb.models") is not None:
+        meter_list.append(
+            _meter(
+                "models on disk",
+                f"{field(doc, 'node.disk_gb.models', 'f1')} GB of models, on the "
+                "boot disk",
+                ratio_bar(doc, "node.disk_gb.models", "node.disk_gb.total"),
+            )
+        )
+
+    if is_cloud:
+        meter_list.append(
             _meter(
                 "storage $",
                 f"{field(doc, 'node.disk_gb.cost.block_gb', 'f1')} GB block · "
@@ -1823,17 +1872,46 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
                     "node.disk_gb.cost.billable_gb",
                     "node.disk_gb.cost.block_gb",
                 ),
-            ),
-            _meter(
-                "load",
-                f"{field(doc, 'node.load.0', 'f2')} / "
-                f"{field(doc, 'node.load.1', 'f2')} / "
-                f"{field(doc, 'node.load.2', 'f2')} on "
-                f"{field(doc, 'node.cores', 'int')} cores",
-                ratio_bar(doc, "node.load.0", "node.cores"),
-            ),
-        ]
+            )
+        )
+
+    meter_list.append(
+        _meter(
+            "load",
+            f"{field(doc, 'node.load.0', 'f2')} / "
+            f"{field(doc, 'node.load.1', 'f2')} / "
+            f"{field(doc, 'node.load.2', 'f2')} on "
+            f"{field(doc, 'node.cores', 'int')} "
+            + ("OCPU" if is_cloud else "threads"),
+            ratio_bar(doc, "node.load.0", "node.cores"),
+        )
     )
+
+    meters = "".join(meter_list)
+
+    # A cloud VM counts OCPUs, which are whole cores; this box counts SMT
+    # threads, and calling 12 of those "cores" overstates the machine by two.
+    cores_unit = "OCPU" if is_cloud else "threads"
+
+    node_note = ""
+    if _dig(doc, "node.wsl") is True:
+        node_note = (
+            '<p class="dim" style="font-size:12px;margin-top:10px">'
+            "WSL: memory, swap and boot disk are this distro's share of the "
+            "Windows host, not the whole machine. The GPU figures come from the "
+            "host driver, so those are the whole card.</p>"
+        )
+
+    # The bill is Oracle's. A local node has no tenancy, no meter and no
+    # invoice to be behind on, so the panel is not rendered rather than
+    # rendered empty.
+    bill_panel = ""
+    if is_cloud:
+        bill_panel = (
+            '<section class="panel"><h2>The bill</h2>'
+            + billing_card(billing)
+            + "</section>"
+        )
 
     top = _dig(doc, "node.top", []) or []
     top_rows = []
@@ -1987,6 +2065,8 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
         submissions=submissions_tile,
         shape=esc(_dig(doc, "node.shape", "shape unknown")),
         cores_n=field(doc, "node.cores", "int"),
+        cores_unit=cores_unit,
+        node_note=node_note,
         source=esc(doc.get("source", "sample")),
         generated=field(doc, "utc"),
         collector_ms=field(doc, "collector_ms", "f1"),
@@ -2004,7 +2084,7 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
         per_sketch_rows="\n".join(per_sketch_rows),
         cost_a="cost 16/96",
         cost_b="cost 4/24",
-        billing_card=billing_card(billing),
+        bill_panel=bill_panel,
     )
 
 
@@ -5693,11 +5773,42 @@ _gh_lock = threading.Lock()
 _GH_LOGIN_RE = re.compile(r"Logged in to github\.com (?:account|as) ([A-Za-z0-9-]+)")
 
 
+#: Where ``gh`` might be, in the order worth trying, for when it is not on
+#: PATH. The web process is a systemd ``--user`` unit, and that manager's PATH
+#: is a minimal one that does not include ``~/.local/bin`` -- which is where gh
+#: goes when it is installed from the release tarball, as it must be on a node
+#: with no root. The symptom is a gh that answers perfectly in the operator's
+#: shell and is invisible to the service, so the New job page offers a typed
+#: box and says nobody is signed in.
+GH_PATHS = (
+    "~/.local/bin/gh",
+    "/usr/local/bin/gh",
+    "/usr/bin/gh",
+    "/snap/bin/gh",
+    "/home/linuxbrew/.linuxbrew/bin/gh",
+)
+
+
+def _gh_binary() -> str | None:
+    """The gh to run: PATH first, then the usual places. None when there is none."""
+    found = shutil.which("gh")
+    if found:
+        return found
+    for candidate in GH_PATHS:
+        expanded = os.path.expanduser(candidate)
+        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+            return expanded
+    return None
+
+
 def _ask_gh() -> str | None:
     """One ``gh auth status``, parsed. None for no gh, no login, or no answer."""
+    binary = _gh_binary()
+    if binary is None:
+        return None
     try:
         done = subprocess.run(
-            ["gh", "auth", "status", "--hostname", "github.com"],
+            [binary, "auth", "status", "--hostname", "github.com"],
             capture_output=True, text=True, timeout=8,
         )
     except (OSError, subprocess.SubprocessError):
