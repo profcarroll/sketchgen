@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Sketchgen Swipe</title>
+<style>
+/* Swipe mode: the gallery in one hand. Two things on this page share one file.
+   The phone in the middle is the mockup — the copy in it is final, the gestures
+   work with a mouse or a finger, and it runs six real sketches with p5 in
+   global mode (the real page frames e/<id>/sketch/ in the gallery's sandboxed
+   iframe instead, spec §4). The notes around it are the spec's pictures.
+   Open this page on a phone and the mockup takes the whole screen, which is
+   the only honest way to review a thing that is meant to be held.
+
+   Palette: the gallery's own, from gallery.css — light and dark for the page,
+   and the kiosk's black-ground dark for the phone, which is single-theme for
+   the same reason the kiosk is: a sketch on black has no light mode. No web
+   font; the gallery fetches nothing but p5 and neither does this. */
+:root {
+  --ink: #16181d; --ink-soft: #4a5160; --ink-faint: #7c8294;
+  --ground: #f7f7f5; --panel: #ffffff; --line: #d9dae0; --chip: #eceef4;
+  --accent: #2f5bd8; --agent: #b8741a;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --ink: #e9eaee; --ink-soft: #a3a9b8; --ink-faint: #6b7180;
+    --ground: #14161a; --panel: #1c1f25; --line: #2e333c; --chip: #262b33;
+    --accent: #8fabff; --agent: #e0a85a;
+  }
+}
+:root[data-theme="dark"] {
+  --ink: #e9eaee; --ink-soft: #a3a9b8; --ink-faint: #6b7180;
+  --ground: #14161a; --panel: #1c1f25; --line: #2e333c; --chip: #262b33;
+  --accent: #8fabff; --agent: #e0a85a;
+}
+* { box-sizing: border-box; }
+html { height: 100%; }
+body {
+  margin: 0; background: var(--ground); color: var(--ink);
+  font-family: var(--sans); font-size: 16px; line-height: 1.5;
+  padding-block: 0; padding-inline: 1.25rem;
+}
+a { color: var(--accent); }
+kbd {
+  font-family: var(--mono); font-size: 0.75rem; color: var(--ink);
+  background: var(--chip); border: 1px solid var(--line); border-bottom-width: 2px;
+  border-radius: 4px; padding: 0.05em 0.45em; white-space: nowrap;
+}
+code { font-family: var(--mono); font-size: 0.85em; }
+
+/* ---- the page around the phone --------------------------------------------- */
+.sheet-page { max-width: 76rem; margin: 0 auto; padding-block: 2rem 4rem; }
+.lede { max-width: 62ch; margin-bottom: 2rem; }
+.lede .eyebrow, .notes h2 .eyebrow, .moments h2 {
+  margin: 0 0 0.4rem; font-size: 0.72rem; font-weight: 500; letter-spacing: 0.1em;
+  text-transform: uppercase; color: var(--ink-faint);
+}
+.lede h1 { margin: 0 0 0.5rem; font-size: 2rem; font-weight: 600; line-height: 1.1; text-wrap: balance; }
+.lede p { margin: 0.4rem 0; color: var(--ink-soft); }
+.cols { display: grid; grid-template-columns: 24.5rem minmax(0, 1fr); gap: 3rem; align-items: start; }
+.device { position: sticky; top: 1.5rem; }
+.device .under { margin: 0.8rem 0 0; font-size: 0.8rem; color: var(--ink-faint); text-align: center; }
+.notes { max-width: 66ch; }
+.notes section { margin: 0 0 2.4rem; }
+.notes h2 { margin: 0 0 0.6rem; font-size: 1.25rem; font-weight: 600; line-height: 1.2; text-wrap: balance; }
+.notes h3 { margin: 1.2rem 0 0.3rem; font-size: 0.95rem; font-weight: 600; }
+.notes p { margin: 0.5rem 0; }
+.notes .note { font-size: 0.85rem; color: var(--ink-soft); }
+.notes ul, .notes ol { padding-left: 1.2rem; margin: 0.5rem 0; }
+.notes li { margin: 0.25rem 0; }
+.notes table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+.notes th, .notes td { text-align: left; vertical-align: top; padding: 0.4rem 0.6rem 0.4rem 0; border-bottom: 1px solid var(--line); }
+.notes th { font-weight: 500; color: var(--ink-soft); font-size: 0.78rem; letter-spacing: 0.06em; text-transform: uppercase; }
+.notes td:first-child { white-space: nowrap; }
+.tablewrap { overflow-x: auto; }
+.decide { border-left: 3px solid var(--agent); padding: 0.1rem 0 0.1rem 1rem; }
+.decide p:first-child { margin-top: 0; }
+
+/* the row of moments: each button puts the phone in one state */
+.moments { margin: 0 0 2rem; }
+.moments .row { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+.moments button {
+  font: inherit; font-size: 0.85rem; color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: 999px; padding: 0.3rem 0.8rem; cursor: pointer;
+}
+.moments button:hover, .moments button:focus-visible { border-color: var(--accent); outline: none; }
+.moments button[aria-current="true"] { background: var(--accent); color: var(--ground); border-color: var(--accent); }
+
+/* the gesture map: six things a thumb can do */
+.gestures { display: grid; grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr)); gap: 0.6rem; }
+.gestures div { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 0.8rem 0.9rem; }
+.gestures .g { font-size: 1.4rem; line-height: 1; color: var(--accent); }
+.gestures b { display: block; margin: 0.4rem 0 0.15rem; font-weight: 600; font-size: 0.95rem; }
+.gestures span { font-size: 0.82rem; color: var(--ink-soft); }
+
+/* ---- the phone ------------------------------------------------------------- */
+.phone {
+  --ground: #050608; --ink: #ecedef; --ink-soft: #a3a9b8; --ink-faint: #6b7180;
+  --accent: #8fabff; --agent: #e0a85a; --line: rgba(236, 237, 239, 0.14);
+  --scrim: rgba(5, 6, 8, 0.82); --scrim-soft: rgba(5, 6, 8, 0.55);
+  --key-ground: rgba(236, 237, 239, 0.09); --panel: #14161a; --chip: #262b33;
+  position: relative; width: 24.5rem; height: 53rem; max-width: 100%;
+  margin: 0 auto; border-radius: 2.6rem; border: 10px solid #1a1c22; background: var(--ground);
+  overflow: hidden; color: var(--ink); font-family: var(--sans); font-size: 16px; line-height: 1.4;
+  box-shadow: 0 30px 60px rgba(0, 0, 0, 0.35);
+  touch-action: none; overscroll-behavior: none; user-select: none; -webkit-user-select: none;
+}
+.phone a { color: var(--accent); }
+.phone kbd { background: var(--key-ground); border-color: var(--line); color: var(--ink); }
+.phone button { font: inherit; }
+
+/* the stage: the sketch, fitted, and the shield over it */
+.stage {
+  position: absolute; inset: 0; display: grid; place-items: center; overflow: hidden;
+  will-change: transform;
+}
+.stage canvas { display: block; }
+.stage.snap { transition: transform 220ms cubic-bezier(0.2, 0.7, 0.2, 1); }
+.stage.leave { transition: transform 160ms cubic-bezier(0.4, 0, 1, 1); }
+.shield { position: absolute; inset: 0; z-index: 3; cursor: grab; }
+.shield:active { cursor: grabbing; }
+.phone.touching .shield { pointer-events: none; }
+
+/* the two cues that grow under a horizontal drag */
+.cue {
+  position: absolute; top: 50%; z-index: 4; transform: translateY(-50%) scale(0.85); opacity: 0;
+  pointer-events: none; display: grid; place-items: center; gap: 0.3rem;
+  transition: opacity 120ms, transform 120ms;
+}
+.cue svg { width: 4.2rem; height: 4.2rem; filter: drop-shadow(0 2px 14px rgba(0, 0, 0, 0.7)); }
+.cue span { font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink); text-shadow: 0 1px 8px rgba(0, 0, 0, 0.8); }
+.cue.like { left: 1.4rem; }
+.cue.judge { right: 1.4rem; }
+.cue.like svg { fill: var(--accent); }
+.cue.judge svg { fill: none; stroke: var(--ink); stroke-width: 2; }
+.cue.burst { animation: burst 700ms ease-out forwards; }
+@keyframes burst { 0% { opacity: 1; transform: translateY(-50%) scale(1); } 100% { opacity: 0; transform: translateY(-50%) scale(1.7); } }
+
+/* status line, top left: place, order; a tap opens the settings sheet.
+   The heart, top right: filled when this login has liked the sketch. */
+.status {
+  position: absolute; top: 0.9rem; left: 1.1rem; z-index: 5; margin: 0;
+  font-size: 0.72rem; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-faint);
+  font-variant-numeric: tabular-nums; text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
+  background: none; border: 0; padding: 0.4rem 0; cursor: pointer;
+}
+.status b { font-weight: 500; color: var(--ink-soft); }
+.heart {
+  position: absolute; top: 0.9rem; right: 1.1rem; z-index: 5; width: 1.5rem; height: 1.5rem;
+  fill: none; stroke: var(--ink-faint); stroke-width: 1.6; opacity: 0.8;
+  filter: drop-shadow(0 1px 6px rgba(0, 0, 0, 0.8)); transition: opacity 200ms;
+}
+.phone.liked .heart { fill: var(--accent); stroke: var(--accent); opacity: 1; }
+.phone.quiet .status, .phone.quiet .heart, .phone.quiet .caption { opacity: 0; }
+.status, .caption { transition: opacity 200ms ease; }
+
+/* the caption: prompt, authors, facts, under a scrim; a tap on it opens the words */
+.caption {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 4;
+  padding: 4.5rem 1.1rem 1.5rem; padding-bottom: max(1.5rem, env(safe-area-inset-bottom));
+  /* Deep enough to read over a white canvas: a third of the gallery's sketches
+     are light, and a scrim that only works on black is a caption that only
+     works sometimes. */
+  background: linear-gradient(to top, rgba(5, 6, 8, 0.94) 0%, rgba(5, 6, 8, 0.8) 55%, rgba(5, 6, 8, 0) 100%);
+  display: grid; gap: 0.35rem; cursor: pointer;
+}
+.caption .prompt {
+  margin: 0; font-size: 1.2rem; line-height: 1.22; font-weight: 500; text-wrap: balance;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9), 0 2px 14px rgba(0, 0, 0, 0.8);
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
+.caption .prompt .num { color: var(--ink-faint); font-weight: 400; margin-right: 0.4em; font-variant-numeric: tabular-nums; }
+.caption .revisions {
+  margin: 0; font-size: 0.85rem; color: var(--ink-soft);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.caption .revisions b { font-weight: 500; color: var(--ink); }
+.caption .authors { margin: 0; font-size: 0.82rem; color: var(--ink-soft); }
+.caption .authors span { color: var(--ink); }
+.caption .facts {
+  margin: 0.15rem 0 0; padding: 0; list-style: none; display: flex; flex-wrap: wrap; gap: 0.25rem 0.9rem;
+  font-size: 0.74rem; letter-spacing: 0.03em; color: var(--ink-soft); font-variant-numeric: tabular-nums;
+}
+.caption .facts b { font-weight: 500; color: var(--ink); }
+.caption .facts .gen b { color: var(--accent); }
+.caption .facts .touch { color: var(--agent); }
+.caption .more { margin: 0; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); }
+
+/* a toast for the one-line answers: liked, sign in, counted */
+.toast {
+  position: absolute; left: 50%; bottom: 7.5rem; z-index: 8; transform: translateX(-50%) translateY(6px);
+  background: var(--scrim); border: 1px solid var(--line); border-radius: 999px; padding: 0.4rem 0.9rem;
+  font-size: 0.82rem; color: var(--ink); opacity: 0; pointer-events: none; white-space: nowrap;
+  transition: opacity 160ms, transform 160ms;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* the pill that says the sketch has the touch, and gives it back */
+.touching-pill {
+  position: absolute; left: 50%; bottom: 1.4rem; z-index: 8; transform: translateX(-50%);
+  background: var(--scrim); border: 1px solid var(--agent); border-radius: 999px; padding: 0.5rem 1rem;
+  font-size: 0.82rem; color: var(--ink); cursor: pointer; display: none; white-space: nowrap;
+}
+.touching-pill b { color: var(--agent); font-weight: 500; }
+.phone.touching .touching-pill { display: block; }
+.phone.touching .caption, .phone.touching .status, .phone.touching .heart { opacity: 0; pointer-events: none; }
+
+/* ---- the sheets: words, judge, settings, sign in ---------------------------- */
+.dim { position: absolute; inset: 0; z-index: 9; background: rgba(5, 6, 8, 0.35); display: none; }
+.sheet {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 10; max-height: 86%;
+  background: var(--panel); border-top: 1px solid var(--line); border-radius: 1.2rem 1.2rem 0 0;
+  padding: 0.6rem 1.1rem 1.4rem; padding-bottom: max(1.4rem, env(safe-area-inset-bottom));
+  overflow: hidden auto; scrollbar-width: none; display: none; touch-action: pan-y;
+  transform: translateY(0); transition: transform 220ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+.sheet.open, .dim.open { display: block; }
+.sheet.judge { max-height: 58%; }
+.sheet .grip { width: 2.4rem; height: 4px; border-radius: 2px; background: var(--line); margin: 0 auto 0.8rem; }
+.sheet .close {
+  position: absolute; top: 0.7rem; right: 0.8rem; background: var(--key-ground); border: 0; color: var(--ink);
+  width: 1.9rem; height: 1.9rem; border-radius: 50%; cursor: pointer; font-size: 0.95rem;
+}
+.sheet h2 { margin: 0 0 0.3rem; font-size: 1.1rem; font-weight: 600; line-height: 1.25; padding-right: 2.2rem; text-wrap: balance; }
+.sheet h3 { margin: 1.1rem 0 0.25rem; font-size: 0.72rem; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ink-faint); }
+.sheet p { margin: 0.25rem 0; font-size: 0.92rem; }
+.sheet .note { font-size: 0.76rem; color: var(--ink-faint); }
+.sheet .links { display: flex; flex-wrap: wrap; gap: 0.3rem 1.2rem; margin-top: 1rem; font-size: 0.9rem; }
+.sheet .pop { display: grid; grid-template-columns: 4.6rem 1fr; gap: 0.1rem 0.7rem; align-items: baseline; margin: 0.35rem 0; }
+.sheet .pop-label { font-size: 0.74rem; letter-spacing: 0.06em; text-transform: uppercase; }
+.sheet .human .pop-label { color: var(--accent); }
+.sheet .agent .pop-label { color: var(--agent); }
+.sheet .score { font-size: 0.98rem; font-variant-numeric: tabular-nums; }
+.sheet .quad { grid-column: 2; font-size: 0.82rem; color: var(--ink-soft); }
+.sheet .fields { margin: 0.2rem 0 0; display: grid; grid-template-columns: max-content 1fr; gap: 0.15rem 0.9rem; font-size: 0.85rem; }
+.sheet .fields dt { color: var(--ink-faint); margin: 0; }
+.sheet .fields dd { margin: 0; color: var(--ink); overflow-wrap: anywhere; }
+.sheet .big {
+  display: block; width: 100%; margin-top: 0.9rem; padding: 0.7rem 1rem; border-radius: 8px;
+  background: var(--accent); color: var(--ground); border: 0; font-weight: 600; cursor: pointer;
+}
+.sheet .quiet-btn { display: block; width: 100%; margin-top: 0.5rem; padding: 0.6rem; background: none; border: 0; color: var(--ink-soft); cursor: pointer; }
+
+/* the judge sheet: two tiles, one of them playing on the stage above */
+.pair { display: grid; grid-template-columns: 1fr 1fr; gap: 0.6rem; margin-top: 0.6rem; }
+.tile {
+  text-align: left; background: var(--chip); border: 2px solid transparent; border-radius: 8px;
+  padding: 0.6rem 0.7rem; color: var(--ink); cursor: pointer;
+}
+.tile[aria-pressed="true"] { border-color: var(--ink); }
+.tile .side-label { display: flex; justify-content: space-between; font-weight: 600; font-size: 1rem; margin: 0 0 0.2rem; }
+.tile .side-label small { font-weight: 400; font-size: 0.7rem; letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-faint); }
+.tile[aria-pressed="true"] .side-label small { color: var(--accent); }
+.tile .side-brief {
+  margin: 0; font-size: 0.78rem; color: var(--ink-soft); line-height: 1.35;
+  display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden;
+}
+.question { margin-top: 0.9rem; }
+.question .ask { margin: 0 0 0.35rem; font-size: 0.92rem; }
+.question .choices { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0.4rem; margin: 0; }
+.question .choices button {
+  padding: 0.55rem; border-radius: 8px; border: 1px solid var(--line); background: var(--key-ground);
+  color: var(--ink); cursor: pointer; font-weight: 500;
+}
+.question .choices button[aria-pressed="true"] { background: var(--ink); color: var(--ground); border-color: var(--ink); }
+.question .answered { margin: 0.3rem 0 0; font-size: 0.76rem; color: var(--ink-faint); min-height: 1em; }
+.reveal { margin-top: 1rem; border-top: 1px solid var(--line); padding-top: 0.6rem; }
+.reveal[hidden] { display: none; }
+.reveal .verdict { font-size: 0.85rem; margin: 0.2rem 0; }
+.reveal .verdict b { color: var(--agent); font-weight: 500; }
+.reveal .after { display: grid; grid-template-columns: 1fr 1fr; gap: 0.4rem; margin-top: 0.8rem; }
+.reveal .after button { padding: 0.6rem; border-radius: 8px; border: 1px solid var(--line); background: var(--key-ground); color: var(--ink); cursor: pointer; }
+
+/* settings: the order rows, the session, the launch link */
+.orders { list-style: none; margin: 0.2rem 0 0; padding: 0; display: grid; gap: 0.15rem; }
+.orders button {
+  width: 100%; text-align: left; display: flex; justify-content: space-between; align-items: baseline;
+  background: none; border: 0; color: var(--ink-soft); padding: 0.45rem 0.2rem; border-bottom: 1px solid var(--line); cursor: pointer;
+}
+.orders button[aria-current="true"] { color: var(--ink); }
+.orders button[aria-current="true"] .state { color: var(--accent); }
+.orders .state { font-size: 0.74rem; color: var(--ink-faint); }
+.session-row { display: flex; justify-content: space-between; align-items: baseline; gap: 1rem; }
+.session-row button { background: none; border: 0; color: var(--accent); cursor: pointer; padding: 0; font-size: 0.9rem; }
+.launch { font-family: var(--mono); font-size: 0.78rem; color: var(--ink-soft); word-break: break-all; }
+
+/* ---- the start card: the one gesture ---------------------------------------- */
+.welcome { position: absolute; inset: 0; z-index: 20; display: grid; place-items: center; background: var(--ground); padding: 1.5rem; }
+.welcome[hidden] { display: none; }
+.welcome .card { max-width: 20rem; text-align: center; }
+.welcome h1 { font-size: 1.2rem; font-weight: 500; margin: 0 0 0.4rem; }
+.welcome p { color: var(--ink-soft); margin: 0.3rem 0; font-size: 0.95rem; }
+.welcome .how { list-style: none; margin: 1rem 0 0; padding: 0; display: grid; gap: 0.3rem; text-align: left; font-size: 0.9rem; }
+.welcome .how li { display: grid; grid-template-columns: 5.4rem 1fr; gap: 0.6rem; align-items: baseline; }
+.welcome .how b { font-weight: 500; color: var(--accent); letter-spacing: 0.04em; font-size: 0.8rem; text-transform: uppercase; }
+.welcome .go {
+  margin-top: 1.3rem; display: inline-block; padding: 0.65rem 1.5rem; border: 1px solid var(--line);
+  border-radius: 8px; background: var(--key-ground); color: var(--ink); cursor: pointer;
+}
+.welcome .go:focus-visible, .welcome .go:hover { border-color: var(--accent); outline: none; }
+.welcome .note { margin-top: 1rem; font-size: 0.78rem; color: var(--ink-faint); }
+
+@media (prefers-reduced-motion: reduce) {
+  .stage, .sheet, .toast, .cue, .caption, .status { transition: none !important; animation: none !important; }
+}
+
+/* ---- on a phone the mockup is the page --------------------------------------- */
+@media (max-width: 40rem) {
+  body { padding-inline: 0; }
+  .cols { display: block; }
+  .lede, .notes, .device .under { display: none; }
+  .sheet-page { padding-block: 0; max-width: none; }
+  .device { position: static; }
+  .phone { position: fixed; inset: 0; width: auto; height: auto; border: 0; border-radius: 0; box-shadow: none; margin: 0; }
+  body.reading { padding-inline: 1.25rem; }
+  body.reading .phone { display: none; }
+  body.reading .lede, body.reading .notes { display: block; }
+  body.reading .sheet-page { padding-block: 1.5rem 3rem; }
+}
+@media (min-width: 40.01rem) and (max-width: 62rem) {
+  .cols { grid-template-columns: 1fr; }
+  .device { position: static; }
+}
+</style>
+
+<div class="sheet-page">
+<header class="lede">
+  <p class="eyebrow">docs/plans/swipe.md · mockup · the copy in the phone is final</p>
+  <h1>Swipe mode</h1>
+  <p>The gallery in one hand. One sketch at a time, full screen, and six things a thumb can do: up for the next one, down for the last one, right to like it, left to judge it against another, a tap for the words, a hold to touch the sketch itself.</p>
+  <p class="note">The phone works — drag it with a mouse, or open this page on a phone and it takes the whole screen. It runs six real entries from the gallery. Counts and agent verdicts are example numbers.</p>
+</header>
+
+<div class="cols">
+<div class="device">
+<div class="phone" id="phone">
+
+  <div class="welcome" id="welcome">
+    <div class="card">
+      <h1>sketchgen · swipe</h1>
+      <p>Sketches from the gallery, one at a time, full screen.</p>
+      <ul class="how">
+        <li><b>swipe up</b><span>the next sketch</span></li>
+        <li><b>swipe right</b><span>like it</span></li>
+        <li><b>swipe left</b><span>judge it against another</span></li>
+        <li><b>tap</b><span>the words, on and off</span></li>
+        <li><b>hold</b><span>touch the sketch</span></li>
+      </ul>
+      <button class="go" id="go" type="button">Start</button>
+      <p class="note">This first tap is the one gesture the browser needs before a sketch can make sound.</p>
+    </div>
+  </div>
+
+  <div class="stage" id="stage"></div>
+  <div class="shield" id="shield" aria-hidden="true"></div>
+
+  <div class="cue like" id="cue-like"><svg viewBox="0 0 24 24"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 5 6.4 5c1.9 0 3.4 1 4.4 2.4A5.3 5.3 0 0 1 15.2 5C18.6 5 20.7 8.4 19.2 11.8 17.1 16.4 12 21 12 21z"/></svg><span>like</span></div>
+  <div class="cue judge" id="cue-judge"><svg viewBox="0 0 24 24"><rect x="2.5" y="5" width="8" height="14" rx="1.5"/><rect x="13.5" y="5" width="8" height="14" rx="1.5"/><path d="M6.5 9.5v5M17.5 9.5v5M15 12h5"/></svg><span>judge</span></div>
+
+  <button class="status" id="status" type="button" aria-label="this page"></button>
+  <svg class="heart" id="heart" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7.5-4.6-9.6-9.2C.9 8.4 3 5 6.4 5c1.9 0 3.4 1 4.4 2.4A5.3 5.3 0 0 1 15.2 5C18.6 5 20.7 8.4 19.2 11.8 17.1 16.4 12 21 12 21z"/></svg>
+
+  <div class="caption" id="caption"></div>
+  <p class="toast" id="toast" role="status"></p>
+  <button class="touching-pill" id="touching" type="button"><b>the sketch has the touch</b> · tap here to swipe again</button>
+
+  <div class="dim" id="dim"></div>
+
+  <section class="sheet" id="sheet-info" aria-label="the words">
+    <div class="grip"></div>
+    <button class="close" type="button" data-close aria-label="close">✕</button>
+    <h2 id="i-title"></h2>
+    <p class="note" id="i-sub"></p>
+    <h3>Brief</h3>
+    <p id="i-brief"></p>
+    <p class="note">The planner's expansion of the prompt. What the executor was asked to build.</p>
+    <h3>Artist's statement · <span id="i-by"></span>, unedited</h3>
+    <p id="i-statement"></p>
+    <p class="note">The executor's own account of what it built. A claim about the work, not a finding about it.</p>
+    <h3>Judgment</h3>
+    <div class="pop human"><span class="pop-label">Humans</span><span class="score" id="i-jh"></span><span class="quad" id="i-qh"></span></div>
+    <div class="pop agent"><span class="pop-label">Agents</span><span class="score" id="i-ja"></span><span class="quad" id="i-qa"></span></div>
+    <p class="note">Bradley–Terry per population. Two scores, never one aggregate. Views and likes are engagement, not judgment.</p>
+    <h3>Provenance</h3>
+    <dl class="fields" id="i-fields"></dl>
+    <p class="links"><a id="i-entry" href="#">open the entry page</a><a id="i-source" href="#">sketch.js</a></p>
+  </section>
+
+  <section class="sheet judge" id="sheet-judge" aria-label="judge">
+    <div class="grip"></div>
+    <button class="close" type="button" data-close aria-label="close">✕</button>
+    <h2>Judge it against another</h2>
+    <p class="note">A is the sketch you were watching. B is another from the gallery. Tap either to play it above.</p>
+    <div class="pair">
+      <button class="tile" type="button" data-side="A" aria-pressed="true"><p class="side-label">A <small>playing</small></p><p class="side-brief" id="j-brief-a"></p></button>
+      <button class="tile" type="button" data-side="B" aria-pressed="false"><p class="side-label">B <small>tap to play</small></p><p class="side-brief" id="j-brief-b"></p></button>
+    </div>
+    <div class="question" data-question="brief">
+      <p class="ask">Which is closer to its brief?</p>
+      <p class="choices"><button type="button" data-vote="A">A</button><button type="button" data-vote="tie">tie</button><button type="button" data-vote="B">B</button></p>
+      <p class="answered"></p>
+    </div>
+    <div class="question" data-question="look">
+      <p class="ask">Which would you rather look at?</p>
+      <p class="choices"><button type="button" data-vote="A">A</button><button type="button" data-vote="tie">tie</button><button type="button" data-vote="B">B</button></p>
+      <p class="answered"></p>
+    </div>
+    <p class="note" id="j-status">Signed in with GitHub, your answers are recorded and counted. Not signed in, they are noted here only.</p>
+    <div class="reveal" id="j-reveal" hidden>
+      <h3>What the agents said</h3>
+      <div id="j-agents"></div>
+      <p class="note">Shown after your answers, never before: being shown one first would anchor the other.</p>
+      <p class="note" id="j-both"></p>
+      <div class="after"><button type="button" id="j-another">judge another pair</button><button type="button" id="j-back">keep swiping</button></div>
+    </div>
+  </section>
+
+  <section class="sheet" id="sheet-settings" aria-label="this page">
+    <div class="grip"></div>
+    <button class="close" type="button" data-close aria-label="close">✕</button>
+    <h2>This page</h2>
+    <p class="note" id="s-place"></p>
+    <h3>Order</h3>
+    <ul class="orders" id="s-orders"></ul>
+    <h3>You</h3>
+    <p class="session-row" id="s-session"></p>
+    <p class="note">Likes and judgments are counted by GitHub login. A sketch counts as a view once it has been on screen for ten seconds.</p>
+    <h3>Launch link for this setup</h3>
+    <p class="launch" id="s-launch"></p>
+    <p class="links"><a href="https://profcarroll.github.io/sketchgen-gallery/">the gallery</a><a href="https://profcarroll.github.io/sketchgen-gallery/kiosk.html">the kiosk</a><a href="#" id="s-about">about this mockup</a></p>
+  </section>
+
+  <section class="sheet" id="sheet-signin" aria-label="sign in">
+    <div class="grip"></div>
+    <button class="close" type="button" data-close aria-label="close">✕</button>
+    <h2 id="si-title">Sign in to like it</h2>
+    <p>Likes and judgments are counted by GitHub login, so the gallery can tell one person from many. You come straight back here afterwards.</p>
+    <button class="big" type="button" id="si-go">Sign in with GitHub</button>
+    <button class="quiet-btn" type="button" data-close>not now</button>
+  </section>
+
+</div>
+<p class="under">Drag the phone with a mouse. <kbd>↑</kbd> <kbd>↓</kbd> next and previous, <kbd>L</kbd> like, <kbd>J</kbd> judge, <kbd>I</kbd> the words, <kbd>Esc</kbd> closes a sheet.</p>
+</div>
+
+<div class="notes">
+
+<section class="moments">
+  <h2>Moments</h2>
+  <div class="row">
+    <button type="button" data-moment="start">start card</button>
+    <button type="button" data-moment="feed">a sketch, with words</button>
+    <button type="button" data-moment="quiet">words off</button>
+    <button type="button" data-moment="dragright">dragging right</button>
+    <button type="button" data-moment="dragleft">dragging left</button>
+    <button type="button" data-moment="info">the words sheet</button>
+    <button type="button" data-moment="judge">judging</button>
+    <button type="button" data-moment="reveal">after both answers</button>
+    <button type="button" data-moment="signin">asked to sign in</button>
+    <button type="button" data-moment="touch">the sketch has the touch</button>
+    <button type="button" data-moment="settings">this page</button>
+  </div>
+</section>
+
+<section id="n-why">
+  <h2>What it is</h2>
+  <p>A new page on the published gallery, <code>swipe.html</code>, shaped like the kiosk: one static shell, a manifest, a script of its own, the same sandboxed iframe every other page runs a sketch in. Where the kiosk is a room with a projector and a keyboard nobody is standing at, this is a phone in a hand: nothing advances by itself, nothing needs a key, and the person holding it can like, judge and read without leaving the sketch.</p>
+  <p>The entry page already works on a phone, and it is the wrong shape for browsing: the sketch is a small box a third of the way down a long page, and moving to the next one is a trip back to the grid. Swipe mode is the entry page's three verbs — view, like, judge — with the page taken away.</p>
+</section>
+
+<section id="n-gestures">
+  <h2>Six gestures</h2>
+  <div class="gestures">
+    <div><div class="g">↑</div><b>swipe up</b><span>the next sketch, in the current order</span></div>
+    <div><div class="g">↓</div><b>swipe down</b><span>the one before it</span></div>
+    <div><div class="g">→</div><b>swipe right</b><span>like it; again to unlike. Signed out, it asks first.</span></div>
+    <div><div class="g">←</div><b>swipe left</b><span>judge it against another: the compare page's two questions</span></div>
+    <div><div class="g">●</div><b>tap</b><span>the words on and off; a tap on the words opens all of them</span></div>
+    <div><div class="g">◉</div><b>hold</b><span>hand the touch to the sketch, for one that responds to it</span></div>
+  </div>
+  <p>Up and down are the feed, because that is what a phone has taught everyone a full-screen thing does. Right is yes and left is the harder question, which is the order every card-swiping app settled on. Left for <em>judge</em> rather than <em>skip</em> because skip already has a gesture, and because it is the one verb the gallery most wants from a stranger with thirty seconds.</p>
+  <p>Desktop courtesy, not a second interface: <kbd>↑</kbd> <kbd>↓</kbd> <kbd>L</kbd> <kbd>J</kbd> <kbd>I</kbd> <kbd>Esc</kbd> do the same six things, and a mouse drag is a swipe, because gestures are pointer events and the tests can drive them.</p>
+  <h3>The shield, and why a hold is needed</h3>
+  <p>The sketch runs in a sandboxed frame with an opaque origin. A finger that lands on the frame belongs to the frame: the page never sees the swipe, and cannot ask the frame to pass it along, because there is no channel and the kiosk spec says why there is none. So a transparent layer sits over the stage and takes every touch, and swiping works anywhere on the screen — the expectation a full-screen feed sets.</p>
+  <p>The cost is that a sketch that answers a touch cannot feel one. A hold of half a second lifts the shield: the sketch has the touch, the words go quiet, and one pill at the bottom says so and gives the touch back. That hold is also the gesture the frame needs before it will make sound, which the kiosk could never deliver. The caption says <em>responds to touch · hold to try</em> on entries whose gate assertions include <code>responds(click)</code> or <code>responds(drag)</code>, so nobody holds a sketch that has nothing to give.</p>
+</section>
+
+<section id="n-screen">
+  <h2>What is on the screen</h2>
+  <p>Less than the kiosk, on purpose. Three things at rest and none of them takes a tap to reach:</p>
+  <ul>
+    <li><b>The status line</b>, top left: <em>3 of 910 · newest</em>. A tap opens the page's own sheet — order, sign-in, the launch link.</li>
+    <li><b>The heart</b>, top right: outlined, or filled when this login has liked the sketch this session.</li>
+    <li><b>The caption</b>, over the bottom under a scrim: the entry number and prompt, the latest revision when there is one, the authors line, a facts row of generation, views and likes. A tap on the caption opens the words sheet; a tap anywhere else hides all three so the sketch is alone, and shows them again.</li>
+  </ul>
+  <p>No progress line: nothing is timed. No code column: a phone is no place to scroll source, and the words sheet links to it. No QR: the phone is the thing the code was for.</p>
+  <h3>The sketch</h3>
+  <p>A window-sized sketch fills the screen, portrait or landscape, as the frame is the window. A fixed canvas is laid out at its own size and scaled with a CSS transform to fit the short side of the screen — the kiosk's <em>fit</em>, and only that one. On a 390-pixel-wide phone an 800×600 canvas is 390×292 in the middle of black; a 400×600 one is nearly the whole screen. Fit rather than the kiosk's <em>native</em> because native on a phone means smaller than the screen for every canvas in the gallery, and rather than <em>fill</em> because cropping a work to a phone is not something to do silently. Turning the phone refits.</p>
+</section>
+
+<section id="n-sheets">
+  <h2>Four sheets</h2>
+  <p>Everything that is not the sketch or its caption lives in a bottom sheet, opened by one gesture and closed by the ✕, a tap on the dimmed sketch, <kbd>Esc</kbd>, or dragging the sheet down.</p>
+  <h3>The words</h3>
+  <p>A tap on the caption. Brief, artist's statement, judgment per population with the quadrant phrase the entry page uses, provenance, and two links out: the entry page and the sketch source. The kiosk's thirteen overlays collapse into this one sheet because a phone has no room to show them beside the sketch and no keyboard to pick among them.</p>
+  <h3>Judge</h3>
+  <p>A swipe left. The compare page's two questions, in a half-height sheet so the stage stays visible above it. A is the sketch just watched; B is a partner chosen the way <code>pickPair</code> chooses one: an offered pair from <code>pairs.json</code> that contains A when there is one, otherwise a published entry at random. Two tiles carry the briefs and nothing else — no prompt, no authors — and tapping a tile plays that side on the stage, one frame at a time, so the pair is judged by watching both in turn rather than side by side in two thumbnails. After both answers the agents' verdicts appear, with links to both entries and a choice: another pair, or back to swiping.</p>
+  <h3>This page</h3>
+  <p>A tap on the status line. The seven orders, named as the grid names them; who is signed in, with sign out, or a sign-in button; the note about views; the launch link for the current order and position.</p>
+  <h3>Sign in</h3>
+  <p>Opened by the first like or the first vote while signed out — never at start, because a page that asks for a login before it has shown anything is a page people leave. One button to GitHub, one to decline. Declined, a like does nothing and a vote is noted on the sheet only, as the compare page already does.</p>
+</section>
+
+<section id="n-flows">
+  <h2>Like, and coming back</h2>
+  <p>A like is the entry page's like button: one POST to the write path, identified by the GitHub session the gallery already keeps in this origin's storage, toggled off by the same gesture. The heart fills, a burst plays, the count in the caption moves.</p>
+  <p>Signing in from here is the one seam. The write path's callback always returns to the gallery's front page with the token in the fragment, where <code>gallery.js</code> claims it. So before leaving for GitHub the swipe page notes where it was, and the front page, having claimed the token, sees the note and sends the visitor straight back to <code>swipe.html?at=827</code> — the sketch they were looking at, now signed in, with the like still to make. One tap on the heart's cue completes it.</p>
+</section>
+
+<section id="n-never">
+  <h2>What it never does</h2>
+  <ul>
+    <li>Advance on its own, or count a view before ten un-paused seconds on screen.</li>
+    <li>Hold more than one iframe, speak to a frame, or evaluate sketch source.</li>
+    <li>Touch storage beyond its own <code>sketchgen-swipe</code> blob, the shared session token, and the one return note.</li>
+    <li>Show B's prompt, authors or verdicts before both questions are answered.</li>
+    <li>Ask for a sign-in before the visitor has done something that needs one.</li>
+    <li>Redirect a phone away from the grid. The grid offers the page; it does not impose it.</li>
+  </ul>
+</section>
+
+<section id="n-decide" class="decide">
+  <p><b>Still the instructor's to decide before the packets go out.</b></p>
+  <ol>
+    <li>Whether a ten-second swipe view posts as an ordinary view or names itself <code>source: "swipe"</code>, which costs a column and a Worker deploy. The recommendation is ordinary: a person who stayed ten seconds is what the number already means.</li>
+    <li>Whether the phone gets a slim manifest of its own (<code>swipe.json</code>, about a fifth of the kiosk's 2.8 MB, with brief and statement fetched from <code>meta.json</code> when the words sheet opens) or loads <code>kiosk.json</code> as it is. The recommendation is the slim one.</li>
+    <li>Where the page is offered: the nav on every page, a line on the grid at phone width, and <em>swipe on from here</em> on the entry page's scanned strip. The last one is a <code>render-all</code>.</li>
+  </ol>
+</section>
+
+</div>
+</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js"></script>
+<script src="swipe-data.js"></script>
+<script>
+(function () {
+  "use strict";
+  var ENTRIES = window.SWIPE_ENTRIES || [];
+  var TOTAL_IN_GALLERY = 910;
+  // Example engagement counts, so the caption has something to show. The real
+  // page reads these from the write path's /counts.
+  var COUNTS = { 987: { views: 61, likes: 2 }, 827: { views: 1088, likes: 23 }, 835: { views: 655, likes: 14 },
+                 838: { views: 412, likes: 9 }, 702: { views: 930, likes: 31 }, 128: { views: 2210, likes: 40 } };
+  // Example agent verdicts for the reveal; the real page reads pairs.json.
+  var VERDICTS = [
+    { question: "brief", choice: "A", judge: "gemma4:e4b" },
+    { question: "look", choice: "B", judge: "gemma4:e4b" }
+  ];
+  var ORDERS = [
+    { key: "newest", label: "newest first" }, { key: "oldest", label: "oldest first" },
+    { key: "random", label: "random" }, { key: "liked", label: "most liked" },
+    { key: "reviewed", label: "most reviewed" }, { key: "controversial", label: "controversial" },
+    { key: "consensus", label: "consensus" }
+  ];
+  var QUADS = {
+    human: { 987: null, 827: "looks good, on brief", 835: "looks good, off brief", 838: "looks good, on brief", 702: "looks good, on brief", 128: "neither" },
+    agent: { 987: "no pairs yet", 827: "looks good, on brief", 835: "neither", 838: "on brief", 702: "looks good, on brief", 128: "looks good, on brief" }
+  };
+
+  var state = {
+    order: "newest", seq: [], i: 0, words: true, liked: {}, username: null,
+    judging: null, touching: false, started: false
+  };
+
+  var $ = function (id) { return document.getElementById(id); };
+  var phone = $("phone"), stage = $("stage"), shield = $("shield"), caption = $("caption");
+  var toastEl = $("toast"), toastTimer = null;
+
+  /* ---- ordering (the grid's seven, over the manifest) ---------------------- */
+  function likesOf(e) { return (COUNTS[e.id] || {}).likes || 0; }
+  function nOf(e, p) { var j = e.judgment[p]; return j ? ((j.look || {}).n || 0) + ((j.brief || {}).n || 0) : 0; }
+  function gapOf(e) {
+    var h = e.judgment.human, a = e.judgment.agent;
+    if (!h || !a || !h.look || !a.look) { return null; }
+    return Math.abs(h.look.pct - a.look.pct);
+  }
+  function byNewest(a, b) { return (b.published_utc > a.published_utc) - (b.published_utc < a.published_utc) || b.id - a.id; }
+  function sequence(order) {
+    var list = ENTRIES.slice();
+    if (order === "newest") { list.sort(byNewest); }
+    else if (order === "oldest") { list.sort(function (a, b) { return -byNewest(a, b); }); }
+    else if (order === "liked") { list.sort(function (a, b) { return likesOf(b) - likesOf(a) || byNewest(a, b); }); }
+    else if (order === "reviewed") { list.sort(function (a, b) { return (nOf(b, "human") + nOf(b, "agent")) - (nOf(a, "human") + nOf(a, "agent")) || byNewest(a, b); }); }
+    else if (order === "controversial" || order === "consensus") {
+      list.sort(function (a, b) {
+        var ga = gapOf(a), gb = gapOf(b);
+        if (ga === null && gb === null) { return byNewest(a, b); }
+        if (ga === null) { return 1; } if (gb === null) { return -1; }
+        return (order === "controversial" ? gb - ga : ga - gb) || byNewest(a, b);
+      });
+    } else { for (var n = list.length - 1; n > 0; n--) { var r = Math.floor(Math.random() * (n + 1)); var t = list[n]; list[n] = list[r]; list[r] = t; } }
+    return list;
+  }
+  function current() { return state.seq[state.i]; }
+
+  /* ---- running a sketch in-page (the mockup's substitute for the frame) ----- */
+  var HOOKS = ["preload", "setup", "draw", "mousePressed", "mouseReleased", "mouseClicked", "mouseMoved", "mouseDragged", "mouseWheel", "windowResized", "touchStarted", "touchMoved", "touchEnded", "doubleClicked"];
+  var inst = null;
+  function run(entry) {
+    if (inst) { inst.remove(); inst = null; }
+    HOOKS.forEach(function (h) { window[h] = undefined; });
+    // The page keeps the keyboard: a sketch's keyPressed never sees a page key.
+    var tail = HOOKS.map(function (h) { return "window." + h + " = (typeof " + h + " === 'function') ? " + h + " : undefined;"; }).join("");
+    try { new Function(entry.src + "\n;" + tail)(); } catch (e) { console.error("sketch failed to load", e); }
+    inst = new p5(undefined, stage);
+    setTimeout(fit, 30);
+  }
+  // Fit: the canvas keeps its own pixels and is scaled to the short side of the
+  // stage. The real page does this with a transform on the frame (kiosk §1).
+  function fit() {
+    var c = stage.querySelector("canvas");
+    if (!c) { return; }
+    var d = inst ? inst.pixelDensity() : 1;
+    var w = c.width / d, h = c.height / d;
+    var s = Math.min(stage.clientWidth / w, stage.clientHeight / h);
+    c.style.width = Math.floor(w * s) + "px";
+    c.style.height = Math.floor(h * s) + "px";
+  }
+  window.addEventListener("resize", function () { setTimeout(fit, 60); });
+
+  /* ---- painting ------------------------------------------------------------- */
+  function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c]; }); }
+  function n(x) { return Number(x).toLocaleString(); }
+  function promptParts(prompt) {
+    var parts = String(prompt).split(/\n\nRevise:\s*/);
+    return { root: parts[0], revisions: parts.slice(1) };
+  }
+  function respondsToTouch(e) {
+    // The real page reads `responds` from the manifest (gate assertions); the
+    // mockup guesses from the prompt.
+    return /\b(click|tap|touch|drag|mouse|cursor)\b/i.test(e.prompt);
+  }
+  function fmtDate(iso) { var d = new Date(iso); return d.toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" }) + " " + iso.slice(11, 16) + " UTC"; }
+  function scoreText(e, p) {
+    var j = e.judgment[p]; if (!j || !j.look) { return "no pairs yet"; }
+    return j.look.score.toFixed(2) + " over " + j.look.n + (j.look.n === 1 ? " pair" : " pairs");
+  }
+  function quadText(e, p) { var q = QUADS[p][e.id]; return q || ""; }
+
+  function paintCaption(e) {
+    var parts = promptParts(e.prompt);
+    var counts = COUNTS[e.id] || {};
+    var html = "<p class=\"prompt\"><span class=\"num\">#" + e.id + "</span>" + esc(parts.root) + "</p>";
+    if (parts.revisions.length) {
+      html += "<p class=\"revisions\"><b>revised " + parts.revisions.length + (parts.revisions.length === 1 ? " time" : " times") + ", latest:</b> " + esc(parts.revisions[parts.revisions.length - 1]) + "</p>";
+    }
+    html += "<p class=\"authors\">Prompted by <span>" + esc(e.submitted_by) + "</span> · planned by <span>" + esc(e.planner) + "</span> · written by <span>" + esc(e.executor) + "</span> under the " + esc(e.rules_file) + " rules" + (e.attempts > 1 ? ", gate passed on attempt " + e.attempts : "") + "</p>";
+    html += "<ul class=\"facts\"><li class=\"gen\"><b>generation " + e.generation + "</b></li>";
+    html += "<li><b>" + (counts.views === undefined ? "—" : n(counts.views)) + "</b> views</li><li><b>" + (counts.likes === undefined ? "—" : n(counts.likes)) + "</b> likes</li>";
+    if (respondsToTouch(e)) { html += "<li class=\"touch\">responds to touch · hold to try</li>"; }
+    html += "</ul><p class=\"more\">tap here for the words</p>";
+    caption.innerHTML = html;
+  }
+  function paintStatus() {
+    var e = current();
+    $("status").innerHTML = "<b>" + (state.i + 1) + "</b> of " + n(ENTRIES.length) + " <span style=\"opacity:.6\">(" + n(TOTAL_IN_GALLERY) + " live)</span> · " + esc(state.order);
+    phone.classList.toggle("liked", !!state.liked[e.id]);
+  }
+  function paintInfo(e) {
+    var parts = promptParts(e.prompt);
+    $("i-title").textContent = "#" + e.id + " · " + parts.root;
+    $("i-sub").textContent = parts.revisions.length ? "Revised " + parts.revisions.length + (parts.revisions.length === 1 ? " time" : " times") + ", latest: " + parts.revisions[parts.revisions.length - 1] : "A root prompt, unrevised.";
+    $("i-brief").textContent = e.brief;
+    $("i-by").textContent = e.executor;
+    $("i-statement").textContent = e.statement;
+    $("i-jh").textContent = scoreText(e, "human"); $("i-qh").textContent = quadText(e, "human");
+    $("i-ja").textContent = scoreText(e, "agent"); $("i-qa").textContent = quadText(e, "agent");
+    var f = [["prompted by", e.submitted_by], ["planned by", e.planner], ["written by", e.executor], ["rules", e.rules_file],
+             ["generation", e.generation + (e.parent_entry_id ? ", revised from #" + e.parent_entry_id + " after a critique by " + e.critique_by : ", a root")],
+             ["attempts", e.attempts], ["created", fmtDate(e.created_utc)], ["tokens", n(e.prompt_tokens) + " prompt + " + n(e.completion_tokens) + " completion"],
+             ["written in", e.wall_s.toFixed(1) + " s"], ["canvas", e.canvas ? e.canvas.join("×") : "the window"], ["licence", e.licence]];
+    $("i-fields").innerHTML = f.map(function (r) { return "<dt>" + esc(r[0]) + "</dt><dd>" + esc(r[1]) + "</dd>"; }).join("");
+    $("i-entry").href = e.url; $("i-source").href = e.url + "sketch/sketch.js";
+  }
+  function paintSettings() {
+    var e = current();
+    $("s-place").textContent = "Sketch " + (state.i + 1) + " of " + ENTRIES.length + " in this mockup; the live gallery has " + n(TOTAL_IN_GALLERY) + ".";
+    $("s-orders").innerHTML = ORDERS.map(function (o) {
+      return "<li><button type=\"button\" data-order=\"" + o.key + "\" aria-current=\"" + (o.key === state.order) + "\"><span>" + o.label + "</span><span class=\"state\">" + (o.key === state.order ? "current" : "") + "</span></button></li>";
+    }).join("");
+    $("s-session").innerHTML = state.username
+      ? "<span>signed in: <b>" + esc(state.username) + "</b></span><button type=\"button\" id=\"s-out\">sign out</button>"
+      : "<span>not signed in</span><button type=\"button\" id=\"s-in\">sign in with GitHub</button>";
+    $("s-launch").textContent = "swipe.html?order=" + state.order + "&at=" + e.id;
+  }
+
+  /* ---- the sheets ----------------------------------------------------------- */
+  function openSheet(id) {
+    closeSheets();
+    if (id === "sheet-info") { paintInfo(current()); }
+    if (id === "sheet-settings") { paintSettings(); }
+    $(id).classList.add("open");
+    $("dim").classList.add("open");
+    $("dim").style.background = id === "sheet-judge" ? "transparent" : "";
+  }
+  function closeSheets() {
+    Array.prototype.forEach.call(phone.querySelectorAll(".sheet"), function (s) { s.classList.remove("open"); s.style.transform = ""; });
+    $("dim").classList.remove("open");
+    if (state.judging) { endJudging(); }
+  }
+  function anySheet() { return !!phone.querySelector(".sheet.open"); }
+  Array.prototype.forEach.call(phone.querySelectorAll("[data-close]"), function (b) { b.addEventListener("click", closeSheets); });
+  $("dim").addEventListener("click", closeSheets);
+  // Dragging a sheet down closes it.
+  Array.prototype.forEach.call(phone.querySelectorAll(".sheet"), function (sheet) {
+    var y0 = null;
+    sheet.addEventListener("pointerdown", function (ev) { if (sheet.scrollTop === 0) { y0 = ev.clientY; } });
+    sheet.addEventListener("pointermove", function (ev) {
+      if (y0 === null) { return; }
+      var dy = Math.max(0, ev.clientY - y0);
+      if (dy > 8) { sheet.style.transition = "none"; sheet.style.transform = "translateY(" + dy + "px)"; }
+    });
+    function end(ev) {
+      if (y0 === null) { return; }
+      var dy = ev.clientY - y0; y0 = null; sheet.style.transition = "";
+      if (dy > 90) { closeSheets(); } else { sheet.style.transform = ""; }
+    }
+    sheet.addEventListener("pointerup", end); sheet.addEventListener("pointercancel", end);
+  });
+
+  function toast(text) {
+    toastEl.textContent = text; toastEl.classList.add("show");
+    clearTimeout(toastTimer); toastTimer = setTimeout(function () { toastEl.classList.remove("show"); }, 1600);
+  }
+
+  /* ---- the seat: which sketch is up ----------------------------------------- */
+  function seat(i) {
+    state.i = (i + state.seq.length) % state.seq.length;
+    var e = current();
+    run(e); paintCaption(e); paintStatus();
+  }
+  function go(dir) {
+    if (state.judging || anySheet()) { return; }
+    var out = dir > 0 ? -110 : 110;
+    stage.className = "stage leave";
+    stage.style.transform = "translateY(" + out + "%)";
+    setTimeout(function () {
+      seat(state.i + dir);
+      stage.className = "stage";
+      stage.style.transform = "translateY(" + (-out) + "%)";
+      void stage.offsetWidth;
+      stage.className = "stage snap";
+      stage.style.transform = "";
+    }, 160);
+  }
+  function settle() { stage.className = "stage snap"; stage.style.transform = ""; }
+
+  /* ---- like ----------------------------------------------------------------- */
+  function like() {
+    var e = current();
+    if (!state.username) { $("si-title").textContent = "Sign in to like it"; openSheet("sheet-signin"); return; }
+    state.liked[e.id] = !state.liked[e.id];
+    COUNTS[e.id] = COUNTS[e.id] || { views: 0, likes: 0 };
+    COUNTS[e.id].likes += state.liked[e.id] ? 1 : -1;
+    paintCaption(e); paintStatus();
+    if (state.liked[e.id]) { var cue = $("cue-like"); cue.classList.remove("burst"); void cue.offsetWidth; cue.classList.add("burst"); setTimeout(function () { cue.classList.remove("burst"); cue.style.opacity = ""; }, 720); toast("liked"); }
+    else { toast("unliked"); }
+  }
+  $("si-go").addEventListener("click", function () {
+    // The real page leaves for <write_path>/login and comes back signed in
+    // (notes: "Like, and coming back"). The mockup pretends.
+    state.username = "profcarroll"; closeSheets(); toast("signed in as profcarroll — swipe right again to like");
+  });
+
+  /* ---- judge ---------------------------------------------------------------- */
+  function pickPartner(a) {
+    var pool = ENTRIES.filter(function (e) { return e.id !== a.id; });
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+  function startJudging() {
+    var a = current(), b = pickPartner(a);
+    state.judging = { a: a, b: b, playing: "A", answered: {} };
+    $("j-brief-a").textContent = a.brief; $("j-brief-b").textContent = b.brief;
+    Array.prototype.forEach.call(phone.querySelectorAll(".choices button"), function (btn) { btn.setAttribute("aria-pressed", "false"); });
+    Array.prototype.forEach.call(phone.querySelectorAll(".answered"), function (p) { p.textContent = ""; });
+    $("j-reveal").hidden = true;
+    $("j-status").textContent = state.username
+      ? "Signed in as " + state.username + ": your answers are recorded and counted."
+      : "Not signed in: your answers are noted here only. Sign in with GitHub from the status line to have them counted.";
+    playSide("A");
+    phone.classList.add("quiet");
+    openSheet("sheet-judge");
+  }
+  function playSide(side) {
+    var j = state.judging; if (!j) { return; }
+    j.playing = side;
+    Array.prototype.forEach.call(phone.querySelectorAll(".tile"), function (t) {
+      var on = t.getAttribute("data-side") === side;
+      t.setAttribute("aria-pressed", on ? "true" : "false");
+      t.querySelector("small").textContent = on ? "playing" : "tap to play";
+    });
+    run(side === "A" ? j.a : j.b);
+  }
+  function endJudging() {
+    var j = state.judging; state.judging = null;
+    phone.classList.remove("quiet");
+    if (j && j.playing !== "A") { run(j.a); }
+  }
+  Array.prototype.forEach.call(phone.querySelectorAll(".tile"), function (t) {
+    t.addEventListener("click", function () { playSide(t.getAttribute("data-side")); });
+  });
+  Array.prototype.forEach.call(phone.querySelectorAll(".question"), function (block) {
+    var q = block.getAttribute("data-question");
+    Array.prototype.forEach.call(block.querySelectorAll("[data-vote]"), function (btn) {
+      btn.addEventListener("click", function () {
+        var j = state.judging; if (!j) { return; }
+        var choice = btn.getAttribute("data-vote");
+        j.answered[q] = choice;
+        Array.prototype.forEach.call(block.querySelectorAll("[data-vote]"), function (o) { o.setAttribute("aria-pressed", o === btn ? "true" : "false"); });
+        block.querySelector(".answered").textContent = (state.username ? "recorded: " : "noted here only: ") + choice;
+        if (j.answered.brief && j.answered.look) {
+          $("j-agents").innerHTML = VERDICTS.map(function (v) {
+            return "<p class=\"verdict\"><b>" + esc(v.judge) + "</b> · " + (v.question === "brief" ? "closer to its brief" : "rather look at") + ": " + esc(v.choice) + "</p>";
+          }).join("") + "<p class=\"note\">Example verdicts. The real page reads the pair's verdicts from pairs.json, or says the agents have not judged this pair.</p>";
+          $("j-both").innerHTML = "A is <a href=\"" + j.a.url + "\">#" + j.a.id + "</a> · B is <a href=\"" + j.b.url + "\">#" + j.b.id + "</a>";
+          $("j-reveal").hidden = false;
+          $("sheet-judge").scrollTop = $("sheet-judge").scrollHeight;
+        }
+      });
+    });
+  });
+  $("j-another").addEventListener("click", function () { startJudging(); });
+  $("j-back").addEventListener("click", closeSheets);
+
+  /* ---- touch mode ----------------------------------------------------------- */
+  function handTouch() {
+    state.touching = true; phone.classList.add("touching");
+    if (navigator.vibrate) { try { navigator.vibrate(12); } catch (e) {} }
+  }
+  $("touching").addEventListener("click", function () { state.touching = false; phone.classList.remove("touching"); });
+
+  /* ---- the gesture engine: pointer events on the shield --------------------- */
+  var AXIS_LOCK = 12, TAP_MOVE = 10, TAP_MS = 300, HOLD_MS = 450, COMMIT_V = 64, COMMIT_H = 90;
+  var g = null;
+  shield.addEventListener("pointerdown", function (ev) {
+    if (!state.started || anySheet()) { return; }
+    shield.setPointerCapture(ev.pointerId);
+    g = { x: ev.clientX, y: ev.clientY, t: Date.now(), axis: null, dx: 0, dy: 0, id: ev.pointerId };
+    g.hold = setTimeout(function () { if (g && !g.axis) { g = null; handTouch(); } }, HOLD_MS);
+    stage.className = "stage";
+  });
+  shield.addEventListener("pointermove", function (ev) {
+    if (!g || ev.pointerId !== g.id) { return; }
+    g.dx = ev.clientX - g.x; g.dy = ev.clientY - g.y;
+    var ax = Math.abs(g.dx), ay = Math.abs(g.dy);
+    if (!g.axis && (ax > AXIS_LOCK || ay > AXIS_LOCK)) { g.axis = ax > ay ? "x" : "y"; clearTimeout(g.hold); }
+    if (g.axis === "y") { stage.style.transform = "translateY(" + (g.dy * 0.6) + "px)"; }
+    if (g.axis === "x") {
+      stage.style.transform = "translateX(" + (g.dx * 0.35) + "px)";
+      var p = Math.min(1, ax / COMMIT_H);
+      $("cue-like").style.opacity = g.dx > 0 ? p : 0;
+      $("cue-judge").style.opacity = g.dx < 0 ? p : 0;
+      $("cue-like").style.transform = "translateY(-50%) scale(" + (0.85 + 0.15 * p) + ")";
+      $("cue-judge").style.transform = "translateY(-50%) scale(" + (0.85 + 0.15 * p) + ")";
+    }
+  });
+  function release(ev) {
+    if (!g || ev.pointerId !== g.id) { return; }
+    var done = g; g = null; clearTimeout(done.hold);
+    $("cue-like").style.opacity = ""; $("cue-judge").style.opacity = "";
+    $("cue-like").style.transform = ""; $("cue-judge").style.transform = "";
+    var dt = Date.now() - done.t;
+    if (!done.axis) {
+      settle();
+      if (Math.abs(done.dx) < TAP_MOVE && Math.abs(done.dy) < TAP_MOVE && dt < TAP_MS) { toggleWords(); }
+      return;
+    }
+    if (done.axis === "y") {
+      var vy = Math.abs(done.dy) / Math.max(1, dt);
+      if (Math.abs(done.dy) > COMMIT_V || vy > 0.5) { go(done.dy < 0 ? 1 : -1); } else { settle(); }
+      return;
+    }
+    settle();
+    if (done.dx > COMMIT_H) { like(); }
+    else if (done.dx < -COMMIT_H) { startJudging(); }
+  }
+  shield.addEventListener("pointerup", release);
+  shield.addEventListener("pointercancel", release);
+  function toggleWords() { state.words = !state.words; phone.classList.toggle("quiet", !state.words); }
+  caption.addEventListener("click", function () { if (state.words && !state.touching) { openSheet("sheet-info"); } });
+  $("status").addEventListener("click", function () { openSheet("sheet-settings"); });
+  $("s-orders").addEventListener("click", function (ev) {
+    var b = ev.target.closest("[data-order]"); if (!b) { return; }
+    var keep = current();
+    state.order = b.getAttribute("data-order"); state.seq = sequence(state.order);
+    state.i = Math.max(0, state.seq.indexOf(keep)); paintStatus(); paintSettings();
+  });
+  $("s-session").addEventListener("click", function (ev) {
+    if (ev.target.id === "s-out") { state.username = null; paintSettings(); toast("signed out"); }
+    if (ev.target.id === "s-in") { state.username = "profcarroll"; paintSettings(); toast("signed in as profcarroll"); }
+  });
+  $("s-about").addEventListener("click", function (ev) { ev.preventDefault(); closeSheets(); document.body.classList.add("reading"); window.scrollTo(0, 0); });
+
+  // Desktop courtesy keys.
+  document.addEventListener("keydown", function (ev) {
+    if (!state.started || ev.metaKey || ev.ctrlKey || ev.altKey) { return; }
+    if (ev.target && /input|textarea/i.test(ev.target.tagName)) { return; }
+    if (ev.key === "Escape") { closeSheets(); if (state.touching) { $("touching").click(); } return; }
+    if (anySheet() || state.touching) { return; }
+    if (ev.key === "ArrowUp") { go(1); } else if (ev.key === "ArrowDown") { go(-1); }
+    else if (ev.key === "l" || ev.key === "L") { like(); } else if (ev.key === "j" || ev.key === "J") { startJudging(); }
+    else if (ev.key === "i" || ev.key === "I") { toggleWords(); } else { return; }
+    ev.preventDefault();
+  });
+
+  /* ---- start ---------------------------------------------------------------- */
+  function start() {
+    if (state.started) { return; }
+    if (!ENTRIES.length) {
+      $("welcome").querySelector(".note").textContent = "swipe-data.js did not load beside this page, so there is nothing to swipe through.";
+      return;
+    }
+    state.started = true;
+    $("welcome").hidden = true;
+    state.seq = sequence(state.order);
+    seat(0);
+  }
+  $("go").addEventListener("click", start);
+
+  /* ---- the moments row: put the phone in one state ------------------------- */
+  var MOMENTS = {
+    start: function () { state.started = false; $("welcome").hidden = false; closeSheets(); if (inst) { inst.remove(); inst = null; } },
+    feed: function () { start(); closeSheets(); if (state.touching) { $("touching").click(); } state.words = true; phone.classList.remove("quiet"); },
+    quiet: function () { MOMENTS.feed(); state.words = false; phone.classList.add("quiet"); },
+    dragright: function () { MOMENTS.feed(); stage.style.transform = "translateX(28px)"; $("cue-like").style.opacity = 0.9; $("cue-like").style.transform = "translateY(-50%) scale(0.98)"; },
+    dragleft: function () { MOMENTS.feed(); stage.style.transform = "translateX(-28px)"; $("cue-judge").style.opacity = 0.9; $("cue-judge").style.transform = "translateY(-50%) scale(0.98)"; },
+    info: function () { MOMENTS.feed(); openSheet("sheet-info"); },
+    judge: function () { MOMENTS.feed(); startJudging(); },
+    reveal: function () { MOMENTS.judge(); phone.querySelector("[data-question=\"brief\"] [data-vote=\"A\"]").click(); phone.querySelector("[data-question=\"look\"] [data-vote=\"B\"]").click(); },
+    signin: function () { MOMENTS.feed(); state.username = null; $("si-title").textContent = "Sign in to like it"; openSheet("sheet-signin"); },
+    touch: function () { MOMENTS.feed(); handTouch(); },
+    settings: function () { MOMENTS.feed(); openSheet("sheet-settings"); }
+  };
+  Array.prototype.forEach.call(document.querySelectorAll("[data-moment]"), function (b) {
+    b.addEventListener("click", function () {
+      Array.prototype.forEach.call(document.querySelectorAll("[data-moment]"), function (o) { o.setAttribute("aria-current", o === b ? "true" : "false"); });
+      MOMENTS[b.getAttribute("data-moment")]();
+    });
+  });
+})();
+</script>
