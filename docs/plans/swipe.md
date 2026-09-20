@@ -361,7 +361,7 @@ de-duplicates a signed-in viewer for 60 s and this page adds no de-duplication o
 
 Advance on its own. Count a view before ten seconds. Hold more than one iframe, `postMessage` to a
 frame, or evaluate sketch source. Touch storage beyond `sketchgen-swipe`, the shared
-`sketchgen_session`, and `sketchgen-swipe-return` (§5), which it only ever writes. Read
+`sketchgen_session`, and `sketchgen-return` (§5), which it only ever writes. Read
 `document.cookie`. Show B's prompt, authors, counts or verdicts before both questions are answered.
 Open the sign-in sheet before the visitor has done something that needs one. Send a request the list
 in §4.1 does not name.
@@ -370,7 +370,7 @@ in §4.1 does not name.
 
 One function, `returnFromSignIn()`, called from `ready()` immediately after `claimTokenFromHash()`
 and only when that call actually claimed a token (have it return a boolean). It reads
-`localStorage["sketchgen-swipe-return"]`, removes it, and if the value matches
+`localStorage["sketchgen-return"]`, removes it, and if the value matches
 `/^swipe\.html(\?[A-Za-z0-9=&_.-]*)?$/` navigates with `location.replace(ROOT + value)`. Anything
 else is dropped unread. The three rules, in a comment above it: consumed once, only in the same
 load that claimed a token (so a stale note can never redirect somebody who typed the front page's
@@ -379,6 +379,9 @@ anywhere else). `swipe.js` writes the note as `"swipe.html?order=<order>&at=<id>
 before it goes to `/login`, and nowhere else.
 
 Also in `gallery.js`'s file header: the storage key it now reads, beside the one it owns.
+
+Since amended by `qr.md` §6.3: the entry page writes this note too, so the key lost its `swipe-`
+and the pattern gained `e/<id>/`. Everything else above still holds.
 
 ## 6. Acceptance
 
