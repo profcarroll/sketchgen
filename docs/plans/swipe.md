@@ -180,7 +180,8 @@ the moment the start card is dismissed (`body.swipe.playing .bar { display: none
 The stage layout, for the CSS (the mockup's `.phone` rules are the reference and are lifted into
 `gallery.css` under `/* ---- swipe ---- */`, `.phone` renamed `body.swipe`, `position: absolute`
 becoming `fixed`, tokens the kiosk's): the stage fills the viewport and centres the frame; the shield
-is over it at `z-index: 3`; the cues at 4; the status line, heart and caption at 4–5; the toast and
+is over it at `z-index: 3` with the caption under it at 2; the cues at 4; the status line and heart at
+5; the toast and
 the pill at 8; the dim at 9 and the sheets at 10; the start card at 20. The caption's scrim is deep
 enough to read over a white canvas — a third of the gallery is light. `body.swipe` sets
 `touch-action: none` and `overscroll-behavior: none`, so no swipe becomes a scroll or a
@@ -199,7 +200,8 @@ matching names are what makes that a mechanical change.
 
 Reads: `config.json` (`cache: "no-store"`, for `write_path`), `swipe.json` (`no-store`),
 `/counts?entries=…` in batches of `COUNTS_BATCH = 100`, `/me` once at start, `e/<id>/meta.json`
-when a sheet needs it (cached per id for the page's life), `pairs.json` on the first judge. Writes,
+when a sheet needs it (cached per id for the page's life), `pairs.json` on the first judge, and
+`GET /logout` on sign-out (as `gallery.js` does: the Worker's cookie goes with the token). Writes,
 each with `authHeaders` (§4.6) and `credentials: "include"`: `POST /view` (§4.7), `POST /like`
 (§4.6), `POST /vote` (§4.5). Nothing else, and the acceptance test pins the list (§6).
 
@@ -251,9 +253,13 @@ element still ends. The constants, from the mockup, and they are the spec:
 While a vertical drag is live the stage follows the finger at 0.6; while a horizontal one is live
 the stage follows at 0.35 and the cue on that side grows from 0 to 1 over `COMMIT_H`. On release:
 
-- **no axis**, inside the tap bounds — toggle the words: `body.swipe.quiet` hides the caption, the
-  status line and the heart, and shows them again. A tap on the caption itself is not a shield
-  event (the caption is above the shield) and opens `sheet-info`.
+- **no axis**, inside the tap bounds — if the words are up and the point is inside the caption's
+  box (`getBoundingClientRect`, read at the tap), open `sheet-info`; otherwise toggle the words:
+  `body.swipe.quiet` hides the caption, the status line and the heart, and shows them again. The
+  caption sits **under** the shield with `pointer-events: none`, so the shield sees every tap and
+  routes it, and a swipe that starts on the words is still a swipe. (The mockup's first draft had
+  the caption above the shield; on a phone that ate the swipes a thumb starts in the bottom
+  third, which is where the caption is.)
 - **no axis**, held past `HOLD_MS` — the shield lifts (`body.swipe.touching`), the caption goes
   quiet, the pill appears, and `navigator.vibrate(12)` where it exists. A hold that never moved is
   never a tap: the hold timer clears the gesture before release can read it.
@@ -317,7 +323,8 @@ it has been on screen for ten seconds.*; the launch link for the current order a
 the gallery and the kiosk.
 
 **Sign in** (`sheet-signin`). Opened by a like or a vote while signed out, never otherwise. Heading
-*Sign in to like it* or *Sign in to record it*; the sentence about GitHub login; one button, *Sign
+*Sign in to like it* or *Sign in to record it* (*Sign in with GitHub* from the settings sheet's own
+row); the sentence about GitHub login; one button, *Sign
 in with GitHub*, which writes the return note (§5) and goes to `base() + "/login"`; one quiet
 button, *not now*. Declined, a like does nothing and a vote stays noted on the sheet.
 
@@ -422,8 +429,11 @@ what the gestures need and nothing more — `setPointerCapture` and `releasePoin
   under ten seconds posts none; a hidden tab (`document.visibilityState` stubbed) posts none.
 - With no `write_path`, no request to `base()` is made at all.
 - The set of URLs in `asked` whose `init.method` is `POST` is a subset of `{/view, /like, /vote}`,
-  asserted over the whole run; and, over the comment-stripped text of `swipe.js`, exactly three
-  `fetch(` calls carry `method:` and their URLs are `base() + "/view"`, `"/like"`, `"/vote"`.
+  asserted over the whole run; over the comment-stripped text of `swipe.js`, exactly three
+  `fetch(` calls carry `method:` and their URLs are `base() + "/view"`, `"/like"`, `"/vote"`; and
+  the set of every `base() + "/…"` literal in the file is exactly `/counts, /me, /logout, /login,
+  /view, /like, /vote` — a request the page makes to the Worker that is not one of those is a bug
+  whatever its method.
 - `swipe.js`'s text names no `localStorage` key other than the three of §4.8, and never writes
   `sketchgen_session` except in `writeToken`.
 - `gallery.js`: with `#session=tok` in the location and the return note set to
