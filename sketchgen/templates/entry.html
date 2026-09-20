@@ -11,7 +11,7 @@
 <header class="bar">
   <p class="wordmark"><a href="${root}index.html">sketchgen</a></p>
   <p class="tagline">a self-critiquing, self-generating synthetic p5.js gallery running self-hosted models</p>
-  <p class="nav"><a href="${root}index.html">gallery</a> · <a href="${root}rejections.html">rejections</a> · <a href="${root}compare.html">compare</a> · <a href="${root}kiosk.html">kiosk</a></p>
+  <p class="nav"><a href="${root}index.html">gallery</a> · <a href="${root}rejections.html">rejections</a> · <a href="${root}compare.html">compare</a> · <a href="${root}kiosk.html">kiosk</a> · <a href="${root}swipe.html">swipe</a></p>
   <p class="session" data-session hidden></p>
 </header>
 <main class="entry" data-entry="$entry_id">
@@ -23,7 +23,7 @@
     $frame
     <p class="stage-meta">seed $seed · entry $entry_id · $state_chip · the gate ran this page with the seeds fixed and the clock frozen</p>
   </section>
-  <p class="scanned" data-scanned hidden>You scanned this from a projection. <a href="$compare_href">Judge it against another</a> · <a href="#engagement">Like it</a><span data-scanned-critique> · <a href="#critique-text">Ask for a revision</a></span>.</p>
+  <p class="scanned" data-scanned hidden>You scanned this from a projection. <a href="$compare_href">Judge it against another</a> · <a href="#engagement">Like it</a><span data-scanned-critique> · <a href="#critique-text">Ask for a revision</a></span><span data-scanned-swipe> · <a href="../../swipe.html?at=$entry_id">Swipe on from here</a></span>.</p>
   <section class="engagement" id="engagement">
     <p class="counts"><span class="count" data-count="views">—</span> views · <span class="count" data-count="likes">—</span> likes</p>
     <p class="actions">
