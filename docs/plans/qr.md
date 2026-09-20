@@ -395,6 +395,27 @@ The rules:
   does not teach the write path a new field (§9).
 - With no `?kiosk`, the entry page is byte-for-byte the page it is today plus §6.1's figure.
 
+### 6.3 Coming back from sign-in
+
+The strip offers a like, and a like wants a sign-in; but `<write_path>/callback` returns to the
+gallery's front page and only there, so a stranger who scanned a wall, tapped *sign in with
+GitHub* and came back through OAuth landed on the index and had to find the sketch again. Most
+did not. So `gallery.js` does on an entry page what `swipe.js` already does on `swipe.html`
+(`swipe.md` §5): before the sign-in anchors navigate, it writes `e/<id>/` — from
+`main.entry[data-entry]`, never from the address bar — into `localStorage["sketchgen-return"]`,
+with `?kiosk` on it when the strip is up so the greeting they arrived with is still there when
+they land. `returnFromSignIn()` reads that note once, on the load that actually claimed a token,
+and acts on it only if it matches one anchored pattern over a closed alphabet, now
+`/^(?:swipe\.html|e\/[0-9]{1,6}\/)(?:\?[A-Za-z0-9=&_.-]*)?$/`. The key loses its `swipe-` because
+it is no longer swipe's; one note written by the deploy before is orphaned and unread, which
+costs at most one visitor one return.
+
+Client-side because the alternative is a `return_to` column on `oauth_state`, a D1 migration and
+a Worker deploy, to carry a string the browser already has — and swipe set this precedent for the
+same reason. The honest limitation: the note lives in this origin's `localStorage`, so a mobile
+in-app browser that hands the OAuth leg to a different browser profile still comes back to the
+index. That is the failure this trade buys, and it is the one it had before.
+
 ## 7. Acceptance
 
 `tests/test_qr.py` (new). The suite has no QR library to check against, so the tests check the
