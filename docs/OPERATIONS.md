@@ -43,6 +43,36 @@ journalctl --user -u sketchgen-worker -n 50     # -f to follow
 Node time is UTC and the laptop is not; two files about one event can disagree by
 four hours.
 
+## The Node card knows which machine it is on
+
+The Console's Node card is drawn for the node it is running on, because a cloud
+VM and a machine on a desk do not have the same facts about them. `node.kind` in
+the console document is `cloud` or `local`, and it is `local` unless something
+proves otherwise — the proof is `meta.node_shape`, which nothing writes but
+`bin/sketchgen billing --identify`, reading it from the instance metadata
+service on the node itself.
+
+What moves with it:
+
+| element | cloud | local |
+|---|---|---|
+| **gpu** meter — VRAM used of total, utilisation, card name | hidden (no A1 shape has one) | shown when `nvidia-smi` answers |
+| **storage $** meter — block gigabytes against the free tier | shown | hidden; a disk that was bought once has no monthly rate, and this meter used to quote Oracle's to a desktop |
+| **The bill** panel | shown | hidden; no tenancy, no meter, no invoice |
+| **model volume** meter | shown when the blobs are on their own filesystem | same rule — and where the size is not knowable at all (Ollama running on the Windows side of a WSL node) no meter is drawn rather than one reading zero |
+| core count, in the header and on **load** | `OCPU` | `threads`, which is what they are |
+
+A WSL node also says so under the meters: its memory, swap and boot disk are the
+distro's share, not the Windows host's, and a reader who takes 8 GiB for the
+machine will misread every number above it. The GPU figures come from the host
+driver, so those are the whole card.
+
+| variable | default | what it does |
+|---|---|---|
+| `SKETCHGEN_NODE_KIND` | auto | `cloud` or `local`, overriding the detection above. Set it on a cloud node that has not been identified yet, or the bill will not be drawn. |
+| `SKETCHGEN_SHAPE` | auto | the one-line machine description on entries and in the header. Set it where the bare architecture and core count miss what makes the timings — the GPU, or a host whose RAM is not the distro's. |
+| `SKETCHGEN_GPU_TTL_S` | 5 | how long the GPU reading is cached. `nvidia-smi` costs about 65 ms and the console refreshes every two seconds. |
+
 ## Pause and resume
 
 The pause switch is a row in the database, not systemctl, so it survives a worker

@@ -1,4 +1,4 @@
-<h1>Console <span class="dim" style="font-size:13px">— $shape · $cores_n cores · source
+<h1>Console <span class="dim" style="font-size:13px">— $shape · $cores_n $cores_unit · source
    <span id="console-source">$source</span> · read $generated · collected $collector_ms ms</span></h1>
 
 $activity
@@ -17,6 +17,7 @@ $cores
     <div style="margin-top:12px">
 $meters
     </div>
+$node_note
     <h3>Top three</h3>
     <table>
       <thead><tr><th class="n">pid</th><th>process</th><th class="n">cpu %</th><th class="n">mem %</th></tr></thead>
@@ -93,8 +94,5 @@ $per_sketch_rows
       tenancy is inside its trial credit.</p>
   </section>
 
-  <section class="panel">
-    <h2>The bill</h2>
-$billing_card
-  </section>
+$bill_panel
 </div>
