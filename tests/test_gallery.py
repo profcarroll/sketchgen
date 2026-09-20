@@ -512,6 +512,35 @@ class TreeTests(GalleryTestCase):
                 (SKETCHES / "good-motion" / name).read_bytes(),
             )
 
+    def test_a_page_that_loads_p5_sound_gets_the_shim_and_keeps_it_once(self):
+        # The one exception to verbatim: a sketch page that loads p5.sound
+        # would say "Loading..." for ever inside a sandboxed frame on WebKit
+        # (soundshim.py), so the copy carries the shim under the addon's tag.
+        # Entries published before the executor wrote it pick it up here.
+        from sketchgen import soundshim
+        one = self.ids[0]
+        row = self.conn.execute("SELECT * FROM entries WHERE id = ?", (one,)).fetchone()
+        source = gallery._source_dir(row, gallery._attempt_rows(self.conn, int(row["job_id"])))
+        page = source / "index.html"
+        original = page.read_text(encoding="utf-8")
+        page.write_text(original.replace("p5.min.js\"></script>\n",
+                                         "p5.min.js\"></script>\n" + soundshim.P5_SOUND_TAG, 1),
+                        encoding="utf-8")
+        self.assertIn("p5.sound.min.js", page.read_text(encoding="utf-8"))
+        self.render()
+        out = (self.dest / "e" / str(one) / "sketch" / "index.html").read_text(encoding="utf-8")
+        self.assertEqual(1, out.count(soundshim.MARKER))
+        self.assertLess(out.index("p5.sound.min.js"), out.index(soundshim.MARKER))
+        self.assertLess(out.index(soundshim.MARKER), out.index('src="sketch.js"'))
+        # sketch.js is still the bytes the gate ran
+        self.assertEqual((self.dest / "e" / str(one) / "sketch" / "sketch.js").read_bytes(),
+                         (source / "sketch.js").read_bytes())
+        # and a source that already carries the shim is not given a second one
+        page.write_text(out, encoding="utf-8")
+        self.render()
+        again = (self.dest / "e" / str(one) / "sketch" / "index.html").read_text(encoding="utf-8")
+        self.assertEqual(out, again)
+
     def test_held_entries_are_not_public(self):
         job = db.enqueue(self.conn, "a held prompt", "profcarroll")
         held = db.create_entry(self.conn, job, state="held", prompt="a held prompt")

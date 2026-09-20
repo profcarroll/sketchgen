@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from sketchgen import executor  # noqa: E402
+from sketchgen import executor, soundshim  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "executor"
@@ -110,6 +110,12 @@ class TestCleanResponse(ExecutorTestCase):
                 self.assertIn("addons/p5.sound.min.js", html)
                 # the addon goes UNDER p5 itself, which has to load first
                 self.assertLess(html.index("p5.min.js"), html.index("p5.sound.min.js"))
+                # and the shim that lets it start inside a sandboxed frame on
+                # WebKit goes under the addon and before the sketch
+                # (soundshim.py)
+                self.assertEqual(1, html.count(soundshim.MARKER))
+                self.assertLess(html.index("p5.sound.min.js"), html.index(soundshim.MARKER))
+                self.assertLess(html.index(soundshim.MARKER), html.index('src="sketch.js"'))
 
     def test_a_sketch_with_no_sound_gets_the_index_byte_for_byte(self):
         # DEFAULT_INDEX_HTML is the gate's own fixtures/good-motion index; a

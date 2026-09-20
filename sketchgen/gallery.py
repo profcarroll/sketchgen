@@ -3,7 +3,7 @@
 One entry row plus its attempt directory in, a directory of plain files out:
 
     <gallery>/e/<id>/index.html          the ENTRY page (not the sketch)
-    <gallery>/e/<id>/sketch/index.html   the sketch's own page, verbatim
+    <gallery>/e/<id>/sketch/index.html   the sketch's own page, verbatim but for soundshim.py
     <gallery>/e/<id>/sketch/sketch.js    the file the entry's frame loads
     <gallery>/e/<id>/strip.png           four frames, from the gate
     <gallery>/e/<id>/gate.png            the gate's single frame
@@ -64,6 +64,7 @@ from typing import Any, Iterable
 from . import pairs as pairs_mod
 from . import lineage
 from . import qr
+from . import soundshim
 
 __all__ = [
     "DEFAULT_GALLERY_URL",
@@ -2098,7 +2099,17 @@ def _write_entry(
         index_html = source / "index.html"
         if sketch_js.is_file() and index_html.is_file():
             written.copy(sketch_js, out / "sketch" / "sketch.js")
-            written.copy(index_html, out / "sketch" / "index.html")
+            # Verbatim, with one exception: a page that loads p5.sound gets
+            # the shim that lets it start inside a sandboxed frame on WebKit
+            # (soundshim.py). Entries published before the executor wrote it
+            # pick it up here, on the next render-all; every other page is
+            # the bytes the gate ran.
+            page = index_html.read_text(encoding="utf-8")
+            shimmed = soundshim.with_shim(page)
+            if shimmed == page:
+                written.copy(index_html, out / "sketch" / "index.html")
+            else:
+                written.write_text(out / "sketch" / "index.html", shimmed)
             has_sketch = True
     has_strip = False
     for which, name in (("strip", "strip.png"), ("png", "gate.png")):
