@@ -938,6 +938,18 @@ class KioskTests(unittest.TestCase):
             self.report["qr"]["onByDefault"]["lines"],
         )
 
+    def test_the_words_are_still_first_in_the_markup(self):
+        # The code shows at the lower left, but it is put there by CSS
+        # (`order: -1`, qr.md §5.2) and not by emitting it first. The words
+        # are what the caption says; the tile is aria-hidden with the URL
+        # printed beside it, and meeting it first is no use to anyone reading
+        # this page as text. Nothing on screen reveals which order the markup
+        # is in, so this is the only thing standing between that decision and
+        # the first person who "fixes" captionShell() to match the layout.
+        self.assertEqual(["words", "qr"], self.report["qr"]["onByDefault"]["order"])
+        # And with the code off, the words are the caption, alone.
+        self.assertEqual(["words"], self.report["qr"]["toggledOff"]["order"])
+
     def test_it_swaps_with_the_entry_and_never_leaves_two(self):
         after = self.report["qr"]["afterAdvance"]
         self.assertEqual(1, after["images"])
