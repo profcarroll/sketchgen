@@ -45,6 +45,8 @@ from pathlib import Path
 from string import Template
 from typing import Any
 
+from . import soundshim
+
 __all__ = [
     "DEFAULT_HOST",
     "DEFAULT_MODEL",
@@ -127,7 +129,11 @@ def index_html_for(js: str) -> tuple[str, str]:
     """
     if not SOUND_RE.search(js):
         return DEFAULT_INDEX_HTML, "default"
-    return DEFAULT_INDEX_HTML.replace(_P5_TAG, _P5_TAG + _P5_SOUND_TAG), "default+p5.sound"
+    # And the shim that keeps the addon from holding the sketch at
+    # "Loading..." inside a sandboxed frame on WebKit (soundshim.py).
+    return soundshim.with_shim(
+        DEFAULT_INDEX_HTML.replace(_P5_TAG, _P5_TAG + _P5_SOUND_TAG)
+    ), "default+p5.sound"
 
 
 # ---------------------------------------------------------------------------
