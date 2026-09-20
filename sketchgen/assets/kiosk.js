@@ -127,6 +127,29 @@
     { key: "consensus", label: "consensus" }
   ];
 
+  /* How a sketch that asked for a size is put on the stage. The Z key walks
+   * this list and the launch link's size= names one (kiosk-fullscreen.md §2).
+   *
+   * Roughly a third of the published gallery calls createCanvas() with two
+   * literals, most often 400x400 or 800x600, because that is what the prompt
+   * asked for. A p5 canvas is exactly the size it was made and does not grow
+   * with its frame, so on a projector those sketches were a postage stamp in
+   * the corner of a black screen. `native` keeps the size the sketch asked
+   * for, the other three overrule it.
+   *
+   * The scale is a CSS transform over the frame, so what is magnified is the
+   * composition the sketch actually drew: an upscaled 400x400 is soft, which
+   * is the honest cost of putting a 400 pixel artwork on a two-metre wall, and
+   * it is never *wrong* the way re-running the sketch at the projector's size
+   * would be. A sketch that centres on (200, 200) must keep centring on
+   * (200, 200). */
+  var SIZES = [
+    { key: "native", label: "as prompted", note: "the size the sketch asked for" },
+    { key: "fit", label: "fit to screen", note: "all of it, as big as it goes" },
+    { key: "fill", label: "fill screen", note: "no bars; the edges are cropped" },
+    { key: "stretch", label: "stretch to screen", note: "no bars; the shape is distorted" }
+  ];
+
   /* The fourteen overlays, in the order the menu lists them and the order the
    * launch link's show= names them. */
   var OVERLAYS = [
@@ -153,6 +176,10 @@
   var DEFAULT_SHOW = ["prompt", "authors", "generation", "views", "likes", "qr"];
   var DEFAULT_EVERY = 60;
   var DEFAULT_ORDER = "newest";
+  /* The sketch's own size, until somebody at the keyboard says otherwise: a
+   * gallery page shows a work at the size it was made, and overruling every
+   * artist in the room is a decision an operator makes, not a default. */
+  var DEFAULT_SIZE = "native";
 
   /* The stored settings blob's shape. A projector that has been running since
    * before the QR overlay existed has a show map that cannot mention a key
@@ -177,6 +204,7 @@
     every: DEFAULT_EVERY,
     paused: false,
     order: DEFAULT_ORDER,
+    size: DEFAULT_SIZE,
     hideAll: false,
     show: {},
     i: 0,
@@ -337,6 +365,14 @@
     return false;
   }
 
+  function sizeNamed(key) {
+    var at;
+    for (at = 0; at < SIZES.length; at += 1) {
+      if (SIZES[at].key === key) { return true; }
+    }
+    return false;
+  }
+
   function overlayNamed(key) {
     var at;
     for (at = 0; at < OVERLAYS.length; at += 1) {
@@ -378,6 +414,7 @@
     var order;
     var every;
     var show;
+    var size;
     var key;
     var list;
 
@@ -389,6 +426,7 @@
     if (saved && typeof saved === "object") {
       if (named(saved.order)) { state.order = saved.order; }
       if (saved.every) { state.every = clampEvery(saved.every); }
+      if (sizeNamed(saved.size)) { state.size = saved.size; }
       if (saved.show && typeof saved.show === "object") {
         list = [];
         for (key in saved.show) {
@@ -415,20 +453,23 @@
     }
     show = params.get("show");
     if (show !== null) { state.show = showFrom(show.split(",")); }
+    size = params.get("size");
+    if (sizeNamed(size)) { state.size = size; }
     // Not a key, and never written to storage: which sketches the gallery
     // counts is a property of the projector somebody set up, not something a
     // bumped keyboard should be able to change on the way past.
     state.viewsOff = params.get("views") === "0";
   }
 
-  /* The launch link and the address bar are the same three parameters, built
+  /* The launch link and the address bar are the same four parameters, built
    * the same way, so the link in the menu footer is a link to what is on the
-   * screen. Order and every come from fixed vocabularies and the overlay keys
-   * are [a-z], so nothing here needs escaping; commas stay commas, which is
-   * what makes the link readable on a projector. */
+   * screen. Order, every and size come from fixed vocabularies and the overlay
+   * keys are [a-z], so nothing here needs escaping; commas stay commas, which
+   * is what makes the link readable on a projector. */
   function query() {
     return "order=" + state.order +
       "&every=" + state.every +
+      "&size=" + state.size +
       "&show=" + shownKeys().join(",") +
       // persist() rewrites the address bar from this string, so a parameter
       // that is not in it is a parameter the first acting key throws away.
@@ -438,13 +479,13 @@
       (state.viewsOff ? "&views=0" : "");
   }
 
-  /* Both halves of §1.8 at once. The address bar keeps only these three
+  /* Both halves of §1.8 at once. The address bar keeps only these four
    * parameters: the kiosk page has no others. */
   function persist() {
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
         v: SETTINGS_VERSION,
-        every: state.every, order: state.order, show: state.show
+        every: state.every, order: state.order, size: state.size, show: state.show
       }));
     } catch (err) { /* private mode: the URL still carries it */ }
     if (window.history && window.history.replaceState) {
@@ -624,10 +665,19 @@
   }
 
   /* An opaque frame cannot be asked how big its canvas is, so the generator
-   * says: a manifest row with canvas gets a frame of that aspect ratio scaled
-   * to fit, and one without gets a frame that fills the stage. The size goes
-   * on the stage as two custom properties rather than on the frame as inline
-   * style, so the frame carries the four attributes it is allowed and no more. */
+   * says: a manifest row with canvas gets a frame laid out at exactly that
+   * size and then scaled, and one without gets an unscaled frame that fills
+   * the stage — a sketch that sized itself to its window is already as big as
+   * the room it was given. Both go on the stage as custom properties rather
+   * than on the frame as inline style, so the frame carries the four
+   * attributes it is allowed and no more.
+   *
+   * Laying the frame out at the canvas's own size is the whole trick. The
+   * frame used to be sized to the fitted box instead, which fitted nothing:
+   * the canvas inside is whatever createCanvas() asked for, so it sat at its
+   * own size in that box's top-left corner and the rest was black. Measured on
+   * a 1440x900 stage, entry 167 (400x400) drew 400x400 in the corner of a
+   * 900x900 frame. Now the frame is 400x400 and --frame-sx/sy magnify it. */
   function fitFrame() {
     var stage = $("stage");
     var entry = current();
@@ -638,15 +688,45 @@
     var scale;
     stage.style.removeProperty("--frame-w");
     stage.style.removeProperty("--frame-h");
+    stage.style.removeProperty("--frame-sx");
+    stage.style.removeProperty("--frame-sy");
     if (!entry || !entry.canvas || entry.canvas.length !== 2) { return; }
     width = Number(entry.canvas[0]);
     height = Number(entry.canvas[1]);
     room = stage.clientWidth;
     tall = stage.clientHeight;
     if (!width || !height || !room || !tall) { return; }
-    scale = Math.min(room / width, tall / height);
-    stage.style.setProperty("--frame-w", Math.floor(width * scale) + "px");
-    stage.style.setProperty("--frame-h", Math.floor(height * scale) + "px");
+    stage.style.setProperty("--frame-w", width + "px");
+    stage.style.setProperty("--frame-h", height + "px");
+    if (state.size === "stretch") {
+      /* The only mode with two different numbers: the axes are pulled apart
+       * until the sketch is the stage, shape and all. */
+      stage.style.setProperty("--frame-sx", String(room / width));
+      stage.style.setProperty("--frame-sy", String(tall / height));
+      return;
+    }
+    if (state.size === "fill") {
+      /* Cover: the smaller ratio is the one that would leave a bar, so take
+       * the larger and let the long axis run off the stage, which
+       * overflow: hidden crops evenly off both edges. */
+      scale = Math.max(room / width, tall / height);
+    } else {
+      scale = Math.min(room / width, tall / height);
+      /* `native` is the size the sketch asked for, with one exception it
+       * cannot argue with: a canvas bigger than the stage has to come down or
+       * the projector simply crops it. Shrinking is not overruling the sketch,
+       * it is the only way to show all of it. */
+      if (state.size === "native") { scale = Math.min(1, scale); }
+    }
+    stage.style.setProperty("--frame-sx", String(scale));
+    stage.style.setProperty("--frame-sy", String(scale));
+  }
+
+  /* Whether the sketch on the stage is one the size keys can do anything to.
+   * A window-sized sketch is already the stage in every mode, and saying so is
+   * better than leaving an operator pressing Z at a screen that never moves. */
+  function sizable(entry) {
+    return !!(entry && entry.canvas && entry.canvas.length === 2);
   }
 
   /* ---- the words -------------------------------------------------------- */
@@ -876,6 +956,14 @@
     $("m-pause-state").textContent = state.paused ? "paused" : "playing";
     $("m-pause").className = state.paused ? "on" : "";
     $("m-hide-state").textContent = state.hideAll ? "hidden" : "";
+    $("m-size-state").textContent = sizeLabel(state.size);
+    // A window-sized sketch is already the stage in all four modes. Saying so
+    // where the key is listed is cheaper than an operator pressing Z four
+    // times at a screen that does not move.
+    $("m-size").className = sizable(current()) ? "on" : "";
+    $("m-size-note").textContent = sizable(current())
+      ? sizeNote(state.size)
+      : "this sketch sizes itself to the screen already";
     for (at = 0; at < ORDERS.length; at += 1) {
       order = ORDERS[at];
       rows.push("<li class=\"" + (order.key === state.order ? "current" : "") +
@@ -897,6 +985,18 @@
     $("launch").textContent = "kiosk.html?" + query();
   }
 
+  function sizeAt(key) {
+    var at;
+    for (at = 0; at < SIZES.length; at += 1) {
+      if (SIZES[at].key === key) { return SIZES[at]; }
+    }
+    return SIZES[0];
+  }
+
+  function sizeLabel(key) { return sizeAt(key).label; }
+
+  function sizeNote(key) { return sizeAt(key).note; }
+
   var menuTimer = null;
 
   function openMenu() {
@@ -917,6 +1017,9 @@
     $("status").innerHTML = (state.paused ? "<span class=\"paused\">paused</span> · " : "") +
       (state.seq.length ? (state.i + 1) + " of " + state.seq.length : "0 of 0") +
       " · " + esc(state.order) +
+      // Named only when it is not the sketch's own size: a projector nobody
+      // has touched should not be captioned with a mode it is not in.
+      (state.size === DEFAULT_SIZE ? "" : " · " + esc(sizeLabel(state.size))) +
       ($("menu").hidden ? "<span class=\"hint\"><kbd>any key</kbd> controls</span>" : "");
   }
 
@@ -1049,6 +1152,19 @@
     else if (key === "[") { state.every = Math.max(15, state.every - 15); }
     else if (key === "f" || key === "F") { fullScreen(); }
     else if (key === "h" || key === "H") { state.hideAll = !state.hideAll; paint(current()); }
+    else if (key === "z" || key === "Z") {
+      at = 0;
+      for (; at < SIZES.length; at += 1) {
+        if (SIZES[at].key === state.size) { break; }
+      }
+      /* A walk rather than a toggle: "full screen" is two different answers —
+       * all of the sketch with bars, or none of the bars with the edges gone —
+       * and an operator aiming a projector is the one who gets to pick. The
+       * frame is refitted here and not on the next sketch, so the key is
+       * visibly the thing that did it. */
+      state.size = SIZES[(at + 1) % SIZES.length].key;
+      fitFrame();
+    }
     else if (key === "s" || key === "S") {
       at = 0;
       for (; at < ORDERS.length; at += 1) {

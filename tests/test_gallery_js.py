@@ -568,7 +568,7 @@ class KioskTests(unittest.TestCase):
         fell_back = self.report["noWritePath"]
         self.assertTrue(fell_back["status"].startswith("1 of 3 · newest"))
         self.assertEqual(
-            "kiosk.html?order=newest&every=60&show=prompt,authors,generation,views,likes,qr",
+            "kiosk.html?order=newest&every=60&size=native&show=prompt,authors,generation,views,likes,qr",
             fell_back["launch"],
         )
         self.assertIn("newest first", fell_back["current"])
@@ -610,18 +610,89 @@ class KioskTests(unittest.TestCase):
         # Twelve wraps that all dealt the same lap would not be a shuffle.
         self.assertGreater(random["laps"], 1)
 
-    def test_a_fixed_canvas_is_scaled_to_fit_and_a_window_sized_one_is_not(self):
+    def test_a_fixed_canvas_frame_is_the_canvas_and_the_scale_does_the_fitting(self):
         fitting = self.report["fitting"]
-        # 800x600 on a 1600x900 stage: limited by height, so 1.5.
+        # The frame is laid out at the sketch's own size, not at a fitted box.
+        # Sizing the box was the old bug: a p5 canvas is exactly as big as
+        # createCanvas() made it and does not grow with its frame, so an
+        # 800x600 sketch in a fitted frame stayed 800x600 in its top-left
+        # corner. The scale below is what the projector actually magnifies.
         self.assertEqual(11, fitting["fixed"]["entry"])
-        self.assertEqual("1200px", fitting["fixed"]["w"])
-        self.assertEqual("900px", fitting["fixed"]["h"])
+        self.assertEqual("800px", fitting["fixed"]["w"])
+        self.assertEqual("600px", fitting["fixed"]["h"])
+        # 800x600 fits inside 1600x900 as it is, and "as prompted" means it.
+        self.assertEqual("1", fitting["fixed"]["sx"])
+        self.assertEqual("1", fitting["fixed"]["sy"])
         # No canvas in the manifest, nothing said about the frame: the CSS
-        # default fills the stage, which is what a window-sized sketch wants.
+        # default fills the stage unscaled, which is what a window-sized
+        # sketch wants.
         self.assertEqual(22, fitting["windowSized"]["entry"])
         self.assertEqual("", fitting["windowSized"]["w"])
         self.assertEqual("", fitting["windowSized"]["h"])
+        self.assertEqual("", fitting["windowSized"]["sx"])
+        self.assertEqual("", fitting["windowSized"]["sy"])
         self.assertIsNone(fitting["windowSized"]["style"])
+
+    # ---- Z: the size a sketch is put on the stage at ----------------------
+
+    def test_z_walks_the_four_sizes_and_comes_back(self):
+        sizing = self.report["sizing"]
+        walk = sizing["walk"]
+        # The frame is the canvas in every mode; only the scale moves.
+        for seat in walk:
+            self.assertEqual("800px", seat["w"])
+            self.assertEqual("600px", seat["h"])
+        # as prompted -> fit -> fill -> stretch -> as prompted, on 1600x900:
+        #   fit     min(1600/800, 900/600) = 1.5, all of it, bars left and right
+        #   fill    max(1600/800, 900/600) = 2,   no bars, top and bottom cropped
+        #   stretch the two ratios apart, which is the only mode where they are
+        self.assertEqual(["1", "1.5", "2", "2", "1"], [seat["sx"] for seat in walk])
+        self.assertEqual(["1", "1.5", "2", "1.5", "1"], [seat["sy"] for seat in walk])
+        # The fourth press is as good as never having pressed it at all.
+        self.assertEqual(walk[0], walk[4])
+        self.assertEqual(
+            ["fit to screen", "fill screen", "stretch to screen", "as prompted"],
+            sizing["labels"],
+        )
+        # Each state says what it costs, because two of the four throw pixels
+        # away and an operator aiming a projector should be told which.
+        self.assertIn("cropped", sizing["notes"][1])
+        self.assertIn("distorted", sizing["notes"][2])
+
+    def test_a_window_sized_sketch_is_the_stage_in_every_size(self):
+        sizing = self.report["sizing"]
+        # Nothing the key can do to a sketch that already sized itself to the
+        # room it was given: four presses, four untouched frames.
+        for seat in sizing["windowSized"]:
+            self.assertEqual({"entry": 22, "w": "", "h": "", "sx": "", "sy": ""}, seat)
+        # And the menu says so, rather than leaving somebody pressing Z at a
+        # screen that never moves.
+        self.assertEqual("", sizing["windowSizedRow"])
+        self.assertIn("sizes itself", sizing["windowSizedNote"])
+
+    def test_as_prompted_still_shrinks_a_canvas_bigger_than_the_stage(self):
+        # The one thing "as prompted" cannot honour. 800x600 on a 400x300
+        # stage comes down by half; the alternative is cropping three quarters
+        # of the sketch and calling it the artist's intent.
+        down = self.report["sizingDown"]
+        self.assertEqual("800px", down["w"])
+        self.assertEqual("600px", down["h"])
+        self.assertEqual("0.5", down["sx"])
+        self.assertEqual("0.5", down["sy"])
+
+    def test_a_size_persists_and_a_link_beats_it(self):
+        sizing = self.report["sizingPersists"]
+        # Stored: the projector comes back up the way it was left.
+        self.assertEqual("2", sizing["fromStorage"]["sx"])
+        self.assertEqual("2", sizing["fromStorage"]["sy"])
+        # And the launch link names it, so the link reproduces the projector.
+        self.assertIn("size=fill", sizing["fromStorageLink"])
+        # A parameter beats a stored setting, as every other setting does.
+        self.assertEqual("2", sizing["urlWins"]["sx"])
+        self.assertEqual("1.5", sizing["urlWins"]["sy"])
+        # A size nobody defined is not a size: the stored one stands.
+        self.assertEqual("2", sizing["nonsense"]["sx"])
+        self.assertEqual("2", sizing["nonsense"]["sy"])
 
     # ---- the start card (§1.7) -------------------------------------------
 
@@ -740,7 +811,7 @@ class KioskTests(unittest.TestCase):
     def test_a_url_sets_the_state_and_the_launch_link_prints_it_back(self):
         settings = self.report["settings"]
         self.assertEqual(
-            "kiosk.html?order=liked&every=45&show=prompt,code", settings["launch"]
+            "kiosk.html?order=liked&every=45&size=native&show=prompt,code", settings["launch"]
         )
         self.assertEqual("45 s", settings["every"])
         self.assertIn("most liked", settings["order"])
@@ -751,22 +822,28 @@ class KioskTests(unittest.TestCase):
         settings = self.report["settings"]
         self.assertEqual(settings["launch"], settings["launchAfterKeys"])
         self.assertEqual(
-            "/kiosk.html?order=liked&every=45&show=prompt,code", settings["address"]
+            "/kiosk.html?order=liked&every=45&size=native&show=prompt,code", settings["address"]
         )
         self.assertEqual(
-            {"v": 2, "every": 45, "order": "liked", "show": {"prompt": True, "code": True}},
+            {
+                "v": 2,
+                "every": 45,
+                "order": "liked",
+                "size": "native",
+                "show": {"prompt": True, "code": True},
+            },
             settings["stored"],
         )
 
     def test_a_url_parameter_beats_a_stored_one_which_beats_the_default(self):
         precedence = self.report["precedence"]
         self.assertEqual(
-            "kiosk.html?order=oldest&every=120&show=brief", precedence["fromStorage"]
+            "kiosk.html?order=oldest&every=120&size=native&show=brief", precedence["fromStorage"]
         )
         # ?every=30 overrides the stored 120; the stored order and overlays,
         # which the URL says nothing about, are left alone.
         self.assertEqual(
-            "kiosk.html?order=oldest&every=30&show=brief", precedence["urlWins"]
+            "kiosk.html?order=oldest&every=30&size=native&show=brief", precedence["urlWins"]
         )
 
     # ---- the words (§4.4) ------------------------------------------------
@@ -902,14 +979,14 @@ class KioskTests(unittest.TestCase):
         # code off and nobody at the keyboard (§5.1).
         migration = self.report["migration"]
         self.assertEqual(
-            "kiosk.html?order=newest&every=60&show=prompt,qr", migration["migrated"]
+            "kiosk.html?order=newest&every=60&size=native&show=prompt,qr", migration["migrated"]
         )
         self.assertEqual(2, migration["stamped"]["v"])
 
     def test_the_stamp_stops_the_migration_running_twice(self):
         # Somebody who turned the code off after the migration keeps it off.
         self.assertEqual(
-            "kiosk.html?order=newest&every=60&show=prompt",
+            "kiosk.html?order=newest&every=60&size=native&show=prompt",
             self.report["migration"]["stays"],
         )
 

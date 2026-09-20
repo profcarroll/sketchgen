@@ -242,6 +242,13 @@ function kioskPage(document) {
       el(document, "span", { class: "keys" }, [el(document, "kbd", { text: "H" })]),
       el(document, "span", { text: "hide every overlay" }),
       el(document, "span", { class: "state", id: "m-hide-state" })
+    ]),
+    el(document, "li", { id: "m-size" }, [
+      el(document, "span", { class: "keys" }, [el(document, "kbd", { text: "Z" })]),
+      el(document, "span", {}, [
+        el(document, "span", { class: "note", id: "m-size-note" })
+      ]),
+      el(document, "span", { class: "state", id: "m-size-state" })
     ])
   ]);
 
@@ -392,6 +399,10 @@ function load(options) {
 
 const FADE = 420;
 
+/* How many presses of Z walk the whole cycle and come back to where it
+ * started, which is the real assertion: a fourth press is as good as none. */
+const SIZES_ROUND = 4;
+
 function settle() {
   return new Promise(function (resolve) { setTimeout(resolve, 0); });
 }
@@ -402,6 +413,13 @@ async function quiet() {
   for (let turn = 0; turn < 8; turn += 1) { await settle(); }
 }
 
+/* Several cases below need the menu open before the key they are actually
+ * testing, because the first press only opens the controls. That opener has to
+ * be a key the page does not bind — it used to be "z", which is now the size
+ * cycle (kiosk-fullscreen.md §2), and an opener that quietly changed the frame
+ * is exactly the bug this comment is here to stop coming back. "y" is bound to
+ * nothing: onKey falls through to handled = false and the press does nothing
+ * but open the menu. */
 function press(document, key) {
   (document.listeners.keydown || []).forEach(function (fn) {
     fn({ key: key, metaKey: false, ctrlKey: false, altKey: false, preventDefault: function () {} });
@@ -557,7 +575,7 @@ async function settings() {
   // Toggling one overlay off and on again leaves the setup exactly as found,
   // which is what makes the stored copy and the address bar comparable to the
   // launch link the page came up with.
-  press(document, "z");
+  press(document, "y");
   press(document, "p");
   press(document, "p");
   return {
@@ -674,7 +692,7 @@ async function qr() {
   const afterAdvance = qrBlock(document);
   press(document, "Escape");
 
-  press(document, "z");                     // opens the menu
+  press(document, "y");                     // opens the menu
   press(document, "Q");                     // Q toggles it off
   const toggledOff = qrBlock(document);
   press(document, "q");                     // and the lowercase key back on
@@ -768,7 +786,7 @@ async function paused() {
   const { document, tock } = await started({ search: "?order=newest&every=60" });
   const before = showing(document);
   tock(15000);                           // a quarter of the way in
-  press(document, "z");                  // opens the menu
+  press(document, "y");                  // opens the menu
   press(document, " ");                  // and now pauses
   tock(0);                               // one frame, so the bar is painted paused
   const bar = progress(document);
@@ -792,7 +810,7 @@ async function random() {
   const { document, tock } = await started({ search: "?order=random" });
   const seen = [showing(document)];
   for (let step = 0; step < 40; step += 1) {
-    press(document, "z");
+    press(document, "y");
     press(document, "ArrowRight");
     tock(FADE);
     seen.push(showing(document));
@@ -805,27 +823,97 @@ async function random() {
   return { seen: seen, repeats: repeats.length, laps: Object.keys(laps).length };
 }
 
-/* An 800x600 canvas on a 1600x900 stage is scaled by 1.5, and a sketch that
- * sizes itself to the window leaves the stage to say how big it is. */
-async function fitting() {
-  const { document, tock } = await started({ search: "?order=oldest", stage: [1600, 900] });
+/* The frame is laid out at the canvas's own size and scaled from there, so an
+ * 800x600 sketch on a 1600x900 stage is an 800x600 frame at whatever --frame-sx
+ * the size mode asks for; a sketch that sizes itself to the window leaves the
+ * stage to say how big it is, in every mode. */
+function frameOf(document) {
   const stage = document.getElementById("stage");
-  const fixed = {
+  return {
     entry: showing(document),
     w: stage.style.getPropertyValue("--frame-w"),
-    h: stage.style.getPropertyValue("--frame-h")
+    h: stage.style.getPropertyValue("--frame-h"),
+    sx: stage.style.getPropertyValue("--frame-sx"),
+    sy: stage.style.getPropertyValue("--frame-sy")
   };
-  press(document, "z");
+}
+
+async function fitting() {
+  const { document, tock } = await started({ search: "?order=oldest", stage: [1600, 900] });
+  const fixed = frameOf(document);
+  press(document, "y");
   press(document, "ArrowRight");
   tock(FADE);
   return {
     fixed: fixed,
-    windowSized: {
-      entry: showing(document),
-      w: stage.style.getPropertyValue("--frame-w"),
-      h: stage.style.getPropertyValue("--frame-h"),
-      style: stage.getAttribute("style")
-    }
+    windowSized: Object.assign(frameOf(document), {
+      style: document.getElementById("stage").getAttribute("style")
+    })
+  };
+}
+
+/* The Z key, walked all the way round, over both a sketch that asked for a
+ * size and one that did not.
+ *
+ * 800x600 on 1600x900: as prompted is 1, because the sketch fits and asking
+ * for 800x600 is asking for 800x600; fit is min(2, 1.5); fill is max(2, 1.5),
+ * which runs 1600 of stage under a 1600-wide sketch and crops the rest; and
+ * stretch is the two ratios, separately, which is the only mode where sx and
+ * sy differ. Then it comes back round to as prompted. */
+async function sizing() {
+  const { document, tock } = await started({ search: "?order=oldest", stage: [1600, 900] });
+  const walk = [frameOf(document)];
+  const labels = [];
+  const notes = [];
+  press(document, "y");                  // opens the menu
+  for (let at = 0; at < SIZES_ROUND; at += 1) {
+    press(document, "z");
+    walk.push(frameOf(document));
+    labels.push(document.getElementById("m-size-state").textContent);
+    notes.push(document.getElementById("m-size-note").textContent);
+  }
+  // …and a window-sized sketch, which none of the four can move.
+  press(document, "ArrowRight");
+  tock(FADE);
+  const windowSized = [];
+  for (let at = 0; at < SIZES_ROUND; at += 1) {
+    press(document, "z");
+    windowSized.push(frameOf(document));
+  }
+  return {
+    walk: walk,
+    labels: labels,
+    notes: notes,
+    windowSized: windowSized,
+    windowSizedRow: document.getElementById("m-size").className,
+    windowSizedNote: document.getElementById("m-size-note").textContent
+  };
+}
+
+/* A canvas bigger than the stage is the one case "as prompted" cannot honour:
+ * 800x600 on a 400x300 stage comes down by half rather than being cropped. */
+async function sizingDown() {
+  const { document } = await started({ search: "?order=oldest", stage: [400, 300] });
+  return frameOf(document);
+}
+
+/* The size the projector was left in survives a reload, and a link that names
+ * one beats it — the same precedence order and every other setting. */
+async function sizingPersists() {
+  const stored = JSON.stringify({ v: 2, every: 60, order: "oldest", size: "fill", show: { prompt: true } });
+  const fromStorage = await started({ stored: stored, stage: [1600, 900] });
+  const urlWins = await started({
+    stored: stored, search: "?size=stretch", stage: [1600, 900]
+  });
+  const nonsense = await started({
+    stored: stored, search: "?size=enormous", stage: [1600, 900]
+  });
+  return {
+    fromStorage: frameOf(fromStorage.document),
+    fromStorageLink: fromStorage.document.getElementById("launch").textContent,
+    urlWins: frameOf(urlWins.document),
+    // A size nobody defined is not a size: the stored one stands.
+    nonsense: frameOf(nonsense.document)
   };
 }
 
@@ -990,6 +1078,9 @@ async function main() {
     paused: await paused(),
     random: await random(),
     fitting: await fitting(),
+    sizing: await sizing(),
+    sizingDown: await sizingDown(),
+    sizingPersists: await sizingPersists(),
     qr: await qr(),
     qrElsewhere: await qrElsewhere(),
     migration: await migration(),
