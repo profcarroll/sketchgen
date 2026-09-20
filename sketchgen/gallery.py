@@ -742,9 +742,11 @@ def _statement(row: sqlite3.Row, source: Path | None) -> str:
 #: The one thing the kiosk cannot ask the sketch itself. Its frame is
 #: ``allow-scripts`` without ``allow-same-origin``, which is opaque by design,
 #: so there is no channel to read the canvas size over — and a fixed-size canvas
-#: in a stage-sized frame sits top-left, where p5 puts it. The generator can
-#: read the source, so the generator says (spec §4.3). Two integer literals and
-#: nothing else counts: a third argument is left outside the match, so
+#: in a stage-sized frame sits top-left, where p5 puts it, which is why the
+#: kiosk scales the frame rather than resizing it (kiosk-fullscreen.md §1). The
+#: generator can read the source, so the generator says (spec §4.3). Two
+#: integer literals and nothing else counts: a third argument is left outside
+#: the match, so
 #: ``createCanvas(800, 600, WEBGL)`` still gives a size, while ``windowWidth``,
 #: a variable or an expression gives none and the kiosk fills the stage.
 _CANVAS_RE = re.compile(r"createCanvas\(\s*(\d+)\s*,\s*(\d+)")

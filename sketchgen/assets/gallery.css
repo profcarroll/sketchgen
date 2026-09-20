@@ -784,9 +784,22 @@ body.kiosk .stage {
   position: relative;
 }
 
-/* The frame carries no inline style of its own: kiosk.js puts the fitted size
- * on the stage as --frame-w and --frame-h, and a row with no canvas in the
- * manifest leaves them unset, which is a frame that fills the stage. */
+/* The frame carries no inline style of its own: kiosk.js puts the sketch's own
+ * canvas size on the stage as --frame-w and --frame-h, and a row with no canvas
+ * in the manifest leaves them unset, which is a frame that fills the stage.
+ *
+ * The frame is laid out at the sketch's size and then *scaled* (spec §4.3,
+ * amended by kiosk-fullscreen.md §2). Sizing the frame alone never worked: a
+ * sandboxed p5 canvas is whatever createCanvas() asked for and does not grow
+ * with its frame, so a 400x400 sketch in a fitted 900x900 frame stayed 400x400
+ * in the frame's top-left corner. A transform scales what the sketch actually
+ * drew, so the pixels on the projector are the sketch's own composition, only
+ * bigger. --frame-sx and --frame-sy are what the Z key changes; they are two
+ * numbers rather than one so that `stretch` can pull the axes apart.
+ *
+ * No max-width or max-height: the scale is the fit, and a clamp on the layout
+ * size would make the frame smaller than the number --frame-sx was computed
+ * against, which is how a sketch ends up mis-sized instead of merely soft. */
 body.kiosk .stage iframe.sketch {
   aspect-ratio: auto;
   background: #000;
@@ -794,8 +807,10 @@ body.kiosk .stage iframe.sketch {
   border-radius: 0;
   display: block;
   height: var(--frame-h, 100%);
-  max-height: 100%;
-  max-width: 100%;
+  transform: scale(var(--frame-sx, 1), var(--frame-sy, 1));
+  /* The stage centres the frame, so the frame grows from its middle and a
+   * `fill` crop takes the same amount off both edges. */
+  transform-origin: center center;
   transition: opacity 420ms ease;
   width: var(--frame-w, 100%);
 }
@@ -1060,6 +1075,16 @@ body.kiosk .rows li {
   grid-template-columns: 4.6rem 1fr auto;
 }
 body.kiosk .rows li.on { color: var(--ink); }
+/* The one row that says what its next press would do, because "sketch size"
+ * names four states and the key alone does not say which one is coming. It
+ * sits inside the label column rather than in .state, which already holds the
+ * state the row is in. */
+body.kiosk .rows li .note {
+  color: var(--ink-faint);
+  display: block;
+  font-size: 0.78rem;
+  margin: 0;
+}
 body.kiosk .rows li .state {
   color: var(--ink-faint);
   font-size: 0.78rem;
