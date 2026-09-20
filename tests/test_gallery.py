@@ -2796,6 +2796,27 @@ class KioskPageTests(GalleryTestCase):
                 other = page.split('<p class="nav">')[1].split("</p>")[0]
                 self.assertNotIn("aria-current", other)
 
+    def test_the_code_sits_at_the_lower_left_at_every_width(self):
+        # qr.md §5.2: the tile is where the eye starts and the words run to
+        # the right of it. The move is CSS and not markup — captionShell()
+        # still emits .words first, because the code is a decorative tile and
+        # the words are the content — so `order: -1` is the whole of it.
+        #
+        # These two only make sense together. `order: -1` reverses a row, and
+        # it reverses a column too, so the stacked rule below 760 px has to be
+        # plain `column`: with `column-reverse` the two reversals cancel and
+        # the code lands under the words, off the bottom of a phone-shaped
+        # screen — the one thing that rule exists to prevent. Revert either
+        # one alone and the code is somewhere nobody wants it.
+        css = (self.dest / "assets" / "gallery.css").read_text(encoding="utf-8")
+        start = css.index("body.kiosk .caption .qr {")
+        self.assertIn("order: -1", css[start:css.index("}", start)])
+        narrow = css.split("@media (max-width: 760px) {")[1]
+        start = narrow.index("body.kiosk .caption { flex-direction:")
+        rule = narrow[start:narrow.index("}", start)]
+        self.assertIn("flex-direction: column;", rule)
+        self.assertNotIn("column-reverse", rule)
+
     def test_a_line_page_reaches_the_kiosk_from_one_level_down(self):
         # lines/<root>.html renders with root="../"; a kiosk link that forgot
         # it would 404 from there and nowhere else.
