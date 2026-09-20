@@ -51,8 +51,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import statistics
+import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -110,6 +112,10 @@ RATE_PER_HOUR_4_24 = 0.0
 # only zero while the two together stay under 200 GB. SKETCHGEN_STORAGE_RATE and
 # SKETCHGEN_FREE_TIER_STORAGE_GB override both when Oracle's price list moves.
 FREE_TIER_STORAGE_GB = float(os.environ.get("SKETCHGEN_FREE_TIER_STORAGE_GB", "200"))
+
+# nvidia-smi costs about 65 ms and the console refreshes every two seconds, so
+# the GPU answer is cached for this long. SKETCHGEN_GPU_TTL_S to tune it.
+GPU_TTL_S = float(os.environ.get("SKETCHGEN_GPU_TTL_S", "5"))
 STORAGE_RATE_USD_GB_MONTH = float(os.environ.get("SKETCHGEN_STORAGE_RATE", "0.0255"))
 
 #: The funnel's rows, in the order the console shows them.
@@ -1359,6 +1365,118 @@ def activity(conn: sqlite3.Connection) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+# Where nvidia-smi is, in the order worth trying. The systemd user manager
+# runs with a minimal PATH that has none of these on it, and on WSL the driver
+# shim is mounted from the Windows host rather than installed, so "it works in
+# my shell" and "the service can see it" are two different questions.
+NVIDIA_SMI_PATHS = (
+    "/usr/lib/wsl/lib/nvidia-smi",
+    "/usr/bin/nvidia-smi",
+    "/usr/local/bin/nvidia-smi",
+)
+
+_GPU_CACHE: tuple[float, dict[str, Any]] | None = None
+
+
+def _nvidia_smi() -> str | None:
+    """The nvidia-smi to run, or None when this node has no GPU tooling."""
+    found = shutil.which("nvidia-smi")
+    if found:
+        return found
+    for candidate in NVIDIA_SMI_PATHS:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _is_wsl() -> bool:
+    """True on WSL, whose MemTotal is a share of a Windows host, not a machine.
+
+    Worth saying on the page: 8 GiB here is half of a 16 GB desktop, and a
+    reader who takes it for the machine will misread every memory number.
+    """
+    try:
+        with open("/proc/version", encoding="utf-8") as handle:
+            return "microsoft" in handle.read().lower()
+    except OSError:  # pragma: no cover - /proc always exists on Linux
+        return False
+
+
+def node_kind(conn: sqlite3.Connection | None = None) -> str:
+    """``cloud`` or ``local`` — which kind of machine the card is describing.
+
+    Local unless something proves otherwise, for the same reason
+    :func:`sketchgen.worker.node_shape` no longer names a shape it cannot
+    prove. The proof is ``meta.node_shape``, which nothing writes but
+    :func:`sketchgen.cli.billing.node_identity`, and which it reads from the
+    instance metadata service on the node itself. ``SKETCHGEN_NODE_KIND``
+    overrides the lot, for a cloud node that has not been identified yet.
+    """
+    override = (os.environ.get("SKETCHGEN_NODE_KIND") or "").strip().lower()
+    if override in ("cloud", "local"):
+        return override
+    if conn is not None:
+        try:
+            if (db.get_meta(conn, "node_shape") or "").strip():
+                return "cloud"
+        except sqlite3.Error:  # pragma: no cover - a closed or partial db
+            pass
+    return "local"
+
+
+def _gpu_block() -> dict[str, Any]:
+    """The GPU as name / VRAM / utilisation; every field None where there is not one.
+
+    Always the same keys, never an absent block: the document's key shape is a
+    contract the console fixture holds us to, and a node without a GPU has to
+    produce the same skeleton as a node with one. "No GPU" is
+    ``vram_mb.total`` being None, which is what the card reads.
+
+    On the local node this is the number that explains the timings: the
+    executor is only fast while it is fully resident in VRAM, and the card has
+    6 GB, so "how full is it" is the first thing an operator wants. A node
+    without ``nvidia-smi`` — every OCI A1 shape so far — caches the empty
+    answer and stops paying for the lookup.
+    """
+    global _GPU_CACHE
+    now = time.monotonic()
+    if _GPU_CACHE is not None and now - _GPU_CACHE[0] < GPU_TTL_S:
+        return _GPU_CACHE[1]
+    block: dict[str, Any] = {
+        "name": None,
+        "vram_mb": {"total": None, "used": None},
+        "util_pct": None,
+    }
+    binary = _nvidia_smi()
+    if binary is None:
+        _GPU_CACHE = (now, block)
+        return block
+    try:
+        done = subprocess.run(
+            [
+                binary,
+                "--query-gpu=name,memory.total,memory.used,utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        lines = [line for line in (done.stdout or "").splitlines() if line.strip()]
+        if done.returncode == 0 and lines:
+            name, total, used, util = [part.strip() for part in lines[0].split(",")]
+            block = {
+                "name": name,
+                "vram_mb": {"total": float(total), "used": float(used)},
+                "util_pct": float(util),
+            }
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    _GPU_CACHE = (now, block)
+    return block
+
+
 def collect(
     conn: sqlite3.Connection,
     jobs_dir: str | os.PathLike[str] = DEFAULT_JOBS_DIR,
@@ -1389,6 +1507,8 @@ def collect(
     cores = _cores()
     node = {
         "shape": node_shape(),
+        "kind": node_kind(conn),
+        "wsl": _is_wsl(),
         "cores": cores,
         "uptime_s": _uptime_s(),
         "load": _loadavg(),
@@ -1403,6 +1523,8 @@ def collect(
     if len(node["cpu_pct"]) < cores:
         node["cpu_pct"] = node["cpu_pct"] + [0.0] * (cores - len(node["cpu_pct"]))
     node["cpu_pct"] = node["cpu_pct"][:cores]
+
+    node["gpu"] = _gpu_block()
 
     base = host_url.rstrip("/")
     version = _http_json(base + "/api/version")

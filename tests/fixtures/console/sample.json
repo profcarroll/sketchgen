@@ -3,6 +3,13 @@
   "collector_ms": 118.4,
   "node": {
     "shape": "VM.Standard.A1.Flex 16/96",
+    "kind": "cloud",
+    "wsl": false,
+    "gpu": {
+      "name": null,
+      "vram_mb": {"total": null, "used": null},
+      "util_pct": null
+    },
     "cores": 16,
     "uptime_s": 191244.6,
     "load": [1.94, 1.12, 0.78],
