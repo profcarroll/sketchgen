@@ -110,6 +110,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import string
 import subprocess
@@ -5772,11 +5773,42 @@ _gh_lock = threading.Lock()
 _GH_LOGIN_RE = re.compile(r"Logged in to github\.com (?:account|as) ([A-Za-z0-9-]+)")
 
 
+#: Where ``gh`` might be, in the order worth trying, for when it is not on
+#: PATH. The web process is a systemd ``--user`` unit, and that manager's PATH
+#: is a minimal one that does not include ``~/.local/bin`` -- which is where gh
+#: goes when it is installed from the release tarball, as it must be on a node
+#: with no root. The symptom is a gh that answers perfectly in the operator's
+#: shell and is invisible to the service, so the New job page offers a typed
+#: box and says nobody is signed in.
+GH_PATHS = (
+    "~/.local/bin/gh",
+    "/usr/local/bin/gh",
+    "/usr/bin/gh",
+    "/snap/bin/gh",
+    "/home/linuxbrew/.linuxbrew/bin/gh",
+)
+
+
+def _gh_binary() -> str | None:
+    """The gh to run: PATH first, then the usual places. None when there is none."""
+    found = shutil.which("gh")
+    if found:
+        return found
+    for candidate in GH_PATHS:
+        expanded = os.path.expanduser(candidate)
+        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+            return expanded
+    return None
+
+
 def _ask_gh() -> str | None:
     """One ``gh auth status``, parsed. None for no gh, no login, or no answer."""
+    binary = _gh_binary()
+    if binary is None:
+        return None
     try:
         done = subprocess.run(
-            ["gh", "auth", "status", "--hostname", "github.com"],
+            [binary, "auth", "status", "--hostname", "github.com"],
             capture_output=True, text=True, timeout=8,
         )
     except (OSError, subprocess.SubprocessError):
