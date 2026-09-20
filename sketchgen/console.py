@@ -1375,7 +1375,7 @@ NVIDIA_SMI_PATHS = (
     "/usr/local/bin/nvidia-smi",
 )
 
-_GPU_CACHE: tuple[float, dict[str, Any] | None] | None = None
+_GPU_CACHE: tuple[float, dict[str, Any]] | None = None
 
 
 def _nvidia_smi() -> str | None:
@@ -1424,24 +1424,33 @@ def node_kind(conn: sqlite3.Connection | None = None) -> str:
     return "local"
 
 
-def _gpu_block() -> dict[str, Any] | None:
-    """The GPU as name / VRAM / utilisation, or None where there is not one.
+def _gpu_block() -> dict[str, Any]:
+    """The GPU as name / VRAM / utilisation; every field None where there is not one.
+
+    Always the same keys, never an absent block: the document's key shape is a
+    contract the console fixture holds us to, and a node without a GPU has to
+    produce the same skeleton as a node with one. "No GPU" is
+    ``vram_mb.total`` being None, which is what the card reads.
 
     On the local node this is the number that explains the timings: the
     executor is only fast while it is fully resident in VRAM, and the card has
     6 GB, so "how full is it" is the first thing an operator wants. A node
-    without ``nvidia-smi`` — every OCI A1 shape so far — caches ``None`` and
-    stops paying for the lookup.
+    without ``nvidia-smi`` — every OCI A1 shape so far — caches the empty
+    answer and stops paying for the lookup.
     """
     global _GPU_CACHE
     now = time.monotonic()
     if _GPU_CACHE is not None and now - _GPU_CACHE[0] < GPU_TTL_S:
         return _GPU_CACHE[1]
-    block: dict[str, Any] | None = None
+    block: dict[str, Any] = {
+        "name": None,
+        "vram_mb": {"total": None, "used": None},
+        "util_pct": None,
+    }
     binary = _nvidia_smi()
     if binary is None:
-        _GPU_CACHE = (now, None)
-        return None
+        _GPU_CACHE = (now, block)
+        return block
     try:
         done = subprocess.run(
             [
@@ -1463,7 +1472,7 @@ def _gpu_block() -> dict[str, Any] | None:
                 "util_pct": float(util),
             }
     except (OSError, ValueError, subprocess.SubprocessError):
-        block = None
+        pass
     _GPU_CACHE = (now, block)
     return block
 
@@ -1515,9 +1524,7 @@ def collect(
         node["cpu_pct"] = node["cpu_pct"] + [0.0] * (cores - len(node["cpu_pct"]))
     node["cpu_pct"] = node["cpu_pct"][:cores]
 
-    gpu = _gpu_block()
-    if gpu is not None:
-        node["gpu"] = gpu
+    node["gpu"] = _gpu_block()
 
     base = host_url.rstrip("/")
     version = _http_json(base + "/api/version")

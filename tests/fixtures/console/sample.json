@@ -5,10 +5,28 @@
     "shape": "VM.Standard.A1.Flex 16/96",
     "cores": 16,
     "uptime_s": 191244.6,
-    "load": [1.94, 1.12, 0.78],
+    "load": [
+      1.94,
+      1.12,
+      0.78
+    ],
     "cpu_pct": [
-      98.0, 96.1, 94.0, 91.2, 12.0, 7.9, 4.0, 2.0,
-      1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+      98.0,
+      96.1,
+      94.0,
+      91.2,
+      12.0,
+      7.9,
+      4.0,
+      2.0,
+      1.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
     ],
     "cpu_total_pct": 25.5,
     "mem_mb": {
@@ -43,16 +61,47 @@
         "free_tier_model_gb": 60.3,
         "over_free_tier_gb": 30.7,
         "would_drop": [
-          {"name": "qwen3-coder:30b-a3b-q4_K_M", "size_gb": 20.51},
-          {"name": "gemma4:26b", "size_gb": 18.0}
+          {
+            "name": "qwen3-coder:30b-a3b-q4_K_M",
+            "size_gb": 20.51
+          },
+          {
+            "name": "gemma4:26b",
+            "size_gb": 18.0
+          }
         ]
       }
     },
     "top": [
-      {"pid": 1188, "cpu_pct": 389.4, "mem_pct": 22.1, "cmd": "ollama runner --model /usr/share/ollama/.ollama/…"},
-      {"pid": 40122, "cpu_pct": 6.2, "mem_pct": 0.4, "cmd": "python3 bin/sketchgen worker"},
-      {"pid": 40318, "cpu_pct": 1.9, "mem_pct": 0.1, "cmd": "sshd ubuntu@notty"}
-    ]
+      {
+        "pid": 1188,
+        "cpu_pct": 389.4,
+        "mem_pct": 22.1,
+        "cmd": "ollama runner --model /usr/share/ollama/.ollama/\u2026"
+      },
+      {
+        "pid": 40122,
+        "cpu_pct": 6.2,
+        "mem_pct": 0.4,
+        "cmd": "python3 bin/sketchgen worker"
+      },
+      {
+        "pid": 40318,
+        "cpu_pct": 1.9,
+        "mem_pct": 0.1,
+        "cmd": "sshd ubuntu@notty"
+      }
+    ],
+    "kind": "cloud",
+    "wsl": false,
+    "gpu": {
+      "name": null,
+      "vram_mb": {
+        "total": null,
+        "used": null
+      },
+      "util_pct": null
+    }
   },
   "model": {
     "ollama_version": "0.34.0",
@@ -87,7 +136,7 @@
   "activity": {
     "step": "writing",
     "headline": "Writing the sketch",
-    "detail": "qwen3-coder:30b-a3b-q4_K_M · job 42, attempt 2 of 3 · correcting from the last evaluation",
+    "detail": "qwen3-coder:30b-a3b-q4_K_M \u00b7 job 42, attempt 2 of 3 \u00b7 correcting from the last evaluation",
     "job_id": 42,
     "entry_id": null,
     "model": "qwen3-coder:30b-a3b-q4_K_M",
@@ -98,9 +147,18 @@
     "live": true,
     "state": "running",
     "recent": [
-      {"headline": "Evaluating the sketch in a browser", "seconds": 3.1},
-      {"headline": "Turning the prompt into a brief", "seconds": 9.4},
-      {"headline": "Picking up the next job", "seconds": 0.2}
+      {
+        "headline": "Evaluating the sketch in a browser",
+        "seconds": 3.1
+      },
+      {
+        "headline": "Turning the prompt into a brief",
+        "seconds": 9.4
+      },
+      {
+        "headline": "Picking up the next job",
+        "seconds": 0.2
+      }
     ]
   },
   "odometer": {
@@ -118,17 +176,66 @@
     }
   },
   "funnel": {
-    "generated": {"now": 1, "session": 39, "per_day": 62.0, "total": 124},
-    "revised": {"now": 0, "session": 11, "per_day": 18.5, "total": 37},
-    "passed_gate": {"now": 0, "session": 27, "per_day": 43.5, "total": 87},
-    "published": {"now": 0, "session": 12, "per_day": 19.5, "total": 39},
-    "held": {"now": 3, "session": 9, "per_day": 14.0, "total": 28},
-    "rejected": {"now": 0, "session": 2, "per_day": 3.5, "total": 7},
-    "failed_kept": {"now": 0, "session": 4, "per_day": 6.5, "total": 13},
-    "archived": {"now": 0, "session": 1, "per_day": 1.0, "total": 2},
-    "children": {"now": 1, "session": 5, "per_day": 8.5, "total": 17}
+    "generated": {
+      "now": 1,
+      "session": 39,
+      "per_day": 62.0,
+      "total": 124
+    },
+    "revised": {
+      "now": 0,
+      "session": 11,
+      "per_day": 18.5,
+      "total": 37
+    },
+    "passed_gate": {
+      "now": 0,
+      "session": 27,
+      "per_day": 43.5,
+      "total": 87
+    },
+    "published": {
+      "now": 0,
+      "session": 12,
+      "per_day": 19.5,
+      "total": 39
+    },
+    "held": {
+      "now": 3,
+      "session": 9,
+      "per_day": 14.0,
+      "total": 28
+    },
+    "rejected": {
+      "now": 0,
+      "session": 2,
+      "per_day": 3.5,
+      "total": 7
+    },
+    "failed_kept": {
+      "now": 0,
+      "session": 4,
+      "per_day": 6.5,
+      "total": 13
+    },
+    "archived": {
+      "now": 0,
+      "session": 1,
+      "per_day": 1.0,
+      "total": 2
+    },
+    "children": {
+      "now": 1,
+      "session": 5,
+      "per_day": 8.5,
+      "total": 17
+    }
   },
-  "submissions": {"pending": 2, "released": 5, "declined": 1},
+  "submissions": {
+    "pending": 2,
+    "released": 5,
+    "declined": 1
+  },
   "per_sketch": {
     "last": {
       "attempts_to_pass": 1.0,
