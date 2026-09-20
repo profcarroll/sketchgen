@@ -1293,6 +1293,10 @@ class SwipeTests(unittest.TestCase):
         # most of them there), and the shield hit-tests the tap instead.
         self.assertEqual("sheet-info", self.report["tapAndHold"]["captionOpens"])
 
+    def test_the_start_card_dismissed_marks_the_body_playing(self):
+        # Which is what hides the header bar (body.swipe.playing .bar).
+        self.assertIn("playing", self.report["tapAndHold"]["before"])
+
     def test_a_tap_above_the_caption_toggles_the_words_instead(self):
         self.assertIsNone(self.report["tapAndHold"]["closedAgain"])
         self.assertIn("quiet", self.report["tapAndHold"]["aboveToggles"])
@@ -1502,7 +1506,7 @@ class SwipeTests(unittest.TestCase):
         self.assertEqual("sheet-info", shown["sheet"])
         self.assertEqual("#11 · A field of slow lines.", shown["title"])
         self.assertEqual(
-            "Revised 1 time, latest: let the lines thin as they near the edge.",
+            "Revised once, latest: let the lines thin as they near the edge.",
             shown["sub"],
         )
         self.assertEqual("Lines drawn across the canvas, thinning at the edges.", shown["brief"])
@@ -1565,7 +1569,7 @@ class SwipeTests(unittest.TestCase):
     def test_the_settings_sheet_names_the_seat_the_orders_and_the_session(self):
         open_ = self.report["settings"]["open"]
         self.assertEqual("sheet-settings", open_["sheet"])
-        self.assertEqual("Sketch 1 of 3.", open_["place"])
+        self.assertEqual("Sketch 1 of 3", open_["place"])
         self.assertEqual(
             [
                 "newest:true", "oldest:false", "random:false", "liked:false",
@@ -1670,9 +1674,11 @@ class SwipeTests(unittest.TestCase):
             self.assertEqual(
                 ["body", "credentials", "headers", "method"], one["keys"], one["url"]
             )
-            if one["url"].endswith("/vote") and not one["hasAuth"]:
-                continue
-            self.assertTrue(one["hasAuth"], one["url"])
+        bare = [one["url"] for one in self.report["everyPost"] if not one["hasAuth"]]
+        # Exactly one, and it is the vote: a token-bearing vote that dropped
+        # the header would show up here as a second entry.
+        self.assertEqual(1, len(bare), bare)
+        self.assertTrue(bare[0].endswith("/vote"), bare)
 
     def test_no_request_carries_credentials_other_than_include(self):
         self.assertTrue(self.report["everyCredentials"])
@@ -1685,6 +1691,17 @@ class SwipeScriptTextTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.code = _without_comments(SWIPE_SCRIPT.read_text(encoding="utf-8"))
+
+    def test_it_speaks_to_the_write_path_at_seven_paths_and_no_other(self):
+        # Every request to base() is a literal `base() + "/..."`, so the set of
+        # those literals is the whole conversation with the Worker: the six
+        # reads and writes of spec §4.1, and /logout on sign-out, which is
+        # gallery.js's own sign-out and clears the Worker's cookie beside the
+        # token this page drops.
+        paths = set(re.findall(r'base\(\) \+ "(/[a-z]+)', self.code))
+        self.assertEqual(
+            {"/counts", "/me", "/logout", "/login", "/view", "/like", "/vote"}, paths
+        )
 
     def test_it_writes_three_things_and_only_those_three(self):
         # Every method other than GET is a write to the write path, so the

@@ -1273,6 +1273,20 @@ body.swipe .stage.snap { transition: transform 220ms cubic-bezier(0.2, 0.7, 0.2,
 body.swipe .stage.leave { transition: transform 160ms cubic-bezier(0.4, 0, 1, 1); }
 /* A finger that lands on the frame belongs to the frame, and there is no
  * channel to ask for it back (spec §1.4), so this takes every touch. */
+/* The frame is the canvas's own size and the scale does the fitting: the
+ * kiosk's rule (kiosk-fullscreen.md §1), rescoped. Without it the frame falls
+ * through to the entry page's 26rem grey box. */
+body.swipe .stage iframe.sketch {
+  aspect-ratio: auto;
+  background: #000;
+  border: 0;
+  border-radius: 0;
+  display: block;
+  height: var(--frame-h, 100%);
+  transform: scale(var(--frame-sx, 1), var(--frame-sy, 1));
+  transform-origin: center center;
+  width: var(--frame-w, 100%);
+}
 body.swipe .shield { position: fixed; inset: 0; z-index: 3; cursor: grab; }
 body.swipe .shield:active { cursor: grabbing; }
 body.swipe.touching .shield { pointer-events: none; }
@@ -1357,7 +1371,7 @@ body.swipe .caption .more {
 
 /* ---- a toast for the one-line answers ---- */
 body.swipe .toast {
-  position: fixed; left: 50%; bottom: 7.5rem; z-index: 8; transform: translateX(-50%) translateY(6px);
+  position: fixed; left: 50%; bottom: calc(7.5rem + env(safe-area-inset-bottom)); z-index: 8; transform: translateX(-50%) translateY(6px);
   background: var(--scrim); border: 1px solid var(--line); border-radius: 999px; padding: 0.4rem 0.9rem;
   font-size: 0.82rem; color: var(--ink); opacity: 0; pointer-events: none; white-space: nowrap;
   transition: opacity 160ms, transform 160ms;
@@ -1366,7 +1380,7 @@ body.swipe .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); 
 
 /* ---- the pill that says the sketch has the touch, and gives it back ---- */
 body.swipe .touching-pill {
-  position: fixed; left: 50%; bottom: 1.4rem; z-index: 8; transform: translateX(-50%);
+  position: fixed; left: 50%; bottom: max(1.4rem, env(safe-area-inset-bottom)); z-index: 8; transform: translateX(-50%);
   background: var(--scrim); border: 1px solid var(--agent); border-radius: 999px; padding: 0.5rem 1rem;
   font-size: 0.82rem; color: var(--ink); cursor: pointer; display: none; white-space: nowrap;
 }

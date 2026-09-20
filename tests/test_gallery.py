@@ -3214,6 +3214,21 @@ class SwipePageTests(GalleryTestCase):
         under = css.split("@media (max-width: 40rem) {")[-1]
         self.assertIn(".swipe-offer { display: block;", under)
 
+    def test_the_frame_rule_is_scoped_to_the_swipe_page_and_reads_the_fit(self):
+        # Without this rule the frame falls through to the entry page's
+        # `iframe.sketch` — a full-width 26rem grey box — and fitFrame()'s four
+        # custom properties are set on the stage and read by nothing.
+        css = (self.dest / "assets" / "gallery.css").read_text(encoding="utf-8")
+        start = css.index("body.swipe .stage iframe.sketch {")
+        rule = css[start:css.index("}", start)]
+        self.assertIn("transform: scale(var(--frame-sx, 1), var(--frame-sy, 1))", rule)
+        self.assertIn("width: var(--frame-w, 100%)", rule)
+        self.assertIn("height: var(--frame-h, 100%)", rule)
+
+    def test_the_bar_hides_once_the_page_is_playing(self):
+        css = (self.dest / "assets" / "gallery.css").read_text(encoding="utf-8")
+        self.assertIn("body.swipe.playing .bar { display: none; }", css)
+
     def test_the_scanned_strip_offers_to_swipe_on_from_here(self):
         # qr.md §6.2's strip, one verb longer: somebody who arrived by phone
         # is exactly who the swipe page is for.

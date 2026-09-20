@@ -2673,7 +2673,12 @@ def _swipe_entry(
     # Absent when there are none, as ``canvas`` is: a sketch that has nothing
     # to give a finger should not be told to hold, and an empty list in the
     # row is one more thing for the script to remember to test for.
-    responds = _responds(meta["assertions"])
+    # And only what the gate confirmed: ``assertions`` is what the planner
+    # asked for, and an off-plan entry is one the gate published anyway with
+    # some of them missed. A caption that says *hold to try* on a sketch the
+    # gate proved does not respond is the one case the fact exists to prevent.
+    missed = set(_offplan(row))
+    responds = _responds(a for a in meta["assertions"] if a not in missed)
     if responds:
         entry["responds"] = responds
     # A listening sketch is framed like any other — the frame is opaque and the
