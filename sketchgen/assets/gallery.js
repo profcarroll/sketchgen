@@ -18,6 +18,11 @@
  * fragment, lives in this origin's localStorage, and rides back as a bearer
  * header. See "the session" below for why a cookie cannot do this job.
  *
+ * Two keys in this origin's localStorage, and only one of them is this file's:
+ * sketchgen_session, which it owns, and sketchgen-swipe-return, which swipe.js
+ * writes and this file only ever reads — a one-shot note saying the sign-in
+ * started on swipe.html and should end there (swipe.md §5).
+ *
  * Until that service exists, config.json carries an empty write_path: every
  * count stays an em dash, the like button stays disabled, and the compare page
  * says votes are not being recorded. The generator never writes a number it
@@ -84,10 +89,13 @@
   /* Runs before anything else: take the token out of the fragment and out of
    * the address bar, so copying the URL does not hand it to someone else. A
    * fragment rather than a query string because a fragment is never sent to a
-   * server, so it cannot land in a log or a Referer header. */
+   * server, so it cannot land in a log or a Referer header.
+   *
+   * It says whether it actually claimed one, because returnFromSignIn() below
+   * is allowed to run in that load and in no other. */
   function claimTokenFromHash() {
     var hash = window.location.hash || "";
-    if (hash.indexOf("#session=") !== 0) { return; }
+    if (hash.indexOf("#session=") !== 0) { return false; }
     var token = decodeURIComponent(hash.slice("#session=".length));
     if (token) { writeToken(token); }
     if (window.history && window.history.replaceState) {
@@ -95,6 +103,42 @@
     } else {
       window.location.hash = "";
     }
+    return !!token;
+  }
+
+  var SWIPE_RETURN_KEY = "sketchgen-swipe-return";
+
+  /* Coming back to the swipe page after signing in (swipe.md §5).
+   *
+   * <write_path>/callback returns to the gallery's front page and only there,
+   * so a visitor who started on swipe.html lands here instead. Rather than
+   * teach the Worker a return path — a column on the OAuth state table and a
+   * deploy — swipe.js leaves a note in storage on its way to /login and this
+   * reads it on the way back. One extra hop, no Worker change.
+   *
+   * A note in storage is not evidence of anything, so three rules, and each
+   * one is a way for it not to be trusted:
+   *
+   *   consumed once — it is removed before it is acted on, so it sends
+   *   somebody back exactly one time and never again;
+   *
+   *   only in the load that claimed a token — ready() calls this only when
+   *   claimTokenFromHash() took one out of the fragment, so a stale note can
+   *   never redirect somebody who typed the front page's address;
+   *
+   *   only to this page's own swipe.html — the pattern allows that filename
+   *   and a query of plain characters, nothing more, so nothing in storage can
+   *   send a visitor to another origin, another path, or a javascript: URL.
+   *
+   * Anything else is dropped unread. */
+  function returnFromSignIn() {
+    var note;
+    try {
+      note = window.localStorage.getItem(SWIPE_RETURN_KEY) || "";
+      window.localStorage.removeItem(SWIPE_RETURN_KEY);
+    } catch (err) { return; /* private mode: there was no note to begin with */ }
+    if (!/^swipe\.html(\?[A-Za-z0-9=&_.-]*)?$/.test(note)) { return; }
+    window.location.replace(ROOT + note);
   }
 
   /* The one place a request's headers are built. The like button and the
@@ -1548,8 +1592,10 @@
 
   ready(function () {
     // First, before any request: the token /callback handed back in the
-    // fragment, stored for this origin and stripped from the address bar.
-    claimTokenFromHash();
+    // fragment, stored for this origin and stripped from the address bar. A
+    // load that claimed one may be somebody on their way back to the swipe
+    // page, and no other load is (swipe.md §5).
+    if (claimTokenFromHash()) { returnFromSignIn(); }
     // And the other parameter this page takes out of the address bar as soon
     // as it has read it: the projection's ?kiosk (qr.md §6.2).
     greetAScan();
