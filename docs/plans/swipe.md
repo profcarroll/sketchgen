@@ -59,8 +59,8 @@ pytest, no dependency in either language. `gallery.js` is the house style for th
    (§4.7) the page POSTs `/view` exactly as the entry page does — `{entry_id}`, the session's
    bearer header, no `source`. A person who stayed ten seconds on a sketch they chose to open is
    what the number already means, which is why this is not the kiosk's case and does not get the
-   kiosk's column. *Recommended and assumed; the instructor may overrule before the packets go
-   out, in which case §1.7 lists the cost.*
+   kiosk's column. *Confirmed by the instructor, 20 September 2026, with §1.2 and the offers in
+   §7 packet A; §1.7 lists what the alternative would have cost.*
 7. **No write-path change.** The Worker already accepts everything this page sends: `/like` and
    `/vote` take the session, `/view` takes anything, `/counts` and `/me` are reads. Naming the
    view `source: "swipe"` would cost `VIEW_SOURCES`, an `ALTER TABLE views ADD COLUMN swipe_count`,
