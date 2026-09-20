@@ -1787,7 +1787,7 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
 
     meter_list: list[str] = []
 
-    if _dig(doc, "node.gpu") is not None:
+    if _dig(doc, "node.gpu.vram_mb.total") is not None:
         meter_list.append(
             _meter(
                 "gpu",
