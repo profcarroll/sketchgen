@@ -850,10 +850,20 @@ body.kiosk .status .hint { margin-left: 1em; }
 body.kiosk .status .hint kbd { font-size: 0.7rem; padding: 0 0.35em; }
 
 /* ---- caption block over the bottom of the stage ---- */
-/* Two parts side by side (qr.md §5.2): the words, and the QR block. A row
- * rather than a second box overlaid on the stage, so that nothing can ever
- * sit on top of anything — the caption already has the scrim, is already
- * pointer-events: none, and is already the thing H hides. */
+/* Two parts side by side (qr.md §5.2): the QR block at the lower left, the
+ * words to the right of it. A row rather than a second box overlaid on the
+ * stage, so that nothing can ever sit on top of anything — the caption
+ * already has the scrim, is already pointer-events: none, and is already the
+ * thing H hides.
+ *
+ * The order is a CSS concern and not a markup one on purpose. captionShell()
+ * emits the words first and the code second, because the words are the
+ * content and the code is an aria-hidden tile with three short lines beside
+ * it — not the first thing a screen reader or a text browser should meet.
+ * `order: -1` moves the tile to the eye's starting corner without moving it
+ * in the reading order, so do not "tidy" this by swapping the two in the
+ * script. And when the code is off, qrHtml() returns nothing at all, so the
+ * words snap back flush left with no rule needed for the empty case. */
 body.kiosk .caption {
   align-items: flex-end;
   background: linear-gradient(to top, var(--scrim-soft), rgba(5, 6, 8, 0));
@@ -869,7 +879,7 @@ body.kiosk .caption {
 }
 body.kiosk .caption:empty { display: none; }
 body.kiosk .caption .words { display: grid; flex: 1 1 auto; gap: 0.45rem; min-width: 0; }
-body.kiosk .caption .qr { display: grid; flex: 0 0 auto; gap: 0.3rem; }
+body.kiosk .caption .qr { display: grid; flex: 0 0 auto; gap: 0.3rem; order: -1; }
 
 /* A phone reads a code from roughly ten times its width. At 13vh on a
  * two-metre projection the tile is about 25 cm, so this works from two or
@@ -1184,10 +1194,13 @@ body.kiosk .welcome .go:hover { border-color: var(--accent); outline: none; }
     width: 100%;
   }
   body.kiosk .caption { padding: 2rem 1rem 1rem; }
-  /* Stacked, the code goes above the words rather than after them: a
+  /* Stacked, the code goes above the words rather than under them: a
    * phone-shaped screen would otherwise push it off the bottom, and the code
-   * is the one thing on this page a stranger can act on. */
-  body.kiosk .caption { flex-direction: column-reverse; align-items: stretch; }
+   * is the one thing on this page a stranger can act on. Plain `column`, not
+   * `column-reverse`: the `order: -1` that puts the tile at the left of the
+   * row already puts it first in the column, and reversing on top of that
+   * would send it back to the bottom. The two declarations are a pair. */
+  body.kiosk .caption { flex-direction: column; align-items: stretch; }
   body.kiosk .menu {
     bottom: 1rem;
     grid-template-columns: 1fr;

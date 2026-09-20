@@ -674,7 +674,14 @@ function qrBlock(document) {
     lines: Array.prototype.map.call(
       document.querySelectorAll(".caption .qr p"),
       function (p) { return p.textContent; }
-    )
+    ),
+    // The markup order, which is not the order on screen: the code is at the
+    // lower left by CSS (`order: -1`), and the words come first here because
+    // they are the content and the tile is decorative.
+    order: Array.prototype.filter.call(
+      document.getElementById("caption").childNodes,
+      function (part) { return part.tagName; }
+    ).map(function (part) { return part.className; })
   };
 }
 

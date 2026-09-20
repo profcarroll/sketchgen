@@ -294,13 +294,20 @@ box onto the stage, so nothing can ever sit on top of anything:
 - `paint()` wraps the existing output: `<div class="words">` + `captionHtml(entry)` + `</div>`,
   then the QR block. `captionHtml` itself is unchanged — it still returns the words and only the
   words.
-- `.caption .words { flex: 1 1 auto; min-width: 0 }`, `.caption .qr { flex: 0 0 auto }`.
+- The code sits at the lower left and the words to the right of it, but the markup keeps emitting
+  the words first: the words are the content, and the code is an `aria-hidden` tile with three
+  short lines beside it, which is not what a screen reader should meet first. The move is
+  `order: -1` on the QR block and nothing in the script. With the code off, `qrHtml()` returns
+  nothing and the words are flush left again with no rule for the empty case.
+- `.caption .words { flex: 1 1 auto; min-width: 0 }`, `.caption .qr { flex: 0 0 auto; order: -1 }`.
 - Inside `.qr`, the image sits on a white tile — `background: #fff; padding: 0.6rem;
   border-radius: 0.4rem` — and is `width: clamp(7rem, 13vh, 12rem); height: auto; display: block`.
   The lines of copy — three, or two with no write path (§5.3) — go under the tile, in the
   caption's small type, on the dark ground.
-- Below 760 px, where the kiosk stacks, the caption becomes `flex-direction: column-reverse` so
-  the code stays above the fold of the words rather than being pushed off a phone-shaped screen.
+- Below 760 px, where the kiosk stacks, the caption becomes `flex-direction: column` so the code
+  stays above the fold of the words rather than being pushed off a phone-shaped screen — plain
+  `column`, because the `order: -1` above already puts the tile first and reversing as well would
+  drop it back to the bottom. The two go together: change one and the other is wrong.
 
 An honest note for the CSS comment and for anyone aiming a projector: a phone reads a code from
 roughly ten times its width. At 13vh on a two-metre projection the tile is about 25 cm, so this
