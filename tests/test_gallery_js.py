@@ -40,9 +40,11 @@ from sketchgen import lineage  # noqa: E402
 
 HARNESS = Path(__file__).resolve().parent / "js" / "run_in_place.js"
 KIOSK_HARNESS = Path(__file__).resolve().parent / "js" / "kiosk.js"
+SWIPE_HARNESS = Path(__file__).resolve().parent / "js" / "swipe.js"
 DOM = Path(__file__).resolve().parent / "js" / "dom.js"
 SCRIPT = Path(__file__).resolve().parent.parent / "sketchgen" / "assets" / "gallery.js"
 KIOSK_SCRIPT = Path(__file__).resolve().parent.parent / "sketchgen" / "assets" / "kiosk.js"
+SWIPE_SCRIPT = Path(__file__).resolve().parent.parent / "sketchgen" / "assets" / "swipe.js"
 
 
 @unittest.skipUnless(shutil.which("node"), "node is not installed")
@@ -1141,6 +1143,612 @@ class KioskScriptTextTests(unittest.TestCase):
         # And it adds no parameter to anything: the only "?kiosk" in the
         # gallery is in the payload the generator encoded.
         self.assertNotIn("?kiosk", self.code)
+
+    def test_it_is_es5_like_the_rest_of_the_gallery(self):
+        # No build step means the file is the file the browser gets.
+        self.assertNotIn("=>", self.code)
+        self.assertNotIn("`", self.code)
+        self.assertIsNone(re.search(r"\b(?:let|const)\s+\w+\s*=", self.code))
+
+
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+class SwipeTests(unittest.TestCase):
+    """swipe.js, run for real against the DOM contract (swipe spec §6).
+
+    ``tests/js/swipe.js`` loads the real script into the stub DOM on a page
+    built from the ids ``swipe.html`` promises, dispatches pointer events at
+    the shield, presses the six courtesy keys and steps a fake clock, then
+    prints one JSON report. Everything below reads that report, so a failure
+    names the gesture rather than the harness.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        done = subprocess.run(
+            [shutil.which("node"), str(SWIPE_HARNESS)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if done.returncode != 0:
+            raise AssertionError(done.stdout + done.stderr)
+        cls.report = json.loads(done.stdout.strip().splitlines()[-1])
+
+    # ---- the seven orders, the seat and the address bar (§4.2) ----------
+
+    def test_each_order_is_the_order_the_kiosk_s_comparator_would_give(self):
+        # The same three entries the kiosk fixture uses, pulled as far apart
+        # as three things can be: all six deterministic orders are different
+        # permutations, so no order can pass by accident.
+        self.assertEqual(
+            {
+                "newest": [33, 22, 11],
+                "oldest": [11, 22, 33],
+                "liked": [22, 11, 33],
+                "reviewed": [33, 11, 22],
+                "controversial": [11, 33, 22],
+                "consensus": [22, 33, 11],
+            },
+            {
+                name: seen for name, seen in self.report["orders"].items()
+                if name != "random"
+            },
+        )
+
+    def test_random_is_a_permutation_of_the_manifest(self):
+        self.assertEqual([11, 22, 33], sorted(self.report["orders"]["random"]))
+
+    def test_at_seats_on_that_id_in_the_current_order(self):
+        self.assertEqual(22, self.report["seating"]["seated"])
+        # An id this gallery does not have is seat 0 rather than an error: a
+        # link to a pruned entry should still open the gallery.
+        self.assertEqual(11, self.report["seating"]["missingAt"])
+
+    def test_the_address_bar_follows_every_seat_and_the_order_is_stored(self):
+        seating = self.report["seating"]
+        self.assertEqual("/swipe.html?order=liked&at=22", seating["addressAfterFirstSeat"])
+        self.assertEqual("/swipe.html?order=liked&at=11", seating["addressAfterSecondSeat"])
+        self.assertEqual(11, seating["seatAfterSecond"])
+        self.assertEqual({"v": 1, "order": "liked"}, seating["storedBlob"])
+
+    def test_a_url_order_beats_a_stored_one_and_a_stored_one_beats_the_default(self):
+        seating = self.report["seating"]
+        self.assertEqual(11, seating["fromStorage"])   # oldest, from storage
+        self.assertEqual(33, seating["urlWins"])       # ?order=newest
+        # An order nobody defined is not an order: the stored one stands.
+        self.assertEqual(11, seating["nonsense"])
+
+    # ---- the feed: up, down, and a drag that did not reach (§4.4) --------
+
+    def test_a_vertical_drag_past_the_threshold_moves_one_seat_each_way(self):
+        feed = self.report["feed"]
+        self.assertEqual(33, feed["start"])
+        self.assertEqual(22, feed["up"]["entry"])      # 0 to -80 in y
+        self.assertEqual(33, feed["down"]["entry"])    # and back
+        self.assertEqual(1, feed["up"]["frames"])
+        self.assertEqual(1, feed["down"]["frames"])
+
+    def test_a_drag_short_of_the_threshold_snaps_back_and_changes_nothing(self):
+        short = self.report["feed"]["short"]
+        self.assertEqual(33, short["entry"])
+        self.assertEqual(1, short["frames"])
+        self.assertEqual("stage snap", short["className"])
+        # Snapped back means the stage is where it started, not held at 40 px.
+        self.assertNotIn("transform", short["style"])
+
+    def test_one_frame_at_a_time_sandboxed_to_scripts_and_nothing_else(self):
+        feed = self.report["feed"]
+        self.assertEqual(1, feed["framesAtStart"])
+        self.assertEqual("allow-scripts", feed["sandbox"])
+        self.assertEqual("./e/33/sketch/", feed["src"])
+        # No allow=, no second sandbox token, nothing the entry page's frame
+        # does not carry.
+        self.assertEqual(["class", "sandbox", "src", "title"], feed["attributes"])
+
+    def test_a_fixed_canvas_is_laid_out_at_its_own_size_and_scaled_to_fit(self):
+        # 400x400 on a 390x844 phone: min(390/400, 844/400) is the short side,
+        # which is the whole of §1.11 — fit, and only fit.
+        fitted = self.report["feed"]["fitted"]
+        self.assertEqual("400px", fitted["w"])
+        self.assertEqual("400px", fitted["h"])
+        self.assertEqual("0.975", fitted["sx"])
+        # And a sketch that sized itself to its window leaves the stage to say
+        # how big it is: no properties at all.
+        self.assertIsNone(self.report["feed"]["windowSized"]["style"])
+
+    def test_the_caption_says_what_a_sketch_has_to_give_a_finger(self):
+        # Entry 22 listens and responds to nothing, so it gets the one line
+        # about the microphone and not the one about holding.
+        caption = self.report["feed"]["caption"]
+        self.assertIn("listens to the microphone · open the entry page to let it", caption)
+        self.assertNotIn("responds to touch", caption)
+        # Entry 33's assertions are responds(click) and responds(audio).
+        liked = self.report["liking"]["liked"]["caption"]
+        self.assertIn("responds to touch · hold to try", liked)
+        self.assertIn("makes sound · hold to hear it", liked)
+
+    # ---- the tap, the hold and the pill (§4.4) ---------------------------
+
+    def test_a_tap_toggles_the_words_and_a_second_one_brings_them_back(self):
+        held = self.report["tapAndHold"]
+        self.assertNotIn("quiet", held["before"])
+        self.assertIn("quiet", held["quietNow"])
+        self.assertNotIn("quiet", held["loudAgain"])
+
+    def test_a_hold_hands_the_touch_over_and_is_never_read_as_a_tap(self):
+        held = self.report["tapAndHold"]
+        self.assertIn("touching", held["touching"]["classes"])
+        # The hold timer clears the gesture before the release can read it.
+        self.assertNotIn("quiet", held["touching"]["classes"])
+        self.assertEqual([12], held["touching"]["buzzed"])
+        # And no gesture starts while the sketch has the touch.
+        self.assertEqual(33, held["heldEntry"])
+
+    def test_the_pill_gives_the_touch_back(self):
+        held = self.report["tapAndHold"]
+        self.assertNotIn("touching", held["given"])
+        self.assertEqual(22, held["movedAfter"])
+
+    def test_a_tap_on_the_caption_opens_the_words_rather_than_hiding_them(self):
+        self.assertEqual("sheet-info", self.report["tapAndHold"]["captionOpens"])
+
+    # ---- a like (§4.6) ---------------------------------------------------
+
+    def test_a_right_swipe_signed_out_asks_and_posts_nothing(self):
+        out = self.report["liking"]["signedOut"]
+        self.assertEqual("sheet-signin", out["sheet"])
+        self.assertEqual("Sign in to like it", out["title"])
+        self.assertEqual(0, out["posts"])
+        self.assertNotIn("liked", out["classes"])
+
+    def test_a_right_swipe_signed_in_posts_one_like_and_then_unlikes_it(self):
+        liking = self.report["liking"]
+        self.assertEqual(
+            [
+                {"entry_id": 33, "on": True},
+                {"entry_id": 33, "on": False},
+            ],
+            [one["body"] for one in liking["posts"]],
+        )
+        self.assertEqual(
+            ["https://write.example.invalid/api/like"] * 2,
+            [one["url"] for one in liking["posts"]],
+        )
+        self.assertIn("liked", liking["liked"]["classes"])
+        self.assertEqual("liked", liking["liked"]["toast"])
+        self.assertNotIn("liked", liking["unliked"]["classes"])
+        self.assertEqual("unliked", liking["unliked"]["toast"])
+        # The caption's count moved with it: 2 likes became 3.
+        self.assertIn("3 likes", liking["liked"]["caption"])
+
+    def test_a_refused_like_empties_the_heart_drops_the_token_and_asks(self):
+        refused = self.report["liking"]["refused"]
+        self.assertNotIn("liked", refused["classes"])
+        self.assertEqual("sheet-signin", refused["sheet"])
+        self.assertIsNone(refused["token"])
+        self.assertEqual(1, refused["posts"])
+
+    # ---- a judgment (§4.5) -----------------------------------------------
+
+    def test_a_left_swipe_opens_the_judge_sheet_on_a_pair(self):
+        judging = self.report["judging"]
+        self.assertEqual("sheet-judge", judging["opened"]["sheet"])
+        self.assertEqual(33, judging["a"])
+        # B is one of the two offered pairs that contain A.
+        self.assertIn(judging["b"], (11, 22))
+        # Two tiles, two briefs, and A still playing above the sheet.
+        self.assertEqual("One square, slowly changing colour.", judging["briefA"])
+        self.assertTrue(judging["briefB"])
+        self.assertEqual("./e/33/sketch/", judging["opened"]["src"])
+        self.assertEqual(1, judging["opened"]["frames"])
+        self.assertIn("quiet", judging["opened"]["classes"])
+
+    def test_nothing_about_b_but_its_brief_is_in_the_document(self):
+        # The compare page blinds the visitor until both answers are in, and
+        # B's authors are the loudest anchor this sheet could hand them.
+        self.assertEqual([], self.report["judging"]["leaked"])
+
+    def test_tapping_b_s_tile_swaps_the_one_iframe_to_b(self):
+        swapped = self.report["judging"]["swapped"]
+        self.assertEqual(1, swapped["frames"])
+        self.assertEqual(
+            "./e/%d/sketch/" % self.report["judging"]["b"], swapped["src"]
+        )
+        self.assertEqual(["A:false", "B:true"], swapped["pressed"])
+
+    def test_each_answer_posts_a_vote_with_the_pair_the_question_and_the_choice(self):
+        judging = self.report["judging"]
+        self.assertEqual(
+            [
+                {"entry_a": 33, "entry_b": judging["b"], "question": "brief", "choice": "A"},
+                {"entry_a": 33, "entry_b": judging["b"], "question": "look", "choice": "B"},
+            ],
+            [one["body"] for one in judging["votes"]],
+        )
+        self.assertEqual("recorded: A", judging["afterOne"]["answered"])
+
+    def test_the_reveal_waits_for_both_answers_and_then_says_what_the_agents_said(self):
+        judging = self.report["judging"]
+        self.assertTrue(judging["opened"]["revealHidden"])
+        self.assertTrue(judging["afterOne"]["revealHidden"])
+        self.assertFalse(judging["afterBoth"]["revealHidden"])
+        # Stored against the pair in (low, high) order and shown the other way
+        # round, so both verdicts come out flipped.
+        self.assertEqual(
+            [
+                "gemma4:e4b · closer to its brief: B",
+                "gemma4:e4b · rather look at: A",
+            ],
+            judging["afterBoth"]["verdicts"],
+        )
+        self.assertEqual("A is #33 · B is #%d" % judging["b"], judging["afterBoth"]["both"])
+        self.assertEqual(
+            [
+                "https://profcarroll.github.io/sketchgen-gallery/e/33/",
+                "https://profcarroll.github.io/sketchgen-gallery/e/%d/" % judging["b"],
+            ],
+            judging["afterBoth"]["links"],
+        )
+
+    def test_judge_another_pair_keeps_a_and_changes_b(self):
+        judging = self.report["judging"]
+        self.assertEqual("One square, slowly changing colour.", judging["another"]["briefA"])
+        self.assertNotEqual(judging["b"], judging["secondB"])
+        self.assertIn(judging["secondB"], (11, 22))
+        # A fresh pair is a fresh pair of questions.
+        self.assertTrue(judging["another"]["revealHidden"])
+        self.assertEqual("", judging["another"]["answered"])
+        self.assertEqual("./e/33/sketch/", judging["another"]["src"])
+
+    def test_keep_swiping_closes_the_sheet_and_frames_a_again(self):
+        back = self.report["judging"]["back"]
+        self.assertIsNone(back["sheet"])
+        self.assertNotIn("quiet", back["classes"])
+        self.assertEqual(1, back["frames"])
+        self.assertEqual("./e/33/sketch/", back["src"])
+        self.assertEqual(33, back["entry"])
+
+    def test_signed_out_a_vote_is_noted_on_the_sheet_and_the_offer_is_a_tap(self):
+        judging = self.report["judging"]
+        self.assertEqual("noted here only: tie", judging["signedOut"]["answered"])
+        # The judge sheet stays open: the sign-in sheet is offered, not forced.
+        self.assertEqual("sheet-judge", judging["signedOut"]["sheet"])
+        self.assertIn("noted here only", judging["signedOut"]["status"])
+        self.assertEqual("sheet-signin", judging["offered"]["sheet"])
+        self.assertEqual("Sign in to record it", judging["offered"]["title"])
+
+    # ---- a view (§4.7) ----------------------------------------------------
+
+    def test_ten_seconds_on_one_seat_is_one_view_and_not_a_frame_before(self):
+        viewing = self.report["viewing"]
+        self.assertEqual(0, viewing["atNine"])
+        self.assertEqual(1, len(viewing["atTen"]))
+        self.assertEqual(
+            "https://write.example.invalid/api/view", viewing["atTen"][0]["url"]
+        )
+        # The entry page's body, not the kiosk's: no source.
+        self.assertEqual({"entry_id": 33}, viewing["atTen"][0]["body"])
+
+    def test_six_hundred_more_frames_on_the_same_seat_post_nothing_more(self):
+        # The flag is set before the request goes out, so no frame can post a
+        # second one while the first is still in flight.
+        self.assertEqual(1, self.report["viewing"]["afterSixHundredFrames"])
+
+    def test_a_seat_left_in_under_ten_seconds_costs_nothing(self):
+        skipped = self.report["viewing"]["afterASkip"]
+        self.assertEqual(0, skipped["posts"])
+        self.assertEqual(22, skipped["entry"])
+
+    def test_a_hidden_tab_counts_nothing_until_somebody_looks_again(self):
+        viewing = self.report["viewing"]
+        self.assertEqual(0, viewing["whileHidden"])
+        self.assertEqual(1, viewing["afterComingBack"])
+
+    def test_time_on_b_counts_for_b_and_not_for_the_seat_it_was_swapped_onto(self):
+        viewing = self.report["viewing"]
+        # Nine seconds on A and nine on B is no view at all; the swap cleared
+        # the dwell, as a seat does.
+        self.assertEqual(0, viewing["beforeBEarnsIt"])
+        self.assertEqual(1, len(viewing["bEarnedIt"]))
+        self.assertEqual(
+            {"entry_id": viewing["bOnTheStage"]}, viewing["bEarnedIt"][0]["body"]
+        )
+        self.assertNotEqual(33, viewing["bOnTheStage"])
+
+    # ---- no write path (§4.1) ---------------------------------------------
+
+    def test_with_no_write_path_nothing_is_asked_of_the_write_path_at_all(self):
+        # The whole run: start, a right swipe, ten seconds, a left swipe and a
+        # vote. Not one /counts, /me, /view, /like or /vote among them — the
+        # four files the gallery itself serves, and nothing else. (Which of
+        # the two partners the judge sheet drew is a coin toss, so its
+        # meta.json is matched by shape.)
+        offline = self.report["offline"]
+        self.assertEqual(
+            ["./swipe.json", "./config.json", "./pairs.json", "./e/33/meta.json"],
+            offline["asked"][:4],
+        )
+        self.assertEqual(5, len(offline["asked"]))
+        self.assertRegex(offline["asked"][4], r"^\./e/(11|22)/meta\.json$")
+        for url in offline["asked"]:
+            self.assertTrue(url.startswith("./"), url)
+        self.assertEqual(0, offline["posts"])
+
+    def test_with_no_write_path_the_counts_are_em_dashes_and_the_heart_is_gone(self):
+        start = self.report["offline"]["start"]
+        self.assertIn("— views", start["caption"])
+        self.assertIn("— likes", start["caption"])
+        self.assertTrue(start["heartHidden"])
+
+    def test_with_no_write_path_a_like_says_so_and_a_vote_is_noted_here_only(self):
+        offline = self.report["offline"]
+        self.assertEqual(
+            "the gallery write path is not deployed yet", offline["right"]["toast"]
+        )
+        # It does not ask for a sign-in it cannot use.
+        self.assertIsNone(offline["right"]["sheet"])
+        self.assertEqual("sheet-judge", offline["judge"]["sheet"])
+        self.assertEqual("noted here only: A", offline["noted"])
+
+    # ---- the words sheet (§4.5) -------------------------------------------
+
+    def test_the_words_sheet_prints_meta_json_and_asks_for_it_once(self):
+        shown = self.report["words"]["shown"]
+        self.assertEqual("sheet-info", shown["sheet"])
+        self.assertEqual("#11 · A field of slow lines.", shown["title"])
+        self.assertEqual(
+            "Revised 1 time, latest: let the lines thin as they near the edge.",
+            shown["sub"],
+        )
+        self.assertEqual("Lines drawn across the canvas, thinning at the edges.", shown["brief"])
+        self.assertEqual("This sketch draws a field of lines.", shown["statement"])
+        self.assertEqual("qwen3-coder:30b-a3b-q4_K_M", shown["by"])
+        # Cached per id for the page's life: closed and reopened is one request.
+        self.assertEqual(1, self.report["words"]["metaCalls"])
+
+    def test_the_words_sheet_says_the_judgment_per_population(self):
+        shown = self.report["words"]["shown"]
+        self.assertEqual("2.10 over 2 pairs", shown["human"])
+        self.assertEqual("looks good, on brief", shown["humanQuad"])
+        self.assertEqual("0.40 over 2 pairs", shown["agent"])
+        # The same quadrant words gallery.py draws the compass square with.
+        self.assertEqual("neither", shown["agentQuad"])
+
+    def test_the_words_sheet_prints_the_provenance_and_two_links_out(self):
+        shown = self.report["words"]["shown"]
+        self.assertEqual(
+            [
+                "prompted by", "planned by", "written by", "rules", "generation",
+                "attempts", "created", "tokens", "written in", "canvas", "licence",
+            ],
+            list(shown["fields"]),
+        )
+        self.assertEqual(
+            "2, revised from #7 after a critique by gemma4:e4b",
+            shown["fields"]["generation"],
+        )
+        self.assertEqual("1,169 prompt + 561 completion", shown["fields"]["tokens"])
+        self.assertEqual("800×600", shown["fields"]["canvas"])
+        self.assertEqual(
+            "https://profcarroll.github.io/sketchgen-gallery/e/11/", shown["entryLink"]
+        )
+        self.assertEqual(
+            "https://profcarroll.github.io/sketchgen-gallery/e/11/sketch/sketch.js",
+            shown["sourceLink"],
+        )
+
+    def test_a_sheet_closes_on_its_cross_on_escape_and_on_the_dim(self):
+        words = self.report["words"]
+        self.assertIsNone(words["closed"])
+        self.assertIsNone(words["afterEscape"])
+        # The dim goes with it, or the next gesture would land on a layer
+        # that is still there and invisible.
+        self.assertEqual("dim", words["dimAfterEscape"])
+        self.assertIsNone(words["afterDim"])
+
+    def test_a_sheet_dragged_down_past_ninety_pixels_closes_and_a_shorter_one_does_not(self):
+        words = self.report["words"]
+        # It follows the finger while the drag is live…
+        self.assertIn("translateY(60px)", words["followed"])
+        self.assertIsNone(words["afterDragDown"])
+        # …and springs back when the finger did not go far enough.
+        self.assertEqual("sheet-info", words["afterShortDrag"]["sheet"])
+        self.assertNotIn("transform", words["afterShortDrag"]["style"])
+
+    # ---- this page (§4.5) --------------------------------------------------
+
+    def test_the_settings_sheet_names_the_seat_the_orders_and_the_session(self):
+        open_ = self.report["settings"]["open"]
+        self.assertEqual("sheet-settings", open_["sheet"])
+        self.assertEqual("Sketch 1 of 3.", open_["place"])
+        self.assertEqual(
+            [
+                "newest:true", "oldest:false", "random:false", "liked:false",
+                "reviewed:false", "controversial:false", "consensus:false",
+            ],
+            open_["rows"],
+        )
+        self.assertIn("signed in: profcarroll", open_["session"])
+        self.assertEqual("swipe.html?order=newest&at=33", open_["launch"])
+        self.assertEqual("1 of 3 · newest", open_["statusLine"])
+
+    def test_changing_the_order_keeps_the_sketch_and_re_seats_it(self):
+        settings = self.report["settings"]
+        reordered = settings["reordered"]
+        self.assertEqual(settings["before"], reordered["entry"])
+        self.assertEqual(1, reordered["frames"])
+        # 33 is second in consensus, and every label says so.
+        self.assertEqual("2 of 3 · consensus", reordered["statusLine"])
+        self.assertEqual("swipe.html?order=consensus&at=33", reordered["launch"])
+        self.assertEqual("/swipe.html?order=consensus&at=33", reordered["address"])
+        self.assertEqual({"v": 1, "order": "consensus"}, reordered["stored"])
+
+    def test_signing_out_drops_the_token_and_says_so(self):
+        out = self.report["settings"]["out"]
+        self.assertIn("not signed in", out["session"])
+        self.assertIsNone(out["token"])
+        self.assertEqual("signed out", out["toast"])
+
+    # ---- signing in, and coming back (§5) ----------------------------------
+
+    def test_signing_in_leaves_the_note_the_front_page_reads_and_goes_to_login(self):
+        signin = self.report["signin"]
+        self.assertEqual("sheet-signin", signin["asked"])
+        # Exactly the shape gallery.js's returnFromSignIn will accept.
+        self.assertEqual("swipe.html?order=newest&at=22", signin["note"])
+        self.assertEqual("https://write.example.invalid/api/login", signin["went"])
+
+    def test_declining_a_sign_in_does_nothing_at_all(self):
+        after = self.report["signin"]["after"]
+        self.assertIsNone(after["sheet"])
+        self.assertNotIn("liked", after["classes"])
+        self.assertEqual(0, after["posts"])
+
+    def test_a_token_in_the_fragment_is_claimed_and_stripped_here_too(self):
+        signin = self.report["signin"]
+        self.assertEqual("tok.9.sig", signin["claimedToken"])
+        self.assertEqual("/swipe.html?order=newest", signin["claimedAddress"])
+
+    # ---- the courtesy keys (§1.5) ------------------------------------------
+
+    def test_the_six_keys_do_the_six_things_a_thumb_does(self):
+        keys = self.report["keys"]
+        self.assertEqual(33, keys["start"])
+        self.assertEqual(22, keys["up"])
+        self.assertEqual(33, keys["down"])
+        self.assertIn("quiet", keys["quietNow"])
+        self.assertNotIn("quiet", keys["loud"])
+        self.assertIn("liked", keys["liked"])
+        self.assertEqual("sheet-judge", keys["judging"])
+        self.assertIsNone(keys["closed"])
+
+    def test_a_modifier_chord_is_a_browser_shortcut_and_stays_one(self):
+        self.assertTrue(self.report["keys"]["afterChord"])
+
+    # ---- the start card -----------------------------------------------------
+
+    def test_the_card_holds_the_tap_until_there_is_something_to_swipe(self):
+        starting = self.report["starting"]
+        self.assertTrue(starting["before"]["disabled"])
+        self.assertEqual("loading…", starting["before"]["label"])
+        self.assertFalse(starting["loaded"]["disabled"])
+        self.assertEqual("Start", starting["loaded"]["label"])
+
+    def test_a_manifest_that_never_arrives_says_so_and_nothing_starts(self):
+        failed = self.report["starting"]["failed"]
+        self.assertEqual("Could not load the gallery's list of sketches.", failed["note"])
+        self.assertTrue(failed["welcomeUp"])
+        self.assertEqual(0, failed["frames"])
+        self.assertNotIn("playing", failed["classes"])
+        # And the gestures are inert rather than half alive.
+        self.assertEqual(0, self.report["starting"]["stillNothing"])
+
+    # ---- every write the page ever makes (§4.1, §4.8) -----------------------
+
+    def test_the_only_posts_over_the_whole_run_are_view_like_and_vote(self):
+        posts = self.report["everyPost"]
+        self.assertTrue(posts, "swipe.js posted nothing at all")
+        self.assertEqual({"POST"}, {one["method"] for one in posts})
+        self.assertEqual(
+            {
+                "https://write.example.invalid/api/view",
+                "https://write.example.invalid/api/like",
+                "https://write.example.invalid/api/vote",
+            },
+            {one["url"] for one in posts},
+        )
+
+    def test_every_post_carries_the_bearer_token_when_one_is_stored(self):
+        # The one that does not is the vote cast while signed out, which is
+        # the case the Worker answers with a 401 and the sheet notes locally.
+        for one in self.report["everyPost"]:
+            self.assertEqual(
+                ["body", "credentials", "headers", "method"], one["keys"], one["url"]
+            )
+            if one["url"].endswith("/vote") and not one["hasAuth"]:
+                continue
+            self.assertTrue(one["hasAuth"], one["url"])
+
+    def test_no_request_carries_credentials_other_than_include(self):
+        self.assertTrue(self.report["everyCredentials"])
+        self.assertEqual({"include"}, set(self.report["everyCredentials"]))
+
+
+class SwipeScriptTextTests(unittest.TestCase):
+    """What swipe.js must and must not contain (swipe spec §4.8). No node."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.code = _without_comments(SWIPE_SCRIPT.read_text(encoding="utf-8"))
+
+    def test_it_writes_three_things_and_only_those_three(self):
+        # Every method other than GET is a write to the write path, so the
+        # count of them is the count of writes: a view, a like and a vote.
+        methods = re.findall(r"method\s*:\s*\"([A-Z]+)\"", self.code)
+        self.assertEqual(["POST", "POST", "POST"], methods)
+        # And they go where they say they go. The fetch and its options are
+        # one expression in the source, so the endpoint and the method that
+        # reach the network together are read together here.
+        posts = re.findall(r"fetch\(([^\n]*?),\s*\{\s*\n\s*method", self.code)
+        self.assertEqual(
+            sorted(['base() + "/view"', 'base() + "/like"', 'base() + "/vote"']),
+            sorted(one.strip() for one in posts),
+        )
+
+    def test_it_never_evaluates_a_sketch_or_talks_to_one(self):
+        self.assertNotIn("new Function", self.code)
+        self.assertNotIn("eval(", self.code)
+        # allow-scripts without allow-same-origin is opaque by design.
+        self.assertNotIn("postMessage", self.code)
+
+    def test_it_never_reads_a_cookie(self):
+        # The session is a bearer token in this origin's storage, and the
+        # reason it is not a cookie is in the file header.
+        self.assertNotIn("document.cookie", self.code)
+
+    def test_the_only_storage_keys_it_touches_are_the_three_of_the_spec(self):
+        calls = re.findall(
+            r"localStorage\.(?:getItem|setItem|removeItem)\(\s*([^,)]+)", self.code
+        )
+        self.assertTrue(calls, "swipe.js no longer touches localStorage at all")
+        self.assertEqual({"SETTINGS_KEY", "STORAGE_KEY", "RETURN_KEY"},
+                         {call.strip() for call in calls})
+        names = dict(re.findall(r'var ([A-Z_]+) = "(sketchgen[-_][a-z-]+)";', self.code))
+        self.assertEqual(
+            {
+                "SETTINGS_KEY": "sketchgen-swipe",
+                "STORAGE_KEY": "sketchgen_session",
+                "RETURN_KEY": "sketchgen-swipe-return",
+            },
+            names,
+        )
+        # And no fourth key anywhere in the file, named or spelled out.
+        self.assertEqual(
+            {"sketchgen-swipe", "sketchgen_session", "sketchgen-swipe-return"},
+            set(re.findall(r'"(sketchgen[-_][a-z-]+)"', self.code)),
+        )
+
+    def test_it_writes_the_shared_session_key_only_in_write_token(self):
+        # It reads the gallery's session and hands it back; minting one is
+        # gallery.js's job on the page /callback actually returns to.
+        writes = re.findall(r"localStorage\.setItem\(\s*STORAGE_KEY", self.code)
+        self.assertEqual(1, len(writes))
+        body = re.search(
+            r"function writeToken\(token\) \{(.*?)\n  \}", self.code, re.S
+        )
+        self.assertIsNotNone(body, "swipe.js no longer has writeToken")
+        self.assertIn("localStorage.setItem(STORAGE_KEY", body.group(1))
+
+    def test_the_return_note_is_only_ever_written(self):
+        # gallery.js is the only reader (§5); a page that read its own note
+        # back could be steered by anything that could write storage.
+        self.assertNotIn("getItem(RETURN_KEY", self.code)
+        self.assertNotIn("removeItem(RETURN_KEY", self.code)
+        self.assertIn("setItem(RETURN_KEY", self.code)
+
+    def test_it_parses_in_a_browser_without_lookbehind(self):
+        # The same line gallery.js and kiosk.js hold: a lookbehind is a syntax
+        # error in a browser too old for it, and a syntax error here is a
+        # black screen with no way out of it.
+        self.assertNotIn("(?<", self.code)
 
     def test_it_is_es5_like_the_rest_of_the_gallery(self):
         # No build step means the file is the file the browser gets.
