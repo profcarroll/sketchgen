@@ -494,6 +494,8 @@ class TreeTests(GalleryTestCase):
             "index.html",
             "kiosk.html",
             "kiosk.json",
+            "swipe.html",
+            "swipe.json",
             "lineage.json",
             f"lines/{one}.html",
         ]
@@ -2772,6 +2774,480 @@ class KioskPageTests(GalleryTestCase):
         self.assertIn('href="../kiosk.html"', line)
 
 
+# ---------------------------------------------------------------------------
+# Swipe mode (docs/plans/swipe.md §2, §3, §6)
+# ---------------------------------------------------------------------------
+
+
+class SwipeManifestTests(GalleryTestCase):
+    """``swipe.json``: the kiosk's rows with the prose taken out.
+
+    kiosk.json is 2.8 MB because it carries every brief and statement in the
+    gallery; the phone shows one of each at a time and fetches meta.json when
+    the words sheet opens (spec §1.2). So what these tests ask is whether the
+    slimmer file is the same rows — same set, same order, same numbers — and
+    whether the prose really left, because a manifest that quietly kept it
+    would be the kiosk's file under another name.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.render()
+
+    def manifest(self):
+        return json.loads((self.dest / "swipe.json").read_text(encoding="utf-8"))
+
+    def rows(self):
+        return {int(entry["id"]): entry for entry in self.manifest()["entries"]}
+
+    def judge(self, question, kind, judge_id, a, b, choice):
+        db.record_judgment(self.conn, a, b, kind, judge_id, question, choice)
+
+    def set_assertions(self, entry_id, assertions):
+        self.conn.execute(
+            "UPDATE entries SET assertions_json = ? WHERE id = ?",
+            (json.dumps(assertions), entry_id),
+        )
+        self.conn.commit()
+        self.render()
+
+    #: Every key spec §2 names, written out rather than imported so that the
+    #: test is a check on the shape and not a restatement of it. ``canvas``,
+    #: ``responds`` and ``mic`` are absent from the list on purpose: they are
+    #: the three optional keys.
+    SPEC_2_KEYS = {
+        "id",
+        "prompt",
+        "submitted_by",
+        "planner",
+        "executor",
+        "rules_file",
+        "attempts",
+        "published_utc",
+        "generation",
+        "parent_entry_id",
+        "critique_by",
+        "judgment",
+        "sketch",
+        "meta",
+        "href",
+        "url",
+    }
+
+    OPTIONAL = {"canvas", "responds", "mic"}
+
+    def test_render_index_writes_the_page_and_the_manifest(self):
+        for name in ("swipe.html", "swipe.json"):
+            with self.subTest(file=name):
+                self.assertTrue((self.dest / name).is_file())
+
+    def test_render_index_alone_writes_them_too(self):
+        # As the kiosk's: a node that only re-indexes must still get the phone.
+        shutil.rmtree(self.dest)
+        self.dest.mkdir()
+        gallery.render_index(self.conn, self.dest, self.config)
+        for name in ("swipe.html", "swipe.json"):
+            with self.subTest(file=name):
+                self.assertTrue((self.dest / name).is_file())
+
+    def test_both_files_pass_the_guard(self):
+        gallery.guard(self.dest)
+
+    def test_only_published_entries_are_in_it(self):
+        one, two, kept = self.ids
+        held = add_child(self.conn, self.tmp, two, state="held")
+        self.render()
+        ids = [int(entry["id"]) for entry in self.manifest()["entries"]]
+        self.assertEqual([one, two], ids)
+        self.assertNotIn(kept, ids)
+        self.assertNotIn(held, ids)
+
+    def test_the_entries_are_in_ascending_id_order(self):
+        third = add_child(self.conn, self.tmp, self.ids[0], state="published")
+        self.render()
+        ids = [int(entry["id"]) for entry in self.manifest()["entries"]]
+        self.assertEqual(sorted(ids), ids)
+        self.assertIn(third, ids)
+
+    def test_the_two_manifests_carry_the_same_entries_in_the_same_order(self):
+        # One pass, one _meta() per row, two files: the shape that makes it
+        # impossible for them to disagree about which entries exist.
+        kiosk = json.loads((self.dest / "kiosk.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            [int(entry["id"]) for entry in kiosk["entries"]],
+            [int(entry["id"]) for entry in self.manifest()["entries"]],
+        )
+
+    def test_every_spec_key_is_present_for_a_root_and_for_a_child(self):
+        rows = self.rows()
+        for name, entry_id in (("root", self.ids[0]), ("child", self.ids[1])):
+            with self.subTest(entry=name):
+                self.assertEqual(
+                    self.SPEC_2_KEYS, set(rows[entry_id]) - self.OPTIONAL
+                )
+
+    def test_a_root_says_so_with_nulls_and_a_child_names_its_parent(self):
+        one, two, _ = self.ids
+        rows = self.rows()
+        self.assertIsNone(rows[one]["parent_entry_id"])
+        self.assertIsNone(rows[one]["critique_by"])
+        self.assertEqual(1, rows[one]["generation"])
+        self.assertEqual(one, rows[two]["parent_entry_id"])
+        self.assertEqual("gemma4:e4b", rows[two]["critique_by"])
+        self.assertEqual(2, rows[two]["generation"])
+
+    def test_the_prose_is_not_in_the_file_at_all(self):
+        # Not merely absent from the row: absent from the bytes. The brief and
+        # the statement are most of the kiosk's 2.8 MB and the whole reason
+        # this file exists (spec §1.2).
+        text = (self.dest / "swipe.json").read_text(encoding="utf-8")
+        for row in self.rows().values():
+            with self.subTest(entry=row["id"]):
+                self.assertNotIn("brief", row)
+                self.assertNotIn("statement", row)
+        for entry_id in self.ids[:2]:
+            entry = self.conn.execute(
+                "SELECT brief, statement FROM entries WHERE id = ?", (entry_id,)
+            ).fetchone()
+            with self.subTest(entry=entry_id):
+                self.assertNotIn(str(entry["brief"]), text)
+                self.assertNotIn(str(entry["statement"]).split("\n")[0], text)
+
+    def test_the_kiosk_only_values_are_gone(self):
+        # The words sheet fetches meta.json for these; carrying them here
+        # would be the kiosk's file with a different name (spec §2).
+        row = self.rows()[self.ids[0]]
+        for key in ("seed", "created_utc", "prompt_tokens", "completion_tokens",
+                    "wall_s", "licence", "root_entry_id", "source", "qr"):
+            with self.subTest(key=key):
+                self.assertNotIn(key, row)
+
+    def test_the_provenance_is_the_same_values_meta_json_carries(self):
+        one = self.ids[0]
+        meta = json.loads(
+            (self.dest / "e" / str(one) / "meta.json").read_text(encoding="utf-8")
+        )
+        row = self.rows()[one]
+        for key in gallery.SWIPE_META_KEYS:
+            with self.subTest(key=key):
+                self.assertEqual(meta[key], row[key])
+
+    def test_where_to_run_it_and_where_to_read_it(self):
+        one = self.ids[0]
+        row = self.rows()[one]
+        self.assertEqual(f"e/{one}/sketch/", row["sketch"])
+        self.assertEqual(f"e/{one}/meta.json", row["meta"])
+        self.assertEqual(f"e/{one}/", row["href"])
+        self.assertEqual(
+            f"https://profcarroll.github.io/sketchgen-gallery/e/{one}/", row["url"]
+        )
+        # The path from the manifest is never assembled in the script, so it
+        # had better name a file that is really there.
+        self.assertTrue((self.dest / row["meta"]).is_file())
+        self.assertTrue((self.dest / row["href"] / "index.html").is_file())
+
+    def test_responds_names_what_the_gate_asserted(self):
+        # Entry one's assertions are motion(idle) and responds(click): the
+        # caption prints *responds to touch · hold to try* off this, and the
+        # shield means nobody finds out any other way (spec §4.4).
+        self.assertEqual(["click"], self.rows()[self.ids[0]]["responds"])
+
+    def test_a_sketch_with_nothing_to_give_has_no_responds_key(self):
+        # Absent, not an empty list: nobody should be told to hold a sketch
+        # that cannot feel it.
+        self.set_assertions(self.ids[1], ["motion(idle)"])
+        self.assertNotIn("responds", self.rows()[self.ids[1]])
+
+    def test_responds_keeps_the_order_the_assertions_list(self):
+        self.set_assertions(
+            self.ids[1], ["responds(click)", "motion(idle)", "responds(drag)"]
+        )
+        self.assertEqual(["click", "drag"], self.rows()[self.ids[1]]["responds"])
+
+    def test_mic_is_true_only_for_a_listening_sketch(self):
+        one, two, _ = self.ids
+        self.assertNotIn("mic", self.rows()[one])
+        self.assertNotIn("mic", self.rows()[two])
+        row = self.conn.execute(
+            "SELECT source_dir FROM entries WHERE id = ?", (two,)
+        ).fetchone()
+        (Path(row["source_dir"]) / "sketch.js").write_text(
+            "let mic;\nfunction setup() { mic = new p5.AudioIn(); mic.start(); }\n",
+            encoding="utf-8",
+        )
+        self.render()
+        # Framed like any other, and the caption says to open the entry page:
+        # skipping it would make the feed lie about the size of the gallery.
+        self.assertIs(True, self.rows()[two]["mic"])
+        self.assertNotIn("mic", self.rows()[one])
+
+    def test_an_unjudged_population_is_absent_not_zero(self):
+        one, two, _ = self.ids
+        self.assertEqual({}, self.rows()[one]["judgment"])
+        self.judge("look", "human", "profcarroll", one, two, "A")
+        self.render()
+        judgment = self.rows()[one]["judgment"]
+        self.assertNotIn("agent", judgment)
+        self.assertEqual({"look"}, set(judgment["human"]))
+
+    def test_the_judgment_block_is_the_kiosk_s_own(self):
+        one, two, _ = self.ids
+        for question in ("look", "brief"):
+            self.judge(question, "human", "profcarroll", one, two, "A")
+        self.render()
+        kiosk = {
+            int(entry["id"]): entry
+            for entry in json.loads(
+                (self.dest / "kiosk.json").read_text(encoding="utf-8")
+            )["entries"]
+        }
+        self.assertEqual(kiosk[one]["judgment"], self.rows()[one]["judgment"])
+
+    def test_a_window_sized_sketch_has_no_canvas_key(self):
+        one = self.ids[0]
+        row = self.conn.execute(
+            "SELECT source_dir FROM entries WHERE id = ?", (one,)
+        ).fetchone()
+        (Path(row["source_dir"]) / "sketch.js").write_text(
+            "function setup() { createCanvas(windowWidth, windowHeight); }\n"
+            "function draw() { background(0); }\n",
+            encoding="utf-8",
+        )
+        self.render()
+        self.assertNotIn("canvas", self.rows()[one])
+        (Path(row["source_dir"]) / "sketch.js").write_text(
+            "function setup() { createCanvas(800, 600); }\n"
+            "function draw() { background(0); }\n",
+            encoding="utf-8",
+        )
+        self.render()
+        self.assertEqual([800, 600], self.rows()[one]["canvas"])
+
+    def test_a_second_render_gives_the_same_bytes(self):
+        first = (self.dest / "swipe.json").read_bytes()
+        self.render()
+        self.assertEqual(first, (self.dest / "swipe.json").read_bytes())
+
+    def test_the_shared_meta_call_left_the_kiosk_rows_alone(self):
+        """The refactor must not have moved a byte of ``kiosk.json``.
+
+        ``_kiosk_entry`` used to make its own ``_meta()`` call and now takes a
+        base built once for both manifests; called without one it still makes
+        that call, which is the pre-refactor path. The two must agree, or the
+        slim manifest was bought with a change to the kiosk's.
+        """
+        parent, children = gallery._forest(self.conn)
+        scores = gallery._all_scores(self.conn)
+        rows = sorted(
+            gallery._entries(self.conn, "published"), key=lambda row: int(row["id"])
+        )
+        alone = {
+            "entries": [
+                gallery._kiosk_entry(
+                    self.conn, row, self.config, parent, children, scores
+                )
+                for row in rows
+            ]
+        }
+        self.assertEqual(
+            json.dumps(alone, indent=2, sort_keys=True) + "\n",
+            (self.dest / "kiosk.json").read_text(encoding="utf-8"),
+        )
+
+
+class SwipePageTests(GalleryTestCase):
+    """``swipe.html`` is a shell, and the nav and the offers that reach it.
+
+    The page carries no entry data by design, as the kiosk's does not:
+    ``swipe.js`` fetches ``swipe.json``. What is pinned here is the DOM
+    contract of spec §3 — the ids the CSS, the script and the JavaScript
+    harness all build from independently, in three parallel packets — and the
+    two additions to the head a phone needs.
+    """
+
+    #: Verbatim from docs/plans/swipe-mockup/swipe.html. The copy is the
+    #: visual spec's, and the start card is the only copy in the page a person
+    #: reads before anything runs.
+    START_CARD = (
+        "sketchgen · swipe",
+        "Sketches from the gallery, one at a time, full screen.",
+        "swipe up",
+        "the next sketch",
+        "swipe right",
+        "like it",
+        "swipe left",
+        "judge it against another",
+        "tap",
+        "the words, on and off",
+        "hold",
+        "touch the sketch",
+        "Start",
+        "This first tap is the one gesture the browser needs before a sketch "
+        "can make sound.",
+    )
+
+    #: Spec §3's table, ids only. Three packets build against this list and
+    #: nothing else, so a rename here is a rename in three repositories' worth
+    #: of work.
+    CONTRACT = (
+        "welcome", "go", "stage", "shield", "cue-like", "cue-judge", "status",
+        "heart", "caption", "toast", "touching", "dim", "sheet-info",
+        "sheet-judge", "sheet-settings", "sheet-signin",
+    )
+
+    def setUp(self):
+        super().setUp()
+        self.render()
+        self.swipe = (self.dest / "swipe.html").read_text(encoding="utf-8")
+
+    def ids_in(self, text):
+        return {attrs["id"] for _, attrs in elements(text) if attrs.get("id")}
+
+    def test_the_start_card_says_what_the_mockup_says(self):
+        for line in self.START_CARD:
+            with self.subTest(line=line):
+                self.assertIn(line, self.swipe)
+
+    def test_every_id_the_contract_names_is_in_the_page(self):
+        present = self.ids_in(self.swipe)
+        for name in self.CONTRACT:
+            with self.subTest(id=name):
+                self.assertIn(name, present)
+
+    def test_each_sheet_carries_a_close_control(self):
+        for name in ("sheet-info", "sheet-judge", "sheet-settings", "sheet-signin"):
+            with self.subTest(sheet=name):
+                sheet = self.swipe.split(f'id="{name}"')[1].split("</section>")[0]
+                self.assertIn("data-close", sheet)
+
+    def test_the_page_carries_no_entry_data(self):
+        self.assertNotIn("data-entry", self.swipe)
+        self.assertNotIn("sketchgen-entries", self.swipe)
+        for row in self.conn.execute("SELECT prompt FROM entries"):
+            with self.subTest(prompt=row["prompt"][:32]):
+                self.assertNotIn(str(row["prompt"]), self.swipe)
+
+    def test_exactly_one_swipe_script_tag(self):
+        scripts = [
+            attrs.get("src", "")
+            for tag, attrs in elements(self.swipe)
+            if tag == "script" and attrs.get("src")
+        ]
+        # swipe.js alone, as the kiosk has kiosk.js alone: nothing is fetched
+        # but swipe.json, config.json, the write path's own endpoints,
+        # meta.json, pairs.json and the frames (spec §4.1), and swipe.js
+        # carries its own copy of base() and of the session helpers.
+        self.assertEqual(["./assets/swipe.js"], scripts)
+        self.assertNotIn("p5.min.js", self.swipe)
+        self.assertNotIn("swipe-data.js", self.swipe)
+
+    def test_the_body_is_the_swipe_page_from_load(self):
+        # The CSS hangs the whole layout off body.swipe; adding the class in
+        # script would show the gallery's own page first and then repaint.
+        self.assertIn('<body class="swipe">', self.swipe)
+
+    def test_the_head_is_shaped_for_a_phone(self):
+        # Two things no other shell has: the ground colour a phone paints
+        # behind the notch and the home bar, and the viewport that lets the
+        # page run under them at all (spec §3).
+        self.assertIn('<meta name="theme-color" content="#050608">', self.swipe)
+        self.assertIn("viewport-fit=cover", self.swipe)
+
+    def test_the_settings_sheet_says_how_a_view_is_counted(self):
+        # The only place a visitor is told, so it is pinned here: swipe.js can
+        # stop counting without anybody noticing, but it cannot stop saying so.
+        self.assertIn(
+            "Likes and judgments are counted by GitHub login. A sketch counts "
+            "as a view once it has been on screen for ten seconds.",
+            self.swipe,
+        )
+
+    def test_the_page_parses(self):
+        self.assertEqual([], balance_errors(self.dest / "swipe.html"))
+
+    def test_every_page_links_to_the_swipe_page_after_the_kiosk(self):
+        one = self.ids[0]
+        pages = [
+            "index.html",
+            "rejections.html",
+            "compare.html",
+            "kiosk.html",
+            "swipe.html",
+            f"e/{one}/index.html",
+            f"lines/{one}.html",
+        ]
+        for name in pages:
+            with self.subTest(page=name):
+                page = (self.dest / name).read_text(encoding="utf-8")
+                nav = page.split('<p class="nav">')[1].split("</p>")[0]
+                self.assertLess(nav.index("kiosk.html"), nav.index("swipe.html"))
+                self.assertIn(">swipe</a>", nav)
+
+    def test_the_swipe_page_marks_itself_current_and_no_other_page_does(self):
+        one = self.ids[0]
+        nav = self.swipe.split('<p class="nav">')[1].split("</p>")[0]
+        self.assertIn('swipe.html" aria-current="page"', nav)
+        self.assertNotIn('kiosk.html" aria-current="page"', nav)
+        for name in ("index.html", "compare.html", f"e/{one}/index.html"):
+            with self.subTest(page=name):
+                page = (self.dest / name).read_text(encoding="utf-8")
+                other = page.split('<p class="nav">')[1].split("</p>")[0]
+                self.assertNotIn("swipe.html\" aria-current", other)
+
+    def test_a_line_page_reaches_the_swipe_page_from_one_level_down(self):
+        line = (self.dest / "lines" / f"{self.ids[0]}.html").read_text(encoding="utf-8")
+        self.assertIn('href="../swipe.html"', line)
+
+    def test_the_grid_offers_the_page_and_the_css_shows_it_at_phone_width(self):
+        # The grid offers it and never imposes it: no redirect, one line under
+        # the sorts, and the stylesheet decides who sees it (spec §7 packet A).
+        for name in ("index.html", "rejections.html"):
+            with self.subTest(page=name):
+                page = (self.dest / name).read_text(encoding="utf-8")
+                self.assertIn(
+                    '<p class="swipe-offer"><a href="./swipe.html">'
+                    "On a phone? Swipe through the gallery →</a></p>",
+                    page,
+                )
+        css = (self.dest / "assets" / "gallery.css").read_text(encoding="utf-8")
+        self.assertIn(".swipe-offer { display: none; }", css)
+        under = css.split("@media (max-width: 40rem) {")[-1]
+        self.assertIn(".swipe-offer { display: block;", under)
+
+    def test_the_scanned_strip_offers_to_swipe_on_from_here(self):
+        # qr.md §6.2's strip, one verb longer: somebody who arrived by phone
+        # is exactly who the swipe page is for.
+        one = self.ids[0]
+        page = (self.dest / "e" / str(one) / "index.html").read_text(encoding="utf-8")
+        self.assertIn(
+            '<span data-scanned-swipe> · <a href="../../swipe.html?at=%d">'
+            "Swipe on from here</a></span>" % one,
+            page,
+        )
+
+    def test_the_swipe_block_is_scoped_to_the_page(self):
+        # Every rule but the grid's offer hangs off body.swipe, which only
+        # this page carries: .stage, .caption, .status and .note are spoken
+        # for elsewhere in the stylesheet and scoping is what keeps them apart.
+        css = (self.dest / "assets" / "gallery.css").read_text(encoding="utf-8")
+        block = css.split("/* ---- swipe ----")[1]
+        for line in block.splitlines():
+            line = line.strip()
+            if not line or "{" not in line or line.startswith(("*", "/*", "@", "}")):
+                continue
+            selectors = line.split("{")[0].strip()
+            if not selectors or selectors.endswith(","):
+                selectors = selectors.rstrip(",")
+            with self.subTest(rule=selectors[:60]):
+                self.assertTrue(
+                    all(
+                        part.strip().startswith(("body.swipe", ".swipe-offer", "0%", "100%"))
+                        for part in selectors.split(",")
+                    ),
+                    selectors,
+                )
+
+
 class GuardTests(GalleryTestCase):
 
     def test_an_email_in_a_statement_is_refused_and_nothing_is_left(self):
@@ -2943,7 +3419,7 @@ class CommandLineTests(GalleryTestCase):
         # deploy that does not know kiosk.json is written cannot know to pull
         # the gallery checkout before the next publish.
         result = self.run_cli("render-index", "--help")
-        for name in ("kiosk.html", "kiosk.json"):
+        for name in ("kiosk.html", "kiosk.json", "swipe.html", "swipe.json"):
             with self.subTest(file=name):
                 self.assertIn(name, result.stdout)
 
