@@ -34,6 +34,7 @@ Python 3.12, stdlib only. Timestamps are UTC, ISO 8601, trailing Z.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import urllib.error
@@ -66,7 +67,9 @@ RULES_DIR = PROMPTS_DIR / "rules"
 TEMPLATE_PATH = PROMPTS_DIR / "executor.md"
 
 DEFAULT_HOST = "http://127.0.0.1:11434"
-DEFAULT_MODEL = "qwen3-coder:30b-a3b-q4_K_M"
+DEFAULT_MODEL = os.environ.get(
+    "SKETCHGEN_EXECUTOR_MODEL", "qwen3-coder:30b-a3b-q4_K_M"
+)
 DEFAULT_NUM_CTX = 8192
 DEFAULT_SEED = 1
 
