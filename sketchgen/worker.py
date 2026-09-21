@@ -720,7 +720,9 @@ ADVISORY_CHECKS = frozenset({"is_looping"})
 #:     assertion goes to `held` for a person; an entry keeps its best attempt;
 #:     the fallback index loads p5.sound for a sketch that asks for it; a
 #:     resource that did not arrive is named in the evidence.
-HARNESS_VERSION = 2
+#: 3 — from 2026-09-21: the gate plays a ghost script after the probes and
+#:     writes ghost.png; nothing it fails changed.
+HARNESS_VERSION = 3
 
 QA_CHECKS = frozenset({
     "console_clean", "frame_advancing", "sound_lib_ok",

@@ -9,7 +9,12 @@ from.  Writes gate.png, strip.png, console.log and report.json into --out.
     python3 sketch_gate.py <sketch_dir> [--assert WORD ...] [--seed N]
                            [--out DIR] [--timeout S] [--json]
                            [--frame-budget-ms MS] [--budget-s S]
-                           [--keep-browser-log]
+                           [--keep-browser-log] [--no-ghost]
+
+After all of that, and after every assertion has been decided, it plays a short
+pointer script through real chromium input and writes ghost.png -- four more
+frames, of a sketch somebody is touching.  Nothing in that window can fail a
+run; see THE GHOST WINDOW below.
 
 Four sampling decisions the fixtures, the first repair run and job 166 forced,
 stated up front:
@@ -86,6 +91,39 @@ the page before any of the page's own scripts -- so before p5.js itself loads.
 
 4.  preserveDrawingBuffer is forced on for webgl/webgl2 contexts, so that a
     WEBGL sketch's canvas can still be read back after the frame is done.
+
+--------------------------------------------------------------------------
+THE GHOST WINDOW (2026-09-21, docs/plans/auto-mouse.md section 5)
+--------------------------------------------------------------------------
+Entry 1103 is a jigsaw puzzle: no_motion, responds(click), responds(drag), and
+on the kiosk a photograph cut into pieces that never move, because nobody is at
+the keyboard.  The gate had the same blindness.  One click at the canvas centre
+and one drag across the middle were all the interaction a sketch ever got, so
+the fourth frame of strip.png was the only interactive evidence a judge or a
+critic ever saw.
+
+So, last of all, the gate plays a pointer script -- the sketch's own
+ghost.json if it wrote one, else the built-in its requested assertions name --
+through page.mouse, stepping the virtual clock between events by the gap in
+their timestamps, and writes four frames of it as ghost.png.
+
+Four things it deliberately is not:
+
+  - It is not strip.png.  strip.png and gate.png are byte-for-byte what they
+    were before this existed (DECIDE[ghost-strip]); both judge populations and
+    the critic compare against them and pairs.artefact_hash is over them, so
+    changing one mid-corpus would split every measurement taken so far.
+  - It is not an assertion.  Every assertion is evaluated before the window
+    runs and against the snapshots taken before it, so responds(click) is
+    exactly as strong -- or as weak -- as it was (DECIDE[click-power],
+    MEASURE[click-assertion-power]).
+  - It is not a check.  A BudgetExceeded inside the window is a note and no
+    ghost.png; console_clean is read at the moment the window opens and not
+    through it.  Nothing a synthetic pointer does to a sketch may fail a run
+    that had already passed, which is what HARNESS_VERSION 3 promises.
+  - It is not free.  The window does count against --budget-s, like every
+    other probe, and a script of 8 s at 60 fps is 480 stepped frames.  It is
+    outside the counted idle window, so timings.ms_per_frame is unchanged.
 
 Limits, stated rather than hidden:
   - A sketch driven by setTimeout/setInterval instead of requestAnimationFrame
@@ -210,6 +248,151 @@ SKETCH_ORIGIN = "http://sketch.localhost"
 # declaring itself static and the gate believes it).
 FAILABLE_CHECKS = ("console_clean", "frame_advancing", "sound_lib_ok",
                    "audio_context_running", "frame_budget")
+
+# ---------------------------------------------------------------------------
+# The ghost pointer (2026-09-21, docs/plans/auto-mouse.md section 5)
+# ---------------------------------------------------------------------------
+# A ghost script is a list of events in canvas fractions -- t in milliseconds
+# from the start of the window, type one of four words, x and y in [0, 1] of
+# the canvas -- and two players read it: the shim inside the published page
+# (sketchgen/ghostshim.py), which dispatches MouseEvents, and this file, which
+# drives page.mouse.  The caps and the four words are DECIDE[ghost-script].
+#
+# Everything from here to GHOST_BUILTINS is a COPY of sketchgen/ghostshim.py's
+# own values.  It is copied and not imported for the reason SOUND_RE is: this
+# file is a standalone script with its own copy on the node and in the course
+# repo, and it imports nothing from the package.  A test pins the two together
+# (tests/test_gate_fixtures.py, the way tests/test_executor.py pins SOUND_RE),
+# so a script the shim would truncate is not one this plays whole.
+GHOST_MAX_EVENTS = 64
+GHOST_MAX_MS = 8000
+GHOST_TYPES = ("move", "down", "up", "click")
+GHOST_KEYS = ("t", "type", "x", "y")
+
+#: The gap the shim leaves between two built-ins played one after another.
+GHOST_GAP_MS = 600
+
+#: What the executor's own script is called on disk, written beside sketch.js
+#: by executor.run and read from there by both players.
+GHOST_JSON = "ghost.json"
+
+#: The four snapshots ghost.png is made of, taken at the quartiles of the
+#: script's own duration -- not at 0, which would be the frame strip.png
+#: already ends on.
+GHOST_SNAPS = ("g0", "g1", "g2", "g3")
+
+#: One stepped frame, in virtual milliseconds: the FRAME_MS the in-page
+#: harness above counts by, so that "step to t" and "the sketch's own clock
+#: reads t" are the same sentence.
+GHOST_FRAME_MS = 1000.0 / 60.0
+
+#: The three default scripts, by name, for an entry that wrote none of its own.
+#: responds(click) gets `click`, responds(drag) gets `drag`, both get both in
+#: that order, and a sketch that asked for neither gets `wander` -- so every
+#: run has a ghost window and every entry a ghost.png.
+GHOST_BUILTINS = {
+    # In from a corner to the centre, one press, then three clicks
+    # apart, on the golden-section points -- three unrelated places say
+    # more about a sketch that reads where it was clicked than three at
+    # the same spacing.
+    "click": [
+        {"t": 50, "type": "move", "x": 0.1325, "y": 0.8675},
+        {"t": 100, "type": "move", "x": 0.185, "y": 0.815},
+        {"t": 150, "type": "move", "x": 0.2375, "y": 0.7625},
+        {"t": 200, "type": "move", "x": 0.29, "y": 0.71},
+        {"t": 250, "type": "move", "x": 0.3425, "y": 0.6575},
+        {"t": 300, "type": "move", "x": 0.395, "y": 0.605},
+        {"t": 350, "type": "move", "x": 0.4475, "y": 0.5525},
+        {"t": 400, "type": "move", "x": 0.5, "y": 0.5},
+        {"t": 500, "type": "down", "x": 0.5, "y": 0.5},
+        {"t": 620, "type": "up", "x": 0.5, "y": 0.5},
+        {"t": 1400, "type": "move", "x": 0.382, "y": 0.618},
+        {"t": 1520, "type": "click", "x": 0.382, "y": 0.618},
+        {"t": 2300, "type": "move", "x": 0.618, "y": 0.382},
+        {"t": 2420, "type": "click", "x": 0.618, "y": 0.382},
+        {"t": 3200, "type": "move", "x": 0.618, "y": 0.618},
+        {"t": 3320, "type": "click", "x": 0.618, "y": 0.618},
+    ],
+    # Two legs: left to right across the middle, then top to bottom
+    # down it, each one press, twelve moves over 800 ms, one release.
+    "drag": [
+        {"t": 200, "type": "move", "x": 0.2, "y": 0.5},
+        {"t": 400, "type": "down", "x": 0.2, "y": 0.5},
+        {"t": 467, "type": "move", "x": 0.25, "y": 0.5},
+        {"t": 533, "type": "move", "x": 0.3, "y": 0.5},
+        {"t": 600, "type": "move", "x": 0.35, "y": 0.5},
+        {"t": 667, "type": "move", "x": 0.4, "y": 0.5},
+        {"t": 733, "type": "move", "x": 0.45, "y": 0.5},
+        {"t": 800, "type": "move", "x": 0.5, "y": 0.5},
+        {"t": 867, "type": "move", "x": 0.55, "y": 0.5},
+        {"t": 933, "type": "move", "x": 0.6, "y": 0.5},
+        {"t": 1000, "type": "move", "x": 0.65, "y": 0.5},
+        {"t": 1067, "type": "move", "x": 0.7, "y": 0.5},
+        {"t": 1133, "type": "move", "x": 0.75, "y": 0.5},
+        {"t": 1200, "type": "move", "x": 0.8, "y": 0.5},
+        {"t": 1320, "type": "up", "x": 0.8, "y": 0.5},
+        {"t": 1800, "type": "move", "x": 0.5, "y": 0.2},
+        {"t": 2000, "type": "down", "x": 0.5, "y": 0.2},
+        {"t": 2067, "type": "move", "x": 0.5, "y": 0.25},
+        {"t": 2133, "type": "move", "x": 0.5, "y": 0.3},
+        {"t": 2200, "type": "move", "x": 0.5, "y": 0.35},
+        {"t": 2267, "type": "move", "x": 0.5, "y": 0.4},
+        {"t": 2333, "type": "move", "x": 0.5, "y": 0.45},
+        {"t": 2400, "type": "move", "x": 0.5, "y": 0.5},
+        {"t": 2467, "type": "move", "x": 0.5, "y": 0.55},
+        {"t": 2533, "type": "move", "x": 0.5, "y": 0.6},
+        {"t": 2600, "type": "move", "x": 0.5, "y": 0.65},
+        {"t": 2667, "type": "move", "x": 0.5, "y": 0.7},
+        {"t": 2733, "type": "move", "x": 0.5, "y": 0.75},
+        {"t": 2800, "type": "move", "x": 0.5, "y": 0.8},
+        {"t": 2920, "type": "up", "x": 0.5, "y": 0.8},
+    ],
+    # A Lissajous path, three turns across against two down, no
+    # button: a field that scatters under the cursor has to be crossed,
+    # not visited.
+    "wander": [
+        {"t": 100, "type": "move", "x": 0.6816, "y": 0.8564},
+        {"t": 200, "type": "move", "x": 0.8236, "y": 0.8951},
+        {"t": 300, "type": "move", "x": 0.8951, "y": 0.8951},
+        {"t": 400, "type": "move", "x": 0.8804, "y": 0.8564},
+        {"t": 500, "type": "move", "x": 0.7828, "y": 0.7828},
+        {"t": 600, "type": "move", "x": 0.6236, "y": 0.6816},
+        {"t": 700, "type": "move", "x": 0.4374, "y": 0.5626},
+        {"t": 800, "type": "move", "x": 0.2649, "y": 0.4374},
+        {"t": 900, "type": "move", "x": 0.1436, "y": 0.3184},
+        {"t": 1000, "type": "move", "x": 0.1, "y": 0.2172},
+        {"t": 1100, "type": "move", "x": 0.1436, "y": 0.1436},
+        {"t": 1200, "type": "move", "x": 0.2649, "y": 0.1049},
+        {"t": 1300, "type": "move", "x": 0.4374, "y": 0.1049},
+        {"t": 1400, "type": "move", "x": 0.6236, "y": 0.1436},
+        {"t": 1500, "type": "move", "x": 0.7828, "y": 0.2172},
+        {"t": 1600, "type": "move", "x": 0.8804, "y": 0.3184},
+        {"t": 1700, "type": "move", "x": 0.8951, "y": 0.4374},
+        {"t": 1800, "type": "move", "x": 0.8236, "y": 0.5626},
+        {"t": 1900, "type": "move", "x": 0.6816, "y": 0.6816},
+        {"t": 2000, "type": "move", "x": 0.5, "y": 0.7828},
+        {"t": 2100, "type": "move", "x": 0.3184, "y": 0.8564},
+        {"t": 2200, "type": "move", "x": 0.1764, "y": 0.8951},
+        {"t": 2300, "type": "move", "x": 0.1049, "y": 0.8951},
+        {"t": 2400, "type": "move", "x": 0.1196, "y": 0.8564},
+        {"t": 2500, "type": "move", "x": 0.2172, "y": 0.7828},
+        {"t": 2600, "type": "move", "x": 0.3764, "y": 0.6816},
+        {"t": 2700, "type": "move", "x": 0.5626, "y": 0.5626},
+        {"t": 2800, "type": "move", "x": 0.7351, "y": 0.4374},
+        {"t": 2900, "type": "move", "x": 0.8564, "y": 0.3184},
+        {"t": 3000, "type": "move", "x": 0.9, "y": 0.2172},
+        {"t": 3100, "type": "move", "x": 0.8564, "y": 0.1436},
+        {"t": 3200, "type": "move", "x": 0.7351, "y": 0.1049},
+        {"t": 3300, "type": "move", "x": 0.5626, "y": 0.1049},
+        {"t": 3400, "type": "move", "x": 0.3764, "y": 0.1436},
+        {"t": 3500, "type": "move", "x": 0.2172, "y": 0.2172},
+        {"t": 3600, "type": "move", "x": 0.1196, "y": 0.3184},
+        {"t": 3700, "type": "move", "x": 0.1049, "y": 0.4374},
+        {"t": 3800, "type": "move", "x": 0.1764, "y": 0.5626},
+        {"t": 3900, "type": "move", "x": 0.3184, "y": 0.6816},
+        {"t": 4000, "type": "move", "x": 0.5, "y": 0.7828},
+    ],
+}
 
 
 def utc_now():
@@ -539,6 +722,10 @@ def parse_args(argv):
     ap.add_argument("--budget-s", type=float, default=DEFAULT_BUDGET_S, metavar="S",
                     help="wall seconds the whole run may take before it stops where it "
                          "is and fails frame_budget (default %g)" % DEFAULT_BUDGET_S)
+    ap.add_argument("--no-ghost", dest="ghost", action="store_false", default=True,
+                    help="skip the ghost window: play no pointer script and write "
+                         "no ghost.png. Nothing it does can fail a run either way; "
+                         "this is for a plain run that wants the old wall cost")
     ap.add_argument("--json", action="store_true", help="print report.json to stdout as well")
     ap.add_argument("--keep-browser-log", action="store_true",
                     help="also write <out>/browser.log: the chromium build, the launch "
@@ -706,9 +893,23 @@ class Recorder:
             text = "<unreadable page error>"
         self.entries.append({"t": utc_now(), "type": "pageerror", "text": text})
 
+    def clean_through(self, upto=None):
+        """True when nothing up to entry *upto* was an error.
+
+        The ghost window (2026-09-21) is the reason this takes a bound. It runs
+        after every check and every assertion has been decided, and a synthetic
+        pointer that clicks where the probe did not could otherwise turn a
+        sketch that passed into a console_clean failure on the strength of input
+        no person sent. HARNESS_VERSION 3 says nothing the gate fails changed,
+        and this is where that is kept true. Everything the window logged is
+        still in console.log and in the report's console list.
+        """
+        seen = self.entries if upto is None else self.entries[:upto]
+        return not any(e["type"] in ("error", "pageerror") for e in seen)
+
     @property
     def clean(self):
-        return not any(e["type"] in ("error", "pageerror") for e in self.entries)
+        return self.clean_through()
 
 
 def launch_args(fake_audio_wav):
@@ -926,6 +1127,232 @@ def audio_dwell(page):
         page.wait_for_timeout(AUDIO_DWELL_WAIT_MS)
 
 
+# ---------------------------------------------------------------------------
+# The ghost window
+# ---------------------------------------------------------------------------
+
+def ghost_number(value):
+    """*value* as a float, or None if it is not a number.
+
+    True is an int in Python and would otherwise be an x of 1.0 at the
+    right-hand edge of the canvas. It is not a coordinate, it is a typo. The
+    same sentence, and the same rule, as executor._number.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def validate_ghost(text):
+    """A ghost script as events, or (None, why).
+
+    Character for character the decision executor.validate_ghost makes, and a
+    test runs both over one list of samples: the executor is what lets a script
+    onto disk, this is what plays it, and a gate that refused what the executor
+    accepted would silently give an entry the built-in instead -- which looks
+    exactly like a working entry.
+
+    Events come back sorted by t, stably, rather than a list out of order being
+    refused: the shim schedules one setTimeout per event and does the same.
+    """
+    try:
+        events = json.loads(text)
+    except ValueError:
+        return None, "not a JSON list"
+    if not isinstance(events, list):
+        return None, "not a JSON list"
+    if not events:
+        return None, "an empty list, so there is nothing to play"
+    if len(events) > GHOST_MAX_EVENTS:
+        return None, "%d events, more than %d" % (len(events), GHOST_MAX_EVENTS)
+
+    out = []
+    for at, event in enumerate(events, start=1):
+        if not isinstance(event, dict):
+            return None, "event %d: not an object" % at
+        if tuple(sorted(event)) != tuple(sorted(GHOST_KEYS)):
+            return None, "event %d: its keys are %s, not %s" % (
+                at, ", ".join(sorted(str(key) for key in event)) or "(none)",
+                "/".join(GHOST_KEYS))
+        when = ghost_number(event["t"])
+        if when is None:
+            return None, "event %d: t is %s, not a number" % (at, json.dumps(event["t"]))
+        if when < 0 or when > GHOST_MAX_MS:
+            return None, "event %d: t is %s, outside [0, %d] ms" % (
+                at, json.dumps(event["t"]), GHOST_MAX_MS)
+        if event["type"] not in GHOST_TYPES:
+            return None, "event %d: type is %s, not one of %s" % (
+                at, json.dumps(event["type"]), "/".join(GHOST_TYPES))
+        for axis in ("x", "y"):
+            where = ghost_number(event[axis])
+            if where is None:
+                return None, "event %d: %s is %s, not a number" % (
+                    at, axis, json.dumps(event[axis]))
+            if where < 0 or where > 1:
+                return None, "event %d: %s is %s, outside [0, 1]" % (
+                    at, axis, json.dumps(event[axis]))
+        out.append({key: event[key] for key in GHOST_KEYS})
+
+    out.sort(key=lambda event: ghost_number(event["t"]))
+    return out, None
+
+
+def ghost_default_name(wanted):
+    """Which built-in a sketch that wrote no script of its own gets."""
+    kinds = {kind for _, kind, _ in wanted}
+    names = [name for name, kind in (("click", "responds(click)"),
+                                     ("drag", "responds(drag)"))
+             if kind in kinds]
+    return ",".join(names) if names else "wander"
+
+
+def ghost_builtin(name):
+    """One or more built-ins, joined the way the shim's `chosen` joins them.
+
+    A comma list is played in order with GHOST_GAP_MS between the end of one
+    and the start of the next, and the result is held to the same caps as a
+    script somebody wrote: the shim truncates at MAX_EVENTS and drops anything
+    past MAX_MS, and two players that disagreed about where a script stops
+    would disagree about what the sketch was shown.
+    """
+    out = []
+    for part in str(name).split(","):
+        script = GHOST_BUILTINS.get(part.strip())
+        if not script:
+            continue
+        shift = (max(event["t"] for event in out) + GHOST_GAP_MS) if out else 0
+        for event in script:
+            out.append(dict(event, t=event["t"] + shift))
+    return [event for event in out if event["t"] <= GHOST_MAX_MS][:GHOST_MAX_EVENTS]
+
+
+def ghost_script(sketch_dir, wanted, notes):
+    """The script this run plays: (events, source, name).
+
+    The sketch's own ghost.json when it has one and it parses, else the
+    built-in its requested assertions name. An unreadable or invalid file is a
+    note and the default, never a refusal: the ghost window is evidence, and a
+    run that stopped because a sketch's pointer script had a typo in it would
+    be the gate failing a sketch for something the gate does not judge.
+    """
+    path = pathlib.Path(sketch_dir) / GHOST_JSON
+    if path.is_file():
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            events, why = None, "could not be read (%s)" % exc
+        else:
+            events, why = validate_ghost(text)
+        if events is not None:
+            return events, "executor", None
+        notes.append("the sketch's own %s was not played: %s; the ghost window "
+                     "used the default script instead" % (GHOST_JSON, why))
+    name = ghost_default_name(wanted)
+    return ghost_builtin(name), "default", name
+
+
+def canvas_rect(page):
+    """The canvas in viewport coordinates, as drag_across reads it."""
+    return page.evaluate(
+        "() => { const c = window.__gate.canvas(); if (!c) return null;"
+        " const r = c.getBoundingClientRect();"
+        " return {x: r.x, y: r.y, w: r.width, h: r.height}; }")
+
+
+def ghost_send(page, box, event, held):
+    """One event, as real chromium input. Returns whether a button is held.
+
+    The move before a press is this player's own: the shim dispatches a bare
+    mousedown at the point, and Playwright presses wherever the pointer already
+    is, so moving there first is how the two arrive at the same clientX. Every
+    built-in already has that move in it, at the same coordinates, which is
+    why it changes nothing for them.
+    """
+    x = box["x"] + box["w"] * float(event["x"])
+    y = box["y"] + box["h"] * float(event["y"])
+    kind = event["type"]
+    if kind == "move":
+        page.mouse.move(x, y)
+    elif kind == "down":
+        page.mouse.move(x, y)
+        page.mouse.down()
+        return True
+    elif kind == "up":
+        page.mouse.move(x, y)
+        page.mouse.up()
+        return False
+    else:
+        page.mouse.click(x, y)
+    return held
+
+
+def play_ghost(page, out_dir, events, budget, notes):
+    """Play *events* and write ghost.png. Never fails a run; returns a summary.
+
+    The clock is stepped between events by the gap in their timestamps at 60
+    frames a second, so the same script under the same seed draws the same
+    frames however loaded the machine is -- the whole reason the rest of this
+    runner hand-steps too.
+
+    A BudgetExceeded here is caught here. The run has already decided
+    everything it decides, and the sketch had already passed or failed on the
+    window that matters; what it loses is its ghost.png, which is a picture.
+    """
+    summary = {"events": len(events), "played": 0, "ms": 0, "png": None}
+    box = canvas_rect(page)
+    if not box:
+        notes.append("ghost window skipped: no canvas to play the pointer script on")
+        return summary
+
+    duration = max(float(event["t"]) for event in events)
+    timeline = [(duration * (at + 1) / 4.0, 0, at, name)
+                for at, name in enumerate(GHOST_SNAPS)]
+    timeline += [(float(event["t"]), 1, at, event) for at, event in enumerate(events)]
+    # Snapshots sort before events at the same millisecond: a frame is only
+    # drawn when the clock is stepped, so an event dispatched at t has not
+    # reached the canvas at t, and snapping after it would show the world
+    # before it with the event's own timestamp on it.
+    timeline.sort(key=lambda item: item[:3])
+
+    stepped = 0
+    held = False
+    try:
+        for when, kind, _at, payload in timeline:
+            want = int(round(when / GHOST_FRAME_MS))
+            if want > stepped:
+                step(page, want - stepped, budget=budget)
+                stepped = want
+            if kind == 0:
+                page.evaluate("name => window.__gate.snap(name)", payload)
+            else:
+                held = ghost_send(page, box, payload, held)
+                summary["played"] += 1
+            summary["ms"] = int(round(when))
+    except BudgetExceeded as exc:
+        # Deliberately not re-raised and deliberately not a check: see the
+        # module docstring, THE GHOST WINDOW. The note is so a person reading
+        # the report knows why the entry page shows no ghost frames.
+        notes.append("the ghost window stopped early and wrote no %s: %s"
+                     % ("ghost.png", exc))
+        return summary
+    finally:
+        if held:
+            # A script may end mid-drag. Nothing runs after this window, but a
+            # pointer left pressed is a state somebody will trip over.
+            try:
+                page.mouse.up()
+            except Exception as exc:  # noqa: BLE001 - tidying, not measuring
+                notes.append("the ghost pointer could not be released: %s" % exc)
+
+    path = out_dir / "ghost.png"
+    if save_data_url(page.evaluate("names => window.__gate.strip(names)",
+                                   list(GHOST_SNAPS)), path):
+        summary["png"] = str(path)
+    else:
+        notes.append("ghost.png could not be produced from the canvas")
+    return summary
+
+
 def save_data_url(data_url, path):
     if not data_url or "," not in data_url:
         return False
@@ -1028,6 +1455,11 @@ def main(argv=None):
                "ms_per_frame": None, "idle_step_s": None}
     budget = Budget(a.frame_budget_ms, a.budget_s, t_start)
     chromium_path = None
+    # The ghost window, and where the console stopped being read for
+    # console_clean. Both stay as they are on a run that never reaches the
+    # window -- one the budget stopped, or one run with --no-ghost.
+    ghost = None
+    ghost_console_mark = None
 
     tone_wav = None
     if want_audio:
@@ -1188,6 +1620,21 @@ def main(argv=None):
                 for literal, kind, params in wanted:
                     assertions[literal] = evaluate_assertion(
                         page, kind, params, state1, tone_brightness, silent_ref)
+
+                # ---- the ghost window ------------------------------------
+                # Last, and after every assertion, on purpose: what the ghost
+                # does to the sketch is evidence for a person, the critic and
+                # the judge, and nothing this window sees is allowed to change
+                # a verdict (auto-mouse.md DECIDE[ghost-strip],
+                # DECIDE[click-power]).
+                if a.ghost:
+                    ghost_console_mark = len(rec.entries)
+                    events, source, script = ghost_script(sketch_dir, wanted, notes)
+                    if events:
+                        ghost = play_ghost(page, out_dir, events, budget, notes)
+                        ghost.update(source=source, script=script)
+                    else:
+                        notes.append("ghost window skipped: no script to play")
             except BudgetExceeded as exc:
                 # Stop where we stand.  Everything measured up to here is kept
                 # -- the checks already decided, the artefacts already written,
@@ -1216,8 +1663,14 @@ def main(argv=None):
                     notes.append("no frame could be read back after the budget "
                                  "stopped the run: %s" % snap)
 
-            # console cleanliness is judged over the whole run
-            checks["console_clean"] = rec.clean
+            # console cleanliness is judged over the whole run -- up to the
+            # ghost window, which opens after every check and assertion has
+            # been decided and may not undo one (Recorder.clean_through).
+            checks["console_clean"] = rec.clean_through(ghost_console_mark)
+            if checks["console_clean"] and not rec.clean:
+                notes.append("the page logged an error during the ghost window, "
+                             "after every check and assertion was decided; it is "
+                             "in console.log and console_clean did not read it")
 
         finally:
             for obj in (context, browser):
@@ -1250,6 +1703,11 @@ def main(argv=None):
         "strip": str(out_dir / "strip.png"),
         "log": str(log_path),
     }
+    # Only when there is a file: an entry gated before 2026-09-21, or one whose
+    # window the budget stopped, has no ghost.png, and the gallery and the
+    # operator's pages both read this to decide whether to show one.
+    if ghost is not None and ghost.get("png"):
+        artefacts["ghost"] = ghost["png"]
     if net_log is not None:
         artefacts["browser_log"] = str(net_log.write(out_dir / "browser.log"))
 
@@ -1264,6 +1722,14 @@ def main(argv=None):
         "notes": notes,
         "resources": res.failures,
         "console": rec.entries,
+        # Which pointer played, whose it was, and how much of it got played:
+        # null on a run with --no-ghost and on every report written before
+        # 2026-09-21. `ms` is the script's own clock, not wall time -- the
+        # virtual millisecond the window reached, which is what falls short
+        # when the budget stops it.
+        "ghost": ({key: ghost[key] for key in
+                   ("source", "script", "events", "played", "ms")}
+                  if ghost is not None else None),
         "artefacts": artefacts,
         "exit": code,
     }

@@ -38,8 +38,14 @@ from sketchgen import worker  # noqa: E402
 
 
 def make_report(sketch_dir, *, checks=None, assertions=None, notes=None,
-                console=None, resources=None, exit_code=0):
-    """One report.json in sketch_gate.py's schema (see its report construction)."""
+                console=None, resources=None, exit_code=0, ghost=None):
+    """One report.json in sketch_gate.py's schema (see its report construction).
+
+    ``ghost`` is the gate's ghost window (auto-mouse.md §5): the summary it
+    writes and, when there is one, the fourth artefact beside the strip. None
+    is what every report written before 2026-09-21 has, and what a run with
+    --no-ghost writes, so it is the default here too.
+    """
     base_checks = {
         "console_clean": True,
         "is_looping": True,
@@ -48,6 +54,13 @@ def make_report(sketch_dir, *, checks=None, assertions=None, notes=None,
         "audio_context_running": None,
     }
     base_checks.update(checks or {})
+    artefacts = {
+        "png": str(Path(sketch_dir) / ".gate" / "gate.png"),
+        "strip": str(Path(sketch_dir) / ".gate" / "strip.png"),
+        "log": str(Path(sketch_dir) / ".gate" / "console.log"),
+    }
+    if ghost is not None:
+        artefacts["ghost"] = str(Path(sketch_dir) / ".gate" / "ghost.png")
     return {
         "sketch_dir": str(sketch_dir),
         "seed": 1,
@@ -59,11 +72,8 @@ def make_report(sketch_dir, *, checks=None, assertions=None, notes=None,
         "notes": notes or [],
         "resources": resources or [],
         "console": console or [],
-        "artefacts": {
-            "png": str(Path(sketch_dir) / ".gate" / "gate.png"),
-            "strip": str(Path(sketch_dir) / ".gate" / "strip.png"),
-            "log": str(Path(sketch_dir) / ".gate" / "console.log"),
-        },
+        "ghost": ghost,
+        "artefacts": artefacts,
         "exit": exit_code,
     }
 
@@ -809,6 +819,44 @@ class TestEntries(WorkerTestCase):
         self.assertTrue(row["shape"])
         self.assertEqual(1, row["seed"])
         self.assertTrue(row["created_utc"].endswith("Z"))
+
+    def test_the_ghost_window_travels_with_the_entry_and_moves_nothing_else(self):
+        """auto-mouse.md §5.3: a fourth artefact, and no migration for it.
+
+        ``ghost.png`` gets no column. The entry names its attempt directory
+        already, the gate writes the file into that directory's ``.gate``, and
+        `gallery._artefact` falls back to exactly there — so what this has to
+        prove is that the two columns that DO exist still point where they
+        always did, and that the gate log carries the summary through to
+        ``meta.json``.
+        """
+        from sketchgen import gallery
+
+        ghost = {"source": "executor", "script": None, "events": 8,
+                 "played": 8, "ms": 1900}
+        job_id = self.enqueue()
+        source = self.jobs / str(job_id) / "attempt-1"
+        gate = StubGate([0], reports=[make_report(source, ghost=ghost)])
+        self.make_worker(gate_fn=gate).run_once()
+
+        row = self.entries(job_id)[0]
+        # The referee changed what it draws, so the entry says which referee.
+        self.assertEqual(3, row["harness_version"])
+        self.assertEqual(worker.HARNESS_VERSION, row["harness_version"])
+        # And what it draws for the judge and the critic did not move.
+        self.assertTrue(row["strip_path"].endswith(".gate/strip.png"))
+        self.assertTrue(row["png_path"].endswith(".gate/gate.png"))
+
+        log = gallery._gate_log(gallery._attempt_rows(self.conn, job_id))
+        self.assertEqual(ghost, log[0]["ghost"])
+
+    def test_an_entry_gated_before_the_ghost_window_carries_none(self):
+        job_id = self.enqueue()
+        self.make_worker().run_once()
+        from sketchgen import gallery
+
+        log = gallery._gate_log(gallery._attempt_rows(self.conn, job_id))
+        self.assertIsNone(log[0]["ghost"])
 
     def test_an_exhausted_job_is_kept_as_an_entry_too(self):
         job_id = self.enqueue(max_attempts=2)

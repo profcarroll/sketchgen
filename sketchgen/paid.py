@@ -2266,8 +2266,13 @@ def verdict_summary(report: Mapping[str, Any] | None,
     that decides the frame budget, and the one no laptop proxy can produce
     (entry 1279: 9.8 ms on the node against 6.4 ms local) — the console,
     the resources the sketch asked for and did not get, the notes, and the
-    node paths of ``strip.png`` and ``gate.png``, to be fetched with the same
-    ``scp`` the judge steps use.
+    node paths of ``strip.png``, ``gate.png`` and, since 2026-09-21,
+    ``ghost.png``, to be fetched with the same ``scp`` the judge steps use.
+
+    ``artefacts`` is copied whole rather than key by key, which is why the
+    ghost window's frames needed nothing here: an agent that wants to see
+    what its own ``ghost`` block did to its sketch reads the path the gate
+    wrote (auto-mouse.md §5.3, ``DECIDE[ghost-dataset]``).
     """
     if not report:
         return {"exit": None, "checks": {}, "assertions": {}, "timings": {},
