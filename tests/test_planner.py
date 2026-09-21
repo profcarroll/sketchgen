@@ -283,13 +283,16 @@ class PlanJobWriteBackTests(unittest.TestCase):
             "--jobs-dir", str(self.jobs_dir), "--db", self.db_path, *extra,
         )
 
-    def test_a_parked_job_is_planned_and_moves_to_executing(self):
+    def test_a_parked_job_is_planned_and_goes_back_on_the_queue(self):
         job_id = self.park()
         result = self.plan_job(job_id)
         self.assertEqual(result.returncode, 0, result.stderr)
 
         job = db.get_job(self.conn, job_id)
-        self.assertEqual("executing", job.state)
+        # queued, not executing: `claim_next` selects on `state = 'queued'`
+        # alone, so a job moved straight to a running state by something that
+        # is not the worker waits there for the stuck-sweep instead.
+        self.assertEqual("queued", job.state)
         self.assertTrue(job.brief)
         self.assertEqual(["motion(idle)", "responds(click)", "size(800,600)"],
                          json.loads(job.assertions_json))
@@ -370,12 +373,26 @@ class PlanJobWriteBackTests(unittest.TestCase):
         self.assertIn("--out is required", result.stderr)
 
     def test_planning_twice_is_refused_by_the_state_machine(self):
-        """The second run finds the job executing, which is the first guard."""
+        """The second run finds the job queued, which is the first guard."""
         job_id = self.park()
         self.assertEqual(self.plan_job(job_id).returncode, 0)
         again = self.plan_job(job_id)
         self.assertEqual(again.returncode, 3)
         self.assertIn("not needs-laptop", again.stderr)
+
+    def test_the_worker_claims_it_straight_into_executing(self):
+        """The point of queueing it: the next pass resumes the job.
+
+        `claim_next` reads the brief this command wrote and skips planning, so
+        the paid plan is executed rather than re-planned locally.
+        """
+        job_id = self.park()
+        self.assertEqual(self.plan_job(job_id).returncode, 0)
+        claimed = db.claim_next(self.conn)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(job_id, claimed.id)
+        self.assertEqual("executing", claimed.state)
+        self.assertEqual("claude-sonnet-5", claimed.planner)
 
 
 class TestLenientParse(unittest.TestCase):
