@@ -918,7 +918,7 @@ class KioskTests(unittest.TestCase):
         self.assertIsNone(words["revisions"], "a root has no revisions line")
         self.assertEqual(
             "Prompted by profcarroll · planned by gemma4:e4b · written by "
-            "qwen3-coder:30b-a3b-q4_K_M under the control rules",
+            "qwen3-coder:30b-a3b-q4_K_M",
             words["authors"],
         )
         self.assertEqual(
@@ -944,7 +944,11 @@ class KioskTests(unittest.TestCase):
             "revised once, latest: let the lines thin as they near the edge.",
             revised["revisions"],
         )
-        self.assertTrue(revised["authors"].endswith(", gate passed on attempt 2"))
+        # The attempt count is the workshop's, not the projection's: the
+        # caption names the three people and models and stops there.
+        self.assertTrue(
+            revised["authors"].endswith("written by qwen3-coder:30b-a3b-q4_K_M")
+        )
 
     def test_judgment_prints_the_score_the_pairs_and_the_quadrant(self):
         words = self.report["words"]
