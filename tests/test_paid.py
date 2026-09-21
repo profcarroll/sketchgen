@@ -10,6 +10,7 @@ path would have got, lands the same rows the local path lands (plan §5.1).
 """
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -22,7 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sketchgen import db  # noqa: E402
 from sketchgen import judge  # noqa: E402
+from sketchgen import lineage  # noqa: E402
 from sketchgen import paid  # noqa: E402
+from sketchgen import worker  # noqa: E402
 
 import test_judge  # noqa: E402
 
@@ -31,6 +34,9 @@ CLI = REPO_ROOT / "bin" / "sketchgen"
 
 GOOD_JUDGE_REPLY = test_judge.GOOD_REPLY
 PNG_BYTES = test_judge.PNG_BYTES
+
+GOOD_CRITIQUE = "Let one of the drifting dots fall out of step with the others.\n"
+TWO_SENTENCES = "It is fine. Make the dots red.\n"
 
 
 class PaidTestCase(unittest.TestCase):
@@ -193,6 +199,138 @@ class JudgeTests(PaidTestCase):
 
 
 # ---------------------------------------------------------------------------
+# The critic
+# ---------------------------------------------------------------------------
+
+
+class CritiqueTests(PaidTestCase):
+
+    def critique_rows(self):
+        return [
+            {k: row[k] for k in row.keys() if k not in ("id", "created_utc")}
+            for row in self.conn.execute("SELECT * FROM critiques ORDER BY entry_id")
+        ]
+
+    def child_jobs(self):
+        keep = ("prompt", "critique", "critique_by", "planner", "executor",
+                "rules_file", "publication", "needs", "submitted_by",
+                "parent_entry_id", "state")
+        return [
+            {k: row[k] for k in keep}
+            for row in self.conn.execute(
+                "SELECT * FROM jobs WHERE parent_entry_id IS NOT NULL ORDER BY id"
+            )
+        ]
+
+    def export(self, limit=1, model="claude-opus-5"):
+        return paid.export_packet(self.conn, "critique", model=model,
+                                  limit=limit, ctx=self.ctx)
+
+    def test_an_item_carries_the_prompt_the_local_critic_renders_and_its_strip(self):
+        item = self.export()["items"][0]
+        row = db.get_entry(self.conn, item["inputs"]["entry"])
+        self.assertEqual(item["prompt"],
+                         lineage.critique_prompt(row, row["statement"], row["brief"]))
+        self.assertEqual(item["images"], [row["strip_path"]])
+        self.assertEqual(item["guard"], paid.sha256_file(row["strip_path"]))
+        self.assertEqual(item["prompt_version"], "critic-v3")
+
+    def test_a_reply_lands_the_rows_the_idle_critic_lands(self):
+        """Plan §5.1 for the critic: the critique row and the child job."""
+        packet = self.export()
+        entry_id = packet["items"][0]["inputs"]["entry"]
+        packet["items"][0]["answer"] = GOOD_CRITIQUE
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(report.rejected, [])
+        landed = (self.critique_rows(), self.child_jobs())
+        self.assertEqual(len(landed[1]), 1)
+
+        self.conn.execute("DELETE FROM critiques")
+        self.conn.execute("DELETE FROM jobs WHERE parent_entry_id IS NOT NULL")
+        reply = self.tmp / "critique.txt"
+        reply.write_text(GOOD_CRITIQUE, encoding="utf-8")
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            run = worker.Worker(
+                self.conn,
+                jobs_dir=self.jobs_dir,
+                critic_model="claude-opus-5",
+                lineage_depth=self.ctx.lineage_depth,
+                critic_fn=lambda conn, eid, **kw: lineage.critique(
+                    conn, eid, model="claude-opus-5", stub=reply),
+                log_stream=devnull,
+            )
+            self.assertTrue(run._critique_one(entry_id, "critic-v3"))
+        self.assertEqual(landed, (self.critique_rows(), self.child_jobs()))
+
+    def test_an_exported_entry_is_the_paid_critics_and_the_idle_loop_skips_it(self):
+        """Plan §3.4: an assignment, not a race for migration 006's one row."""
+        claimed = self.export(limit=1)["items"][0]["inputs"]["entry"]
+        offered = db.entries_to_critique(self.conn, "critic-v3", 1,
+                                         exclude=db.paid_claims(self.conn, "critique"))
+        self.assertEqual(len(offered), 1)
+        self.assertNotEqual(offered, [claimed])
+        seen = []
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            run = worker.Worker(
+                self.conn, jobs_dir=self.jobs_dir, idle_critique=3,
+                critic_fn=lambda conn, eid, **kw: seen.append(eid) or (_ for _ in ()).throw(
+                    lineage.CritiqueRefused("stop here")),
+                log_stream=devnull,
+            )
+            run._idle_critique()
+        self.assertNotIn(claimed, seen)
+        self.assertEqual(len(seen), 2)
+
+    def test_another_model_is_not_offered_what_one_model_holds(self):
+        first = {i["inputs"]["entry"] for i in self.export(limit=2)["items"]}
+        second = {i["inputs"]["entry"]
+                  for i in self.export(limit=3, model="claude-sonnet-5")["items"]}
+        self.assertFalse(first & second)
+        again = {i["inputs"]["entry"] for i in self.export(limit=2)["items"]}
+        self.assertEqual(first, again, "a model's own claims are offered again")
+
+    def test_landing_releases_the_claim_and_a_rejection_keeps_it(self):
+        packet = self.export(limit=2)
+        packet["items"][0]["answer"] = GOOD_CRITIQUE
+        packet["items"][1]["answer"] = TWO_SENTENCES
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(len(report.recorded), 1)
+        self.assertIn("sentences", report.rejected[0]["reason"])
+        self.assertEqual(set(db.paid_claims(self.conn, "critique")),
+                         {packet["items"][1]["inputs"]["entry"]})
+
+    def test_an_unparseable_answer_leaves_the_entry_uncritiqued(self):
+        """Plan §5.4. The idle loop would record a rejected row; this must not."""
+        packet = self.export()
+        packet["items"][0]["answer"] = "```js\nfill(255);\n```"
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(len(report.rejected), 1)
+        self.assertEqual(self.critique_rows(), [])
+        self.assertEqual(self.child_jobs(), [])
+
+    def test_a_changed_strip_is_rejected_and_writes_nothing(self):
+        packet = self.export()
+        packet["items"][0]["answer"] = GOOD_CRITIQUE
+        Path(packet["items"][0]["images"][0]).write_bytes(PNG_BYTES + b"\x42")
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertIn("strip", report.rejected[0]["reason"])
+        self.assertEqual((self.critique_rows(), self.child_jobs()), ([], []))
+
+    def test_a_model_id_that_cannot_sign_a_critique_is_rejected(self):
+        packet = self.export()
+        packet["items"][0]["answer"] = GOOD_CRITIQUE
+        packet["items"][0]["model"] = "vendor/model+tag"
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertIn("cannot sign", report.rejected[0]["reason"])
+        self.assertEqual(self.critique_rows(), [])
+
+    def test_release_hands_entries_back(self):
+        self.export(limit=3)
+        self.assertEqual(len(paid.release(self.conn, "critique", None)), 3)
+        self.assertEqual(db.paid_claims(self.conn, "critique"), {})
+
+
+# ---------------------------------------------------------------------------
 # The CLI
 # ---------------------------------------------------------------------------
 
@@ -200,7 +338,7 @@ class JudgeTests(PaidTestCase):
 class CliTests(PaidTestCase):
 
     def test_help_exits_zero_for_every_subcommand(self):
-        for name in ("export", "import", "status"):
+        for name in ("export", "import", "status", "release"):
             with self.subTest(subcommand=name):
                 result = subprocess.run(
                     [sys.executable, str(CLI), "paid", name, "--help"],
@@ -246,7 +384,14 @@ class CliTests(PaidTestCase):
     def test_status_names_every_step_with_a_route(self):
         result = self.run_cli("status", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("judge", json.loads(result.stdout))
+        waiting = json.loads(result.stdout)
+        self.assertIn("judge", waiting)
+        self.assertEqual(waiting["critique"]["count"], 3)
+
+    def test_release_needs_ids_or_all(self):
+        self.assertEqual(self.run_cli("release", "--step", "critique").returncode, 3)
+        result = self.run_cli("release", "--step", "critique", "--all", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ on a machine that holds a credential (docs/plans/agentic-cli.md §3.8):
   export  write what the node would have asked a model, for one step
   import  land the answers that packet comes back with
   status  what is waiting for an answer from off the node, per step
+  release hand claimed subjects back to the local path (the critic's entries)
 
 Every verb takes ``--json`` and prints one object. Exit codes, as everywhere in
 this project: 0 success, 1 failure, 3 refused (no database, not a packet, a
@@ -166,6 +167,23 @@ def cmd_status(args: argparse.Namespace) -> int:
     return _run(args, work)
 
 
+def cmd_release(args: argparse.Namespace) -> int:
+    def work(conn: sqlite3.Connection) -> int:
+        if not args.all and not args.ids:
+            raise paid_mod.PaidRefused("name the ids to release, or --all")
+        released = paid_mod.release(conn, args.step, None if args.all else args.ids)
+        if args.json:
+            print(json.dumps({"step": args.step, "released": released}))
+        elif released:
+            print(f"released {', '.join(map(str, released))}: the local "
+                  f"{args.step} path may take them again")
+        else:
+            print("nothing was claimed")
+        return EXIT_OK
+
+    return _run(args, work)
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -227,3 +245,22 @@ def register(top: argparse._SubParsersAction) -> None:
     )
     _add_common(sta)
     sta.set_defaults(func=cmd_status, _parser=sta)
+
+    rel = sub.add_parser(
+        "release",
+        help="hand exported subjects back to the local path",
+        description=(
+            "An entry exported to a paid critic is assigned to it: the idle "
+            "loop's local critic skips it until its answer is imported. This "
+            "gives entries back without an answer — a packet that is never "
+            "coming home. Jobs need no release: a parked job is failed or "
+            "answered, not reclaimed."
+        ),
+    )
+    rel.add_argument("--step", required=True, choices=("critique",),
+                     help="the step whose claims to release")
+    rel.add_argument("ids", nargs="*", type=int, metavar="ID",
+                     help="entry ids to release")
+    rel.add_argument("--all", action="store_true", help="release every claim")
+    _add_common(rel)
+    rel.set_defaults(func=cmd_release, _parser=rel)
