@@ -1707,7 +1707,7 @@ class Worker:
         asked for.
         """
         assigned = db.get_assignment(self.conn).get(step)
-        if assigned and models.is_paid(assigned):
+        if assigned and models.is_paid(assigned, self.conn):
             self.log(f"idle: {step} is assigned to {assigned}, off the node; "
                      "skipping it here")
             return None
@@ -2174,7 +2174,7 @@ class Worker:
         """
         if job.brief and job.assertions:
             return job
-        if models.is_paid(self.planner_model_for(job)):
+        if models.is_paid(self.planner_model_for(job), self.conn):
             # `paid`, or a model named in SKETCHGEN_PAID_MODELS — the job's
             # own, or the assignment's for a job that named none: either way it
             # is answered off the node, by `paid export --step plan` and
@@ -2357,7 +2357,7 @@ class Worker:
 
         model = self.executor_model_for(job)
         paid_reply = attempt_dir / PAID_REPLY
-        if models.is_paid(model) and not paid_reply.is_file():
+        if models.is_paid(model, self.conn) and not paid_reply.is_file():
             # DECIDE[credential-model] B: this attempt is written off the node.
             # Park it; `paid export --step execute` renders the prompt this
             # attempt would have sent — evidence and all — and `paid import`
@@ -2380,7 +2380,7 @@ class Worker:
             model=model,
         )
         try:
-            if models.is_paid(model):
+            if models.is_paid(model, self.conn):
                 execution = self._paid_execution(
                     brief=brief, assertions=assertions, rules_file=rules,
                     attempt_dir=attempt_dir, asked=model,

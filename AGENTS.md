@@ -53,74 +53,90 @@ $SG <command> --db ~/sketchgen/sketchgen.db
 Any of the four steps — `plan`, `execute`, `judge`, `critique` — can be
 answered by a model that is not on the node. The node writes what it would have
 asked; you answer; the node reads it back through the same parser the local
-path uses. Full reference: `docs/OPERATIONS.md` → *Paid steps*.
+path uses, and gates the sketch itself. Reference: `docs/OPERATIONS.md` →
+*Paid steps*.
 
-**If you are the paid model, you answer the items yourself** — the `prompt` in
-each item is addressed to you. Put your reply, verbatim, in that item's
-`answer`, and set `model` to your own exact model id. That id is the entry's
-provenance and the gallery prints it; do not write a model you are not.
+**If you are the paid model, you answer the items yourself.** Each item's
+`prompt` is addressed to you. Put your reply, verbatim, in `answer`, and set the
+packet's `model` to your own exact model id — it becomes the entry's public
+provenance; never write a model you are not.
 
-One-time setup (the operator's, not yours, unless asked):
+### The stop rule
 
-- Your model id must be in `SKETCHGEN_PAID_MODELS` in **both**
-  `sketchgen-web` and `sketchgen-worker` (a systemd drop-in). Otherwise the
-  worker sends your id to Ollama and the job fails with a 404. Check:
-  `systemctl --user show sketchgen-worker -p Environment`.
-- `sketchgen paid assign --plan <you> --execute <you>` makes every job that names no
-  model yours. **Unset it afterwards** (`--plan local --execute local`): while
-  set, it also catches released public submissions and preselects you on the
-  New job page.
+**Run `preflight` first. If it says NOT READY, fix only the checks marked
+`fix (you)`, run it again, and if anything is still failing, report the failing
+checks to the operator — verbatim — and stop.** Do not investigate the node,
+read unit files, restart services, resume the generator, or work around a
+failed check. The same applies at every step below: when a verb exits 3 or
+says `stop`, report what it printed and stop. Every verb here tells you what to
+do next; if you find yourself guessing, that is a missing verb — say so.
 
-A whole job, from the laptop:
+### The recipe (from the laptop)
 
 ```bash
-# runs sketchgen on the node; the packet files live on the node too
+# every sketchgen command runs on the node; the packet travels over ssh stdio
 sg() { ssh sld-cloud "~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen $* --db ~/sketchgen/sketchgen.db"; }
+ME=claude-sonnet-5                                  # your own exact model id
 
-# 1. queue it — with NO --planner flag, so it takes the assignment
-#    (`--planner local` forces the node's model; enqueue has no --executor).
-#    Two layers of quoting: the prompt crosses ssh.
-sg enqueue --prompt "'a tide of slow lines'" --by profcarroll
-# 2. wait until the worker parks it (≤ ~30 s; poll, don't act)
-sg paid status --json
-# 3. export, copy, answer, copy back, import
-sg paid export --step plan --out /tmp/plan.json
-scp sld-cloud:/tmp/plan.json .        # fill in each item's "answer" and "model"
-scp plan.json sld-cloud:/tmp/plan.json
-sg paid import /tmp/plan.json --json
-# 4. wait for it to park again at needs='execute'; repeat 3 with --step execute
-# 5. wait for the gate. Held → done (a person publishes). Parked again at
-#    needs='execute' → the gate failed, and the next export carries its
-#    evidence in the prompt. Repeat 3 until held, or failed at max_attempts
-#    (default 3).
+sg paid preflight --as $ME                          # READY, or the stop rule
+# (the only fix that is yours: `sg paid models add $ME` — a name, not a key)
+
+sg enqueue --prompt "'a tide of slow lines'" --by profcarroll \
+           --planner $ME --executor $ME --json      # → {"job": N, …}
+# the prompt crosses ssh, so it is quoted twice
+
+sg paid wait --job N                                # blocks; prints `next:`
+sg paid export --step plan --job N --as $ME --out - > plan.json
+#   write your plan into items[0].answer (see "Answers" below)
+sg paid import - < plan.json                        # JSON: recorded / rejected
+
+sg paid wait --job N                                # → next: export --step execute
+sg paid export --step execute --job N --as $ME --out - > sketch.json
+#   write your sketch into items[0].answer
+sg paid import - < sketch.json
+
+sg paid wait --job N
+# held            → done: a person publishes it. Report the entry id.
+# next: execute   → the gate failed; the new export carries its evidence in the
+#                   prompt. Answer again. Attempts count up to max_attempts (3).
+# failed          → done: report last_error.
 ```
 
-What to know while doing it:
+`wait` only reads; it is how you wait. It returns when the job needs you, is
+finished, or cannot move (the generator paused, or a person is needed) — and
+exits 3 in the last case: report and stop. It gives up after 30 minutes (exit
+1); run it again once, then report.
 
-- **Rejected is safe.** An answer that will not parse, or whose `guard` no
-  longer matches, writes nothing and the job stays parked; the raw answer is
-  kept in `FILE.rejected.json`. Fix it and import again. A rejected execute
-  answer does not use up an attempt.
+### Answers
+
+- **Plan:** a line `Brief`, one paragraph describing the sketch, then a line
+  `Assertions` and one word per line from the closed vocabulary in the prompt
+  (e.g. `motion(idle)`, `responds(click)`, `size(800,600)`). Anything outside
+  the vocabulary is dropped; the gate implements nothing else.
+- **Execute:** a fenced ```` ```js ```` block with the whole sketch (p5.js,
+  global mode), optionally ```` ```html ````, and the statement the prompt asks
+  for. The gate is headless Chromium on the node and is not negotiable: on a
+  failure, read the evidence at the end of the next prompt and fix what it
+  names.
 - **Change nothing in a packet but `answer` and `model`.** `guard`,
   `prompt_version` and `inputs` are how the node knows the answer is still
-  about what it asked. A packet cut before a prompt file changed is refused:
-  export again.
-- **Plan answers** follow `prompts/planner.md`: a `Brief` heading and
-  paragraph, then `Assertions`, one vocabulary word per line. Only words in
-  the closed vocabulary survive (`planner.VOCAB`); the gate implements nothing
-  else.
-- **Execute answers** must contain a fenced ```` ```js ```` block; the prompt
-  says the rest. The gate — headless Chromium on the node — is the referee and
-  you cannot talk it round: read the evidence in the next prompt and fix what
-  it names.
-- **Images are paths on the node** (`images` in judge and critique items).
-  `scp sld-cloud:<path> .` to look at them. A critique or verdict written
-  without looking is worse than none — the local critic refuses to work blind.
-- **Critique packets claim their entries**; the idle critic skips them until
-  imported. Abandoning a packet: `sg paid release --step critique --all`.
-- Everything you make is badged **off-node** in the gallery, and a paid
-  executor is a second variable in the rules-file A/B the gallery is measuring:
-  keep a paid run as its own batch, and say which in the PR or notes.
+  about what it asked; a stale packet is refused — export again.
+- **Rejected is safe.** An answer that does not parse writes nothing, uses no
+  attempt, and comes back verbatim in `import`'s output. Fix it, import again.
+
+### Other steps and settings
+
+- **Judge / critique** items name images by their path on the node:
+  `scp sld-cloud:<path> .` and look before answering — the local critic refuses
+  to work blind, and so should you. Export them without `--job`; a critique
+  packet claims its entries until imported (`sg paid release --step critique
+  --all` to give them back).
+- `paid assign` sets a model for every job that names none. Prefer
+  `enqueue --planner/--executor`, which touches only your job. If you did
+  assign, unset it: `sg paid assign --plan local --execute local`.
+- Everything you make is badged **off-node**, and a paid executor is a second
+  variable in the rules-file A/B the gallery measures: keep a paid run as its
+  own batch and say so.
 
 ## Deploying
 

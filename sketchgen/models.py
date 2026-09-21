@@ -43,6 +43,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Any
 
 __all__ = [
     "CACHE_TTL_S",
@@ -56,6 +57,7 @@ __all__ = [
     "label",
     "paid_models",
     "ran_off_node",
+    "remember_registered",
     "with_capability",
 ]
 
@@ -299,37 +301,61 @@ _PAID_NAME_CHARS = frozenset(
 )
 
 
-def paid_models() -> list[str]:
-    """The paid model ids this node offers, from :data:`PAID_MODELS_ENV`.
+#: The names registered in the database, as the web handler loaded them for
+#: the request this thread is serving (:func:`remember_registered`). The menus
+#: are drawn without a connection in hand, and one request is one thread.
+_THREAD = threading.local()
 
-    A list of **names** and nothing else (docs/plans/agentic-cli.md §3.7). No
-    credential, and no network call: a name is not a secret, and the node must
-    not be able to verify one, because verifying it would mean calling it. Read
-    on every call, like the menus' catalogue, so the web and the worker agree
-    with whatever their unit files say — and both units must say the same
-    thing, or the page offers a model the worker would send to Ollama.
 
-    Order is kept, duplicates dropped, and anything that is not model-id
-    shaped — or that is the word ``paid`` or ``local`` itself — is ignored.
+def _paid_name(word: str) -> bool:
+    return (
+        word not in (PAID, "local")
+        and bool(word)
+        and word[0].isalnum()
+        and len(word) <= 128
+        and not (set(word) - _PAID_NAME_CHARS)
+    )
+
+
+def remember_registered(names: list[str] | None) -> None:
+    """Hand this thread the registered names; the web does it per request."""
+    _THREAD.names = list(names or [])
+
+
+def paid_models(conn: Any = None) -> list[str]:
+    """The paid model ids this node routes off the node.
+
+    Two sources, in this order, duplicates dropped: the names registered in the
+    database (``sketchgen paid models add``; read from ``conn`` when given, or
+    from what :func:`remember_registered` handed this thread), then
+    :data:`PAID_MODELS_ENV`. A list of **names** and nothing else
+    (docs/plans/agentic-cli.md §3.7): no credential, and no network call — the
+    node must not be able to verify a name, because verifying it would mean
+    calling it.
+
+    Anything that is not model-id shaped, or that is the word ``paid`` or
+    ``local`` itself, is ignored.
     """
-    raw = os.environ.get(PAID_MODELS_ENV, "")
+    if conn is not None:
+        from . import db  # local: db is the lower layer and never imports this
+
+        registered = db.get_paid_models(conn)
+    else:
+        registered = list(getattr(_THREAD, "names", []) or [])
     found: list[str] = []
-    for word in raw.replace(",", " ").split():
-        if word in (PAID, "local") or word in found:
-            continue
-        if not word[0].isalnum() or len(word) > 128 or set(word) - _PAID_NAME_CHARS:
-            continue
-        found.append(word)
+    for word in registered + os.environ.get(PAID_MODELS_ENV, "").replace(",", " ").split():
+        if _paid_name(word) and word not in found:
+            found.append(word)
     return found
 
 
-def is_paid(name: str | None) -> bool:
+def is_paid(name: str | None, conn: Any = None) -> bool:
     """True for ``paid`` and for any name in :func:`paid_models`."""
     text = (name or "").strip()
-    return bool(text) and (text == PAID or text in paid_models())
+    return bool(text) and (text == PAID or text in paid_models(conn))
 
 
-def ran_off_node(name: str | None) -> bool:
+def ran_off_node(name: str | None, conn: Any = None) -> bool:
     """Whether a model id recorded on an entry names a model not run here.
 
     What the gallery's badge reads (docs/plans/agentic-cli.md §1), so it must
@@ -350,7 +376,7 @@ def ran_off_node(name: str | None) -> bool:
     text = (name or "").strip()
     if not text or text in ("local", "stub"):
         return False
-    if is_paid(text):
+    if is_paid(text, conn):
         return True
     _, colon, tag = text.partition(":")
     return not colon or tag.endswith("cloud")

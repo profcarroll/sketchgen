@@ -1353,14 +1353,18 @@ def _off_node(conn: sqlite3.Connection, row: Any) -> list[tuple[str, str]]:
     about the entry, and did not make it. Read by :func:`sketchgen.models.
     ran_off_node`, from the ids alone, so a re-render reaches the same answer.
     """
+    # The ledger's critic chips are drawn further down without a connection;
+    # this is where the page first has one, so the registered paid names are
+    # handed to the thread here for them (sketchgen.models.remember_registered).
+    models.remember_registered(models.paid_models(conn))
     found = [
         (step, str(row[step]))
         for step in ("planner", "executor")
-        if models.ran_off_node(row[step])
+        if models.ran_off_node(row[step], conn)
     ]
     link = _lineage_row(conn, int(row["id"]))
     who = str((link["critique_by"] if link is not None else "") or "").strip()
-    if who and models.ran_off_node(who) and _critic_is_a_model(conn, row, who):
+    if who and models.ran_off_node(who, conn) and _critic_is_a_model(conn, row, who):
         found.append(("critic", who))
     return found
 

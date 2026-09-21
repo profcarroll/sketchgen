@@ -9,6 +9,9 @@ on a machine that holds a credential (docs/plans/agentic-cli.md §3.8):
   status  what is waiting for an answer from off the node, per step
   release hand claimed subjects back to the local path (the critic's entries)
   assign  which model runs each step by default — or all four at once
+  models  register the paid model ids this node routes off the node
+  preflight  ready or not, and the fix for each thing that is not
+  wait    block until a job needs you, is done, or cannot move
 
 Every verb takes ``--json`` and prints one object. Exit codes, as everywhere in
 this project: 0 success, 1 failure, 3 refused (no database, not a packet, a
@@ -62,7 +65,8 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 
 
 def _ctx(args: argparse.Namespace) -> paid_mod.Context:
-    return paid_mod.Context(jobs_dir=Path(os.path.expanduser(args.jobs_dir)))
+    return paid_mod.Context(jobs_dir=Path(os.path.expanduser(args.jobs_dir)),
+                            job=getattr(args, "job", None))
 
 
 def _run(args: argparse.Namespace, work) -> int:
@@ -100,11 +104,20 @@ def cmd_export(args: argparse.Namespace) -> int:
             conn, args.step, model=model, limit=args.limit, ctx=_ctx(args)
         )
         count = len(packet["items"])
+        text = json.dumps(packet, indent=2, sort_keys=True) + "\n"
+        if args.out == "-":
+            # The packet itself is the output: over ssh it lands on the
+            # laptop with no scp, and `paid import -` takes it back on stdin.
+            if not count:
+                print(f"nothing to {args.step}: no item is waiting for {model}",
+                      file=sys.stderr)
+                return EXIT_OK
+            sys.stdout.write(text)
+            return EXIT_OK
         out = Path(os.path.expanduser(args.out))
         if count:
             out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(json.dumps(packet, indent=2, sort_keys=True) + "\n",
-                           encoding="utf-8")
+            out.write_text(text, encoding="utf-8")
         if args.json:
             print(json.dumps({"step": args.step, "items": count,
                               "out": str(out) if count else None}, sort_keys=True))
@@ -133,18 +146,24 @@ def _save_rejected(path: Path, rejected: list[dict]) -> Path | None:
 
 def cmd_import(args: argparse.Namespace) -> int:
     def work(conn: sqlite3.Connection) -> int:
-        path = Path(os.path.expanduser(args.file))
+        stdin = args.file == "-"
+        path = Path("stdin") if stdin else Path(os.path.expanduser(args.file))
         try:
-            packet = json.loads(path.read_text(encoding="utf-8"))
+            text = sys.stdin.read() if stdin else path.read_text(encoding="utf-8")
+            packet = json.loads(text)
         except OSError as exc:
             raise paid_mod.PaidRefused(f"cannot read {path}: {exc}") from exc
         except json.JSONDecodeError as exc:
             raise paid_mod.PaidRefused(f"{path} is not JSON: {exc}") from exc
         report = paid_mod.import_packet(conn, packet, ctx=_ctx(args))
-        saved = _save_rejected(path, report.rejected)
-        if args.json:
+        # From stdin there is no file to save beside; the rejected answers go
+        # back in the output instead, so they are still never lost.
+        saved = None if stdin else _save_rejected(path, report.rejected)
+        if args.json or stdin:
             payload = report.as_dict()
             payload["rejected_saved"] = str(saved) if saved else None
+            if stdin:
+                payload["rejected"] = report.rejected
             print(json.dumps(payload, sort_keys=True))
             return EXIT_OK
         print(f"{len(report.recorded)} {report.step} item(s) landed from {path}"
@@ -193,6 +212,75 @@ def cmd_release(args: argparse.Namespace) -> int:
     return _run(args, work)
 
 
+def cmd_models(args: argparse.Namespace) -> int:
+    def work(conn: sqlite3.Connection) -> int:
+        names = db.get_paid_models(conn)
+        for name in args.names:
+            if args.action == "add":
+                paid_mod._check_model(name)
+                if ":" in name:
+                    raise paid_mod.PaidRefused(
+                        f"{name!r} looks like an Ollama tag (name:tag); a paid "
+                        "model id has no tag, or the node could not tell them apart"
+                    )
+        if args.action == "add":
+            names = db.set_paid_models(conn, names + list(args.names))
+        elif args.action == "remove":
+            names = db.set_paid_models(conn, [n for n in names if n not in args.names])
+        from_env = [n for n in models.paid_models() if n not in names]
+        if args.json:
+            print(json.dumps({"registered": names, "from_environment": from_env}))
+            return EXIT_OK
+        print("registered: " + (", ".join(names) or "(none)"))
+        if from_env:
+            print(f"from {models.PAID_MODELS_ENV} in this shell: " + ", ".join(from_env))
+        return EXIT_OK
+
+    return _run(args, work)
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    def work(conn: sqlite3.Connection) -> int:
+        result = paid_mod.preflight(conn, args.model)
+        if args.json:
+            print(json.dumps(result, sort_keys=True))
+        else:
+            print("READY" if result["ready"] else "NOT READY")
+            for row in result["checks"]:
+                mark = "ok  " if row["ok"] else "FAIL"
+                print(f"  {mark} {row['check']:<11} {row['detail']}")
+                if not row["ok"]:
+                    print(f"       fix ({row['who']}): {row['fix']}")
+            info = result["info"]
+            if info:
+                print(f"  jobs queued ahead: {info['queued_ahead']}")
+                if info["assignment"]:
+                    print("  assignment: " + ", ".join(
+                        f"{k}={v}" for k, v in sorted(info["assignment"].items())))
+            if not result["ready"]:
+                print("Fix what is yours; report what is the operator's, and stop.")
+        return EXIT_OK if result["ready"] else EXIT_REFUSED
+
+    return _run(args, work)
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    def work(conn: sqlite3.Connection) -> int:
+        result = paid_mod.wait_for(conn, args.job, timeout=args.timeout,
+                                   interval=args.interval)
+        if args.json:
+            print(json.dumps(result, sort_keys=True))
+        else:
+            print(result["say"])
+            if result.get("command"):
+                print(f"next: {result['command']}")
+        if result["timed_out"]:
+            return EXIT_FAIL
+        return EXIT_REFUSED if result["do"] == "stop" else EXIT_OK
+
+    return _run(args, work)
+
+
 def _assign_changes(args: argparse.Namespace) -> dict[str, str | None]:
     changes: dict[str, str | None] = {}
     if args.all:
@@ -218,7 +306,7 @@ def cmd_assign(args: argparse.Namespace) -> int:
         changes = _assign_changes(args)
         assignment = (db.set_assignment(conn, changes) if changes
                       else db.get_assignment(conn))
-        paid_names = set(models.paid_models())
+        paid_names = set(models.paid_models(conn))
         notes = []
         for step, model in sorted(assignment.items()):
             if model != "paid" and model not in paid_names and ":" not in model:
@@ -228,7 +316,7 @@ def cmd_assign(args: argparse.Namespace) -> int:
                     "parks it for the laptop only if its unit names it, and "
                     "otherwise sends it to Ollama"
                 )
-        if models.is_paid(assignment.get("execute")) or (
+        if models.is_paid(assignment.get("execute"), conn) or (
             assignment.get("execute") and ":" not in assignment["execute"]
         ):
             notes.append(
@@ -283,7 +371,9 @@ def register(top: argparse._SubParsersAction) -> None:
                      help="the model that will answer, e.g. claude-opus-5 "
                           "(default: the step's assignment, `paid assign`)")
     exp.add_argument("--out", required=True, metavar="FILE",
-                     help="where to write the packet")
+                     help="where to write the packet; - writes it to stdout")
+    exp.add_argument("--job", type=int, default=None, metavar="N",
+                     help="plan and execute: offer only job N (your own)")
     exp.add_argument("--limit", type=int, default=20, metavar="N",
                      help="at most this many items (default: %(default)s)")
     _add_common(exp)
@@ -300,7 +390,8 @@ def register(top: argparse._SubParsersAction) -> None:
             "FILE.rejected.json."
         ),
     )
-    imp.add_argument("file", metavar="FILE", help="the filled-in packet")
+    imp.add_argument("file", metavar="FILE",
+                     help="the filled-in packet; - reads it from stdin")
     _add_common(imp)
     imp.set_defaults(func=cmd_import, _parser=imp)
 
@@ -330,6 +421,56 @@ def register(top: argparse._SubParsersAction) -> None:
     rel.add_argument("--all", action="store_true", help="release every claim")
     _add_common(rel)
     rel.set_defaults(func=cmd_release, _parser=rel)
+
+    mod = sub.add_parser(
+        "models",
+        help="the paid model ids this node routes off the node",
+        description=(
+            "Register the ids of models that answer off the node. Names only, "
+            "never a key. Every process reads this list from the database, so "
+            "a name added here routes at once — no unit file, no restart. "
+            "SKETCHGEN_PAID_MODELS in a unit's environment still counts too."
+        ),
+    )
+    mod.add_argument("action", nargs="?", choices=("list", "add", "remove"),
+                     default="list")
+    mod.add_argument("names", nargs="*", metavar="MODEL_ID")
+    _add_common(mod)
+    mod.set_defaults(func=cmd_models, _parser=mod)
+
+    pre = sub.add_parser(
+        "preflight",
+        help="ready or not ready to run a job as MODEL, and why",
+        description=(
+            "Every check the paid flow depends on — schema, the model's "
+            "registration, one running worker, the generator running — each "
+            "with the command that fixes it and whose command that is. Exit 0 "
+            "ready, 3 not ready. Run it first; if it is not ready, fix what is "
+            "yours and report the rest."
+        ),
+    )
+    pre.add_argument("--as", dest="model", required=True, metavar="MODEL_ID",
+                     help="your own exact model id")
+    _add_common(pre)
+    pre.set_defaults(func=cmd_preflight, _parser=pre)
+
+    wai = sub.add_parser(
+        "wait",
+        help="block until job N needs you, is finished, or cannot move",
+        description=(
+            "Read-only. Returns when the job is parked for a step you answer "
+            "(and prints the export command), when it is held/published/failed, "
+            "when it needs a person, or when the generator is paused. Exit 0, "
+            "1 on timeout, 3 when there is nothing for you to do but report."
+        ),
+    )
+    wai.add_argument("--job", type=int, required=True, metavar="N")
+    wai.add_argument("--timeout", type=float, default=1800.0, metavar="S",
+                     help="give up after S seconds (default %(default)s)")
+    wai.add_argument("--interval", type=float, default=5.0, metavar="S",
+                     help="poll every S seconds (default %(default)s)")
+    _add_common(wai)
+    wai.set_defaults(func=cmd_wait, _parser=wai)
 
     asg = sub.add_parser(
         "assign",
