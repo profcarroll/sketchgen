@@ -75,6 +75,20 @@ A grey field that breathes, with one circle held still in the middle of it.
 PAID_ENV = {models.PAID_MODELS_ENV: "claude-opus-5, claude-sonnet-5"}
 
 
+def migrations_upto(version, into):
+    """A migrations directory holding everything up to ``version``.
+
+    How a test builds a database as it stood before some migration and then
+    applies that one migration to it. The directory is the argument
+    :func:`db.migrate` takes, so nothing is mocked.
+    """
+    into.mkdir(parents=True, exist_ok=True)
+    for sql in sorted(db.MIGRATIONS_DIR.glob("*.sql")):
+        if int(sql.name[:3]) <= version:
+            shutil.copy(sql, into / sql.name)
+    return into
+
+
 class PaidTestCase(unittest.TestCase):
     """One temp directory, one temp database, three published entries."""
 
@@ -576,11 +590,7 @@ class Migration014Tests(unittest.TestCase):
     def test_a_database_at_013_keeps_its_jobs_and_learns_execute(self):
         tmp = Path(tempfile.mkdtemp(prefix="sketchgen-014-"))
         self.addCleanup(shutil.rmtree, tmp, True)
-        before = tmp / "migrations"
-        before.mkdir()
-        for sql in sorted(db.MIGRATIONS_DIR.glob("*.sql")):
-            if not sql.name.startswith("014"):
-                shutil.copy(sql, before / sql.name)
+        before = migrations_upto(13, tmp / "migrations")
         conn = db.connect(tmp / "old.db")
         self.addCleanup(conn.close)
         db.migrate(conn, before)
@@ -595,7 +605,10 @@ class Migration014Tests(unittest.TestCase):
         db.add_attempt(conn, job_id, 1, model="qwen3-coder:30b", evidence="e")
         was = dict(conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
 
-        self.assertEqual(db.migrate(conn), [14])
+        # 014 alone: 015 adds two columns to this very table, and the row this
+        # test compares before and after is the rebuild's, not theirs.
+        self.assertEqual(db.migrate(conn, migrations_upto(14, tmp / "through14")),
+                         [14])
         now = dict(conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
         self.assertEqual(was, now)
         self.assertEqual(list(was), list(now), "column order changed")
@@ -1902,3 +1915,308 @@ class UsageTests(AgentLoopTests):
         attempt = db.list_attempts(self.conn, job)[0]
         self.assertEqual((attempt.prompt_tokens, attempt.completion_tokens), (None, None))
         self.assertIsNotNone(attempt.wall_s)
+
+
+# ---------------------------------------------------------------------------
+# The process cost (packet 8)
+# ---------------------------------------------------------------------------
+
+
+class Migration015Tests(unittest.TestCase):
+    """Five nullable columns, and nothing already written moves.
+
+    015 is `ALTER TABLE … ADD COLUMN` five times, so this is less about the
+    SQL than about the promise attached to it: a node mid-deploy, with rows
+    written under 014, reads them all back afterwards.
+    """
+
+    def test_a_database_at_014_keeps_every_row_and_gains_the_columns(self):
+        tmp = Path(tempfile.mkdtemp(prefix="sketchgen-015-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        conn = db.connect(tmp / "old.db")
+        self.addCleanup(conn.close)
+        db.migrate(conn, migrations_upto(14, tmp / "migrations"))
+        self.assertEqual(db.schema_version(conn), 14)
+
+        job_id = db.enqueue(conn, "a tide of slow lines", "octocat", brief="a brief",
+                            planner="claude-sonnet-5", executor="claude-sonnet-5")
+        db.add_attempt(conn, job_id, 1, model="claude-sonnet-5", wall_s=111.0,
+                       prompt_tokens=2100, completion_tokens=3300, gate_exit=0)
+        entry_id = db.create_entry(conn, job_id, prompt="a tide of slow lines",
+                                   wall_s=111.0, attempts=1)
+        jobs = dict(conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
+        entries = dict(conn.execute("SELECT * FROM entries WHERE id = ?",
+                                    (entry_id,)).fetchone())
+
+        self.assertEqual(db.migrate(conn), [15])
+        self.assertEqual(db.schema_version(conn), 15)
+
+        job = db.get_job(conn, job_id)
+        self.assertEqual(jobs, {k: v for k, v in dict(
+            conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        ).items() if k in jobs})
+        self.assertEqual(entries, {k: v for k, v in dict(
+            conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+        ).items() if k in entries})
+        # The new columns are null on every row written before them, which is
+        # the true thing to say about a job nobody reported a cost for.
+        self.assertEqual((job.since_utc, job.note), (None, None))
+        self.assertIsNone(db.list_attempts(conn, job_id)[0].process_json)
+        after = dict(conn.execute("SELECT * FROM entries WHERE id = ?",
+                                  (entry_id,)).fetchone())
+        self.assertEqual((after["note"], after["process_json"]), (None, None))
+        # and they are writable through the verbs, not by hand
+        db.transition(conn, job_id, "planning")
+        self.assertEqual(db.get_job(conn, job_id).state, "planning")
+
+    def test_db_init_applies_it(self):
+        tmp = Path(tempfile.mkdtemp(prefix="sketchgen-015-init-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.assertIn(15, db.init(tmp / "fresh.db"))
+        conn = db.connect(tmp / "fresh.db")
+        self.addCleanup(conn.close)
+        self.assertEqual(db.schema_version(conn), 15)
+        self.assertGreaterEqual(db.schema_version(self.fixture()), 15)
+
+    def fixture(self):
+        tmp = Path(tempfile.mkdtemp(prefix="sketchgen-015-fixture-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        conn, _ids = test_judge.build_entries(tmp)
+        self.addCleanup(conn.close)
+        return conn
+
+
+class ProcessCostTests(AgentLoopTests):
+    """What the work around the reply cost, recorded beside it and kept apart.
+
+    Job 1286 became entry 1279 in 4 min 26 s of node time. The 37 minutes and
+    193,000 generated tokens before `paid start` — a browser rig, a local
+    prototype, a skill — were nowhere, and the entry reads as a sketch written
+    in under two minutes. These are the two costs (dossier 01 §6.4): the reply's,
+    which the node measures, and the process's, which only the agent knows.
+    """
+
+    PROCESS = {"session_s": 2520, "output_tokens": 207537, "thinking_tokens": 42000,
+               "tool_calls": 41, "screenshots": 9, "effort": "max"}
+
+    def drive(self, *, process=None, usage=None, since=None, note=None, tries=0):
+        """One whole job, off the node, through the worker's stub gate."""
+        job = self.start(since=since, note=note)["job"]
+        self.worker().run_once()                       # parked for the plan
+        packet = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        packet["items"][0]["answer"] = CLEAN_PLAN
+        paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.worker().run_once()                       # parked for the attempt
+        for k in range(1, tries + 1):
+            # What packet 7 leaves behind: the count outlives the request, and
+            # it is the node's own, never the agent's word.
+            db.add_paid_try(self.conn, job, self.MODEL, k,
+                            str(self.jobs_dir / str(job) / f"try-{k}"))
+            db.drop_paid_try(self.conn, job, k)
+        packet = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        packet["items"][0]["answer"] = GOOD_SKETCH
+        if usage is not None:
+            packet["items"][0]["usage"] = usage
+        if process is not None:
+            packet["items"][0]["process"] = process
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.worker().run_once()                       # the gate, and the entry
+        return job, report
+
+    def entry_of(self, job):
+        return self.conn.execute(
+            "SELECT * FROM entries WHERE job_id = ?", (job,)).fetchone()
+
+    # -- the object ------------------------------------------------------------
+
+    def test_the_item_offers_a_process_slot_only_where_there_is_a_row_for_it(self):
+        job = self.start()["job"]
+        self.worker().run_once()
+        plan = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        self.assertNotIn("process", plan["items"][0])
+        plan["items"][0]["answer"] = CLEAN_PLAN
+        paid.import_packet(self.conn, plan, ctx=self.ctx)
+        self.worker().run_once()
+        attempt = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        self.assertEqual(attempt["items"][0]["process"], paid.EMPTY_PROCESS)
+        self.assertIn("tokens generated", attempt["how_to_answer"])
+
+    def test_process_is_read_as_numbers_or_not_at_all(self):
+        read = paid.process_of({"process": {"session_s": "2520.4", "output_tokens": "9",
+                                            "tool_calls": -3, "screenshots": "lots",
+                                            "effort": "  max  "}})
+        self.assertEqual(read["session_s"], 2520.4)
+        self.assertEqual(read["output_tokens"], 9)
+        self.assertIsNone(read["tool_calls"])
+        self.assertIsNone(read["screenshots"])
+        self.assertEqual(read["effort"], "max")
+        self.assertEqual(paid.process_of({}), paid.EMPTY_PROCESS)
+        self.assertFalse(paid.process_reported(paid.process_of({})))
+
+    # -- where it lands --------------------------------------------------------
+
+    def test_a_reported_process_lands_on_the_attempt_then_on_the_entry(self):
+        job, _report = self.drive(process=self.PROCESS, tries=4,
+                                  note="skill=algorithmic-art; local prototype")
+        attempt = db.list_attempts(self.conn, job)[0]
+        found = json.loads(attempt.process_json)
+        self.assertEqual(found["session_s"], 2520.0)
+        self.assertEqual(found["output_tokens"], 207537)
+        self.assertEqual(found["effort"], "max")
+        # the one field the node fills in itself
+        self.assertEqual(found["tries"], 4)
+        entry = self.entry_of(job)
+        self.assertEqual(json.loads(entry["process_json"]), found)
+        self.assertEqual(entry["note"], "skill=algorithmic-art; local prototype")
+
+    def test_an_unreported_process_is_null_on_both_rows_and_never_zero(self):
+        job, _report = self.drive()
+        self.assertIsNone(db.list_attempts(self.conn, job)[0].process_json)
+        self.assertIsNone(self.entry_of(job)["process_json"])
+        self.assertIsNone(self.entry_of(job)["note"])
+
+    def test_a_half_reported_process_keeps_the_rest_null(self):
+        job, _report = self.drive(process={"output_tokens": 12000})
+        found = json.loads(db.list_attempts(self.conn, job)[0].process_json)
+        self.assertEqual(found["output_tokens"], 12000)
+        self.assertIsNone(found["session_s"])
+        self.assertIsNone(found["tool_calls"])
+        self.assertNotIn("tries", found)
+
+    def test_the_tries_alone_are_recorded_when_the_agent_reports_nothing(self):
+        job, _report = self.drive(tries=2)
+        found = json.loads(db.list_attempts(self.conn, job)[0].process_json)
+        self.assertEqual(found["tries"], 2)
+        self.assertIsNone(found["output_tokens"])
+
+    def test_the_process_cost_changes_none_of_the_reply_s_own_numbers(self):
+        """The two costs stay two numbers (plan §5.3).
+
+        Nothing in pairs.py, the judge or a batch total reads `process_json`;
+        the columns they do read are the same with a process object and
+        without one, on two jobs answered identically.
+        """
+        usage = {"prompt_tokens": 2100, "completion_tokens": 3300}
+        with_cost, _ = self.drive(usage=usage, process=self.PROCESS, tries=4)
+        without, _ = self.drive(usage=usage)
+        columns = "prompt_tokens, completion_tokens, attempts"
+        rows = [dict(self.conn.execute(
+            f"SELECT {columns} FROM entries WHERE job_id = ?", (job,)).fetchone())
+            for job in (with_cost, without)]
+        self.assertEqual(rows[0], rows[1])
+        attempts = [db.list_attempts(self.conn, job)[0] for job in (with_cost, without)]
+        self.assertEqual(attempts[0].prompt_tokens, attempts[1].prompt_tokens)
+        self.assertEqual(attempts[0].completion_tokens, attempts[1].completion_tokens)
+        # wall_s is the round trip the node timed, not the session the agent
+        # reported: 2,520 s of process time never reaches it.
+        for attempt in attempts:
+            self.assertLess(attempt.wall_s, 600)
+        self.assertEqual(self.entry_of(with_cost)["wall_s"], attempts[0].wall_s)
+
+    # -- --since, and the budget line -----------------------------------------
+
+    def test_start_records_since_and_note_and_next_echoes_the_elapsed(self):
+        since = (datetime.now(timezone.utc) - timedelta(minutes=42)).strftime(db.UTC_FORMAT)
+        result = self.start(since=since, note="skill=algorithmic-art")
+        job = db.get_job(self.conn, result["job"])
+        self.assertEqual((job.since_utc, job.note), (since, "skill=algorithmic-art"))
+        self.assertEqual(result["budget_say"],
+                         "budget: held within 10 min of --since, under 30,000 tokens "
+                         "generated, 8 tries · advisory")
+        sleep, clock = self.fake_time()
+        now = paid.next_for(self.conn, job.id, self.MODEL, timeout=0, sleep=sleep,
+                            clock=clock, ctx=self.ctx)
+        self.assertEqual(now["elapsed"]["from"], "--since")
+        self.assertEqual(now["elapsed"]["minutes"], 42.0)
+        self.assertIn("42 min", now["elapsed"]["say"])
+        self.assertIn("over budget by 32 min", now["elapsed"]["over_budget"])
+
+    def test_without_since_the_elapsed_counts_from_the_lease_and_says_so(self):
+        job = self.start()["job"]
+        sleep, clock = self.fake_time()
+        now = paid.next_for(self.conn, job, self.MODEL, timeout=0, sleep=sleep,
+                            clock=clock, ctx=self.ctx)
+        self.assertEqual(now["elapsed"]["from"], "the lease")
+        self.assertIsNone(now["elapsed"]["over_budget"])
+        self.assertIn("from the lease", now["elapsed"]["say"])
+
+    def test_an_over_budget_import_says_so_and_records_anyway(self):
+        since = (datetime.now(timezone.utc) - timedelta(minutes=42)).strftime(db.UTC_FORMAT)
+        job = self.start(since=since)["job"]
+        self.worker().run_once()
+        packet = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        packet["items"][0]["answer"] = CLEAN_PLAN
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(len(report.recorded), 1)
+        self.assertEqual(db.get_job(self.conn, job).state, "queued")
+        self.assertIn("over budget by 32 min", report.elapsed["over_budget"])
+        self.assertIn("finish, and report it", report.elapsed["over_budget"])
+        self.assertEqual(report.as_dict()["elapsed"]["from"], "--since")
+
+    def test_the_tokens_an_agent_reports_are_measured_against_the_budget(self):
+        job, report = self.drive(process={"output_tokens": 207537})
+        self.assertIn("177,537 tokens generated", report.elapsed["over_budget"])
+        self.assertEqual(paid.tokens_generated(self.conn, job), 207537)
+
+    def test_a_since_that_cannot_be_true_is_refused_and_nothing_is_queued(self):
+        queued = len(db.list_jobs(self.conn, "queued"))
+        ahead = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime(db.UTC_FORMAT)
+        old = (datetime.now(timezone.utc) - timedelta(days=2)).strftime(db.UTC_FORMAT)
+        for bad, word in ((ahead, "future"), (old, "last session"), ("yesterday", "UTC")):
+            with self.subTest(since=bad):
+                with self.assertRaises(paid.PaidRefused) as caught:
+                    self.start(since=bad)
+                self.assertIn(word, str(caught.exception))
+        with self.assertRaises(paid.PaidRefused):
+            self.start(note="x" * (paid.NOTE_MAX + 1))
+        self.assertEqual(queued, len(db.list_jobs(self.conn, "queued")))
+
+    def test_since_takes_what_date_u_prints_and_an_offset_too(self):
+        now = "2026-09-21T14:03:22Z"
+        self.assertEqual(paid.parse_since("2026-09-21T14:00:00Z", now=now),
+                         "2026-09-21T14:00:00Z")
+        self.assertEqual(paid.parse_since("2026-09-21T10:00:00-04:00", now=now),
+                         "2026-09-21T14:00:00Z")
+        self.assertEqual(paid.parse_since("2026-09-21 13:55:00", now=now),
+                         "2026-09-21T13:55:00Z")
+        self.assertIsNone(paid.parse_since(None))
+
+    # -- the budget verb, and the freshness pair --------------------------------
+
+    def test_the_budget_verb_writes_the_rows_start_reads(self):
+        self.assertEqual(paid.budget(self.conn),
+                         {"minutes": 10.0, "tokens": 30000, "tries": 8})
+        written = paid.set_budget(self.conn, tokens=20000, tries=2)
+        self.assertEqual(written, {"minutes": 10.0, "tokens": 20000, "tries": 2})
+        self.assertEqual(paid.try_cap(self.conn), 2)
+        self.assertIn("under 20,000 tokens generated", self.start()["budget_say"])
+        with self.assertRaises(paid.PaidRefused):
+            paid.set_budget(self.conn, minutes=0)
+
+    def test_the_budget_verb_prints_and_writes_from_the_command_line(self):
+        printed = self.cli("paid", "budget")
+        self.assertEqual(printed.returncode, 0, printed.stderr)
+        self.assertIn("under 30,000 tokens generated", printed.stdout)
+        written = self.cli("paid", "budget", "--tokens", "20000", "--json")
+        self.assertEqual(written.returncode, 0, written.stderr)
+        self.assertEqual(json.loads(written.stdout)["tokens"], 20000)
+        self.assertIn("under 20,000 tokens generated", self.cli("paid", "budget").stdout)
+
+    def test_the_preflight_says_which_checkout_the_node_is_on(self):
+        report = paid.preflight(self.conn, self.MODEL, **self.one_worker)
+        self.assertIn("node_commit", report["info"])
+        self.assertEqual(report["info"]["agents_md_sha256"],
+                         paid.sha256_file(REPO_ROOT / "AGENTS.md"))
+        self.assertEqual(report["info"]["budget"], paid.budget(self.conn))
+        started = self.start()
+        self.assertEqual(started["node_commit"], report["info"]["node_commit"])
+        self.assertEqual(started["agents_md_sha256"],
+                         report["info"]["agents_md_sha256"])
+
+    def test_a_node_with_no_git_reports_a_null_commit_and_no_failure(self):
+        db.set_paid_models(self.conn, [self.MODEL])
+        with mock.patch.dict(os.environ, {"PATH": ""}, clear=False):
+            self.assertIsNone(paid.node_commit())
+            report = paid.preflight(self.conn, self.MODEL, **self.one_worker)
+        self.assertTrue(report["ready"], report["checks"])
+        self.assertIsNone(report["info"]["node_commit"])

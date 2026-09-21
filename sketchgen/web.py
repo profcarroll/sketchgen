@@ -3418,6 +3418,37 @@ def _artefacts(app: App, job_id: int, attempt_n: int) -> str:
     return '<div class="cards">' + "".join(shots) + "</div>"
 
 
+def process_line(attempt: db.Attempt) -> str:
+    """What the agent said this attempt's work cost it, for the footer line.
+
+    Migration 015, beside the reply's own numbers and never added to them:
+    the seconds and tokens to the left of it are the round trip and the reply,
+    and these are the session around it. Empty for every local attempt, which
+    has no agent to have reported anything.
+    """
+    try:
+        found = json.loads(attempt.process_json or "")
+    except ValueError:
+        return ""
+    if not isinstance(found, dict):
+        return ""
+    parts = []
+    if isinstance(found.get("session_s"), (int, float)):
+        parts.append(f"{human_seconds(found['session_s'])} session")
+    for key, word in (("output_tokens", "generated"),
+                      ("thinking_tokens", "thinking"),
+                      ("tool_calls", "tool calls"),
+                      ("screenshots", "screenshots"),
+                      ("tries", "tries")):
+        if isinstance(found.get(key), int) and not isinstance(found[key], bool):
+            parts.append(f"{found[key]:,} {word}")
+    if found.get("effort"):
+        parts.append(f"effort {esc(found['effort'])}")
+    if not parts:
+        return ""
+    return " · process: " + " · ".join(parts) + " (as reported by the agent)"
+
+
 def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
     attempts = db.list_attempts(conn, job.id)
     attempt_n = attempts[-1].n if attempts else 0
@@ -3475,7 +3506,8 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
             f"prompt {esc(attempt.prompt_version or '—')} · "
             f"{esc(attempt.prompt_tokens or 0)} in / {esc(attempt.completion_tokens or 0)} out · "
             f"{esc(human_seconds(attempt.wall_s))} wall"
-            "</p></section>"
+            + process_line(attempt)
+            + "</p></section>"
         )
     if not blocks:
         blocks.append(
@@ -3498,6 +3530,11 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
         ("parent entry", f"entry {job.parent_entry_id}" if job.parent_entry_id else "—"),
         ("critique", job.critique or "—"),
         ("critique by", job.critique_by or "—"),
+        # Migration 015: the two things about a job only the agent that drove
+        # it could say. `since` is declared, not measured — the node's clock
+        # never saw the work before `paid start` (job 1286, entry 1279).
+        ("since (UTC, declared)", job.since_utc or "—"),
+        ("note", job.note or "—"),
         ("submitted by", job.submitted_by),
         ("created (UTC)", job.created_utc),
         ("updated (UTC)", job.updated_utc),

@@ -130,6 +130,11 @@ META_KEYS = (
     "prompt_tokens",
     "completion_tokens",
     "wall_s",
+    # Migration 015: what the agent reported the work around the reply cost,
+    # and the line it wrote about how this entry was made. Beside the numbers
+    # above, never added to them, and read by nothing that measures anything.
+    "process",
+    "note",
     "shape",
     "seed",
     "lineage",
@@ -1217,6 +1222,31 @@ def _timing(report: dict[str, Any], key: str) -> float | None:
     return float(value)
 
 
+def _process(row: sqlite3.Row) -> dict[str, Any] | None:
+    """The entry's process cost as an object, or None (migration 015).
+
+    Written by the worker from the attempt this entry kept, which got it from
+    the agent that answered. Unreadable JSON is None, not a half object: this
+    is a line on a page, and there is nothing here worth guessing at.
+    """
+    try:
+        raw = row["process_json"]
+    except (IndexError, KeyError):  # pragma: no cover - a row from an old SELECT
+        return None
+    try:
+        found = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    if not isinstance(found, dict):
+        return None
+    # Imported here, not at the top: the shape of the object belongs to the
+    # paid path that wrote it, and the publisher should not carry that whole
+    # module to render a gallery of entries that never had one.
+    from . import paid as paid_mod
+
+    return {key: found.get(key) for key in paid_mod.PROCESS_KEYS if key in found}
+
+
 def _gate_log(attempts: list[sqlite3.Row]) -> list[dict[str, Any]]:
     """What each attempt's gate run said — §7's "and what each attempt's gate
     run said", from report.json where there is one."""
@@ -1285,6 +1315,8 @@ def _meta(
         "prompt_tokens": row["prompt_tokens"],
         "completion_tokens": row["completion_tokens"],
         "wall_s": row["wall_s"],
+        "process": _process(row),
+        "note": row["note"],
         "shape": row["shape"],
         "seed": row["seed"],
         "lineage": {
@@ -2005,6 +2037,50 @@ def _lineage_text_panel(meta: dict[str, Any], line_page: bool) -> str:
     return "\n    ".join(parts)
 
 
+def _row_after(pairs: list[tuple[str, str]], label: str) -> int:
+    """Where a row goes to land directly after ``label``; the end if it is gone."""
+    for index, (name, _value) in enumerate(pairs):
+        if name == label:
+            return index + 1
+    return len(pairs)  # pragma: no cover - the table always has Wall seconds
+
+
+def _process_line(process: dict[str, Any] | None) -> str | None:
+    """The Process row's one line, or None when there is nothing to say.
+
+    `42 min · 207,537 tokens generated · 4 tries · as reported by the agent`,
+    with an em dash in any slot the agent left blank — the same rule as the
+    token counts above, because a blank is true and a guess is not.
+
+    The three slots are always printed, units and all, so a reader can see
+    what the dash is a dash *of*; `tries` is the node's own count of the gate
+    runs this sketch was given before it was committed to (`paid try`), and
+    `effort` is printed only when the harness named one.
+    """
+    if not process or all(value is None for value in process.values()):
+        return None
+    seconds = process.get("session_s")
+    minutes = (f"{round(float(seconds) / 60.0):,} min"
+               if isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
+               else "— min")
+    tokens = process.get("output_tokens")
+    generated = (f"{int(tokens):,} tokens generated"
+                 if isinstance(tokens, int) and not isinstance(tokens, bool)
+                 else "— tokens generated")
+    count = process.get("tries")
+    if isinstance(count, int) and not isinstance(count, bool):
+        tries = f"{count} {'try' if count == 1 else 'tries'}"
+    else:
+        tries = "— tries"
+    parts = [minutes, generated, tries]
+    if process.get("effort"):
+        parts.append(f"effort {process['effort']}")
+    # The suffix the provenance table already uses for anything a model said
+    # about itself. The node measured none of this but the tries.
+    parts.append("as reported by the agent")
+    return " · ".join(parts)
+
+
 def _provenance_rows(meta: dict[str, Any]) -> str:
     lineage = meta["lineage"]
     away = {item["step"] for item in meta.get("off_node") or []}
@@ -2088,6 +2164,16 @@ def _provenance_rows(meta: dict[str, Any]) -> str:
         ),
         ("Attribution", _esc(meta["attribution"])),
     ]
+    # After Wall seconds, and only when there is one: the process cost is the
+    # work around the reply — a prototype, a skill, the minutes before the job
+    # existed — and an entry no agent reported on has none, which is different
+    # from having a row of dashes (docs/plans/agent-rig.md §5.3).
+    process = _process_line(meta.get("process"))
+    if process:
+        pairs.insert(_row_after(pairs, "Wall seconds"), ("Process", _esc(process)))
+    if meta.get("note"):
+        pairs.insert(_row_after(pairs, "Process" if process else "Wall seconds"),
+                     ("Note", _esc(meta["note"])))
     if meta["last_error"]:
         pairs.append(("Last error", _esc(meta["last_error"])))
     return _rows(pairs)

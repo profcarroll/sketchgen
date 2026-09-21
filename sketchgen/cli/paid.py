@@ -4,7 +4,7 @@ A drop-in subcommand (see sketchgen/cli/__init__.py). The work is in
 sketchgen/paid.py; this is the shell around it, shaped to be driven by an agent
 on a machine that holds a credential (docs/plans/agentic-cli.md §3.8).
 
-The agent's own job is three verbs, repeated:
+The agent's own job is a handful of verbs, repeated:
 
   start   register yourself, preflight, queue one job as you, lease it
   next    what now: the packet to answer, "wait" (run it again), done, or stop
@@ -17,6 +17,7 @@ And the rest, for the per-entry steps and the operator:
   export  write what the node would have asked a model, for one step
   status  what is waiting for an answer from off the node, per step
   assign  which local model runs each step by default (paid: judge, critique)
+  budget  the advisory numbers `start` prints, and the per-job try cap
   models  register the paid model ids this node routes off the node
   preflight  ready or not, and the fix for each thing that is not
   wait    block until a job needs you (superseded by `next`, kept)
@@ -173,6 +174,9 @@ def cmd_import(args: argparse.Namespace) -> int:
             if stdin:
                 payload["rejected"] = report.rejected
             print(json.dumps(payload, sort_keys=True))
+            # The packet came up the pipe and the JSON is the answer, so the
+            # agent's own reading goes where its progress lines go.
+            _say_elapsed(report.elapsed, sys.stderr)
             return EXIT_OK
         print(f"{len(report.recorded)} {report.step} item(s) landed from {path}"
               + (f", {report.skipped} unanswered" if report.skipped else ""))
@@ -182,6 +186,7 @@ def cmd_import(args: argparse.Namespace) -> int:
             print(f"  rejected {row['item']}: {row['reason']}")
         if saved:
             print(f"the rejected answers are kept, verbatim, in {saved}")
+        _say_elapsed(report.elapsed, sys.stdout)
         if report.then():
             print(f"next: {report.then()}")
         return EXIT_OK
@@ -288,6 +293,15 @@ def _print_info(info: dict) -> None:
     if not info:
         return
     print(f"  jobs queued ahead: {info.get('queued_ahead', 0)}")
+    if info.get("node_commit"):
+        # DECIDE[freshness]: the checkout this node is running, so an agent
+        # can tell whether the AGENTS.md it read is the one the node cut its
+        # packets under (2026-09-21, a session reading #131 against #132).
+        print(f"  node commit: {info['node_commit']} — if `git merge-base "
+              f"--is-ancestor {info['node_commit'][:12]} HEAD` fails in your "
+              "checkout, pull before reading further")
+    if info.get("budget"):
+        print(f"  {paid_mod.budget_line(info['budget'])}")
     now = info.get("worker_now")
     if now:
         where = now.get("headline") or now.get("step")
@@ -324,6 +338,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             conn, model=args.model, prompt=prompt, by=args.by,
             planner=args.planner, executor=args.executor, rules_file=args.rules,
             max_attempts=args.max_attempts, publication=args.publication,
+            since=args.since, note=args.note,
         )
         if args.json:
             print(json.dumps(result, sort_keys=True))
@@ -343,8 +358,17 @@ def cmd_start(args: argparse.Namespace) -> int:
             print(f"started job {result['job']}: planner {result['planner']}, "
                   f"executor {result['executor']}, leased to {result['model']} "
                   f"until {result['lease_until']}")
+            # Advisory, and the word is in the line: nothing here refuses an
+            # import (DECIDE[agent-budget]). An agent with no number to hold
+            # itself to spent 37 minutes on entry 1279 without noticing.
+            print(f"  {result['budget_say']}"
+                  + (f", from {result['since_utc']}" if result.get("since_utc")
+                     else " · no --since: `elapsed` will count from the lease"))
+            if result.get("note"):
+                print(f"  note: {result['note']}")
             _print_info({"queued_ahead": result["queued_ahead"],
-                         "worker_now": result["worker_now"]})
+                         "worker_now": result["worker_now"],
+                         "node_commit": result.get("node_commit")})
             if result.get("partner"):
                 # Two agents on one job: say now who the other one is and what
                 # it runs, so the operator can bring it before `next` asks.
@@ -356,6 +380,23 @@ def cmd_start(args: argparse.Namespace) -> int:
     return _run(args, work)
 
 
+def _say_elapsed(elapsed: dict | None, stream) -> None:
+    """The `elapsed` line, and the over-budget line when there is one.
+
+    One line each, never more: a budget that shouts is a budget an agent
+    learns to skip. It is advisory — nothing here changes an exit code
+    (DECIDE[agent-budget]).
+    """
+    if not elapsed:
+        return
+    tokens = elapsed.get("tokens_generated")
+    print(elapsed["say"]
+          + (f"; {tokens:,} tokens generated" if isinstance(tokens, int) else ""),
+          file=stream)
+    if elapsed.get("over_budget"):
+        print(elapsed["over_budget"], file=stream)
+
+
 def cmd_next(args: argparse.Namespace) -> int:
     def work(conn: sqlite3.Connection) -> int:
         result = paid_mod.next_for(
@@ -365,6 +406,7 @@ def cmd_next(args: argparse.Namespace) -> int:
         # Always one JSON object on stdout: when `do` is `answer` it is the
         # packet itself, to be answered and given to `paid import -`.
         sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        _say_elapsed(result.get("elapsed"), sys.stderr)
         return EXIT_REFUSED if result["do"] == "stop" else EXIT_OK
 
     return _run(args, work)
@@ -404,6 +446,26 @@ def cmd_wait(args: argparse.Namespace) -> int:
         if result["timed_out"]:
             return EXIT_FAIL
         return EXIT_REFUSED if result["do"] == "stop" else EXIT_OK
+
+    return _run(args, work)
+
+
+def cmd_budget(args: argparse.Namespace) -> int:
+    def work(conn: sqlite3.Connection) -> int:
+        changing = any(value is not None
+                       for value in (args.minutes, args.tokens, args.tries))
+        limits = (paid_mod.set_budget(conn, minutes=args.minutes, tokens=args.tokens,
+                                      tries=args.tries)
+                  if changing else paid_mod.budget(conn))
+        if args.json:
+            print(json.dumps(limits, sort_keys=True))
+            return EXIT_OK
+        print(paid_mod.budget_line(limits))
+        print(f"  meta {paid_mod.BUDGET_KEY}: minutes and tokens · "
+              f"meta {paid_mod.TRY_CAP_KEY}: tries")
+        print("  advisory: `start` prints it, `next` and `import` say when a job "
+              "is past it, and nothing refuses.")
+        return EXIT_OK
 
     return _run(args, work)
 
@@ -623,7 +685,7 @@ def register(top: argparse._SubParsersAction) -> None:
         "start",
         help="begin one job as MODEL: register, preflight, queue, lease",
         description=(
-            "The first of the agent's three verbs. Registers MODEL as a paid "
+            "The first of the agent's verbs. Registers MODEL as a paid "
             "model if it is not (a name, never a key), runs the preflight and "
             "refuses — exit 3, nothing queued — if it is not ready, queues one "
             "job with MODEL as planner and executor (or `local`, an Ollama tag, "
@@ -650,6 +712,16 @@ def register(top: argparse._SubParsersAction) -> None:
                            "session answers the attempts")
     sta_.add_argument("--rules", choices=("control", "treatment", "random"),
                       default=None, help="rules file for the executor")
+    sta_.add_argument("--since", default=None, metavar="ISO",
+                      help="when your work on this began, UTC, as `date -u "
+                           "+%%FT%%TZ` prints it: the first command AGENTS.md "
+                           "asks for. `next` and `import` count `elapsed` from "
+                           "it; without it they count from the lease, which "
+                           "starts here and cannot see what came before")
+    sta_.add_argument("--note", default=None, metavar="TEXT",
+                      help="what the node cannot see about how this job is being "
+                           "made — `skill=algorithmic-art; local prototype`. It "
+                           "goes on the job and on the entry page")
     sta_.add_argument("--max-attempts", dest="max_attempts", type=int, default=3,
                       metavar="N", help="execute+gate attempts (default 3)")
     sta_.add_argument("--publication", choices=("hold", "auto"), default="hold")
@@ -712,6 +784,28 @@ def register(top: argparse._SubParsersAction) -> None:
                      help="poll every S seconds (default %(default)s)")
     _add_common(tri)
     tri.set_defaults(func=cmd_try, _parser=tri)
+
+    bud = sub.add_parser(
+        "budget",
+        help="the advisory numbers `start` prints, and the per-job try cap",
+        description=(
+            "With no flags, print the budget. With flags, write it: minutes "
+            "and tokens to the `meta` row paid_budget, tries to paid_try_cap. "
+            "It is never enforced — an import past it prints a line and still "
+            "records, because refusing one would reward not reporting "
+            "(DECIDE[agent-budget]) — and it exists so an agent has a number "
+            "to hold itself to. The operator's verb: rule 4 means nothing "
+            "edits those rows by hand."
+        ),
+    )
+    bud.add_argument("--minutes", type=float, default=None, metavar="N",
+                     help="minutes from --since to held (default 10)")
+    bud.add_argument("--tokens", type=int, default=None, metavar="N",
+                     help="tokens generated by the agent (default 30000)")
+    bud.add_argument("--tries", type=int, default=None, metavar="N",
+                     help="`paid try` runs one job may ask for (default 8)")
+    _add_common(bud)
+    bud.set_defaults(func=cmd_budget, _parser=bud)
 
     asg = sub.add_parser(
         "assign",
