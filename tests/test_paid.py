@@ -325,6 +325,8 @@ class PlanTests(PaidTestCase):
             document = json.loads(
                 (self.jobs_dir / str(job_id) / "plan.json").read_text(encoding="utf-8"))
             document.pop("started_utc")
+            # The paid path times its own round trip; `plan --job` has none.
+            document.pop("durations")
             raw = (self.jobs_dir / str(job_id) / "response.txt").read_text(encoding="utf-8")
             return (job.state, job.brief, job.assertions_json, job.planner,
                     job.needs, document, raw)
@@ -1336,3 +1338,74 @@ class AgentLoopTests(PaidTestCase):
         self.assertEqual(json.loads(result.stdout)["released"][0]["state"], "queued")
         result = self.cli("paid", "release", "--json")
         self.assertEqual(result.returncode, 3)
+
+
+class UsageTests(AgentLoopTests):
+    """What an off-node step costs: the node times the round trip itself and
+    records the token counts the agent reports, on the rows a local attempt
+    uses, so the entry page stops saying "—" for a Sonnet sketch."""
+
+    def test_every_item_offers_an_empty_usage_and_says_what_goes_in_it(self):
+        job = self.start()["job"]
+        self.worker().run_once()
+        packet = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        self.assertEqual(packet["items"][0]["usage"],
+                         {"prompt_tokens": None, "completion_tokens": None})
+        self.assertIn("never an estimate", packet["how_to_answer"])
+
+    def test_usage_is_read_as_integers_or_not_at_all(self):
+        self.assertEqual(paid.usage_of({"usage": {"prompt_tokens": "812",
+                                                  "completion_tokens": None}}),
+                         {"prompt_tokens": 812, "completion_tokens": None})
+        self.assertEqual(paid.usage_of({"usage": {"prompt_tokens": -1,
+                                                  "completion_tokens": "lots"}}),
+                         {"prompt_tokens": None, "completion_tokens": None})
+        self.assertEqual(paid.usage_of({}), {"prompt_tokens": None, "completion_tokens": None})
+
+    def test_the_round_trip_and_the_counts_land_on_the_attempt_and_the_entry(self):
+        job = self.start()["job"]
+        self.worker().run_once()
+        packet = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        packet["items"][0]["answer"] = CLEAN_PLAN
+        packet["items"][0]["usage"] = {"prompt_tokens": 900, "completion_tokens": 150}
+        packet["created_utc"] = "2026-09-21T13:48:00Z"  # cut a while ago
+        paid.import_packet(self.conn, packet, ctx=self.ctx)
+        plan = json.loads((self.jobs_dir / str(job) / "plan.json").read_text())
+        self.assertEqual(plan["tokens"], {"prompt_tokens": 900, "completion_tokens": 150})
+        self.assertGreater(plan["durations"]["round_trip_s"], 60)
+
+        self.worker().run_once()
+        packet = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        packet["items"][0]["answer"] = GOOD_SKETCH
+        packet["items"][0]["usage"] = {"prompt_tokens": 2100, "completion_tokens": 3300}
+        packet["created_utc"] = "2026-09-21T13:50:00Z"
+        paid.import_packet(self.conn, packet, ctx=self.ctx)
+        meta = json.loads((self.jobs_dir / str(job) / "attempt-1" / worker.PAID_META).read_text())
+        self.assertEqual(meta["usage"], {"prompt_tokens": 2100, "completion_tokens": 3300})
+        self.assertGreater(meta["round_trip_s"], 60)
+
+        self.worker().run_once()  # the gate
+        attempt = db.list_attempts(self.conn, job)[0]
+        self.assertEqual((attempt.prompt_tokens, attempt.completion_tokens), (2100, 3300))
+        self.assertEqual(attempt.wall_s, meta["round_trip_s"])
+        entry = self.conn.execute(
+            "SELECT prompt_tokens, completion_tokens, wall_s, shape FROM entries "
+            "WHERE job_id = ?", (job,)).fetchone()
+        self.assertEqual(tuple(entry)[:3], (2100, 3300, meta["round_trip_s"]))
+        self.assertTrue(entry["shape"].startswith("off-node (claude-sonnet-5) · gated on "),
+                        entry["shape"])
+
+    def test_unreported_counts_stay_null_rather_than_zero(self):
+        job = self.start()["job"]
+        self.worker().run_once()
+        packet = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        packet["items"][0]["answer"] = CLEAN_PLAN
+        paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.worker().run_once()
+        packet = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        packet["items"][0]["answer"] = GOOD_SKETCH
+        paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.worker().run_once()
+        attempt = db.list_attempts(self.conn, job)[0]
+        self.assertEqual((attempt.prompt_tokens, attempt.completion_tokens), (None, None))
+        self.assertIsNotNone(attempt.wall_s)

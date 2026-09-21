@@ -902,10 +902,13 @@ def trim_detail(text: str | None, limit: int = DETAIL_MAX_CHARS) -> str:
     return flat if len(flat) <= limit else flat[: limit - 1] + "…"
 
 
-def node_shape() -> str:
+def node_shape(conn: "sqlite3.Connection | None" = None) -> str:
     """The machine this entry was made on, as one string for the gallery.
 
-    ``SKETCHGEN_SHAPE`` wins when it is set; otherwise the core count and
+    ``SKETCHGEN_SHAPE`` wins when it is set; then the shape the node learned
+    about itself from IMDS (``meta.node_shape``, with its OCPU and memory
+    figures — ``VM.Standard.A1.Flex 16/96``) when ``conn`` is given and the
+    node has identified itself; otherwise the core count and
     MemTotal are read and reported against the machine architecture. The
     tenancy's trial ends about 10/1 and 16/96 becomes 4/24 (spec §9) — the
     entry has to say which one made it, or the timings in it mean nothing.
@@ -924,6 +927,10 @@ def node_shape() -> str:
     override = os.environ.get("SKETCHGEN_SHAPE")
     if override:
         return override
+    if conn is not None:
+        known = identified_shape(conn)
+        if known:
+            return known
     try:
         cores = len(os.sched_getaffinity(0))
     except (AttributeError, OSError):  # pragma: no cover - non-Linux
@@ -938,6 +945,36 @@ def node_shape() -> str:
     except (OSError, ValueError, IndexError):  # pragma: no cover - non-Linux
         gib = 0
     return f"{platform.machine()} {cores}/{gib}"
+
+
+def identified_shape(conn: "sqlite3.Connection") -> str | None:
+    """``meta.node_shape`` with its OCPU/GiB figures, or None if unidentified."""
+    try:
+        name = (db.get_meta(conn, "node_shape") or "").strip()
+        if not name:
+            return None
+        ocpus = db.get_meta(conn, "node_ocpus")
+        memory = db.get_meta(conn, "node_memory_gb")
+        if ocpus and memory:
+            return f"{name} {float(ocpus):g}/{float(memory):g}"
+        return name
+    except (ValueError, TypeError, sqlite3.Error):
+        return None
+
+
+def made_on(conn: "sqlite3.Connection", executor_model: str | None) -> str:
+    """What ``entries.shape`` says: the maker, and the gate if they differ.
+
+    An entry written off the node was not made on this machine; the node only
+    gated it. Until 2026-09-21 the row still said the node's shape, which made
+    a Sonnet sketch look like it took an A1's minutes. Now it names the model
+    and the gate: the timings on the row are the round trip to that model, and
+    the gate's own numbers are in the gate log.
+    """
+    here = node_shape(conn)
+    if executor_model and models.ran_off_node(executor_model, conn):
+        return f"off-node ({executor_model}) · gated on {here}"
+    return here
 
 
 def brief_with_evidence(brief: str, evidence: str | None) -> str:
@@ -2077,7 +2114,7 @@ class Worker:
             prompt_tokens=total("prompt_tokens"),
             completion_tokens=total("completion_tokens"),
             wall_s=total("wall_s"),
-            shape=node_shape(),
+            shape=made_on(self.conn, kept.model if kept else self.executor_model_for(job)),
             seed=report.get("seed", executor.DEFAULT_SEED),
             parent_entry_id=job.parent_entry_id,
             submitted_by=job.submitted_by,
@@ -2334,6 +2371,7 @@ class Worker:
         from ``paid.json``, not the word the job was queued under.
         """
         answered = asked
+        meta: dict = {}
         try:
             meta = json.loads((attempt_dir / PAID_META).read_text(encoding="utf-8"))
             answered = str(meta.get("model") or asked)
@@ -2348,7 +2386,21 @@ class Worker:
             out_dir=str(attempt_dir),
             stub=str(attempt_dir / PAID_REPLY),
         )
-        return Execution.from_result(result)
+        execution = Execution.from_result(result)
+        # The stub replay measured itself (milliseconds) and knows no tokens.
+        # What the step cost is in paid.json: the round trip the node timed
+        # from export to import, and the counts the agent reported, if any.
+        # Recorded where a local attempt's are, so the entry sums them alike.
+        if isinstance(meta, dict):
+            trip = meta.get("round_trip_s")
+            if isinstance(trip, (int, float)):
+                execution.wall_s = float(trip)
+            usage = meta.get("usage") if isinstance(meta.get("usage"), dict) else {}
+            for key in ("prompt_tokens", "completion_tokens"):
+                value = usage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    setattr(execution, key, value)
+        return execution
 
     def _preflight_lines(self, job_id: int, n: int, attempt_dir: Path) -> list[str]:
         """The pre-flight scan over one attempt directory, as evidence lines.
