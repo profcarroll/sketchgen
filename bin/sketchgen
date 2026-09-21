@@ -379,9 +379,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
     With ``--job N`` the prompt comes from the job rather than the command line
     and the result goes back onto it: the brief, the assertions and the model
-    that wrote them, in the one ``db.transition`` that also moves the job to
-    ``executing`` — the same write the worker makes on the local path, so a job
+    that wrote them, in the one ``db.transition`` that also puts the job back on
+    the queue — the same columns the worker writes on the local path, so a job
     planned here is indistinguishable afterwards from one planned on the node.
+    The worker claims it on its next pass and, because it now has a brief,
+    ``claim_next`` takes it straight to ``executing`` without re-planning it.
 
     That is the return leg of DECIDE[credential-model] branch B. ``--planner
     paid`` parks a job at ``needs-laptop`` and until now nothing brought it
@@ -1011,7 +1013,7 @@ def build_parser() -> argparse.ArgumentParser:
                              help="plan job N, which must be waiting at "
                                   "needs-laptop: its prompt is used, and the "
                                   "brief, the assertions and --model are written "
-                                  "back as it moves to executing")
+                                  "back as it goes on the queue for the worker")
     plan_parser.add_argument("--by", default="", metavar="USERNAME",
                              help="GitHub username of the submitter, for the "
                                   "record (default: the job's, with --job)")
