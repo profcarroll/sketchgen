@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -1283,6 +1284,70 @@ class AgentLoopTests(PaidTestCase):
         self.assertFalse(parked[theirs]["yours"])
         self.assertEqual(parked[theirs]["command"], f"sketchgen paid release --job {theirs}")
         self.assertEqual(report["info"]["leases"][str(mine)]["model"], self.MODEL)
+
+    # -- an agent that never comes back (job 1263, 2026-09-21) ---------------------
+
+    def later(self, minutes):
+        """A timestamp ``minutes`` from now, in the database's format."""
+        return (datetime.now(timezone.utc) + timedelta(minutes=minutes)).strftime(
+            db.UTC_FORMAT)
+
+    def test_the_worker_hands_back_a_job_whose_lease_lapsed(self):
+        """gemini-3.8-flash ran out of weekly quota mid-plan: its lease lapsed
+        and the job would have sat parked until the quota reset."""
+        job = self.start()["job"]
+        run = self.worker()
+        run.run_once()
+        self.assertEqual(db.get_job(self.conn, job).state, "needs-laptop")
+        self.assertEqual([], run.sweep_unattended())  # the agent is still here
+        self.assertEqual([job], run.sweep_unattended(now=self.later(25)))
+        after = db.get_job(self.conn, job)
+        self.assertEqual((after.state, after.needs, after.planner, after.executor),
+                         ("queued", None, None, None))
+        self.assertIn("handed to the local path by the worker", after.last_error)
+        self.assertIn(f"for {self.MODEL} with no agent", after.last_error)
+
+    def test_an_agent_back_after_the_hand_back_is_told_to_stop(self):
+        job = self.start()["job"]
+        run = self.worker()
+        run.run_once()
+        run.sweep_unattended(now=self.later(25))
+        result = paid.next_for(self.conn, job, self.MODEL, timeout=10)
+        self.assertEqual(result["do"], "stop")
+        self.assertIn("not yours any more", result["say"])
+        self.assertIn("handed to the local path by the worker", result["say"])
+        self.assertEqual({}, db.paid_leases(self.conn))  # and took no lease
+
+    def test_a_live_lease_keeps_the_job_however_long_it_has_been_parked(self):
+        job = self.start()["job"]
+        run = self.worker()
+        run.run_once()
+        db.lease_paid(self.conn, job, self.MODEL, 60)
+        self.assertEqual([], run.sweep_unattended(now=self.later(25)))
+        self.assertEqual(db.get_job(self.conn, job).state, "needs-laptop")
+
+    def test_a_job_parked_a_moment_ago_waits_a_lease_for_its_agent(self):
+        job = self.start()["job"]
+        run = self.worker()
+        run.run_once()
+        db.release_lease(self.conn, job)
+        self.assertEqual([], run.sweep_unattended(now=self.later(5)))
+        self.assertEqual([job], run.sweep_unattended(now=self.later(21)))
+
+    def test_preflight_does_not_offer_release_of_a_job_another_agent_holds(self):
+        db.set_paid_models(self.conn, [self.MODEL, "gemini-3.8-flash"])
+        theirs = paid.start(self.conn, model="gemini-3.8-flash", prompt="tide",
+                            by="octocat", **self.one_worker)["job"]
+        self.worker().run_once()
+        report = paid.preflight(self.conn, self.MODEL, **self.one_worker)
+        row = {r["job"]: r for r in report["info"]["parked"]}[theirs]
+        self.assertEqual((row["yours"], row["leased_to"], row["command"]),
+                         (False, "gemini-3.8-flash", None))
+        shown = self.cli("paid", "preflight", "--as", self.MODEL).stdout
+        line = next(l for l in shown.splitlines() if f"parked: job {theirs}" in l)
+        self.assertIn("leased to gemini-3.8-flash until", line)
+        self.assertNotIn("no agent", line)
+        self.assertNotIn("release", line)
 
     # -- the whole recipe, as AGENTS.md writes it now ------------------------------
 
