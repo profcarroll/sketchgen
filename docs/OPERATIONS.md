@@ -1469,6 +1469,15 @@ round trip costs one worker pass, not a pass plus ten minutes of filler. Every
 so an agent that vanishes holds the idle loop for minutes, not the night. The
 worker's card says `standing by for job N (model)` while it waits.
 
+When a lease lapses, the job goes too. Every pass, the worker hands any job
+parked for a plan or an attempt that has no live lease, and has been parked
+for at least a lease's length, to this node's models — the same
+`paid release` an operator would run, recorded as `handed to the local path
+by the worker: parked N minutes for MODEL with no agent holding a lease`.
+Before 2026-09-21 only the idle loop recovered: job 1263's agent
+(gemini-3.8-flash) ran out of its weekly quota mid-plan, and the job would
+have sat parked until the quota reset a week later.
+
 **What an off-node step costs is recorded, honestly.** The node cannot meter a
 model it did not run, so it measures what it can and records what it is told:
 `round_trip_s`, export to import, goes on the attempt as `wall_s` (and into
@@ -1493,8 +1502,10 @@ python3 bin/sketchgen paid release --job N [--by WHO --reason TEXT]
 ```
 
 which blanks its paid columns, re-queues it, and records who handed it back;
-`preflight` lists such jobs with that command. An agent that must stop uses
-the same verb on its own job.
+`preflight` lists such jobs with that command, and the worker runs it itself
+a lease's length after the last lease lapsed. A job leased to another agent
+is listed as `leased to X until T` with no command: it is theirs. An agent
+that must stop uses the same verb on its own job.
 
 **A paid executor is one round trip per attempt, and the gate stays here.** The
 worker parks the job at the top of each attempt it has no reply for. `paid export
