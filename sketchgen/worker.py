@@ -1672,17 +1672,20 @@ class Worker:
         second probe could only refuse the worker its own resident model, or
         undo the test-mode observing probe the CLI injected.
         """
+        model = self._assigned("judge", self.judge_model)
+        if model is None:
+            return 0
         self._say(
             "judging",
             "Comparing two sketches",
-            f"{self.judge_model} · looking for a pair · closer to the brief, "
+            f"{model} · looking for a pair · closer to the brief, "
             "rather look at",
-            model=self.judge_model,
+            model=model,
         )
         try:
             counts = self.judge_fn(
                 self.conn,
-                model=self.judge_model,
+                model=model,
                 host=self.host,
                 limit=self.idle_judge,
                 rng=random.Random(self._idle_seed()),
@@ -1694,6 +1697,22 @@ class Worker:
             return 0
         return int((counts or {}).get("judged") or 0)
 
+    def _assigned(self, step: str, configured: str) -> str | None:
+        """The model this idle step runs with, or None when it runs elsewhere.
+
+        The assignment (agentic-cli §3.6) wins over the unit's setting. A paid
+        model assigned to the step means the step is answered off the node by
+        `sketchgen paid`, so the local loop leaves it alone: for the critic that
+        is the whole of §3.4's rule, and for the judge it is what the operator
+        asked for.
+        """
+        assigned = db.get_assignment(self.conn).get(step)
+        if assigned and models.is_paid(assigned):
+            self.log(f"idle: {step} is assigned to {assigned}, off the node; "
+                     "skipping it here")
+            return None
+        return assigned or configured
+
     def _idle_critique(self) -> int:
         """Critique up to ``idle_critique`` published entries and spawn children.
 
@@ -1701,6 +1720,9 @@ class Worker:
         rejected critique is an action, and it is what stops that entry being
         offered again under the same prompt version.
         """
+        model = self._assigned("critique", self.critic_model)
+        if model is None:
+            return 0
         try:
             version = lineage.prompt_version()
         except Exception as exc:
@@ -1719,7 +1741,7 @@ class Worker:
         recorded = 0
         for entry_id in candidates:
             try:
-                if self._critique_one(entry_id, version):
+                if self._critique_one(entry_id, version, model):
                     recorded += 1
             except Exception as exc:  # as above: logged, dropped
                 self.log(
@@ -1738,8 +1760,10 @@ class Worker:
         """
         return lineage.parent_rules_file(self.conn, entry_row)
 
-    def _critique_one(self, entry_id: int, version: str) -> bool:
+    def _critique_one(self, entry_id: int, version: str,
+                      model: str | None = None) -> bool:
         """One entry: critique it, spawn its child, record what happened."""
+        critic_model = model or self.critic_model
         row = self.conn.execute(
             "SELECT * FROM entries WHERE id = ?", (int(entry_id),)
         ).fetchone()
@@ -1750,15 +1774,15 @@ class Worker:
         self._say(
             "critiquing",
             f"Critiquing entry {entry_id}",
-            f"{self.critic_model} · one sentence that becomes a child prompt"
+            f"{critic_model} · one sentence that becomes a child prompt"
             + (f" · generation {parent_generation}" if parent_generation is not None
                else ""),
             entry_id=int(entry_id),
-            model=self.critic_model,
+            model=critic_model,
         )
         try:
             critique = self.critic_fn(
-                self.conn, int(entry_id), model=self.critic_model, host=self.host
+                self.conn, int(entry_id), model=critic_model, host=self.host
             )
         except lineage.CritiqueRefused as exc:
             # It could not run at all (no prompt file, no stub). The entry is
@@ -1773,7 +1797,7 @@ class Worker:
                 self.conn,
                 entry_id,
                 critique=raw or None,
-                critique_by=self.critic_model,
+                critique_by=critic_model,
                 prompt_version=version,
                 spawned_job_id=None,
                 rejected_reason=str(exc),
@@ -2106,7 +2130,11 @@ class Worker:
         wrong.
         """
         named = (job.planner or "").strip()
-        if not named or named in ("local", "paid"):
+        if not named:
+            # A job that named nothing takes the assignment, when there is one
+            # (agentic-cli §3.6); `local` still means this worker's own model.
+            return db.get_assignment(self.conn).get("plan") or self.planner_model
+        if named == "local":
             return self.planner_model
         return named
 
@@ -2126,7 +2154,9 @@ class Worker:
         model host (migration 014, ``needs='execute'``).
         """
         named = (job.executor or "").strip()
-        if not named or named == "local":
+        if not named:
+            return db.get_assignment(self.conn).get("execute") or self.executor_model
+        if named == "local":
             return self.executor_model
         return named
 
@@ -2144,12 +2174,14 @@ class Worker:
         """
         if job.brief and job.assertions:
             return job
-        if models.is_paid(job.planner):
-            # `paid`, or a model named in SKETCHGEN_PAID_MODELS: either way it
+        if models.is_paid(self.planner_model_for(job)):
+            # `paid`, or a model named in SKETCHGEN_PAID_MODELS — the job's
+            # own, or the assignment's for a job that named none: either way it
             # is answered off the node, by `paid export --step plan` and
             # `paid import` (or `plan --job`), never from here.
             db.transition(self.conn, job.id, "needs-laptop", needs="plan")
-            self.log(f"job {job.id}: planner is {job.planner!r}, a paid model — "
+            self.log(f"job {job.id}: planner is {self.planner_model_for(job)!r}, "
+                     "a paid model — "
                      "needs-laptop, needs=plan (DECIDE[credential-model] B: no "
                      "paid key on the node)")
             return None
