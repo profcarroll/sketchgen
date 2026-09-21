@@ -75,7 +75,8 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 
 def _ctx(args: argparse.Namespace) -> paid_mod.Context:
     return paid_mod.Context(jobs_dir=Path(os.path.expanduser(args.jobs_dir)),
-                            job=getattr(args, "job", None))
+                            job=getattr(args, "job", None),
+                            process_unreported=bool(getattr(args, "no_process", False)))
 
 
 def _run(args: argparse.Namespace, work) -> int:
@@ -591,6 +592,12 @@ def register(top: argparse._SubParsersAction) -> None:
     )
     imp.add_argument("file", metavar="FILE",
                      help="the filled-in packet; - reads it from stdin")
+    imp.add_argument(
+        "--no-process", dest="no_process", action="store_true",
+        help=("the harness answering cannot report a process cost: land an "
+              "attempt on a --since job with an empty `process` instead of "
+              "rejecting it (the empty cost is recorded as declared)"),
+    )
     _add_common(imp)
     imp.set_defaults(func=cmd_import, _parser=imp)
 

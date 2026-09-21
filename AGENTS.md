@@ -79,7 +79,11 @@ and 30,000 generated tokens by default, advisory, never enforced. A sketch is a
 few minutes' work: read this file, plan, write under 150 lines, check it,
 import. The executor prompt says "no second chance". That is written for local
 models, which get one reply per attempt. You have three attempts and a verdict
-takes seconds.
+takes seconds. Before each `import` of an attempt, run
+`python3 rig/cost.py --since $SINCE` and put its last line in
+`items[0].process`: on a `--since` job an attempt with an empty `process` is
+rejected (nothing written, answer kept) with that command in the reason, and
+`bin/sg paid import --no-process -` is how you say your harness cannot count.
 
 **Freshness.** `bin/sg paid preflight --as $ME` prints `node_commit`; if `git
 merge-base --is-ancestor <it> HEAD` fails in your checkout, pull before reading
@@ -241,7 +245,10 @@ driving it — never release one of those — and as `no agent` once nobody is.
   carries a `process` slot for what the work *around* the reply cost you:
   `session_s`, `output_tokens`, `thinking_tokens`, `tool_calls`, `screenshots`,
   `effort`. Same rule as `usage` — leave out what your harness cannot tell you,
-  and never estimate. The node adds the tries it ran for you and shows the line
+  and never estimate. On a job started with `--since`, an attempt whose
+  `process` is all null is rejected with the `rig/cost.py` line to run; an
+  import with `--no-process` records the empty cost as declared, not
+  forgotten (job 1308, 2026-09-21). The node adds the tries it ran for you and shows the line
   on the entry page as *as reported by the agent*; nothing in the A/B or any
   judgment reads it. `rig/cost.py` prints the object to paste.
 - **Change nothing in a packet but `answer`, `usage`, `process` and `model`.** `guard`,
