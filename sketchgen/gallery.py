@@ -360,7 +360,7 @@ def _resolve_config(dest_dir: Path, config: Config | None) -> Config:
 #: ``web.STATE_LABELS`` already uses on the operator side, so the two halves of
 #: the project say the same words about the same row.
 STATE_CHIPS = {
-    "failed-kept": ("failed", "rejected · gate"),
+    "failed-kept": ("failed", "rejected · automatic"),
     "rejected": ("rejected", "rejected · operator"),
 }
 
@@ -532,13 +532,6 @@ def _offplan(row: Any) -> list[str]:
     except (TypeError, ValueError):
         return []
     return [str(name) for name in names] if isinstance(names, list) else []
-
-
-def _and_list(items: list[str]) -> str:
-    """``a``, ``a and b``, ``a, b and c`` — the gate's names read as a sentence."""
-    if len(items) <= 1:
-        return "".join(items)
-    return ", ".join(items[:-1]) + " and " + items[-1]
 
 
 def _is_public(row: Any) -> bool:
@@ -1322,21 +1315,15 @@ def _meta(
 # ---------------------------------------------------------------------------
 
 
-def _byline(row: sqlite3.Row, meta: dict[str, Any]) -> str:
+def _byline(row: sqlite3.Row) -> str:
     by = _esc(row["submitted_by"] or "an operator")
     planner = _esc(row["planner"] or "no planner on record")
     executor = _esc(row["executor"] or "no executor on record")
-    attempts = meta["attempts"] or 1
-    if row["state"] == "published":
-        tail = f"passed the gate on attempt {attempts}"
-    else:
-        tail = (
-            f"did not pass the gate in {attempts} attempt"
-            f"{'s' if attempts != 1 else ''}"
-        )
-    return (
-        f"Prompt by {by}. Planned by {planner}, written by {executor}, {tail}."
-    )
+    # What it took to get here — the attempt count, and whether the run was
+    # held or published — is the workshop's business, not a visitor's. It is
+    # still on the page, under Provenance, where the machine-facing fields
+    # live.
+    return f"Prompt by {by}. Planned by {planner}, written by {executor}."
 
 
 def _critic_chip(who: Any) -> str:
@@ -1406,9 +1393,7 @@ CRITIQUE_FORM = """<section class="panel critique-form" data-critique="{entry_id
       revision. One sentence becomes the next generation's prompt.
     </p>
     <div data-critique-in hidden>
-      <p class="note">One sentence, under 40 words, no code — the same contract the critic
-      model works under. Your sentence is appended to this entry's prompt and the child is
-      queued.</p>
+      <p class="note">One sentence, under 40 words, no code.</p>
       <label class="rule" for="critique-text">Say what should change, not how to write it.</label>
       <textarea id="critique-text" rows="2" data-critique-text></textarea>
       <p class="rule" data-critique-rule></p>
@@ -1418,9 +1403,7 @@ CRITIQUE_FORM = """<section class="panel critique-form" data-critique="{entry_id
         <p class="revise"><span class="label">Revise:</span> <em data-critique-echo>…</em></p>
       </div>
       <p class="actions">
-        <button type="button" class="primary" data-critique-send>Queue the child</button>
-        <span class="note">generation {generation} · a person's critique, so the line does \
-not stall here</span>
+        <button type="button" class="primary" data-critique-send>Submit Critique</button>
       </p>
     </div>
     <div data-critique-sent hidden>
@@ -1473,9 +1456,6 @@ def _critique_form(
     return CRITIQUE_FORM.format(
         entry_id=int(row["id"]),
         child_prompt=_child_prompt(title, revisions),
-        # The child's generation, not this entry's: a critique released now
-        # becomes the next one down (plan §1.5 leaves the depth rule alone).
-        generation=int(meta["lineage"]["generation"]) + 1,
     )
 
 
@@ -1516,7 +1496,7 @@ def _heavy_chip(heavy: dict[str, float | None]) -> str:
     else:
         # No frame rate in the report — the older runs have none — so say the
         # measurement that did put it over the line rather than invent one.
-        text = f"heavy · {heavy.get('total_s') or 0:.0f} s in the gate"
+        text = f"heavy · {heavy.get('total_s') or 0:.0f} s to run"
     return f'<span class="chip heavy">{_esc(text)}</span>'
 
 
@@ -1593,8 +1573,8 @@ def _frame(
             # is where runInPlace looks for it.
             '      <p class="run-note" data-run-note></p>\n'
             '    </div>\n'
-            f'    <p class="stage-heavy">{_heavy_chip(heavy)} The gate had to grind '
-            "through this one, so it waits for a click rather than starting itself."
+            f'    <p class="stage-heavy">{_heavy_chip(heavy)} This one is slow to '
+            "draw, so it waits for a click rather than starting itself."
             "</p>"
         )
     return (
@@ -2146,12 +2126,12 @@ def _write_entry(
         # populations, two scores, never one aggregate).
         failed_note = (
             '<p class="chip offplan">OFF-PLAN — this sketch runs. It differs from '
-            f"the plan the planner wrote for it: {_esc(_and_list(offplan))}.</p>"
+            "the plan the planner wrote for it.</p>"
         )
     elif row["state"] == "failed-kept":
         reason = _rejection_reason(conn, row)
         failed_note = (
-            '<p class="chip failed">REJECTED BY THE GATE — kept, because a gallery that only '
+            '<p class="chip failed">REJECTED — kept, because a gallery that only '
             f"shows successes is not a record of anything: {_esc(reason)}</p>"
         )
     elif row["state"] == "rejected":
@@ -2169,7 +2149,7 @@ def _write_entry(
         entry_id=entry_id,
         title=_esc(title),
         subtitle=_subtitle(revisions, meta),
-        byline=_byline(row, meta),
+        byline=_byline(row),
         failed_note=failed_note,
         frame=_frame(has_sketch, title, heavy=_heavy(meta), has_strip=has_strip,
                      mic=has_sketch and _needs_mic(source)),
@@ -2821,9 +2801,8 @@ def _line_node(
         body = ""
     else:
         body = (
-            '<p class="node-prompt">This generation has not been through the '
-            "publication gate, so the gallery shows the critique and nothing "
-            "else.</p>"
+            '<p class="node-prompt">This generation is not published, so the '
+            "gallery shows the critique and nothing else.</p>"
         )
     return (
         f'<div class="node depth-{depth}">'
@@ -2921,8 +2900,8 @@ def render_index(
                 failed,
                 heading="Rejections",
                 intro=(
-                    "Entries the gate rejected after every attempt, and entries a "
-                    "person rejected, kept on purpose: a gallery that only shows "
+                    "Entries that never ran correctly, and entries a person "
+                    "rejected, kept on purpose: a gallery that only shows "
                     "successes is not a record of anything."
                 ),
                 page="rejections.html",
