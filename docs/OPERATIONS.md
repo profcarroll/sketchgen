@@ -1454,11 +1454,33 @@ once (`printf %q`), so a prompt is quoted like any other argument; stdin and
 stdout pass through. `start` registers the model if needed, runs the
 preflight (NOT READY: exit 3, nothing queued), queues one job with the agent as
 planner and executor (`--planner local` / `--executor local` to keep a step
-here), and **leases** the job. `next` returns within `--timeout` (240 s, under
-a tool call's limit) with one JSON object: the packet itself when the job is
-parked for the agent (`do: answer`), `wait` with the worker's current step
-when the worker has it, `done`, or `stop` (exit 3). `import` puts the job back
-on the queue as before and prints the `next` command.
+here, an Ollama tag for a named local model), and **leases** the job. `next`
+returns within `--timeout` (240 s, under a tool call's limit) with one JSON
+object: the packet itself when the job is parked for the agent (`do: answer`),
+`wait` with the worker's current step when the worker has it, `done`,
+`handoff` (below), or `stop` (exit 3). `import` puts the job back on the queue
+as before and prints the `next` command.
+
+**Two paid models on one job.** `--planner` / `--executor` also take another
+*registered* paid id, so an operator can have one model plan and another
+execute from off the node — the split the New job page gives two local models.
+Asked for exactly that on 2026-09-21 (Sonnet 5 planning, Opus executing), a
+Sonnet 5 session found `start` refusing any paid id but its own and, rightly,
+stopped: one agent cannot honestly be two models, since the id on a packet is
+the entry's provenance. So it is two sessions and a handoff that `next`
+carries. The planner's `next` answers `handoff` the moment its plan is in,
+naming the executor's command (`sketchgen paid next --job N --as <executor>`)
+and dropping its lease; the executor's `next` answers `wait` while the other
+agent plans (leaving the planner's lease alone), then takes the attempts and
+the lease. Whichever agent runs `start` holds the lease first; the other takes
+it over when the step is its own. The second id must be registered before
+`start` — the operator's `paid models add`, so the name the second session
+must answer as is chosen, not guessed — and `start` refuses otherwise, listing
+what is registered. `preflight` shows a job parked for another agent with that
+agent's `next` command and the `release` beside it, and the sweep above still
+applies: the second session has a lease's length from the park to arrive, or
+the job goes to this node's models. The entry records each
+step's model as before: planner and executor differ, both badged off-node.
 
 **The lease** (`meta` row `paid_leases`, `SKETCHGEN_PAID_LEASE_MINUTES`,
 default 20) is how the worker knows an agent is at the other end. While one

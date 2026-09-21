@@ -306,6 +306,9 @@ def _print_info(info: dict) -> None:
         then = f" -> {row['command']}" if row.get("command") else ""
         print(f"  parked: job {row['job']} needs {row['needs']} ({whose}, since "
               f"{row['since_utc']}){then}")
+        if (not row["yours"] and not row.get("leased_to") and row.get("release")
+                and row["release"] != row.get("command")):
+            print(f"          or, if no such agent is coming: {row['release']}")
     if info.get("assignment"):
         print("  assignment: " + ", ".join(
             f"{k}={v}" for k, v in sorted(info["assignment"].items())))
@@ -341,6 +344,11 @@ def cmd_start(args: argparse.Namespace) -> int:
                   f"until {result['lease_until']}")
             _print_info({"queued_ahead": result["queued_ahead"],
                          "worker_now": result["worker_now"]})
+            if result.get("partner"):
+                # Two agents on one job: say now who the other one is and what
+                # it runs, so the operator can bring it before `next` asks.
+                print(f"  {result['partner_step']} is {result['partner']}'s: "
+                      f"{result['say']}")
             print(f"next: {result['then']}")
         return EXIT_OK if result["started"] else EXIT_REFUSED
 
@@ -596,9 +604,11 @@ def register(top: argparse._SubParsersAction) -> None:
             "The first of the agent's three verbs. Registers MODEL as a paid "
             "model if it is not (a name, never a key), runs the preflight and "
             "refuses — exit 3, nothing queued — if it is not ready, queues one "
-            "job with MODEL as planner and executor (or `local` for either), "
-            "and leases the job to MODEL so the worker takes it first and does "
-            "no idle work while MODEL is driving it. Prints the `next` command."
+            "job with MODEL as planner and executor (or `local`, an Ollama tag, "
+            "or another registered paid model for either: that step is handed "
+            "to that agent when it comes), and leases the job to MODEL so the "
+            "worker takes it first and does no idle work while MODEL is driving "
+            "it. Prints the `next` command."
         ),
     )
     sta_.add_argument("--as", dest="model", required=True, metavar="MODEL_ID",
@@ -609,9 +619,13 @@ def register(top: argparse._SubParsersAction) -> None:
                       help="what to make; omitted or `-`: read from stdin, which "
                            "needs no quoting through ssh")
     sta_.add_argument("--planner", default=None, metavar="MODEL",
-                      help="yourself (default), `local`, or an Ollama tag")
+                      help="yourself (default), `local`, an Ollama tag, or a "
+                           "registered paid model (`paid models list`), whose "
+                           "session answers the plan")
     sta_.add_argument("--executor", default=None, metavar="MODEL",
-                      help="yourself (default), `local`, or an Ollama tag")
+                      help="yourself (default), `local`, an Ollama tag, or a "
+                           "registered paid model (`paid models list`), whose "
+                           "session answers the attempts")
     sta_.add_argument("--rules", choices=("control", "treatment", "random"),
                       default=None, help="rules file for the executor")
     sta_.add_argument("--max-attempts", dest="max_attempts", type=int, default=3,
@@ -628,9 +642,11 @@ def register(top: argparse._SubParsersAction) -> None:
             "`answer` — the object is the packet for the step the job is parked "
             "at; write your reply into items[0].answer and `paid import -` it. "
             "`wait` — the worker has it; `worker` says what it is doing; run "
-            "this again (exit 0). `done` — held, failed, published. `stop` — "
-            "a person is needed, the generator is paused, or another agent "
-            "holds the job (exit 3): report and stop. Renews your lease on "
+            "this again (exit 0). `done` — held, failed, published. `handoff` "
+            "— the rest of a split job is the other paid model's; `then` is "
+            "its command and you are finished (exit 0). `stop` — a person is "
+            "needed, the generator is paused, or another agent holds the job "
+            "(exit 3): report and stop. Renews your lease on "
             "every poll. Returns within --timeout, which is shorter than a "
             "tool call on purpose."
         ),
