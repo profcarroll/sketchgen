@@ -1422,7 +1422,10 @@ class Worker:
         )
 
         self._say("claiming", "Picking up the next job")
-        job = db.claim_next(self.conn)
+        # A job under a live paid lease first: an agent is waiting on it, and
+        # every pass it spends behind an idle-spawned child is a pass the agent
+        # spends polling (db.claim_next, 2026-09-21).
+        job = db.claim_next(self.conn, prefer=db.paid_leases(self.conn))
         if job is None:
             self.log("queue: nothing queued")
             self._idle_round()
@@ -1642,11 +1645,15 @@ class Worker:
         # Once per idle cycle, because this is the moment the worker has time:
         # a job stuck in a running state is a job nobody is coming back for.
         self.sweep_stuck()
+        if self._standing_by():
+            return
         judged = self._idle_judge() if self.idle_judge > 0 else None
         # Between the two steps, not only around the pair. Each one can sit on
         # the model host for as long as its timeout allows, and the operator
         # who asked for a pause in the middle of that meant this step too.
         if self._idle_pause_taken("the judge"):
+            return
+        if self._standing_by():
             return
         critiqued = self._idle_critique() if self.idle_critique > 0 else None
         if self._idle_pause_taken("the critic"):
@@ -1663,6 +1670,34 @@ class Worker:
         # The nap that follows is the step; this is the half of its sentence
         # only the round knows. See :meth:`_nap`.
         self._idle_note = "queue empty · " + ", ".join(parts)
+
+    def _standing_by(self) -> bool:
+        """Whether a paid lease is live, in which case idle work waits.
+
+        A lease (db.paid_leases) means an agent is driving a job through
+        `sketchgen paid` right now and will put it back on the queue within
+        minutes. The judge and the critic each hold the model host for as long
+        as their timeouts allow, and the critic queues a child that takes the
+        worker for five minutes more; run now, they land between the agent's
+        import and the worker's claim, and the agent polls through all of it
+        (2026-09-21, job 1246). So while a lease is live the worker does
+        nothing but nap and look at the queue. A lease expires on its own, so
+        an agent that vanishes costs the idle loop minutes, not the night.
+        """
+        leases = db.paid_leases(self.conn)
+        if not leases:
+            return False
+        parts = [
+            f"job {job_id} leased to {lease.get('model')} until "
+            f"{lease.get('until_utc')}"
+            for job_id, lease in sorted(leases.items())
+        ]
+        self.log("idle: standing by — " + "; ".join(parts)
+                 + "; no judge or critique while an agent is driving a job")
+        self._idle_note = "standing by for " + ", ".join(
+            f"job {job_id} ({lease.get('model')})" for job_id, lease in sorted(leases.items())
+        )
+        return True
 
     def _idle_judge(self) -> int:
         """Judge up to ``idle_judge`` pairs with the local judge (packet 5.2).
