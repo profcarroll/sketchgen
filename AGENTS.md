@@ -119,8 +119,11 @@ the node's logs, list its processes, or start anything to hurry it.
 
 If you cannot finish — out of budget, told to stop — hand the job back so this
 node's models finish it: `bin/sg paid release --job N --by $ME --reason "…"`.
-A job left parked with nobody coming is the one thing the preflight reports
-as `parked: … no agent`; the same `release` clears it.
+If you vanish instead — killed, out of quota — the worker does the same
+release itself once your lease has lapsed and the job has sat twenty minutes
+parked (job 1263, 2026-09-21, whose agent's weekly quota ran out mid-plan).
+The preflight shows a parked job as `leased to X until T` while its agent is
+driving it — never release one of those — and as `no agent` once nobody is.
 
 ### Answers
 

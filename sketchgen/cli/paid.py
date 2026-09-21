@@ -296,9 +296,16 @@ def _print_info(info: dict) -> None:
         print(f"  lease: job {lease_job} is {lease.get('model')}'s until "
               f"{lease.get('until_utc')}")
     for row in info.get("parked") or []:
-        whose = "yours" if row["yours"] else f"{row['model']}'s, no agent"
+        if row["yours"]:
+            whose = "yours"
+        elif row.get("leased_to"):
+            whose = (f"{row['model']}'s, leased to {row['leased_to']} until "
+                     f"{row['lease_until']}")
+        else:
+            whose = f"{row['model']}'s, no agent"
+        then = f" -> {row['command']}" if row.get("command") else ""
         print(f"  parked: job {row['job']} needs {row['needs']} ({whose}, since "
-              f"{row['since_utc']}) -> {row['command']}")
+              f"{row['since_utc']}){then}")
     if info.get("assignment"):
         print("  assignment: " + ", ".join(
             f"{k}={v}" for k, v in sorted(info["assignment"].items())))
