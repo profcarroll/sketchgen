@@ -2930,7 +2930,7 @@ def _assignment_note(conn: sqlite3.Connection) -> str:
         + " — set with <code>sketchgen paid assign</code>.</p>"
     )
     executor_model = assignment.get("execute")
-    if executor_model and models.is_paid(executor_model):
+    if executor_model and models.is_paid(executor_model, conn):
         note += (
             f'<p class="err">Every job that names no executor is written by '
             f"{esc(executor_model)}, off this node: one round trip per attempt "
@@ -6338,6 +6338,18 @@ class OpHandler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method: str, body: bool = True) -> None:
         path = urllib.parse.urlsplit(self.path).path
+        # The menus are drawn without a connection, so the paid model names
+        # registered in the database are handed to this request's thread here
+        # (sketchgen.models.remember_registered). A database that cannot be
+        # read means no registered names, not a page that fails.
+        try:
+            conn = self.app.connect()
+            try:
+                models.remember_registered(db.get_paid_models(conn))
+            finally:
+                conn.close()
+        except (sqlite3.Error, OSError):
+            models.remember_registered([])
         matched_path = False
         for route_method, pattern, handler_name in ROUTES:
             if handler_name == "post_quit" and not self.app.once_for_test:

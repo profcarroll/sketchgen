@@ -1419,16 +1419,23 @@ done is fine.
 | `judge` | pairs that model has not judged | `judge.import_verdicts_detailed` | `artefact_hash` of both strips and briefs |
 | `critique` | what the idle critic would take | `lineage.validate` → `record_critique` + `spawn` | sha256 of the strip |
 
-**Which models count as paid.** `paid`, and every name in `SKETCHGEN_PAID_MODELS`
-— a comma-separated list of model ids, names only, no credential. Set it the same
-in **both** unit files, or the New job page will offer a model the worker sends to
-Ollama:
+**Which models count as paid.** `paid`, every id registered with `paid models
+add`, and every name in `SKETCHGEN_PAID_MODELS`. Registration is the one to use:
+it is stored in the database, so the worker, the web page and every CLI see it
+at once, with no unit file and no restart — and an agent can check it, which it
+cannot do for a unit's environment. Names only, never a key.
 
 ```bash
-systemctl --user edit sketchgen-web.service     # Environment=SKETCHGEN_PAID_MODELS=claude-opus-5,claude-sonnet-5
-systemctl --user edit sketchgen-worker.service  # the same line
-systemctl --user restart sketchgen-web.service sketchgen-worker.service
+python3 bin/sketchgen paid models add claude-sonnet-5
+python3 bin/sketchgen paid preflight --as claude-sonnet-5   # READY, or what to fix
 ```
+
+`preflight` checks the schema, the registration, that exactly one worker is
+running (or the drip timer is on), and that the generator is running; each
+failure names its fix and whether the agent or the operator owns it. An agent
+names models for its own job with `enqueue --planner M --executor M` (refused
+up front if M would reach Ollama), waits with `paid wait --job N`, and moves
+packets over ssh with `export --out -` / `import -`. AGENTS.md has the recipe.
 
 A job whose planner is one of them parks at `needs-laptop` exactly as `paid` does,
 and the entry records the model that answered.
