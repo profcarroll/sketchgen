@@ -51,6 +51,8 @@ from typing import Any, Callable, Mapping
 
 from . import db
 from . import judge
+from . import lineage
+from . import worker
 
 __all__ = [
     "PACKET_KIND",
@@ -60,6 +62,7 @@ __all__ = [
     "Rejected",
     "export_packet",
     "import_packet",
+    "release",
     "sha256_file",
     "waiting",
 ]
@@ -91,7 +94,7 @@ class Context:
     """What an adapter needs beyond the connection: where the node keeps things."""
 
     jobs_dir: Path = field(default_factory=lambda: Path("~/sketchgen/jobs").expanduser())
-    lineage_depth: int = 3
+    lineage_depth: int = worker.DEFAULT_LINEAGE_DEPTH
 
 
 def sha256_file(path: str | Path) -> str:
@@ -242,10 +245,171 @@ class JudgeAdapter(Adapter):
                 f"look={answers['look']} by {model}")
 
 
+class CritiqueAdapter(Adapter):
+    """The critic: one sentence about one published entry, which becomes a child.
+
+    Offering is :func:`db.entries_to_critique` — the entries the idle loop
+    would reach for — and every entry offered is **claimed** for the model the
+    packet is cut for (:func:`db.paid_claims`), which the idle loop then skips.
+    That is plan §3.4's answer: `critiques` holds one row per entry per prompt
+    version, so the paid critic is the only critic for the entries it has been
+    handed rather than a racer for them. An export re-offers this model's own
+    outstanding claims first, so a packet lost on the laptop costs nothing.
+
+    Landing is the idle loop's two writes — :func:`lineage.spawn` and
+    :func:`db.record_critique`, with the same arguments — after
+    :func:`lineage.validate`, unchanged. One difference, on purpose: the idle
+    loop records a critique that fails the validator as a rejected row, which
+    uses up the entry for that prompt version. Here it writes nothing and the
+    entry stays claimed, because the reply is the laptop's to try again (plan
+    §5.4), and the raw text is saved beside the packet.
+
+    The guard is the sha256 of the strip (plan §3.3). The strip is the evidence
+    and :func:`lineage.critique` refuses to critique without it; a strip that
+    changed since export means the sentence is about a picture that is gone.
+    """
+
+    step = "critique"
+    how_to_answer = (
+        "Show the model the item's prompt with the one image in 'images' (the "
+        "sketch's frame strip: the only evidence of what it shows). Put its "
+        "reply, verbatim, in 'answer': one sentence, under 40 words, no code."
+    )
+
+    def prompt_version(self) -> str:
+        try:
+            return lineage.prompt_version()
+        except lineage.CritiqueRefused as exc:
+            raise PaidRefused(str(exc)) from exc
+
+    def _others(self, conn: sqlite3.Connection, model: str) -> list[int]:
+        return [
+            entry_id
+            for entry_id, claim in db.paid_claims(conn, self.step).items()
+            if claim.get("model") != model
+        ]
+
+    def offer(self, conn, *, model, limit, ctx):
+        version = self.prompt_version()
+        wanted = db.entries_to_critique(
+            conn, version, limit, exclude=self._others(conn, model)
+        )
+        items = []
+        for entry_id in wanted:
+            row = db.get_entry(conn, entry_id)
+            strip = str(row["strip_path"])
+            try:
+                guard = sha256_file(strip)
+            except Rejected:
+                continue  # an unreadable strip: the local critic refuses it too
+            items.append(
+                {
+                    "key": f"entry {entry_id}",
+                    "prompt": lineage.critique_prompt(row, row["statement"], row["brief"]),
+                    "images": [strip],
+                    "guard": guard,
+                    "prompt_version": version,
+                    "inputs": {
+                        "entry": entry_id,
+                        "generation": lineage.generation_of(conn, entry_id),
+                    },
+                    "answer": "",
+                }
+            )
+        db.claim_paid(conn, self.step, [item["inputs"]["entry"] for item in items], model)
+        return items
+
+    def waiting(self, conn):
+        claims = db.paid_claims(conn, self.step)
+        try:
+            open_ = db.entries_to_critique(
+                conn, self.prompt_version(), 10_000, exclude=claims
+            )
+        except PaidRefused:
+            open_ = []
+        return {
+            "count": len(open_),
+            "claimed": {str(k): v for k, v in sorted(claims.items())},
+            "summary": f"{len(open_)} entr{'y' if len(open_) == 1 else 'ies'} "
+                       f"to critique, {len(claims)} claimed off the node",
+        }
+
+    def land(self, conn, item, *, model, ctx):
+        inputs = item.get("inputs") or {}
+        try:
+            entry_id = int(inputs["entry"])
+        except (KeyError, TypeError, ValueError):
+            raise Rejected("the item names no entry") from None
+        row = db.get_entry(conn, entry_id)
+        if row is None:
+            raise Rejected(f"there is no entry {entry_id}")
+        if not lineage.CRITIQUE_BY_RE.match(model):
+            # It becomes `critique_by` on the child, which is narrower than a
+            # model id; better refused here than recorded as a spawn refusal.
+            raise Rejected(f"{model!r} cannot sign a critique: letters, digits, "
+                           "'.', '_', ':' and '-' only")
+        version = str(item.get("prompt_version") or "")
+        if version != self.prompt_version():
+            raise Rejected(
+                f"cut under {version or 'no prompt version'}, and the critic is "
+                f"now {self.prompt_version()}: export again"
+            )
+        if db.get_critique(conn, entry_id, version) is not None:
+            raise Rejected(f"entry {entry_id} already has a {version} critique")
+        strip = str(row["strip_path"] or "")
+        if not strip or sha256_file(strip) != str(item.get("guard") or ""):
+            raise Rejected("the strip no longer matches; the sketch changed")
+        try:
+            text = lineage.validate(str(item.get("answer") or ""))
+        except lineage.CritiqueFailed as exc:
+            raise Rejected(str(exc)) from exc
+
+        job_id: int | None = None
+        reason: str | None = None
+        try:
+            job_id = lineage.spawn(
+                conn,
+                parent_entry_id=entry_id,
+                critique=text,
+                critique_by=model,
+                submitted_by=row["submitted_by"] or "",
+                max_depth=ctx.lineage_depth,
+                rules_file=lineage.parent_rules_file(conn, row),
+                publication="hold",
+            )
+        except ValueError as exc:
+            reason = f"spawn refused: {exc}"
+        if job_id is None and reason is None:
+            reason = "the parent is a rejected entry, and a line does not grow from one"
+        db.record_critique(
+            conn,
+            entry_id,
+            critique=text,
+            critique_by=model,
+            prompt_version=version,
+            spawned_job_id=job_id,
+            rejected_reason=reason,
+            strip_path=strip,
+            strip_sha256=item.get("guard"),
+        )
+        db.release_paid(conn, self.step, [entry_id])
+        if job_id is None:
+            return f"entry {entry_id}: critiqued by {model}, spawned nothing: {reason}"
+        return f"entry {entry_id}: critiqued by {model} -> job {job_id}"
+
+
 #: One adapter per step. A step not listed here refuses at the CLI.
 ADAPTERS: dict[str, Adapter] = {
     "judge": JudgeAdapter(),
+    "critique": CritiqueAdapter(),
 }
+
+
+def release(conn: sqlite3.Connection, step: str,
+            subject_ids: list[int] | None = None) -> list[int]:
+    """Hand claimed subjects back to the local path. Only the critic claims."""
+    adapter_for(step)
+    return db.release_paid(conn, step, subject_ids)
 
 
 def adapter_for(step: str) -> Adapter:

@@ -1701,8 +1701,11 @@ class Worker:
             self.log(f"idle: no critique prompt to work from: {exc}")
             return 0
         try:
+            # An entry exported to a paid critic is that critic's until its
+            # answer is imported or the claim released (agentic-cli §3.4).
             candidates = db.entries_to_critique(
-                self.conn, version, self.idle_critique
+                self.conn, version, self.idle_critique,
+                exclude=db.paid_claims(self.conn, "critique"),
             )
         except sqlite3.Error as exc:
             self.log(f"idle: cannot look for entries to critique: {exc}")
@@ -1727,13 +1730,7 @@ class Worker:
         *setting*, so a random line stays random and the coin is tossed again
         per child (spec §9).
         """
-        job_id = entry_row["job_id"] if "job_id" in entry_row.keys() else None
-        if job_id is None:
-            return None
-        row = self.conn.execute(
-            "SELECT rules_file FROM jobs WHERE id = ?", (int(job_id),)
-        ).fetchone()
-        return row["rules_file"] if row is not None else None
+        return lineage.parent_rules_file(self.conn, entry_row)
 
     def _critique_one(self, entry_id: int, version: str) -> bool:
         """One entry: critique it, spawn its child, record what happened."""

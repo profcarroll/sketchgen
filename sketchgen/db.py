@@ -811,7 +811,10 @@ def get_critique(
 
 
 def entries_to_critique(
-    conn: sqlite3.Connection, prompt_version: str, limit: int = 1
+    conn: sqlite3.Connection,
+    prompt_version: str,
+    limit: int = 1,
+    exclude: Iterable[int] = (),
 ) -> list[int]:
     """Published entries with no live child and no critique yet, oldest first.
 
@@ -835,9 +838,18 @@ def entries_to_critique(
     block a dead child used to cause above, and it is excluded here for the
     same reason -- the query offers only entries a critique can actually be
     written for.
+
+    ``exclude`` is the entries assigned to a critic that is not asking — the
+    paid critic's claims, when the local one asks (:func:`paid_claims`). It is
+    in the query and not filtered afterwards for the reason above: at LIMIT 1 an
+    excluded entry at the head of the list would block every entry behind it.
     """
     if int(limit) <= 0:
         return []
+    skip = sorted({int(entry_id) for entry_id in exclude})
+    not_in = (
+        f"  AND e.id NOT IN ({', '.join('?' for _ in skip)}) " if skip else ""
+    )
     rows = conn.execute(
         "SELECT e.id AS id FROM entries e "
         "WHERE e.state = 'published' "
@@ -851,8 +863,9 @@ def entries_to_critique(
         "  AND NOT EXISTS (SELECT 1 FROM critiques q WHERE q.entry_id = e.id "
         "                    AND q.prompt_version = ?) "
         "  AND e.strip_path IS NOT NULL AND TRIM(e.strip_path) <> '' "
-        "ORDER BY e.created_utc, e.id LIMIT ?",
-        (prompt_version, int(limit)),
+        + not_in
+        + "ORDER BY e.created_utc, e.id LIMIT ?",
+        (prompt_version, *skip, int(limit)),
     ).fetchall()
     return [int(row["id"]) for row in rows]
 
@@ -1183,6 +1196,80 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str | None) -> None:
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
+
+
+# ---------------------------------------------------------------------------
+# Paid claims — which entries a critic off the node has been handed
+# ---------------------------------------------------------------------------
+
+#: Meta key prefix for :func:`paid_claims`. One row per step, holding JSON.
+PAID_CLAIMS_KEY = "paid_claims:"
+
+
+def paid_claims(conn: sqlite3.Connection, step: str) -> dict[int, dict[str, str]]:
+    """``{subject id: {"model", "claimed_utc"}}`` handed out by ``paid export``.
+
+    Only the critic needs this (docs/plans/agentic-cli.md §3.4). `critiques` is
+    UNIQUE (entry_id, prompt_version), keyed on what was asked rather than who
+    answered, so a paid critic and the local one would compete for one row per
+    entry and whichever ran first would lock the other out in silence. Instead
+    an entry exported to a paid critic is *assigned* to it: the idle loop skips
+    what is claimed here, and an import releases the claim. The planner and the
+    executor need none of this, because a job parked at ``needs-laptop`` is
+    already out of the worker's reach; the judge needs none because
+    `judgments` is keyed on who judged.
+
+    No migration: a `meta` row of JSON, read whole and written whole.
+    """
+    raw = get_meta(conn, PAID_CLAIMS_KEY + step)
+    try:
+        found = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    if not isinstance(found, dict):
+        return {}
+    claims: dict[int, dict[str, str]] = {}
+    for key, value in found.items():
+        try:
+            claims[int(key)] = dict(value) if isinstance(value, dict) else {}
+        except (TypeError, ValueError):
+            continue
+    return claims
+
+
+def _write_paid_claims(
+    conn: sqlite3.Connection, step: str, claims: dict[int, dict[str, str]]
+) -> None:
+    set_meta(
+        conn,
+        PAID_CLAIMS_KEY + step,
+        json.dumps({str(k): v for k, v in sorted(claims.items())}, sort_keys=True)
+        if claims else None,
+    )
+
+
+def claim_paid(
+    conn: sqlite3.Connection, step: str, subject_ids: Iterable[int], model: str
+) -> None:
+    """Assign these subjects to ``model``. A subject claimed already is re-claimed."""
+    claims = paid_claims(conn, step)
+    now = utc_now()
+    for subject in subject_ids:
+        claims[int(subject)] = {"model": model, "claimed_utc": now}
+    _write_paid_claims(conn, step, claims)
+
+
+def release_paid(
+    conn: sqlite3.Connection, step: str, subject_ids: Iterable[int] | None = None
+) -> list[int]:
+    """Hand subjects back to the local path; ``None`` releases every one."""
+    claims = paid_claims(conn, step)
+    wanted = set(claims) if subject_ids is None else {int(s) for s in subject_ids}
+    released = sorted(wanted & set(claims))
+    for subject in released:
+        del claims[subject]
+    _write_paid_claims(conn, step, claims)
+    return released
 
 
 # ---------------------------------------------------------------------------
