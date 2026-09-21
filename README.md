@@ -130,6 +130,8 @@ From the console's production telemetry, after the first day of running:
 | prefill / decode | 94.8 / 25.4 tok/s |
 | API calls | 0 — all inference local (for these runs; see off-node above) |
 
+Agents (coding or paid-model): read [AGENTS.md](AGENTS.md) first.
+
 ## File map
 
 ```
