@@ -418,6 +418,42 @@ class Element {
     (this.listeners[name] || []).forEach(function (fn) { fn(detail); });
     return detail;
   }
+
+  /* The page's own door, as opposed to `dispatch` above, which is the tests'.
+   * The ghost pointer (ghostshim.py) dispatches a MouseEvent on the canvas and
+   * relies on it bubbling, because p5 attaches its mouse handlers to window,
+   * so this walks up the tree when the event says it bubbles. */
+  dispatchEvent(event) {
+    if (event.target === undefined || event.target === null) { event.target = this; }
+    var node = this;
+    while (node) {
+      (node.listeners[event.type] || []).forEach(function (fn) { fn(event); });
+      if (!event.bubbles) { break; }
+      node = node.parentNode;
+    }
+    return !event.defaultPrevented;
+  }
+}
+
+/* The one event constructor a script here builds for itself. Only the fields
+ * the ghost pointer sets and p5 reads; isTrusted is false, and is false on a
+ * real synthetic event too, which is what makes the shim's yield-to-a-hand
+ * testable at all. */
+class MouseEvent {
+  constructor(type, init) {
+    const opts = init || {};
+    this.type = String(type);
+    this.bubbles = !!opts.bubbles;
+    this.cancelable = !!opts.cancelable;
+    this.clientX = opts.clientX === undefined ? 0 : opts.clientX;
+    this.clientY = opts.clientY === undefined ? 0 : opts.clientY;
+    this.button = opts.button === undefined ? 0 : opts.button;
+    this.buttons = opts.buttons === undefined ? 0 : opts.buttons;
+    this.isTrusted = false;
+    this.defaultPrevented = false;
+    this.target = null;
+  }
+  preventDefault() { this.defaultPrevented = true; }
 }
 
 REFLECTED.forEach(function (name) {
@@ -504,4 +540,4 @@ function makeWindow() {
   return window;
 }
 
-module.exports = { Element, Text, Document, makeWindow };
+module.exports = { Element, Text, Document, MouseEvent, makeWindow };

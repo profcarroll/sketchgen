@@ -3,7 +3,7 @@
 One entry row plus its attempt directory in, a directory of plain files out:
 
     <gallery>/e/<id>/index.html          the ENTRY page (not the sketch)
-    <gallery>/e/<id>/sketch/index.html   the sketch's own page, verbatim but for soundshim.py
+    <gallery>/e/<id>/sketch/index.html   the sketch's own page, verbatim but for the two shims
     <gallery>/e/<id>/sketch/sketch.js    the file the entry's frame loads
     <gallery>/e/<id>/strip.png           four frames, from the gate
     <gallery>/e/<id>/gate.png            the gate's single frame
@@ -65,6 +65,7 @@ from . import pairs as pairs_mod
 from . import lineage
 from . import models
 from . import qr
+from . import ghostshim
 from . import soundshim
 
 __all__ = [
@@ -287,6 +288,26 @@ def guard(dest_dir: str | Path, written: _Written | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: How long the kiosk's ghost pointer waits before playing its script again,
+#: in seconds. kiosk.js carries the same default, for a gallery whose
+#: config.json predates this field.
+DEFAULT_GHOST_LOOP_S = 6
+
+
+def _ghost_loop_seconds(value: Any) -> int:
+    """``kiosk_ghost_loop_s``, or the default when it is not a usable number.
+
+    Clamped rather than trusted, for the reason ``clampEvery`` in kiosk.js is:
+    a projector nobody is watching should not be able to be left ghosting once
+    an hour, or forty times a second, by a typo in a file nobody rereads.
+    """
+    try:
+        seconds = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_GHOST_LOOP_S
+    return seconds if 1 <= seconds <= 600 else DEFAULT_GHOST_LOOP_S
+
+
 @dataclass(frozen=True)
 class Config:
     """The two URLs the generated pages need, and the repository behind them.
@@ -301,12 +322,20 @@ class Config:
     pipeline because the write path has no switch of its own to turn it off
     with: this one is a line in the gallery checkout's ``config.json``, which
     ``load`` reads back and ``render-index`` leaves as it found it.
+
+    ``kiosk_ghost`` and ``kiosk_ghost_loop_s`` are the same kind of lever for
+    the ghost pointer (docs/plans/auto-mouse.md ``DECIDE[ghost-off]``): off for
+    the whole gallery in one line and a ``render-index``, no deploy. The other
+    two switches are ``?ghost=0`` for one projector and the ``M`` key for one
+    room.
     """
 
     write_path: str = ""
     gallery_url: str = DEFAULT_GALLERY_URL
     repository: str = DEFAULT_REPOSITORY
     kiosk_views: bool = True
+    kiosk_ghost: bool = True
+    kiosk_ghost_loop_s: int = DEFAULT_GHOST_LOOP_S
 
     @classmethod
     def load(cls, dest_dir: str | Path) -> "Config":
@@ -328,6 +357,11 @@ class Config:
             # counts its views, which is the state every checkout is in the
             # first time this runs.
             kiosk_views=data.get("kiosk_views") is not False,
+            # Absent is on here too, and for the same reason: a checkout that
+            # predates the ghost pointer should get it, not go without it
+            # until somebody notices the line is missing.
+            kiosk_ghost=data.get("kiosk_ghost") is not False,
+            kiosk_ghost_loop_s=_ghost_loop_seconds(data.get("kiosk_ghost_loop_s")),
         )
 
     def to_json(self) -> str:
@@ -338,6 +372,8 @@ class Config:
                     "gallery_url": self.gallery_url,
                     "repository": self.repository,
                     "kiosk_views": self.kiosk_views,
+                    "kiosk_ghost": self.kiosk_ghost,
+                    "kiosk_ghost_loop_s": self.kiosk_ghost_loop_s,
                 },
                 indent=2,
                 sort_keys=True,
@@ -2254,13 +2290,16 @@ def _write_entry(
         index_html = source / "index.html"
         if sketch_js.is_file() and index_html.is_file():
             written.copy(sketch_js, out / "sketch" / "sketch.js")
-            # Verbatim, with one exception: a page that loads p5.sound gets
-            # the shim that lets it start inside a sandboxed frame on WebKit
-            # (soundshim.py). Entries published before the executor wrote it
-            # pick it up here, on the next render-all; every other page is
-            # the bytes the gate ran.
+            # Verbatim, with two exceptions, and they are the only two. A
+            # page that loads p5.sound gets the shim that lets it start
+            # inside a sandboxed frame on WebKit (soundshim.py); every page
+            # gets the ghost pointer, which is inert without ?ghost= in the
+            # URL and is how the kiosk moves a sketch that waits to be
+            # touched (ghostshim.py). Entries published before either existed
+            # pick them up here, on the next render-all; apart from those two
+            # scripts this is the bytes the gate ran.
             page = index_html.read_text(encoding="utf-8")
-            shimmed = soundshim.with_shim(page)
+            shimmed = ghostshim.with_shim(soundshim.with_shim(page))
             if shimmed == page:
                 written.copy(index_html, out / "sketch" / "index.html")
             else:
@@ -2706,6 +2745,25 @@ def _kiosk_judgment(scores: dict, entry_id: int) -> dict[str, dict[str, dict]]:
     return out
 
 
+#: ``responds(click)`` → ``click``. The gate's assertion vocabulary is the only
+#: place the generator can learn that a sketch has something to give, and two
+#: pages say so: the swipe caption prints *responds to touch · hold to try*,
+#: because the shield means nobody finds out by accident (swipe.md §4.4), and
+#: the kiosk sends a ghost pointer into the frame, because on a projector
+#: nobody is going to find out at all (auto-mouse.md ``DECIDE[ghost-who]``).
+_RESPONDS_RE = re.compile(r"responds\((\w+)\)")
+
+
+def _responds(assertions: Iterable[str]) -> list[str]:
+    """The ``<what>`` of every ``responds(<what>)`` assertion, in order."""
+    out: list[str] = []
+    for assertion in assertions:
+        match = _RESPONDS_RE.search(str(assertion))
+        if match is not None:
+            out.append(match.group(1))
+    return out
+
+
 def _manifest_base(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2721,13 +2779,23 @@ def _manifest_base(
     and :func:`_needs_mic` each read the sketch source. Doing that twice per
     entry would double the cost of a 910-entry render for two files that must
     agree by construction, so the shared half is built here and handed to both.
+
+    ``responds`` is only what the gate confirmed: ``assertions`` is what the
+    planner asked for, and an off-plan entry is one the gate published anyway
+    with some of them missed. Both readers act on it — the phone tells a finger
+    to hold, the projector sends a ghost pointer — and doing either to a sketch
+    the gate proved does not respond is the one case the subtraction exists to
+    prevent.
     """
     attempts = _attempt_rows(conn, int(row["job_id"]))
+    meta = _meta(conn, row, attempts, config, parent, children)
+    missed = set(_offplan(row))
     return {
         "entry_id": int(row["id"]),
-        "meta": _meta(conn, row, attempts, config, parent, children),
+        "meta": meta,
         "canvas": _canvas_size(row, attempts),
         "mic": _needs_mic(_source_dir(row, attempts)),
+        "responds": _responds(a for a in meta["assertions"] if a not in missed),
     }
 
 
@@ -2762,6 +2830,12 @@ def _kiosk_entry(
     entry["url"] = config.entry_url(entry_id)
     if base["canvas"] is not None:
         entry["canvas"] = base["canvas"]
+    # Absent when there are none, as ``canvas`` is. The kiosk reads it for one
+    # thing only: whether to put ?ghost= on the frame's src, so a sketch that
+    # waits to be touched moves on a wall nobody is standing at
+    # (auto-mouse.md §3.2). The same list the swipe caption reads.
+    if base["responds"]:
+        entry["responds"] = base["responds"]
     entry["judgment"] = _kiosk_judgment(scores, entry_id)
     return entry
 
@@ -2797,23 +2871,6 @@ SWIPE_META_KEYS = (
 #: root.
 SWIPE_LINEAGE_KEYS = ("generation", "parent_entry_id", "critique_by")
 
-#: ``responds(click)`` → ``click``. The gate's assertion vocabulary is the only
-#: place the generator can learn that a sketch has something to give a finger,
-#: and the caption says so — *responds to touch · hold to try* — because the
-#: shield means nobody finds out by accident (spec §4.4).
-_RESPONDS_RE = re.compile(r"responds\((\w+)\)")
-
-
-def _responds(assertions: Iterable[str]) -> list[str]:
-    """The ``<what>`` of every ``responds(<what>)`` assertion, in order."""
-    out: list[str] = []
-    for assertion in assertions:
-        match = _RESPONDS_RE.search(str(assertion))
-        if match is not None:
-            out.append(match.group(1))
-    return out
-
-
 def _swipe_entry(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2826,8 +2883,11 @@ def _swipe_entry(
     """One entry as the phone reads it: the caption's values, and where to run.
 
     Every value here is one :func:`_kiosk_entry` already computes, minus the
-    prose and plus three the kiosk has no use for: what the sketch responds to,
-    whether it listens, and the path of its meta.json.
+    prose and plus two the kiosk has no use for: whether it listens, and the
+    path of its meta.json. ``responds`` used to be a third; the kiosk reads it
+    now too, to decide whether to send a ghost pointer into the frame, so it
+    is computed once in :func:`_manifest_base` like everything else both files
+    print.
     """
     if base is None:
         base = _manifest_base(conn, row, config, parent, children)
@@ -2838,15 +2898,11 @@ def _swipe_entry(
     entry.update({key: meta["lineage"][key] for key in SWIPE_LINEAGE_KEYS})
     # Absent when there are none, as ``canvas`` is: a sketch that has nothing
     # to give a finger should not be told to hold, and an empty list in the
-    # row is one more thing for the script to remember to test for.
-    # And only what the gate confirmed: ``assertions`` is what the planner
-    # asked for, and an off-plan entry is one the gate published anyway with
-    # some of them missed. A caption that says *hold to try* on a sketch the
-    # gate proved does not respond is the one case the fact exists to prevent.
-    missed = set(_offplan(row))
-    responds = _responds(a for a in meta["assertions"] if a not in missed)
-    if responds:
-        entry["responds"] = responds
+    # row is one more thing for the script to remember to test for. Computed
+    # in :func:`_manifest_base`, with the off-plan subtraction, so the two
+    # manifests cannot disagree about what an entry answers to.
+    if base["responds"]:
+        entry["responds"] = base["responds"]
     # A listening sketch is framed like any other — the frame is opaque and the
     # mic is refused it, so it runs deaf, and the caption says to open the
     # entry page instead. Skipping it would make the feed lie about the size of

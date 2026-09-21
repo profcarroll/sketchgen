@@ -45,6 +45,7 @@ from pathlib import Path
 from string import Template
 from typing import Any
 
+from . import ghostshim
 from . import soundshim
 
 __all__ = [
@@ -75,8 +76,10 @@ DEFAULT_MODEL = os.environ.get(
 DEFAULT_NUM_CTX = 8192
 DEFAULT_SEED = 1
 
-#: The index.html written when the model emits no ``html`` block: the gate's
+#: The page written when the model emits no ``html`` block: the gate's
 #: fixtures/good-motion index, p5 pinned at 1.11.3, nothing else in it.
+#: :func:`index_html_for` is what actually goes to disk, and it adds the two
+#: shims — this is the page they are added to.
 DEFAULT_INDEX_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -125,15 +128,20 @@ def index_html_for(js: str) -> tuple[str, str]:
 
     The model can still write its own ``html`` block and this never runs. Only
     the fallback got smarter about what the sketch it is wrapping actually asked
-    for.
+    for. A model-supplied page is written verbatim here and picks up both shims
+    in the gallery's copy instead (``gallery._write_entry``).
     """
     if not SOUND_RE.search(js):
-        return DEFAULT_INDEX_HTML, "default"
+        # The ghost pointer goes on every page, sound or not: it is inert
+        # without ?ghost= in the URL, and putting it here rather than only in
+        # the gallery's copy is what makes the page the gate runs the page
+        # that gets published (ghostshim.py, auto-mouse.md §3.1).
+        return ghostshim.with_shim(DEFAULT_INDEX_HTML), "default"
     # And the shim that keeps the addon from holding the sketch at
     # "Loading..." inside a sandboxed frame on WebKit (soundshim.py).
-    return soundshim.with_shim(
+    return ghostshim.with_shim(soundshim.with_shim(
         DEFAULT_INDEX_HTML.replace(_P5_TAG, _P5_TAG + _P5_SOUND_TAG)
-    ), "default+p5.sound"
+    )), "default+p5.sound"
 
 
 # ---------------------------------------------------------------------------

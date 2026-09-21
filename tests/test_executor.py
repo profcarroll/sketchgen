@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from sketchgen import executor, soundshim  # noqa: E402
+from sketchgen import executor, ghostshim, soundshim  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "executor"
@@ -88,9 +88,17 @@ class TestCleanResponse(ExecutorTestCase):
         result = self.replay("clean.txt")
         self.assertEqual(result.index_source, "default")
         html = (self.out / "index.html").read_text(encoding="utf-8")
-        self.assertEqual(html, executor.DEFAULT_INDEX_HTML)
+        self.assertEqual(html, ghostshim.with_shim(executor.DEFAULT_INDEX_HTML))
         self.assertIn("p5.js/1.11.3/p5.min.js", html)
         self.assertNotIn("p5.sound", html)
+        # The ghost pointer is on every page the executor writes, sound or
+        # not, and it is after the sketch, because p5 attaches its handlers
+        # when sketch.js runs and the shim only dispatches (ghostshim.py).
+        self.assertEqual(1, html.count(ghostshim.MARKER))
+        self.assertLess(html.index('src="sketch.js"'), html.index(ghostshim.MARKER))
+        # Inert, though, until something puts ?ghost= in the URL: this is the
+        # page the entry page and the swipe feed load too.
+        self.assertIn('param("ghost")', html)
 
     def test_the_fallback_index_loads_p5_sound_when_the_sketch_needs_it(self):
         """The library trap, closed.
@@ -116,13 +124,25 @@ class TestCleanResponse(ExecutorTestCase):
                 self.assertEqual(1, html.count(soundshim.MARKER))
                 self.assertLess(html.index("p5.sound.min.js"), html.index(soundshim.MARKER))
                 self.assertLess(html.index(soundshim.MARKER), html.index('src="sketch.js"'))
+                # and the ghost pointer goes after the sketch, so the whole
+                # order is p5 -> addon -> sound marker -> sketch.js -> ghost
+                # marker (auto-mouse.md §3.4)
+                self.assertEqual(1, html.count(ghostshim.MARKER))
+                self.assertLess(html.index('src="sketch.js"'), html.index(ghostshim.MARKER))
 
     def test_a_sketch_with_no_sound_gets_the_index_byte_for_byte(self):
         # DEFAULT_INDEX_HTML is the gate's own fixtures/good-motion index; a
-        # sketch that never mentions sound must still get exactly those bytes.
+        # sketch that never mentions sound must still get exactly those bytes,
+        # and the only thing added to them is the ghost pointer, which every
+        # page carries and which does nothing without ?ghost= in the URL.
         html, how = executor.index_html_for("function setup(){ createCanvas(9, 9); }")
         self.assertEqual("default", how)
-        self.assertEqual(executor.DEFAULT_INDEX_HTML, html)
+        self.assertEqual(ghostshim.with_shim(executor.DEFAULT_INDEX_HTML), html)
+        self.assertEqual(
+            executor.DEFAULT_INDEX_HTML,
+            html.replace(ghostshim.SHIM, ""),
+            "the ghost shim is the only difference, and it comes out cleanly",
+        )
 
     def test_the_sound_names_are_the_gate_s_own(self):
         """If one list moves the other must; the gate is the authority."""

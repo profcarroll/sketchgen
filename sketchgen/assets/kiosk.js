@@ -46,6 +46,17 @@
  * Any of that can be turned off without a deploy: kiosk_views in config.json
  * for the gallery, ?views=0 for one projector.
  *
+ * And the one parameter it adds to anything (docs/plans/auto-mouse.md):
+ *
+ *   <root><sketch>?ghost=click,drag&ghost_loop=6000
+ *                   for an entry the gate confirmed responds to a click or a
+ *                   drag. The frame's own shim plays a pointer script inside
+ *                   itself; this page dispatches nothing and cannot, because
+ *                   the frame is an opaque origin. Off in three places, as
+ *                   the views are: kiosk_ghost and kiosk_ghost_loop_s in
+ *                   config.json for the gallery, ?ghost=0 for one projector,
+ *                   M for one room.
+ *
  * What it must never do (spec §4.5), and what the tests hold it to: write
  * anything but that one view; read document.cookie; present an identity of any
  * kind, because /counts is a public read, /view takes an anonymous one, and
@@ -181,6 +192,14 @@
    * artist in the room is a decision an operator makes, not a default. */
   var DEFAULT_SIZE = "native";
 
+  /* The ghost pointer (docs/plans/auto-mouse.md §3.2). The kinds are in the
+   * order the shim plays them, and they are the only two: responds(audio) is
+   * never ghosted, because a synthetic event is not a user gesture and cannot
+   * resume an AudioContext. The seconds are what config.json says, and this
+   * is what a gallery whose config.json predates the field gets. */
+  var GHOST_KINDS = ["click", "drag"];
+  var DEFAULT_GHOST_LOOP_S = 6;
+
   /* The stored settings blob's shape. A projector that has been running since
    * before the QR overlay existed has a show map that cannot mention a key
    * that did not exist, so without this it would come back with the code off
@@ -213,7 +232,9 @@
     playing: false,
     viewed: false,      /* has this seat been counted? cleared by seat() */
     sinceInput: 0,      /* playing seconds since the last key or mouse move */
-    viewsOff: false     /* ?views=0, which is not a key and is not persisted */
+    viewsOff: false,    /* ?views=0, which is not a key and is not persisted */
+    ghost: true,        /* M, persisted beside every and order */
+    ghostOff: false     /* ?ghost=0, which is not a key and is not persisted */
   };
 
   /* ---- small helpers ---------------------------------------------------- */
@@ -427,6 +448,9 @@
       if (named(saved.order)) { state.order = saved.order; }
       if (saved.every) { state.every = clampEvery(saved.every); }
       if (sizeNamed(saved.size)) { state.size = saved.size; }
+      /* Absent is on, so a projector configured before the ghost pointer
+       * existed gets it; only a stored false turns it off. */
+      if (saved.ghost === false) { state.ghost = false; }
       if (saved.show && typeof saved.show === "object") {
         list = [];
         for (key in saved.show) {
@@ -459,10 +483,13 @@
     // counts is a property of the projector somebody set up, not something a
     // bumped keyboard should be able to change on the way past.
     state.viewsOff = params.get("views") === "0";
+    // The same, for the same reason: whether the sketches on this projector
+    // move by themselves is a property of the projector somebody set up.
+    state.ghostOff = params.get("ghost") === "0";
   }
 
-  /* The launch link and the address bar are the same four parameters, built
-   * the same way, so the link in the menu footer is a link to what is on the
+  /* The launch link and the address bar are the same parameters, built the
+   * same way, so the link in the menu footer is a link to what is on the
    * screen. Order, every and size come from fixed vocabularies and the overlay
    * keys are [a-z], so nothing here needs escaping; commas stay commas, which
    * is what makes the link readable on a projector. */
@@ -476,16 +503,18 @@
       // It rides in the launch link for the same reason: the link is supposed
       // to reproduce the projector, and a projector that counts nothing is
       // not reproduced by a link that counts.
-      (state.viewsOff ? "&views=0" : "");
+      (state.viewsOff ? "&views=0" : "") +
+      (state.ghostOff ? "&ghost=0" : "");
   }
 
-  /* Both halves of §1.8 at once. The address bar keeps only these four
-   * parameters: the kiosk page has no others. */
+  /* Both halves of §1.8 at once. The address bar keeps only what query()
+   * builds: the kiosk page has no other parameters. */
   function persist() {
     try {
       window.localStorage.setItem(STORAGE_KEY, JSON.stringify({
         v: SETTINGS_VERSION,
-        every: state.every, order: state.order, size: state.size, show: state.show
+        every: state.every, order: state.order, size: state.size,
+        show: state.show, ghost: state.ghost
       }));
     } catch (err) { /* private mode: the URL still carries it */ }
     if (window.history && window.history.replaceState) {
@@ -653,15 +682,51 @@
    * and no postMessage channel. A sketch's own key handler therefore never
    * sees a kiosk key, and a kiosk key never reaches a sketch. */
   function showEntry(entry) {
+    var kinds;
     if (frame) { frame.remove(); frame = null; }
     if (!entry) { return; }
     frame = document.createElement("iframe");
     frame.className = "sketch";
     frame.setAttribute("sandbox", "allow-scripts");
-    frame.src = ROOT + entry.sketch;
+    /* The only thing this page ever says to a sketch, and it says it once, in
+     * the URL. The page inside reads it at load and plays a pointer script at
+     * its own canvas; nothing is dispatched from here, nothing is posted, and
+     * the frame still carries the four attributes it is allowed
+     * (docs/plans/auto-mouse.md DECIDE[ghost-channel]). */
+    kinds = ghosting(entry);
+    frame.src = ROOT + entry.sketch + (kinds.length
+      ? "?ghost=" + kinds.join(",") + "&ghost_loop=" + ghostLoopMs() : "");
     frame.title = "entry " + entry.id + " running";
     $("stage").insertBefore(frame, $("caption"));
     fitFrame();
+  }
+
+  /* Which of the two gestures this entry answers to, in the shim's order.
+   * kiosk.json carries only what the gate confirmed, off-plan misses already
+   * subtracted (gallery._manifest_base), so a sketch the gate proved does not
+   * respond is never given a pointer to ignore. */
+  function ghostKinds(entry) {
+    var responds = (entry && entry.responds) || [];
+    var kinds = [];
+    var at;
+    for (at = 0; at < GHOST_KINDS.length; at += 1) {
+      if (responds.indexOf(GHOST_KINDS[at]) !== -1) { kinds.push(GHOST_KINDS[at]); }
+    }
+    return kinds;
+  }
+
+  /* Every condition in one place, as countingViews() is, so there is one line
+   * to read when asking why a projector is or is not ghosting. */
+  function ghosting(entry) {
+    if (!state.ghost || state.ghostOff) { return []; }
+    if (config && config.kiosk_ghost === false) { return []; }
+    return ghostKinds(entry);
+  }
+
+  function ghostLoopMs() {
+    var seconds = config && config.kiosk_ghost_loop_s;
+    if (typeof seconds !== "number" || !(seconds > 0)) { seconds = DEFAULT_GHOST_LOOP_S; }
+    return Math.round(seconds * 1000);
   }
 
   /* An opaque frame cannot be asked how big its canvas is, so the generator
@@ -817,6 +882,14 @@
       facts.push("<li>written in <b>" + secs(entry.wall_s) + "</b></li>");
     }
     if (on("licence")) { facts.push("<li><b>" + esc(entry.licence) + "</b></li>"); }
+    /* Last, where swipe prints *responds to touch*, and not an overlay: there
+     * is no key to turn it off because there is nothing to turn off when the
+     * pointer is not running, and a room that sees a sketch moving on its own
+     * is owed the two words either way. H still hides it with everything
+     * else. */
+    if (!state.hideAll && ghosting(entry).length) {
+      facts.push("<li class=\"ghost\">ghost pointer</li>");
+    }
     if (facts.length) { html += "<ul class=\"facts\">" + facts.join("") + "</ul>"; }
     return html;
   }
@@ -954,6 +1027,11 @@
     $("m-pause-state").textContent = state.paused ? "paused" : "playing";
     $("m-pause").className = state.paused ? "on" : "";
     $("m-hide-state").textContent = state.hideAll ? "hidden" : "";
+    // Named on and off rather than shown as a count: it acts on the entries
+    // that respond to something, which is a hundredth of the gallery, and an
+    // operator needs to know the switch is thrown, not how many it caught.
+    $("m-ghost").className = (state.ghost && !state.ghostOff) ? "on" : "";
+    $("m-ghost-state").textContent = (state.ghost && !state.ghostOff) ? "on" : "off";
     $("m-size-state").textContent = sizeLabel(state.size);
     // A window-sized sketch is already the stage in all four modes. Saying so
     // where the key is listed is cheaper than an operator pressing Z four
@@ -1150,6 +1228,17 @@
     else if (key === "[") { state.every = Math.max(15, state.every - 15); }
     else if (key === "f" || key === "F") { fullScreen(); }
     else if (key === "h" || key === "H") { state.hideAll = !state.hideAll; paint(current()); }
+    else if (key === "m" || key === "M") {
+      /* The frame is re-seated rather than left to the next sketch, because
+       * the parameter is read once at load and there is no way to tell a
+       * running frame anything: the key is visibly the thing that did it, as
+       * Z is. It costs the sketch its start, which is the honest price of
+       * changing a URL. M and not G — G is the generation overlay, and
+       * auto-mouse.md DECIDE[ghost-off] was wrong about that. */
+      state.ghost = !state.ghost;
+      showEntry(current());
+      paint(current());
+    }
     else if (key === "z" || key === "Z") {
       at = 0;
       for (; at < SIZES.length; at += 1) {
