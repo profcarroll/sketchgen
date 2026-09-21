@@ -263,6 +263,12 @@ UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 #: job; a job that says nothing is executed under the rules the course teaches.
 DEFAULT_RULES = "treatment"
 
+#: What `sketchgen paid import --step execute` leaves in an attempt directory:
+#: the paid model's reply, verbatim, and who wrote it. The worker gates an
+#: attempt from these instead of calling a model (see Worker._paid_execution).
+PAID_REPLY = "paid-response.txt"
+PAID_META = "paid.json"
+
 #: The heading the previous attempt's evidence is filed under in the next
 #: attempt's brief. The executor template needs no new slot for this and its
 #: prompt_version therefore does not change: the evidence is part of the brief,
@@ -2110,13 +2116,14 @@ class Worker:
         The mirror of :meth:`planner_model_for`, over ``jobs.executor`` — a
         column the schema has had since migration 001 and that nothing in the
         pipeline ever wrote, so it is free to carry what the New job page asked
-        for. There is no ``paid`` here: ``needs`` has no ``execute`` value, so
-        there is no state for a job whose executor lives on the laptop.
-
-        A blank column, or the word ``local``, means the worker's default. A tag
+        for.         A blank column, or the word ``local``, means the worker's default. A tag
         naming a model this node does not have fails the attempt with the model
         host's own answer, which is recorded as the attempt's evidence and
         repaired against like any other executor failure.
+
+        ``paid``, or a model named in ``SKETCHGEN_PAID_MODELS``, is returned
+        as it is: :meth:`_attempt` sees it is paid and never sends it to the
+        model host (migration 014, ``needs='execute'``).
         """
         named = (job.executor or "").strip()
         if not named or named == "local":
@@ -2239,6 +2246,43 @@ class Worker:
             self._pause_after_attempt(job.id)
         return EXIT_OK
 
+    def _paid_execution(
+        self,
+        *,
+        brief: str,
+        assertions: list[str],
+        rules_file: str,
+        attempt_dir: Path,
+        asked: str,
+    ) -> Execution:
+        """An attempt whose reply was written off the node, replayed through
+        the executor's own parser.
+
+        ``executor.run`` with ``stub`` is the path the tests have always used
+        to replay a saved reply, and it is exactly the seam a paid model needs:
+        it renders the same prompt this attempt would have sent (and writes it
+        to ``prompt.txt``, beside the reply it was answered with), parses the
+        reply with the same parser, and writes ``sketch.js`` and ``index.html``
+        where the gate looks. The model recorded is the one that answered,
+        from ``paid.json``, not the word the job was queued under.
+        """
+        answered = asked
+        try:
+            meta = json.loads((attempt_dir / PAID_META).read_text(encoding="utf-8"))
+            answered = str(meta.get("model") or asked)
+        except (OSError, ValueError, AttributeError):
+            pass
+        result = executor.run(
+            brief=brief,
+            assertions=assertions,
+            rules_file=rules_file,
+            model=answered,
+            host=self.host,
+            out_dir=str(attempt_dir),
+            stub=str(attempt_dir / PAID_REPLY),
+        )
+        return Execution.from_result(result)
+
     def _preflight_lines(self, job_id: int, n: int, attempt_dir: Path) -> list[str]:
         """The pre-flight scan over one attempt directory, as evidence lines.
 
@@ -2280,6 +2324,17 @@ class Worker:
         brief = brief_with_evidence(job.brief or job.prompt, evidence)
 
         model = self.executor_model_for(job)
+        paid_reply = attempt_dir / PAID_REPLY
+        if models.is_paid(model) and not paid_reply.is_file():
+            # DECIDE[credential-model] B: this attempt is written off the node.
+            # Park it; `paid export --step execute` renders the prompt this
+            # attempt would have sent — evidence and all — and `paid import`
+            # leaves the reply here and re-queues the job, and the next pass
+            # comes back to exactly this line and takes the other branch.
+            db.transition(self.conn, job.id, "needs-laptop", needs="execute")
+            self.log(f"job {job.id}: attempt {n}/{job.max_attempts} is written by "
+                     f"{model!r}, a paid model — needs-laptop, needs=execute")
+            return None
         self.log(f"job {job.id}: attempt {n}/{job.max_attempts} executing into "
                  f"{attempt_dir} with {model}"
                  + (" and the previous attempt's evidence" if evidence else ""))
@@ -2293,14 +2348,20 @@ class Worker:
             model=model,
         )
         try:
-            execution = self.executor_fn(
-                brief=brief,
-                assertions=assertions,
-                rules_file=rules,
-                out_dir=str(attempt_dir),
-                model=model,
-                host=self.host,
-            )
+            if models.is_paid(model):
+                execution = self._paid_execution(
+                    brief=brief, assertions=assertions, rules_file=rules,
+                    attempt_dir=attempt_dir, asked=model,
+                )
+            else:
+                execution = self.executor_fn(
+                    brief=brief,
+                    assertions=assertions,
+                    rules_file=rules,
+                    out_dir=str(attempt_dir),
+                    model=model,
+                    host=self.host,
+                )
         except StopNow:
             raise
         except Exception as exc:

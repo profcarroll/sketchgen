@@ -2321,7 +2321,7 @@ EXECUTOR_MENU = ModelMenu(
     # Here vision IS news: it says which model could be shown the gate's
     # screenshot rather than the text of build_evidence().
     mention=("vision", "audio"),
-    off_node=lambda: (),
+    off_node=lambda: paid_choices(sentinel=True),
     wanted="models that can complete",
 )
 
