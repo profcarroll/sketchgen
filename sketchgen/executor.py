@@ -13,6 +13,10 @@ What the model is asked for, and what this module keeps of it:
     a malformed response and the caller exits 1)
   - a fenced block tagged ``html`` -> ``index.html``  (optional; only when an
     addon library is needed, otherwise DEFAULT_INDEX_HTML is written instead)
+  - a fenced block tagged ``ghost`` -> ``ghost.json`` (optional; the pointer
+    script the kiosk and the gate play when nobody is at the keyboard, and the
+    one block here whose contents are checked rather than stored verbatim —
+    see :func:`validate_ghost`, and ``DECIDE[ghost-dataset]``)
   - a paragraph under a ``Statement`` heading -> ``statement.md``, stored
     verbatim, because spec section 7 publishes it unedited as the executor's own
     claim about its work.
@@ -62,6 +66,7 @@ __all__ = [
     "render_prompt",
     "resolve_rules",
     "run",
+    "validate_ghost",
 ]
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -295,6 +300,7 @@ _TAG_ALIASES = {
     "javascript": "js",
     "jsx": "js",
     "html": "html",
+    "ghost": "ghost",
 }
 
 
@@ -304,14 +310,19 @@ class Parsed:
 
     js: str | None = None
     html: str | None = None
+    #: The optional pointer script (``DECIDE[ghost-dataset]``), as text. Kept
+    #: unvalidated: this dataclass is what the reply *said*, and whether it
+    #: parses is :func:`validate_ghost`'s question.
+    ghost: str | None = None
     statement: str | None = None
     blocks: list[str] = field(default_factory=list)
     js_block_count: int = 0
     html_block_count: int = 0
+    ghost_block_count: int = 0
 
 
 def parse_response(text: str) -> Parsed:
-    """Pull the js block, the optional html block and the Statement paragraph.
+    """Pull the js block, the optional html and ghost blocks and the Statement.
 
     Order does not matter and chatter around the blocks is ignored: the model is
     asked for a fixed order but is not trusted to keep it. Only the first block
@@ -369,6 +380,10 @@ def parse_response(text: str) -> Parsed:
                 parsed.html_block_count += 1
                 if parsed.html is None:
                     parsed.html = body
+            elif tag == "ghost":
+                parsed.ghost_block_count += 1
+                if parsed.ghost is None:
+                    parsed.ghost = body
             fence = None
             tag = None
             buffer = []
@@ -382,6 +397,8 @@ def parse_response(text: str) -> Parsed:
         parsed.blocks.append("js")
     if parsed.html is not None:
         parsed.blocks.append("html")
+    if parsed.ghost is not None:
+        parsed.blocks.append("ghost")
     if parsed.statement is not None:
         parsed.blocks.append("statement")
     return parsed
@@ -395,6 +412,87 @@ def _close_statement(parsed: Parsed, collected: list[str]) -> None:
     if body and parsed.statement is None:
         parsed.statement = body
     return None
+
+
+#: The four keys an event carries, and nothing else. Exactly, not at least: a
+#: fifth key is a model describing something this system does not play —
+#: a duration, a button, a key — and accepting it silently would publish a
+#: script that does less than its author thinks it does.
+GHOST_KEYS = ("t", "type", "x", "y")
+
+
+def _number(value: Any) -> float | None:
+    """*value* as a float, or None if it is not a number.
+
+    ``True`` is an ``int`` in Python and would otherwise be an x of 1.0 at the
+    right-hand edge of the canvas. It is not a coordinate; it is a typo.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
+
+
+def validate_ghost(text: str) -> tuple[list[dict] | None, str | None]:
+    """The ghost block as events the players can read, or why it is not.
+
+    ``(events, None)`` or ``(None, reason)``, where *reason* is one line
+    written for the model that wrote the block: it goes back in the next
+    attempt's evidence (``worker.evidence_with_ghost``), and "invalid" would
+    tell it nothing it could act on.
+
+    The shape is ``DECIDE[ghost-script]`` in docs/plans/auto-mouse.md §1 and
+    the caps are :mod:`sketchgen.ghostshim`'s own, read from there rather than
+    restated: the shim holds every script to them again in the browser, and
+    two numbers that could drift apart would mean a script this accepted and
+    the page silently truncated.
+
+    Events come back sorted by ``t`` — stably, so two events at the same
+    millisecond stay in the order they were written; the shim schedules one
+    ``setTimeout`` per event and a list that ran backwards would play
+    backwards with nothing to say so. Positions in a reason are 1-based: the
+    author is reading their own list, not indexing it.
+    """
+    try:
+        events = json.loads(text)
+    except ValueError:
+        return None, "not a JSON list"
+    if not isinstance(events, list):
+        return None, "not a JSON list"
+    if not events:
+        return None, "an empty list, so there is nothing to play"
+    if len(events) > ghostshim.MAX_EVENTS:
+        return None, "%d events, more than %d" % (len(events), ghostshim.MAX_EVENTS)
+
+    out: list[dict] = []
+    for at, event in enumerate(events, start=1):
+        if not isinstance(event, dict):
+            return None, "event %d: not an object" % at
+        if tuple(sorted(event)) != tuple(sorted(GHOST_KEYS)):
+            return None, "event %d: its keys are %s, not %s" % (
+                at, ", ".join(sorted(str(key) for key in event)) or "(none)",
+                "/".join(GHOST_KEYS),
+            )
+        when = _number(event["t"])
+        if when is None:
+            return None, "event %d: t is %s, not a number" % (at, json.dumps(event["t"]))
+        if when < 0 or when > ghostshim.MAX_MS:
+            return None, "event %d: t is %s, outside [0, %d] ms" % (
+                at, json.dumps(event["t"]), ghostshim.MAX_MS)
+        if event["type"] not in ghostshim.TYPES:
+            return None, "event %d: type is %s, not one of %s" % (
+                at, json.dumps(event["type"]), "/".join(ghostshim.TYPES))
+        for axis in ("x", "y"):
+            where = _number(event[axis])
+            if where is None:
+                return None, "event %d: %s is %s, not a number" % (
+                    at, axis, json.dumps(event[axis]))
+            if where < 0 or where > 1:
+                return None, "event %d: %s is %s, outside [0, 1]" % (
+                    at, axis, json.dumps(event[axis]))
+        out.append({key: event[key] for key in GHOST_KEYS})
+
+    out.sort(key=lambda event: _number(event["t"]))
+    return out, None
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +519,11 @@ class Result:
     blocks: list[str]
     index_source: str | None
     sketch_js_lines: int | None
+    #: What became of a ``ghost`` block: ``{"events": N}`` when one was
+    #: accepted and written, ``{"rejected": "<reason>"}`` when one was
+    #: dropped, None when the reply carried none. Never a reason to fail the
+    #: attempt — see :func:`run`.
+    ghost: dict[str, Any] | None
     extra_blocks: dict[str, int]
     tokens: dict[str, int | None]
     durations_ns: dict[str, int | None]
@@ -526,6 +629,7 @@ def run(
     parsed = parse_response(raw) if raw else Parsed()
     index_source: str | None = None
     sketch_lines: int | None = None
+    ghost: dict[str, Any] | None = None
 
     if error is None and (parsed.js is None or not parsed.js.strip()):
         error = "malformed response: no fenced js block"
@@ -545,6 +649,24 @@ def run(
         if parsed.statement is not None:
             (out / "statement.md").write_text(parsed.statement + "\n", encoding="utf-8")
             files.append("statement.md")
+        if parsed.ghost is not None:
+            # An invalid ghost block is NOT a rejected reply. The sketch is
+            # the answer; the pointer script is an extra the entry does not
+            # need, and there is a built-in waiting for it either way
+            # (ghostshim.BUILTINS). Spending one of three attempts on a
+            # malformed optional block would cost the sketch to save nothing,
+            # so the block is dropped, the reason is recorded, and the next
+            # attempt — if the gate asks for one — is told in a sentence.
+            events, why = validate_ghost(parsed.ghost)
+            if events is None:
+                ghost = {"rejected": why}
+            else:
+                (out / "ghost.json").write_text(
+                    json.dumps(events, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                files.append("ghost.json")
+                ghost = {"events": len(events)}
 
     tokens = {
         "prompt_eval_count": response.get("prompt_eval_count"),
@@ -575,9 +697,11 @@ def run(
         blocks=parsed.blocks,
         index_source=index_source,
         sketch_js_lines=sketch_lines,
+        ghost=ghost,
         extra_blocks={
             "js": max(0, parsed.js_block_count - 1),
             "html": max(0, parsed.html_block_count - 1),
+            "ghost": max(0, parsed.ghost_block_count - 1),
         },
         tokens=tokens,
         durations_ns=durations_ns,
