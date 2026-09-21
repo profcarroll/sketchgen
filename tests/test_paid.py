@@ -224,6 +224,19 @@ class PaidModelListTests(unittest.TestCase):
             self.assertFalse(models.is_paid("gemma4:e4b"))
             self.assertFalse(models.is_paid(None))
 
+    def test_off_node_is_read_from_the_id_alone(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            for name, expected in (
+                ("claude-sonnet-5", True),        # entry 1223: no tag, no list
+                ("paid", True),
+                ("gpt-oss:120b-cloud", True),     # Ollama forwards it
+                ("gemma4:e4b", False),
+                ("qwen3-coder:30b-a3b-q4_K_M", False),
+                ("local", False), ("stub", False), ("", False), (None, False),
+            ):
+                with self.subTest(name=name):
+                    self.assertIs(models.ran_off_node(name), expected)
+
     def test_unset_means_only_the_word_paid(self):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(models.paid_models(), [])

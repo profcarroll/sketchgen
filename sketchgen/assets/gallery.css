@@ -151,6 +151,10 @@ p.chip.rejected { text-transform: none; letter-spacing: 0; border-radius: 8px; p
  * page uses for facts. */
 .chip.offplan { background: var(--chip); color: var(--ink-soft); }
 p.chip.offplan { text-transform: none; letter-spacing: 0; border-radius: 8px; padding: 0.5rem 0.75rem; }
+/* Off-node: a model that made this entry ran somewhere other than this node
+ * (a paid model, answered through `sketchgen paid`). A fact about provenance,
+ * not a verdict, so it takes the agent's ink on the neutral ground. */
+.chip.offnode { color: var(--agent); }
 .chip.agree { background: var(--ok-ground); color: var(--ok-ink); }
 /* A critic chip names who asked for the revision: a model in the agent
  * colour, a person in the ok colour, the same two colours the scores use. */
