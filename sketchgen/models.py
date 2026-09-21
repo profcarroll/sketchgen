@@ -55,6 +55,7 @@ __all__ = [
     "is_paid",
     "label",
     "paid_models",
+    "ran_off_node",
     "with_capability",
 ]
 
@@ -326,3 +327,30 @@ def is_paid(name: str | None) -> bool:
     """True for ``paid`` and for any name in :func:`paid_models`."""
     text = (name or "").strip()
     return bool(text) and (text == PAID or text in paid_models())
+
+
+def ran_off_node(name: str | None) -> bool:
+    """Whether a model id recorded on an entry names a model not run here.
+
+    What the gallery's badge reads (docs/plans/agentic-cli.md §1), so it must
+    answer from the id alone, with no model host to ask: a page re-rendered a
+    year from now has to reach the same verdict about the same row.
+
+    - ``paid`` and anything in :func:`paid_models`: off the node by definition.
+    - An id with no tag. Ollama names every model ``name:tag`` — ``/api/tags``
+      lists ``gemma4:e4b``, never ``gemma4`` — so an id without a colon did not
+      come from this node's Ollama. This is what makes entry 1223, planned by
+      ``claude-sonnet-5`` before any list of paid names existed, read true.
+    - A ``…cloud`` tag, which Ollama proxies to ollama.com
+      (``gpt-oss:120b-cloud``): the node forwarded it, it did not run it.
+
+    Blank, ``local`` and the test suite's ``stub`` are not claims about
+    anywhere, and answer False.
+    """
+    text = (name or "").strip()
+    if not text or text in ("local", "stub"):
+        return False
+    if is_paid(text):
+        return True
+    _, colon, tag = text.partition(":")
+    return not colon or tag.endswith("cloud")

@@ -73,6 +73,8 @@ STATEMENT_TWO = (
 #: Every key spec §7 asks for, plus the four the packet adds. Written out here
 #: rather than imported so that the test is a check and not a restatement.
 SPEC_7_KEYS = {
+    # agentic-cli §1: which of the models that made it ran off the node
+    "off_node",
     "prompt",
     "brief",
     "statement",
@@ -1484,6 +1486,93 @@ class OffPlanTests(GalleryTestCase):
     def test_a_row_written_before_the_column_existed_is_not_off_plan(self):
         # _offplan reads a column older rows do not carry; it must not raise.
         self.assertEqual([], gallery._offplan({"id": 1}))
+
+
+class OffNodeTests(GalleryTestCase):
+    """An entry any of whose models ran off the node says so (agentic-cli §1).
+
+    The gallery-wide sentence stopped claiming every model is self-hosted; the
+    truth moved onto the entry, which already knew it.
+    """
+
+    def publish(self, *, planner="gemma4:e4b", executor="qwen3-coder:30b",
+                parent=None, critique_by=None, critic_row=False):
+        prompt = "a slow tide of lines"
+        if critique_by:
+            prompt = lineage.compose_prompt(prompt, "make it slower")
+        job = db.enqueue(self.conn, prompt, "profcarroll",
+                         parent_entry_id=parent, critique_by=critique_by,
+                         critique="make it slower" if critique_by else None)
+        self.conn.execute("UPDATE jobs SET state = 'published' WHERE id = ?", (job,))
+        entry = db.create_entry(
+            self.conn, job, state="published", prompt=prompt,
+            planner=planner, executor=executor, parent_entry_id=parent,
+            published_utc=db.utc_now(), submitted_by="profcarroll",
+        )
+        if critique_by:
+            db.add_lineage(self.conn, entry, parent, 2, critique_by, "make it slower")
+            if critic_row:
+                db.record_critique(self.conn, parent, critique="make it slower",
+                                   critique_by=critique_by, prompt_version="critic-v3",
+                                   spawned_job_id=job)
+        gallery.render_entry(self.conn, entry, self.dest, self.config)
+        base = self.dest / "e" / str(entry)
+        return (
+            (base / "index.html").read_text(encoding="utf-8"),
+            json.loads((base / "meta.json").read_text(encoding="utf-8")),
+        )
+
+    def test_the_footer_no_longer_claims_every_model_is_self_hosted(self):
+        self.render()
+        for page in self.pages():
+            text = page.read_text(encoding="utf-8")
+            if "AI Disclosure" not in text:
+                continue
+            with self.subTest(page=page.name):
+                self.assertNotIn("fully attributed self-hosted models", text)
+                self.assertIn("off-node", text)
+
+    def test_a_local_entry_wears_no_badge(self):
+        page, meta = self.publish()
+        self.assertNotIn('class="chip offnode"', page)
+        self.assertEqual(meta["off_node"], [])
+
+    def test_a_paid_planner_is_badged_and_named_on_its_own_page(self):
+        """Entry 1223's shape: planned by claude-sonnet-5, written locally."""
+        page, meta = self.publish(planner="claude-sonnet-5")
+        self.assertEqual(meta["off_node"],
+                         [{"step": "planner", "model": "claude-sonnet-5"}])
+        self.assertIn('Planned by claude-sonnet-5 <span class="chip offnode"', page)
+        self.assertIn("claude-sonnet-5 · answered off this node · prompt", page)
+        self.assertNotIn("qwen3-coder:30b · answered off this node", page)
+
+    def test_a_paid_executor_is_badged(self):
+        page, meta = self.publish(executor="claude-opus-5")
+        self.assertEqual([o["step"] for o in meta["off_node"]], ["executor"])
+        self.assertIn('written by claude-opus-5 <span class="chip offnode"', page)
+
+    def test_an_ollama_cloud_tag_is_off_the_node_too(self):
+        _, meta = self.publish(executor="gpt-oss:120b-cloud")
+        self.assertEqual([o["step"] for o in meta["off_node"]], ["executor"])
+
+    def test_a_paid_critic_is_badged_but_a_person_is_not(self):
+        parent = self.ids[0]
+        page, meta = self.publish(parent=parent, critique_by="claude-opus-5",
+                                  critic_row=True)
+        self.assertEqual(meta["off_node"],
+                         [{"step": "critic", "model": "claude-opus-5"}])
+        self.assertIn('<span class="chip model">claude-opus-5</span> '
+                      '<span class="chip offnode"', page)
+        # a GitHub username with the same shape, and no critiques row: a person
+        page, meta = self.publish(parent=parent, critique_by="octocat")
+        self.assertEqual(meta["off_node"], [])
+        self.assertIn('<span class="chip person">octocat</span>', page)
+
+    def test_the_card_is_badged_on_the_grid(self):
+        self.publish(planner="claude-sonnet-5")
+        self.render()
+        index = (self.dest / "index.html").read_text(encoding="utf-8")
+        self.assertEqual(index.count('class="chip offnode"'), 1)
 
 
 class CritiqueFormTests(GalleryTestCase):

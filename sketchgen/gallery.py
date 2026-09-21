@@ -63,6 +63,7 @@ from typing import Any, Iterable
 
 from . import pairs as pairs_mod
 from . import lineage
+from . import models
 from . import qr
 from . import soundshim
 
@@ -132,6 +133,7 @@ META_KEYS = (
     "shape",
     "seed",
     "lineage",
+    "off_node",
     "source",
     "created_utc",
     "published_utc",
@@ -1293,6 +1295,9 @@ def _meta(
             "critique_by": line["critique_by"] if line is not None else None,
             "critique": line["critique"] if line is not None else None,
         },
+        "off_node": [
+            {"step": step, "model": model} for step, model in _off_node(conn, row)
+        ],
         "source": {
             "entry": config.entry_url(entry_id),
             "repository": config.tree_url(entry_id),
@@ -1315,10 +1320,61 @@ def _meta(
 # ---------------------------------------------------------------------------
 
 
-def _byline(row: sqlite3.Row) -> str:
+#: The badge an entry wears when any model that made it ran somewhere else.
+OFF_NODE_CHIP = (
+    '<span class="chip offnode" title="a model that made this entry ran off '
+    'this node; Provenance names it">off-node</span>'
+)
+
+
+def _critic_is_a_model(conn: sqlite3.Connection, row: Any, who: str) -> bool:
+    """Whether this entry's ``critique_by`` is a model rather than a person.
+
+    A colon settles it for an Ollama tag, as :func:`_critic_chip` has always
+    said. A paid model has no colon and a GitHub username can look exactly like
+    one, so the record decides instead: a model critic's sentence is a row in
+    `critiques` naming the job it spawned, and a person's never is.
+    """
+    if ":" in who:
+        return True
+    found = conn.execute(
+        "SELECT 1 FROM critiques WHERE spawned_job_id = ? AND critique_by = ? LIMIT 1",
+        (int(row["job_id"]), who),
+    ).fetchone()
+    return found is not None
+
+
+def _off_node(conn: sqlite3.Connection, row: Any) -> list[tuple[str, str]]:
+    """``[(step, model), …]`` for every model that made this entry off the node.
+
+    The planner and the executor are on the row. The critic whose sentence
+    spawned this entry is on its lineage link, and counts only when it was a
+    model (:func:`_critic_is_a_model`). The judge is not here: a verdict is
+    about the entry, and did not make it. Read by :func:`sketchgen.models.
+    ran_off_node`, from the ids alone, so a re-render reaches the same answer.
+    """
+    found = [
+        (step, str(row[step]))
+        for step in ("planner", "executor")
+        if models.ran_off_node(row[step])
+    ]
+    link = _lineage_row(conn, int(row["id"]))
+    who = str((link["critique_by"] if link is not None else "") or "").strip()
+    if who and models.ran_off_node(who) and _critic_is_a_model(conn, row, who):
+        found.append(("critic", who))
+    return found
+
+
+def _byline(row: sqlite3.Row, off: Iterable[tuple[str, str]] = ()) -> str:
     by = _esc(row["submitted_by"] or "an operator")
-    planner = _esc(row["planner"] or "no planner on record")
-    executor = _esc(row["executor"] or "no executor on record")
+    away = {step for step, _ in off}
+
+    def named(step: str, missing: str) -> str:
+        text = _esc(row[step] or missing)
+        return f"{text} {OFF_NODE_CHIP}" if step in away else text
+
+    planner = named("planner", "no planner on record")
+    executor = named("executor", "no executor on record")
     # What it took to get here — the attempt count, and whether the run was
     # held or published — is the workshop's business, not a visitor's. It is
     # still on the page, under Provenance, where the machine-facing fields
@@ -1326,7 +1382,7 @@ def _byline(row: sqlite3.Row) -> str:
     return f"Prompt by {by}. Planned by {planner}, written by {executor}."
 
 
-def _critic_chip(who: Any) -> str:
+def _critic_chip(who: Any, *, model: bool = False) -> str:
     """Who asked for this revision, as a chip: a model, or a person.
 
     ``critique_by`` carries a model tag (``gemma4:e4b``) when a critic model
@@ -1339,6 +1395,10 @@ def _critic_chip(who: Any) -> str:
         return '<span class="chip">unknown</span>'
     if ":" in name:
         return f'<span class="chip model">{_esc(name.split(":", 1)[0])}</span>'
+    if model:
+        # A paid critic: a model with no tag to drop, which the colon test
+        # would have called a person (see _critic_is_a_model).
+        return f'<span class="chip model">{_esc(name)}</span> {OFF_NODE_CHIP}'
     return f'<span class="chip person">{_esc(name)}</span>'
 
 
@@ -1374,8 +1434,12 @@ def _subtitle(revisions: list[str], meta: dict[str, Any]) -> str:
         )
     return (
         '<p class="sub"><span class="label">Revise:</span> '
-        f"<em>{_esc(revisions[-1])}</em> {_critic_chip(link['critique_by'])}"
-        f'<span class="dim">{tail}</span></p>'
+        f"<em>{_esc(revisions[-1])}</em> "
+        + _critic_chip(
+            link["critique_by"],
+            model=any(o["step"] == "critic" for o in meta["off_node"]),
+        )
+        + f'<span class="dim">{tail}</span></p>'
     )
 
 
@@ -1652,6 +1716,9 @@ def _ledger_critic_chip(item: dict[str, Any] | None, *, is_root: bool) -> str:
         # "gemma4:e4b" is one model at one size; the size is in the Provenance
         # table and would be noise five times down a column.
         return f'<span class="chip model">{_esc(who.split(":", 1)[0])}</span>'
+    if not is_root and models.is_paid(who):
+        # A paid critic has no tag for the colon test to find.
+        return f'<span class="chip model">{_esc(who)}</span>'
     return f'<span class="chip person">{_esc(who)}</span>'
 
 
@@ -1936,6 +2003,13 @@ def _lineage_text_panel(meta: dict[str, Any], line_page: bool) -> str:
 
 def _provenance_rows(meta: dict[str, Any]) -> str:
     lineage = meta["lineage"]
+    away = {item["step"] for item in meta.get("off_node") or []}
+
+    def where(step: str) -> str:
+        # Said in words here, where a person reads the record: the chip is the
+        # headline, this is the fact.
+        return " · answered off this node" if step in away else ""
+
     gate_lines = "<br>".join(
         _esc(
             f"attempt {item['attempt']}: gate exit "
@@ -1962,11 +2036,13 @@ def _provenance_rows(meta: dict[str, Any]) -> str:
         ("Submitted by", _dash(meta["submitted_by"])),
         (
             "Planner",
-            f"{_dash(meta['planner'])} · prompt {_dash(meta['planner_prompt_version'])}",
+            f"{_dash(meta['planner'])}{where('planner')} · prompt "
+            f"{_dash(meta['planner_prompt_version'])}",
         ),
         (
             "Executor",
-            f"{_dash(meta['executor'])} · prompt {_dash(meta['executor_prompt_version'])}",
+            f"{_dash(meta['executor'])}{where('executor')} · prompt "
+            f"{_dash(meta['executor_prompt_version'])}",
         ),
         ("Rules file", _dash(meta["rules_file"])),
         ("Assertions", _esc(", ".join(meta["assertions"])) or "none"),
@@ -1981,7 +2057,7 @@ def _provenance_rows(meta: dict[str, Any]) -> str:
             "Lineage",
             f"parent {_dash(lineage['parent_entry_id'])} · children {_esc(kids)} · "
             f"generation {_dash(lineage['generation'])} · critique by "
-            f"{_dash(lineage['critique_by'])}",
+            f"{_dash(lineage['critique_by'])}{where('critic')}",
         ),
         (
             "Source",
@@ -2149,7 +2225,7 @@ def _write_entry(
         entry_id=entry_id,
         title=_esc(title),
         subtitle=_subtitle(revisions, meta),
-        byline=_byline(row),
+        byline=_byline(row, [(o["step"], o["model"]) for o in meta["off_node"]]),
         failed_note=failed_note,
         frame=_frame(has_sketch, title, heavy=_heavy(meta), has_strip=has_strip,
                      mic=has_sketch and _needs_mic(source)),
@@ -2256,13 +2332,13 @@ def _card(
             f"{_esc(revisions[-1])}</p>"
         )
     reason = ""
-    chip = ""
+    chip = OFF_NODE_CHIP + " " if _off_node(conn, row) else ""
     if failed:
         text = _rejection_reason(conn, row)
         reason = f'<p class="reason">{_esc(text)}</p>'
         # The chip names which kind this is. Both are rejections and both are
         # kept; only one of them had a person behind it.
-        chip = _state_chip(str(row["state"])) + " "
+        chip = _state_chip(str(row["state"])) + " " + chip
     return template.substitute(
         entry_id=entry_id,
         href=f"e/{entry_id}/",
