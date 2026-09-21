@@ -35,13 +35,17 @@ means *abort the attempt in flight and re-queue the job*; ``pausing`` with any
 other reason means *finish the attempt in flight, then stop*. See
 :func:`is_stop_now`.
 
-**What the fence refuses on.** ``pgrep -af opencode`` finding any process other
-than this one is a refusal: an interactive session holds the slot for an hour at
-a time, and a second client makes both parties about 9x slower
-(``node-16x96-first-day.md`` §6). A model *listed by* ``/api/ps`` is **not** a
-refusal on its own. The node runs ``KEEP_ALIVE=30m``, so a model stays resident
-for half an hour after the last request with no client attached, and refusing on
-residency would refuse almost always while telling us nothing about contention.
+**What the fence refuses on.** Two kinds of process, on two different grounds.
+``pgrep -af opencode`` finding any process other than this one is a refusal: an
+interactive session holds the slot for an hour at a time, and a second client
+makes both parties about 9x slower (``node-16x96-first-day.md`` §6). **Another
+sketchgen worker** is refused harder — it races this one for jobs rather than
+merely for the slot, so it is refused even under ``observing_probe``, which
+softens everything else. See :func:`worker_processes`. A model *listed by*
+``/api/ps`` is **not** a refusal on its own. The node runs ``KEEP_ALIVE=30m``,
+so a model stays resident for half an hour after the last request with no client
+attached, and refusing on residency would refuse almost always while telling us
+nothing about contention.
 The resident models are logged on every run, so a contended run can be recognised
 after the fact. If ``/api/ps`` cannot be reached at all, that is logged and is
 not a refusal either: a job that needs the model then fails on its own
@@ -56,6 +60,13 @@ paused job is claimable again on resume rather than stranded in ``repairing``.
 An attempt that has already been recorded is never re-run: the attempt number
 resumes from the highest row in the table, and the evidence from that row is
 what the next attempt is given.
+
+The same rule applies *between the steps of an idle round*, and did not before
+2026-09-21: the control row is read again after the judge and after the critic
+(:meth:`Worker._idle_pause_taken`), because either can sit on the model host for
+the length of its timeout and a stop asked for in the middle of that used to go
+unseen until the round was over — long enough for the round to start a fresh
+critique after the operator had already said stop.
 
 **Idle work, packet 5.4.** When the queue is empty and control is ``running``,
 the worker does one bounded round of idle work before it sleeps: it judges up to
@@ -182,6 +193,7 @@ __all__ = [
     "human_gap",
     "idle_summary",
     "is_stop_now",
+    "is_worker_argv",
     "minutes_between",
     "node_shape",
     "observing_probe",
@@ -191,6 +203,7 @@ __all__ = [
     "stub_judge",
     "stub_planner",
     "trim_detail",
+    "worker_processes",
 ]
 
 EXIT_OK = 0
@@ -359,6 +372,9 @@ class FenceResult:
     ollama_error: str | None = None
     #: Clients the probe saw but chose not to refuse on (test mode only).
     observed: list[str] = field(default_factory=list)
+    #: Other sketchgen workers. Never moves to :attr:`observed`: see
+    #: :func:`fence`.
+    workers: list[str] = field(default_factory=list)
 
 
 def opencode_processes() -> list[str]:
@@ -384,6 +400,64 @@ def opencode_processes() -> list[str]:
     return found
 
 
+def is_worker_argv(argv: list[str]) -> bool:
+    """True when ``argv`` is a sketchgen worker invocation.
+
+    Read as *argv*, not as a string, and that is the point. ``pgrep -f`` matches
+    its pattern anywhere in the command line, so every shell whose command text
+    merely mentions the worker matches it too — ``grep 'bin/sketchgen worker'
+    job.log`` would refuse the daemon for as long as the grep ran. Here the
+    match has to be structural: some argument *is* the ``sketchgen`` script, and
+    the one after it *is* the word ``worker``. Both documented invocations
+    qualify — systemd's ``… /app/bin/sketchgen worker`` and the shell's
+    ``python3 bin/sketchgen worker --once`` — and a shell that talks about them
+    does not, because there the whole command is one argument.
+    """
+    for first, second in zip(argv, argv[1:]):
+        name = first.rsplit("/", 1)[-1]
+        if name == "sketchgen" and second == "worker":
+            return True
+    return False
+
+
+def worker_processes() -> list[str]:
+    """Other sketchgen workers — the ones that race this one for *jobs*.
+
+    Separate from :func:`opencode_processes` because the two are refused on
+    different grounds. An ``opencode`` session is a contention problem: both
+    parties get about 9x slower and nothing is corrupted. A second worker is a
+    correctness problem — it calls ``db.claim_next`` against the same database,
+    so the two can hold the same job and step on each other's transitions.
+
+    Found on 2026-09-21: a ``worker --once`` run by hand beside the resident
+    daemon claimed a job the daemon was already executing, and the daemon's own
+    transition then raised ``IllegalTransition: failed -> gating``. The fence
+    did not see it, because until now it looked only for ``opencode``.
+
+    Reads ``/proc`` rather than shelling out, the way ``console._find_processes``
+    does: the argv test above needs the arguments apart, and ``pgrep`` only ever
+    hands back a line with them joined.
+    """
+    mine = {os.getpid(), os.getppid()}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    found: list[str] = []
+    for entry in entries:
+        if not entry.isdigit() or int(entry) in mine:
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                raw = handle.read()
+        except OSError:  # it exited, or it is not ours to read
+            continue
+        argv = [part for part in raw.decode("utf-8", "replace").split("\0") if part]
+        if is_worker_argv(argv):
+            found.append(f"{entry} {' '.join(argv)}")
+    return found
+
+
 def resident_models(host: str = DEFAULT_HOST, timeout: float = 5.0) -> tuple[list[str], str | None]:
     """``GET /api/ps``: the model names Ollama has resident, and any error."""
     url = host.rstrip("/") + "/api/ps"
@@ -398,10 +472,11 @@ def resident_models(host: str = DEFAULT_HOST, timeout: float = 5.0) -> tuple[lis
 
 
 def default_probe(host: str = DEFAULT_HOST) -> dict[str, Any]:
-    """The real probe: other clients, and what Ollama has loaded."""
+    """The real probe: other clients, other workers, and what Ollama has loaded."""
     names, error = resident_models(host)
     return {
         "processes": opencode_processes(),
+        "workers": worker_processes(),
         "models": names,
         "ollama_error": error,
     }
@@ -424,6 +499,10 @@ def observing_probe(host: str = DEFAULT_HOST) -> Callable[[], dict[str, Any]]:
         return {
             "processes": [],
             "observed_processes": seen.get("processes") or [],
+            # Not softened. A stubbed run calls no model, so it cannot contend
+            # for inference — but it still claims jobs and transitions them,
+            # which is the whole of what a second worker gets wrong.
+            "workers": seen.get("workers") or [],
             "models": seen.get("models") or [],
             "ollama_error": seen.get("ollama_error"),
         }
@@ -441,9 +520,24 @@ def fence(probe: Callable[[], dict[str, Any]] = default_probe) -> FenceResult:
     """
     seen = probe() or {}
     processes = list(seen.get("processes") or [])
+    workers = list(seen.get("workers") or [])
     models = list(seen.get("models") or [])
     observed = list(seen.get("observed_processes") or [])
     error = seen.get("ollama_error")
+    # Another worker is refused first and refused unconditionally, ahead of the
+    # test-mode softening `observing_probe` applies to everything else: two
+    # workers against one database is a job-claiming race, not a slow node.
+    if workers:
+        return FenceResult(
+            ok=False,
+            reason="another sketchgen worker is running: " + "; ".join(workers)
+            + " — stop it, or the systemd unit, before running this one",
+            processes=processes,
+            workers=workers,
+            models=models,
+            ollama_error=error,
+            observed=observed,
+        )
     if processes:
         return FenceResult(
             ok=False,
@@ -1293,15 +1387,19 @@ class Worker:
             self.log(f"control: {reason} and no attempt is in flight; now paused")
             return EXIT_OK
 
+        result = fence(self.probe)
+
         # Before anything else this process does with the queue: put back the
         # jobs a dead worker left in flight. It is pure database work, no model
-        # and no browser, so it runs ahead of the fence — a worker that is about
-        # to refuse can still clean up after the one that came before it.
-        if not self._swept:
+        # and no browser, so it runs ahead of the refusal below — a worker that
+        # is about to refuse on a busy slot can still clean up after the one
+        # that came before it. Not, though, when the refusal is another *worker*:
+        # a job in flight then belongs to a process that is alive and coming
+        # back for it, and sweeping would re-queue it out from under them.
+        if not self._swept and not result.workers:
             self._swept = True
             self.sweep_stuck()
 
-        result = fence(self.probe)
         for name in result.models:
             self.log(f"fence: ollama has {name} resident (not a refusal)")
         for line in result.observed:
@@ -1370,7 +1468,13 @@ class Worker:
         # There is one worker. Anything in a running state at this moment was
         # left there by the previous one and nobody is attending it, however
         # recent its timestamp: back on the queue now, not in thirty minutes.
-        self.sweep_stuck(everything=True)
+        # Unless there is *not* one worker: a second one holds live jobs, and
+        # this sweep is the indiscriminate kind, so it would take them all.
+        if fence(self.probe).workers:
+            self.log("worker: another sketchgen worker is running — not sweeping; "
+                     "the jobs in flight are its own")
+        else:
+            self.sweep_stuck(everything=True)
         while not self._terminating:
             try:
                 code = self.run_once()
@@ -1487,6 +1591,40 @@ class Worker:
         """
         return int("".join(ch for ch in db.utc_now()[:16] if ch.isdigit()))
 
+    def _idle_pause_taken(self, after: str) -> bool:
+        """Settle to ``paused`` if the operator asked while idle work ran. True if so.
+
+        Idle work holds no attempt, so both flavours of ``pausing`` mean the
+        same thing here and mean it at once — the rule :meth:`run_once` already
+        applies at the top of a pass, applied *between* the steps of a round as
+        well.
+
+        Before 2026-09-21 the control row was read once per pass and never
+        again, so a stop that arrived while the judge was waiting on the model
+        host was invisible until the whole round was over: on the node, a stop
+        asked for at 02:30:56 was answered by a *fresh* critique at 02:33:46,
+        because the judge had been sitting on a ten-minute timeout in between.
+
+        Never raises, for the reason in :meth:`_idle_round`'s docstring: a
+        control row that cannot be read is not a reason to lose the round.
+        """
+        try:
+            control = self._control()
+        except sqlite3.Error as exc:
+            self.log(f"idle: the control row could not be read: {exc}")
+            return False
+        if control is None or control.state != "pausing":
+            return False
+        reason = control.reason or "no reason given"
+        try:
+            db.set_control(self.conn, "paused", control.reason)
+        except sqlite3.Error as exc:
+            self.log(f"idle: the control row could not be set to paused: {exc}")
+            return False
+        self.log(f"control: {reason}; {after} has finished and nothing is in "
+                 "flight; now paused")
+        return True
+
     def _idle_round(self) -> None:
         """One bounded round of idle work: judge a pair, critique an entry.
 
@@ -1499,7 +1637,14 @@ class Worker:
         # a job stuck in a running state is a job nobody is coming back for.
         self.sweep_stuck()
         judged = self._idle_judge() if self.idle_judge > 0 else None
+        # Between the two steps, not only around the pair. Each one can sit on
+        # the model host for as long as its timeout allows, and the operator
+        # who asked for a pause in the middle of that meant this step too.
+        if self._idle_pause_taken("the judge"):
+            return
         critiqued = self._idle_critique() if self.idle_critique > 0 else None
+        if self._idle_pause_taken("the critic"):
+            return
         if judged or critiqued:
             return
         parts = [
