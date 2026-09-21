@@ -1282,8 +1282,49 @@ for each one's capabilities, cached 60 s) and show the models in two groups:
 
 | | filtered on | default | `paid`? |
 |---|---|---|---|
-| **Planner** | `vision` | `worker.DEFAULT_PLANNER_MODEL` | yes — `needs='plan'` |
+| **Planner** | `vision` | `worker.DEFAULT_PLANNER_MODEL` | yes — `needs='plan'`, and see below |
 | **Executor** | `completion` | `executor.DEFAULT_MODEL` | no — there is no `needs='execute'` |
+
+#### Bringing a paid plan back
+
+`paid` parks the job and the node stops: branch B of DECIDE[credential-model]
+keeps the credential off this box, so the planning happens wherever the key is.
+`plan --job` is the way back in.
+
+```bash
+# on the node: what is waiting, and what it was asked for
+python3 bin/sketchgen db status | sed -n '/needs-laptop/p'
+python3 -c "import sqlite3;print(sqlite3.connect('$HOME/sketchgen/sketchgen.db').execute('select id,prompt from jobs where state=\'needs-laptop\'').fetchall())"
+```
+
+Ask the model that holds the credential for a plan in the shape
+`prompts/planner.md` asks for — a `Brief` heading and an `Assertions` list —
+save its reply verbatim, and replay it:
+
+```bash
+python3 bin/sketchgen plan --job 1228 --model claude-sonnet-5 --stub reply.txt
+```
+
+That parses the reply through the same parser the local planner uses, writes
+`plan.json` and `response.txt` into the job's own directory, and puts the brief,
+the assertions and the model on the job as it moves to `executing`. The worker
+picks it up on its next pass and executes it locally, as it would any other job.
+
+Three things worth knowing:
+
+- **`--model` is the model that answered, not the one you meant to ask.** It
+  lands in `jobs.planner` in place of the word `paid`, and it is what provenance
+  shows afterwards. The rule is the paid judge's: a verdict belongs to the model
+  that gave it.
+- **A reply that will not parse costs nothing.** The job stays at
+  `needs-laptop`, `response.txt` is saved beside it, and the same `--job` takes
+  a better reply. Only a parsed plan moves the job.
+- **`--job` refuses a job in any other state**, so it cannot race the worker for
+  `jobs.brief` — the one-writer rule the fence enforces for jobs, applied to the
+  column. Planning the same job twice is refused for the same reason: the second
+  run finds it `executing`.
+
+The executor and the critic have no equivalent yet.
 
 The planner menu names `vision` on no row, because every row has it; the executor menu
 does, because there it is news — a vision-capable executor is one that could be shown

@@ -342,6 +342,33 @@ def cmd_execute(args: argparse.Namespace) -> int:
         print(f"sketchgen: {result.error}", file=sys.stderr)
         print(f"raw response kept at {result.out_dir}/response.txt", file=sys.stderr)
     return EXIT_OK if result.ok else EXIT_FAIL
+def _plan_target(conn, job_id: int):
+    """The job a ``--job`` plan is for, or a refusal printed and ``None``.
+
+    Only a job parked at ``needs-laptop`` is claimable here. Anything else is
+    either finished, or in flight with the worker attending it — and a second
+    writer of ``jobs.brief`` is the same class of mistake as a second worker.
+    """
+    job = db.get_job(conn, job_id)
+    if job is None:
+        print(f"sketchgen: no job {job_id}", file=sys.stderr)
+        return None
+    if job.state != "needs-laptop":
+        print(
+            f"sketchgen: job {job_id} is {job.state}, not needs-laptop — only a "
+            "job waiting for the laptop can be planned here",
+            file=sys.stderr,
+        )
+        return None
+    if job.needs not in (None, "plan"):
+        print(
+            f"sketchgen: job {job_id} is waiting for {job.needs!r}, not a plan",
+            file=sys.stderr,
+        )
+        return None
+    return job
+
+
 def cmd_plan(args: argparse.Namespace) -> int:
     """Turn one prompt into a brief and a validated assertion list.
 
@@ -349,28 +376,66 @@ def cmd_plan(args: argparse.Namespace) -> int:
     written even when the response is unusable: the raw text is the only
     evidence of what the model actually said, and it is the thing a person
     reads when a job fails.
+
+    With ``--job N`` the prompt comes from the job rather than the command line
+    and the result goes back onto it: the brief, the assertions and the model
+    that wrote them, in the one ``db.transition`` that also moves the job to
+    ``executing`` — the same write the worker makes on the local path, so a job
+    planned here is indistinguishable afterwards from one planned on the node.
+
+    That is the return leg of DECIDE[credential-model] branch B. ``--planner
+    paid`` parks a job at ``needs-laptop`` and until now nothing brought it
+    back: the paid model's reply could be parsed with ``--stub`` and then had
+    nowhere to go. The prompt needs no hash to travel with it, the way the
+    judge's claims do — ``jobs.prompt`` is written once by ``enqueue`` and no
+    code in this repo updates it, so what the laptop was shown is what the job
+    still holds.
     """
     started = planner.utc_now()
-    out_dir = Path(args.out)
+    conn = None
+    job = None
+    prompt, by = args.prompt, args.by
+    if args.job is not None:
+        conn = _open_db(args.db)
+        if conn is None:
+            return EXIT_FAIL
+        job = _plan_target(conn, args.job)
+        if job is None:
+            conn.close()
+            return EXIT_REFUSED
+        prompt, by = job.prompt, (args.by or job.submitted_by)
+    if not args.out and job is None:
+        print("sketchgen: --out is required without --job", file=sys.stderr)
+        return EXIT_FAIL
+    out_dir = Path(
+        args.out
+        if args.out
+        else os.path.join(os.path.expanduser(args.jobs_dir), str(args.job))
+    )
+    def done(code: int) -> int:
+        if conn is not None:
+            conn.close()
+        return code
+
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         print(f"sketchgen: cannot write to {out_dir}: {exc}", file=sys.stderr)
-        return EXIT_FAIL
+        return done(EXIT_FAIL)
 
     try:
         result = planner.plan(
-            args.prompt,
+            prompt,
             args.model,
             host=args.host,
             num_ctx=args.num_ctx,
             seed=args.seed,
             stub=args.stub,
-            by=args.by,
+            by=by,
         )
     except planner.PlannerRefused as exc:
         print(f"sketchgen: plan refused: {exc}", file=sys.stderr)
-        return EXIT_REFUSED
+        return done(EXIT_REFUSED)
     except planner.PlannerFailed as exc:
         raw_path = out_dir / "response.txt"
         try:
@@ -381,7 +446,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
         else:
             print(f"sketchgen: plan failed: {exc}; raw response saved to {raw_path}",
                   file=sys.stderr)
-        return EXIT_FAIL
+        # The job stays parked at needs-laptop. A reply that would not parse is
+        # a reply to try again, not a job to fail: the raw text is beside the
+        # job and the laptop can hand back a better one under the same --job.
+        if job is not None:
+            print(f"sketchgen: job {job.id} is unchanged, still needs-laptop",
+                  file=sys.stderr)
+        return done(EXIT_FAIL)
 
     document = {
         "brief": result.brief,
@@ -401,7 +472,30 @@ def cmd_plan(args: argparse.Namespace) -> int:
         )
     except OSError as exc:
         print(f"sketchgen: cannot write the plan to {out_dir}: {exc}", file=sys.stderr)
-        return EXIT_FAIL
+        return done(EXIT_FAIL)
+
+    if job is not None:
+        # The worker's own write, made from here: state, brief, assertions and
+        # the model that wrote them in one statement. `planner` takes the model
+        # that answered rather than the word `paid` it was queued under, for
+        # the judge's reason — provenance is who answered, not who was asked.
+        # `needs` is cleared by hand because `transition` does not clear it, and
+        # a job left `needs='plan'` while executing reads as still waiting.
+        try:
+            job = db.transition(
+                conn,
+                job.id,
+                "executing",
+                brief=result.brief,
+                assertions_json=json.dumps(result.assertions),
+                planner=args.model,
+                needs=None,
+            )
+        except db.IllegalTransition as exc:
+            print(f"sketchgen: the plan is written to {out_dir} but job "
+                  f"{args.job} did not move: {exc}", file=sys.stderr)
+            return done(EXIT_FAIL)
+        document["job"] = job.id
 
     if args.json:
         print(json.dumps(document, indent=2))
@@ -413,6 +507,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
             print(f"defaulted: {', '.join(result.defaulted)}")
         for item in result.rejected:
             print(f"rejected: {item['word']}  ({item['reason']})")
+        if job is not None:
+            print(f"job {job.id}: planned by {args.model}, now {job.state} — "
+                  "the worker takes it from here")
+    return done(EXIT_OK)
+
+
 def _sync_report(result: dict, as_json: bool) -> None:
     if as_json:
         print(json.dumps(result, indent=2))
@@ -890,15 +990,34 @@ def build_parser() -> argparse.ArgumentParser:
         "plan",
         help="expand a prompt into a brief and a validated assertion list",
         description="Expand one prompt into a brief and a list of gate assertions "
-                    "drawn only from the runner's closed vocabulary.",
+                    "drawn only from the runner's closed vocabulary. With --job "
+                    "the prompt comes from a job parked at needs-laptop and the "
+                    "result is written back onto it, which is the return leg of "
+                    "the paid planner path: --planner paid parks the job, the "
+                    "laptop asks the model that holds the credential, and "
+                    "--stub replays its reply through this same parser.",
     )
-    plan_parser.add_argument("--prompt", required=True, help="the submitted prompt")
+    plan_source = plan_parser.add_mutually_exclusive_group(required=True)
+    plan_source.add_argument("--prompt", help="the submitted prompt")
+    plan_source.add_argument("--job", type=int, metavar="N",
+                             help="plan job N, which must be waiting at "
+                                  "needs-laptop: its prompt is used, and the "
+                                  "brief, the assertions and --model are written "
+                                  "back as it moves to executing")
     plan_parser.add_argument("--by", default="", metavar="USERNAME",
-                             help="GitHub username of the submitter, for the record")
+                             help="GitHub username of the submitter, for the "
+                                  "record (default: the job's, with --job)")
     plan_parser.add_argument("--model", required=True, metavar="M",
-                             help="model tag, e.g. gemma4:e4b")
-    plan_parser.add_argument("--out", required=True, metavar="DIR",
-                             help="directory for plan.json and response.txt")
+                             help="model tag, e.g. gemma4:e4b, or the paid model "
+                                  "that answered when replaying one with --stub")
+    plan_parser.add_argument("--out", default=None, metavar="DIR",
+                             help="directory for plan.json and response.txt "
+                                  "(default with --job: <jobs-dir>/<N>)")
+    plan_parser.add_argument("--jobs-dir", dest="jobs_dir",
+                             default=worker.DEFAULT_JOBS_DIR, metavar="D",
+                             help="where --job looks for its job directory "
+                                  "(default: $SKETCHGEN_JOBS, else "
+                                  "~/sketchgen/jobs)")
     plan_parser.add_argument("--stub", default=None, metavar="FILE",
                              help="replay this saved response; calls no model")
     plan_parser.add_argument("--host", default=planner.DEFAULT_HOST,
@@ -909,6 +1028,7 @@ def build_parser() -> argparse.ArgumentParser:
                              help="sampling seed (default 1)")
     plan_parser.add_argument("--json", action="store_true",
                              help="print plan.json to stdout as well")
+    _add_db_option(plan_parser)
     plan_parser.set_defaults(func=cmd_plan, _parser=plan_parser)
     sync_parser = top.add_parser(
         "sync",
