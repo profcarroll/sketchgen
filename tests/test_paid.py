@@ -17,6 +17,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -24,10 +25,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from sketchgen import db  # noqa: E402
 from sketchgen import judge  # noqa: E402
 from sketchgen import lineage  # noqa: E402
+from sketchgen import models  # noqa: E402
 from sketchgen import paid  # noqa: E402
+from sketchgen import planner  # noqa: E402
+from sketchgen import web  # noqa: E402
 from sketchgen import worker  # noqa: E402
 
 import test_judge  # noqa: E402
+import test_planner  # noqa: E402
+import test_worker  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CLI = REPO_ROOT / "bin" / "sketchgen"
@@ -37,6 +43,9 @@ PNG_BYTES = test_judge.PNG_BYTES
 
 GOOD_CRITIQUE = "Let one of the drifting dots fall out of step with the others.\n"
 TWO_SENTENCES = "It is fine. Make the dots red.\n"
+
+CLEAN_PLAN = test_planner.load("clean")
+PAID_ENV = {models.PAID_MODELS_ENV: "claude-opus-5, claude-sonnet-5"}
 
 
 class PaidTestCase(unittest.TestCase):
@@ -196,6 +205,150 @@ class JudgeTests(PaidTestCase):
         self.assertEqual(len(report.recorded), 2)
         self.assertEqual({r["judge_id"] for r in self.agent_verdicts()},
                          {"claude-laptop"})
+
+
+# ---------------------------------------------------------------------------
+# The planner
+# ---------------------------------------------------------------------------
+
+
+class PaidModelListTests(unittest.TestCase):
+
+    def test_names_come_from_the_environment_in_order_without_duplicates(self):
+        env = {models.PAID_MODELS_ENV:
+               "claude-opus-5 claude-sonnet-5,claude-opus-5, paid local bad;name"}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(models.paid_models(), ["claude-opus-5", "claude-sonnet-5"])
+            self.assertTrue(models.is_paid("claude-sonnet-5"))
+            self.assertTrue(models.is_paid("paid"))
+            self.assertFalse(models.is_paid("gemma4:e4b"))
+            self.assertFalse(models.is_paid(None))
+
+    def test_unset_means_only_the_word_paid(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(models.paid_models(), [])
+            self.assertTrue(models.is_paid("paid"))
+
+    def test_the_planner_menu_offers_each_named_model_off_this_node(self):
+        with mock.patch.dict(os.environ, PAID_ENV), \
+                mock.patch.object(web.models, "catalogue", return_value=[]):
+            groups = dict(web.planner_groups())
+            offered = [value for value, _ in groups["off this node"]]
+            self.assertEqual(offered, ["paid", "claude-opus-5", "claude-sonnet-5"])
+            self.assertEqual(web.check_planner("claude-opus-5"), "claude-opus-5")
+            self.assertEqual(web.planner_column("claude-opus-5"), "claude-opus-5")
+            self.assertEqual(web.planner_column("paid"), "paid")
+
+
+class PlanTests(PaidTestCase):
+
+    def setUp(self):
+        super().setUp()
+        # build_entries leaves its three jobs queued; the worker would take
+        # those first. They stand for finished work, so finish them.
+        self.conn.execute("UPDATE jobs SET state = 'published'")
+
+    def park(self, prompt="a grid of pale squares", by="octocat", planner="paid"):
+        """A job the worker parked, exactly as the worker parks it."""
+        job_id = db.enqueue(self.conn, prompt, by, planner=planner)
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            run = worker.Worker(self.conn, jobs_dir=self.jobs_dir, log_stream=devnull,
+                                probe=lambda: dict(test_worker.FREE_SLOT))
+            self.assertEqual(run.run_once(), 0)
+        self.assertEqual(db.get_job(self.conn, job_id).state, "needs-laptop")
+        return job_id
+
+    def export(self, limit=5):
+        return paid.export_packet(self.conn, "plan", model="claude-opus-5",
+                                  limit=limit, ctx=self.ctx)
+
+    def test_a_named_paid_model_parks_the_job_like_the_word_paid(self):
+        with mock.patch.dict(os.environ, PAID_ENV):
+            job_id = self.park(planner="claude-sonnet-5")
+        self.assertEqual(db.get_job(self.conn, job_id).needs, "plan")
+
+    def test_an_item_carries_the_prompt_the_local_planner_renders(self):
+        job_id = self.park(prompt="sixty drifting circles", by="mona")
+        item = self.export()["items"][0]
+        self.assertEqual(item["inputs"]["job"], job_id)
+        self.assertEqual(item["prompt"],
+                         planner.build_prompt("sixty drifting circles", "mona"))
+        self.assertEqual(item["guard"], "")  # plan §3.3: none needed, and why
+
+    def test_a_reply_lands_what_plan_job_lands(self):
+        """Plan §5.1 for the planner: the job's columns and plan.json."""
+        first, second = self.park(), self.park()
+        packet = self.export()
+        packet["items"][0]["answer"] = CLEAN_PLAN
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(report.rejected, [])
+
+        stub = self.tmp / "clean.txt"
+        stub.write_text(CLEAN_PLAN, encoding="utf-8")
+        result = subprocess.run(
+            [sys.executable, str(CLI), "plan", "--job", str(second),
+             "--model", "claude-opus-5", "--stub", str(stub),
+             "--jobs-dir", str(self.jobs_dir), "--db", self.dbpath],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        def shape(job_id):
+            job = db.get_job(self.conn, job_id)
+            document = json.loads(
+                (self.jobs_dir / str(job_id) / "plan.json").read_text(encoding="utf-8"))
+            document.pop("started_utc")
+            raw = (self.jobs_dir / str(job_id) / "response.txt").read_text(encoding="utf-8")
+            return (job.state, job.brief, job.assertions_json, job.planner,
+                    job.needs, document, raw)
+
+        self.assertEqual(shape(first), shape(second))
+        self.assertEqual(db.get_job(self.conn, first).state, "queued")
+
+    def test_the_worker_takes_it_from_the_queue_and_the_entry_knows_its_plan(self):
+        job_id = self.park()
+        packet = self.export()
+        packet["items"][0]["answer"] = CLEAN_PLAN
+        paid.import_packet(self.conn, packet, ctx=self.ctx)
+        with open(os.devnull, "w", encoding="utf-8") as devnull:
+            run = worker.Worker(
+                self.conn, jobs_dir=self.jobs_dir, log_stream=devnull,
+                executor_fn=test_worker.StubExecutor(), gate_fn=test_worker.StubGate([0]),
+                probe=lambda: dict(test_worker.FREE_SLOT),
+            )
+            self.assertEqual(run.run_once(), 0)
+        self.assertEqual(db.get_job(self.conn, job_id).state, "held")
+        entry = self.conn.execute(
+            "SELECT planner, planner_prompt_version FROM entries WHERE job_id = ?",
+            (job_id,)).fetchone()
+        self.assertEqual(entry["planner"], "claude-opus-5")
+        self.assertEqual(entry["planner_prompt_version"], planner.prompt_version())
+
+    def test_an_unparseable_answer_leaves_the_job_parked(self):
+        job_id = self.park()
+        packet = self.export()
+        packet["items"][0]["answer"] = "motion(idle)\n"
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertIn("still needs-laptop", report.rejected[0]["reason"])
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual((job.state, job.needs, job.brief), ("needs-laptop", "plan", None))
+
+    def test_a_job_that_moved_on_is_rejected(self):
+        job_id = self.park()
+        packet = self.export()
+        packet["items"][0]["answer"] = CLEAN_PLAN
+        db.transition(self.conn, job_id, "failed", last_error="given up on")
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertIn("not needs-laptop", report.rejected[0]["reason"])
+
+    def test_the_same_answer_cannot_land_twice(self):
+        self.park()
+        packet = self.export()
+        packet["items"][0]["answer"] = CLEAN_PLAN
+        paid.import_packet(self.conn, packet, ctx=self.ctx)
+        again = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(again.recorded, [])
+        self.assertEqual(len(again.rejected), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -386,6 +539,7 @@ class CliTests(PaidTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         waiting = json.loads(result.stdout)
         self.assertIn("judge", waiting)
+        self.assertEqual(waiting["plan"]["count"], 0)
         self.assertEqual(waiting["critique"]["count"], 3)
 
     def test_release_needs_ids_or_all(self):

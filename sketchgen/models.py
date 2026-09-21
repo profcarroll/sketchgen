@@ -52,7 +52,9 @@ __all__ = [
     "Model",
     "catalogue",
     "forget",
+    "is_paid",
     "label",
+    "paid_models",
     "with_capability",
 ]
 
@@ -277,3 +279,50 @@ def label(
     if default and model.name == default:
         text += " (default)"
     return text
+
+
+# ---------------------------------------------------------------------------
+# Paid models: names, configured, never asked
+# ---------------------------------------------------------------------------
+
+#: A comma- or space-separated list of model ids that are answered off the node
+#: — ``claude-opus-5,claude-sonnet-5`` — for the menus and for the worker's
+#: decision to park a step at ``needs-laptop`` instead of calling Ollama.
+PAID_MODELS_ENV = "SKETCHGEN_PAID_MODELS"
+
+#: The word that has meant "not on this node" since migration 001.
+PAID = "paid"
+
+_PAID_NAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:/+-"
+)
+
+
+def paid_models() -> list[str]:
+    """The paid model ids this node offers, from :data:`PAID_MODELS_ENV`.
+
+    A list of **names** and nothing else (docs/plans/agentic-cli.md §3.7). No
+    credential, and no network call: a name is not a secret, and the node must
+    not be able to verify one, because verifying it would mean calling it. Read
+    on every call, like the menus' catalogue, so the web and the worker agree
+    with whatever their unit files say — and both units must say the same
+    thing, or the page offers a model the worker would send to Ollama.
+
+    Order is kept, duplicates dropped, and anything that is not model-id
+    shaped — or that is the word ``paid`` or ``local`` itself — is ignored.
+    """
+    raw = os.environ.get(PAID_MODELS_ENV, "")
+    found: list[str] = []
+    for word in raw.replace(",", " ").split():
+        if word in (PAID, "local") or word in found:
+            continue
+        if not word[0].isalnum() or len(word) > 128 or set(word) - _PAID_NAME_CHARS:
+            continue
+        found.append(word)
+    return found
+
+
+def is_paid(name: str | None) -> bool:
+    """True for ``paid`` and for any name in :func:`paid_models`."""
+    text = (name or "").strip()
+    return bool(text) and (text == PAID or text in paid_models())
