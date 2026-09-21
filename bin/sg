@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# sg — run one sketchgen command on the node, from the laptop.
+#
+#   bin/sg paid start --as claude-sonnet-5 --by profcarroll --prompt "a tide of slow lines"
+#   bin/sg paid next --job 1253 --as claude-sonnet-5 > packet.json
+#   bin/sg paid import - < packet.json
+#
+# Every argument is quoted once, here, with printf %q, and arrives on the node
+# as the same argument: a prompt with spaces, quotes or a dollar sign needs no
+# second layer of quoting. Before this wrapper the recipe was a shell function
+# that pasted "$*" into an ssh command line, and the prompt had to be quoted
+# twice ("'like this'"), which is the kind of trap an agent falls into once per
+# session. Stdin and stdout pass straight through, so a packet travels over ssh
+# with no scp. Exit status is the remote command's: 0 ok, 1 failed, 3 refused.
+#
+# Settings, all optional:
+#   SKETCHGEN_NODE     ssh host (default sld-cloud)
+#   SKETCHGEN_REMOTE   the node's checkout of ~/sketchgen (default ~/sketchgen)
+#   SKETCHGEN_SSH      the ssh command (default ssh); tests point it at a fake
+set -u
+node="${SKETCHGEN_NODE:-sld-cloud}"
+remote="${SKETCHGEN_REMOTE:-\$HOME/sketchgen}"
+ssh_cmd="${SKETCHGEN_SSH:-ssh}"
+
+if [ "$#" -eq 0 ]; then
+    echo "usage: sg <sketchgen command> [args…]   (runs on $node; --db is added)" >&2
+    exit 3
+fi
+
+quoted=""
+for arg in "$@"; do
+    quoted+=" $(printf '%q' "$arg")"
+done
+
+# The venv is ~/sketchgen/.venv, not app/.venv (AGENTS.md); --db goes last so
+# every subcommand's own parser sees it.
+exec "$ssh_cmd" -o BatchMode=yes "$node" \
+    "$remote/.venv/bin/python3 $remote/app/bin/sketchgen$quoted --db $remote/sketchgen.db"

@@ -1432,13 +1432,58 @@ python3 bin/sketchgen paid preflight --as claude-sonnet-5   # READY, or what to 
 
 `preflight` checks the schema, the registration, that exactly one worker is
 running (or the drip timer is on), and that the generator is running; each
-failure names its fix and whether the agent or the operator owns it. An agent
-names models for its own job with `enqueue --planner M --executor M` (refused
-up front if M would reach Ollama), waits with `paid wait --job N`, and moves
-packets over ssh with `export --out -` / `import -`. AGENTS.md has the recipe.
+failure names its fix and whether the agent or the operator owns it. It also
+reports what the worker is doing this second, every live lease, and every job
+parked for a plan or an attempt — whose it is and the command that moves it.
 
 A job whose planner is one of them parks at `needs-laptop` exactly as `paid` does,
 and the entry records the model that answered.
+
+**An agent's own job is three verbs.** Since 2026-09-21 (the second Sonnet 5
+run, which sat ten minutes in a blocking `wait` behind an idle-spawned job and
+was killed) the recipe in AGENTS.md is:
+
+```bash
+bin/sg paid start --as claude-sonnet-5 --by profcarroll --prompt "a tide of slow lines"
+bin/sg paid next --job N --as claude-sonnet-5 > packet.json    # do: answer|wait|done|stop
+bin/sg paid import - < packet.json                               # then next again
+```
+
+`bin/sg` runs one command on the node over ssh with every argument quoted
+once (`printf %q`), so a prompt is quoted like any other argument; stdin and
+stdout pass through. `start` registers the model if needed, runs the
+preflight (NOT READY: exit 3, nothing queued), queues one job with the agent as
+planner and executor (`--planner local` / `--executor local` to keep a step
+here), and **leases** the job. `next` returns within `--timeout` (240 s, under
+a tool call's limit) with one JSON object: the packet itself when the job is
+parked for the agent (`do: answer`), `wait` with the worker's current step
+when the worker has it, `done`, or `stop` (exit 3). `import` puts the job back
+on the queue as before and prints the `next` command.
+
+**The lease** (`meta` row `paid_leases`, `SKETCHGEN_PAID_LEASE_MINUTES`,
+default 20) is how the worker knows an agent is at the other end. While one
+is live the worker claims the leased job ahead of anything else queued and
+does **no idle work** — no judge, no critique, no spawned child — so a paid
+round trip costs one worker pass, not a pass plus ten minutes of filler. Every
+`start`, `next`, `export --job` and `import` renews it; it lapses on its own,
+so an agent that vanishes holds the idle loop for minutes, not the night. The
+worker's card says `standing by for job N (model)` while it waits.
+
+**A paid job is made only by `paid start`.** The New job page lists what this
+node runs and nothing else; `paid assign --plan/--execute` take local tags
+only; and a critique child never inherits a paid planner or executor
+(`lineage.spawn` blanks them, so the child is made here). Each of those was a
+way to make a job parked for an agent that did not exist — jobs 1246 and 1252
+on 2026-09-21 — and the console counted them as broken for hours. A parked job
+nobody is coming for is handed to this node's models with
+
+```bash
+python3 bin/sketchgen paid release --job N [--by WHO --reason TEXT]
+```
+
+which blanks its paid columns, re-queues it, and records who handed it back;
+`preflight` lists such jobs with that command. An agent that must stop uses
+the same verb on its own job.
 
 **A paid executor is one round trip per attempt, and the gate stays here.** The
 worker parks the job at the top of each attempt it has no reply for. `paid export
@@ -1494,7 +1539,8 @@ on the queue and the resident worker claims it on its next pass. Nothing in this
 path runs a worker, and #118 is what happens when something does.
 
 `judge export|import` still work, and `paid import` reads a `judge export` packet
-too.
+too. `paid wait` is kept for scripts that used it (its default timeout is now
+240 s); `paid next` is what to use.
 
 ## The write-path sync as a timer
 

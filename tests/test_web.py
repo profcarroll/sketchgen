@@ -1163,7 +1163,7 @@ class TestNewJob(WebTestCase):
     def test_save_as_defaults_keeps_the_options_and_the_prompt(self):
         status, body = self.post_page(
             "/new/defaults",
-            {"action": "save", "prompt": "still being typed", "planner": "paid",
+            {"action": "save", "prompt": "still being typed", "planner": "local",
              "rules": "random", "publication": "auto", "max_attempts": "5",
              "assert": ["responds(click)", "size"], "size_w": "800", "size_h": "600"},
         )
@@ -1172,7 +1172,6 @@ class TestNewJob(WebTestCase):
         self.assertIn("still being typed", body)
         fresh = self.text("/new")
         self.assertIn("Defaults saved", fresh)
-        self.assertIn('<option value="paid" selected>', fresh)
         self.assertIn('<option value="random" selected>', fresh)
         self.assertIn('<option value="auto" selected>', fresh)
         self.assertIn('value="5"', fresh)
@@ -3904,10 +3903,10 @@ class TestPlannerMenu(PlannerMenuTestCase):
         away = menu.index('<optgroup label="off this node">')
         self.assertLess(here, menu.index('value="gemma4:e4b"'))
         self.assertLess(menu.index('value="gemma4:e4b"'), away)
-        # the cloud tag and the paid route are both in the second group, and
-        # the cloud one says where it goes
+        # the cloud tag is in the second group and says where it goes; the
+        # paid route is not a choice here at all since 2026-09-21
         self.assertLess(away, menu.index('value="gemma4:31b-cloud"'))
-        self.assertLess(away, menu.index('value="paid"'))
+        self.assertNotIn('value="paid"', menu)
         self.assertIn("leaves this node", menu)
 
     def test_the_menu_says_which_one_a_job_gets_by_default(self):
@@ -3930,11 +3929,14 @@ class TestPlannerMenu(PlannerMenuTestCase):
         self.assertEqual(303, status)
         self.assertEqual("qwen3.5:9b", self.newest_planner(before))
 
-    def test_paid_still_reaches_the_column_as_paid(self):
+    def test_paid_is_not_a_choice_this_page_makes(self):
+        """A paid job needs an agent present for it, and the agent is at a
+        shell: `sketchgen paid start`. Two jobs queued for the laptop with
+        nobody at the other end sat at needs-laptop for hours on 2026-09-21."""
         before = self.queued_ids()
         self.post("/new", {"prompt": "a paid plan", "submitted_by": "student-three",
                            "planner": "paid"})
-        self.assertEqual("paid", self.newest_planner(before))
+        self.assertEqual(before, self.queued_ids())
 
     def test_local_still_means_the_workers_default(self):
         """An old bookmark, an old saved default, a form with no planner field."""
@@ -4045,13 +4047,13 @@ class TestExecutorMenu(PlannerMenuTestCase):
         coder = re.search(r'<option value="qwen3-coder[^>]*>([^<]*)<', menu).group(1)
         self.assertNotIn("vision", coder)
 
-    def test_there_is_a_paid_executor_off_this_node(self):
+    def test_there_is_no_paid_executor_on_this_page(self):
         """Migration 014 gave `needs` an 'execute' value, so a job whose
-        executor lives on the laptop has a state to wait in; the menu offers
-        it where the other routes off the box are."""
+        executor lives on the laptop has a state to wait in — but the job is
+        made by the agent that will answer it (`paid start`), never here."""
         menu = self.select("executor")
-        off = menu.split('label="off this node"', 1)[1]
-        self.assertIn('value="paid"', off)
+        self.assertNotIn('value="paid"', menu)
+        self.assertNotIn("claude", menu)
 
     def test_the_chosen_model_is_what_the_job_is_queued_with(self):
         before = self.queued_ids()
@@ -4138,7 +4140,7 @@ class TestPlannerMenuWithNoModelHost(PlannerMenuTestCase):
         self.assertIn('<option value="local" selected>', menu)
         self.assertIn(worker.DEFAULT_PLANNER_MODEL, menu)
         self.assertIn("the model host did not answer", menu)
-        self.assertIn('<option value="paid"', menu)
+        self.assertNotIn('<option value="paid"', menu)
 
     def test_a_job_can_still_be_queued(self):
         before = self.queued_ids()
