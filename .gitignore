@@ -8,3 +8,10 @@ writepath/.wrangler/
 
 # Claude Code agent worktrees (harness scratch, not project files)
 .claude/worktrees/
+
+# The local rig's two working files: the pinned p5 (1 MB, fetched by
+# rig/fetch-p5.sh) and whatever sketch is being looked at. Both are ignored so
+# that `git status` is clean after the rig has been used, which is the thing
+# the job-1286 agent had to clean up by hand on 2026-09-21.
+rig/p5.min.js
+rig/sketch.js
