@@ -1286,7 +1286,7 @@ for each one's capabilities, cached 60 s) and show the models in two groups:
 | | filtered on | default | `paid`? |
 |---|---|---|---|
 | **Planner** | `vision` | `worker.DEFAULT_PLANNER_MODEL` | yes — `needs='plan'`, and see below |
-| **Executor** | `completion` | `executor.DEFAULT_MODEL` | no — there is no `needs='execute'` |
+| **Executor** | `completion` | `executor.DEFAULT_MODEL` | yes — `needs='execute'`, once per attempt (migration 014) |
 
 #### Bringing a paid plan back
 
@@ -1336,8 +1336,8 @@ Three things worth knowing:
   column. Planning the same job twice is refused for the same reason: the second
   run finds it `executing`.
 
-The critic has its own route now (`paid export --step critique`); the executor
-does not yet.
+The critic and the executor have their own routes now — see
+[Paid steps](#paid-steps-any-model-step-answered-off-the-node).
 
 The planner menu names `vision` on no row, because every row has it; the executor menu
 does, because there it is news — a vision-capable executor is one that could be shown
@@ -1415,6 +1415,7 @@ done is fine.
 | step | offered | lands via | guard |
 |---|---|---|---|
 | `plan` | jobs at `needs-laptop`, `needs='plan'` | `planner.parse_response` → job back on the **queue** | none needed — `jobs.prompt` never changes |
+| `execute` | jobs at `needs-laptop`, `needs='execute'` | reply saved to `attempt-N/paid-response.txt` → job back on the **queue**; the worker gates it | the attempt number and the previous attempt's evidence |
 | `judge` | pairs that model has not judged | `judge.import_verdicts_detailed` | `artefact_hash` of both strips and briefs |
 | `critique` | what the idle critic would take | `lineage.validate` → `record_critique` + `spawn` | sha256 of the strip |
 
@@ -1431,6 +1432,23 @@ systemctl --user restart sketchgen-web.service sketchgen-worker.service
 
 A job whose planner is one of them parks at `needs-laptop` exactly as `paid` does,
 and the entry records the model that answered.
+
+**A paid executor is one round trip per attempt, and the gate stays here.** The
+worker parks the job at the top of each attempt it has no reply for. `paid export
+--step execute` renders the prompt that attempt would have sent — the brief, and
+from attempt 2 on the gate's evidence from the attempt before — and `paid import`
+checks the reply has a fenced js block, leaves it in `attempt-N/` and re-queues the
+job. The resident worker then does the rest of the attempt exactly as for a local
+model: parse, the real gate, evidence, and either held or parked again for attempt
+N+1. Repeat the two commands until `db status` shows the job held (or failed at
+`max_attempts`). A reply with no js block is rejected and the job stays parked, so
+a bad reply does not use up an attempt.
+
+A paid executor is a second variable in a running experiment — much larger than
+the difference between two local models warned about under
+[Which models run a job](#which-models-run-a-job). It is on every attempt and every
+entry, and the entry is badged **off-node** in the gallery, so the analysis can
+control for it; it is not controlled for you.
 
 **An exported critique is assigned, not raced.** `critiques` holds one row per entry
 per prompt version, so an entry in a critique packet is claimed for the model the

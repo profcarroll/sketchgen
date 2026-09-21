@@ -101,7 +101,12 @@ TRANSITIONS: dict[str, frozenset[str]] = {
     # with no js block never reaches the gate, so the job repairs without
     # passing through gating and its attempt row carries a null gate_exit with
     # "executor: …" as its evidence.
-    "executing": frozenset({"gating", "repairing", "failed", "queued"}),
+    # executing -> needs-laptop is the paid executor (migration 014): a job
+    # whose executor is answered off the node parks here, needs='execute', at
+    # the top of each attempt the laptop has not yet written, and comes back
+    # through `paid import` -> queued like a paid plan does.
+    "executing": frozenset({"gating", "repairing", "failed", "queued",
+                            "needs-laptop"}),
     "gating": frozenset({"held", "repairing", "failed", "queued"}),
     "repairing": frozenset({"executing", "needs-laptop", "failed", "queued"}),
     # needs-laptop -> queued is the laptop's way back in (`plan --job`): the

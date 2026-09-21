@@ -4045,10 +4045,13 @@ class TestExecutorMenu(PlannerMenuTestCase):
         coder = re.search(r'<option value="qwen3-coder[^>]*>([^<]*)<', menu).group(1)
         self.assertNotIn("vision", coder)
 
-    def test_there_is_no_paid_executor(self):
-        """`needs` has no 'execute' value, so there is no state for a job whose
-        executor lives on the laptop."""
-        self.assertNotIn('value="paid"', self.select("executor"))
+    def test_there_is_a_paid_executor_off_this_node(self):
+        """Migration 014 gave `needs` an 'execute' value, so a job whose
+        executor lives on the laptop has a state to wait in; the menu offers
+        it where the other routes off the box are."""
+        menu = self.select("executor")
+        off = menu.split('label="off this node"', 1)[1]
+        self.assertIn('value="paid"', off)
 
     def test_the_chosen_model_is_what_the_job_is_queued_with(self):
         before = self.queued_ids()
