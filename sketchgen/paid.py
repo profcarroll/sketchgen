@@ -132,6 +132,11 @@ class Context:
     #: Offer only this job (plan and execute): an agent running its own job
     #: should not be handed everybody else's parked ones.
     job: int | None = None
+    #: The agent has said, on the command line, that its harness cannot report
+    #: a process cost (`paid import --no-process`). Without it an attempt on a
+    #: job started with `--since` whose `process` is all nulls is rejected —
+    #: see :meth:`ExecuteAdapter.land` for the incident.
+    process_unreported: bool = False
 
 
 def sha256_file(path: str | Path) -> str:
@@ -602,6 +607,25 @@ class ExecuteAdapter(Adapter):
         if parsed.js is None or not parsed.js.strip():
             raise Rejected(f"no fenced js block; job {job_id} is unchanged, still "
                            "needs-laptop")
+        process = process_of(item)
+        if job.since_utc and not process_reported(process) and not ctx.process_unreported:
+            # A `--since` is the agent saying it is keeping the budget; an
+            # all-null `process` on the same job is the agent forgetting the
+            # last step of keeping it. Job 1308 (entry 1300, 2026-09-21)
+            # started with --since, never ran rig/cost.py, and landed a
+            # process of nulls that the import took in silence; the entry page
+            # shows dashes and nothing says whether that was a harness that
+            # could not count or a session that did not. So the omission is
+            # rejected — nothing written, the answer kept, one re-import —
+            # and an empty process has to be declared, with --no-process,
+            # to be recorded. A job without --since made no such promise.
+            raise Rejected(
+                f"process is empty and job {job_id} was started with --since "
+                f"{job.since_utc}: run  python3 rig/cost.py --since {job.since_utc}  "
+                "and put its last line in items[0].process, then import again; "
+                "if your harness cannot report it, import with --no-process. "
+                "Nothing was written."
+            )
         attempt_dir = ctx.jobs_dir / str(job_id) / f"attempt-{n}"
         try:
             attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -621,7 +645,13 @@ class ExecuteAdapter(Adapter):
                             # the agent says the work around this reply cost.
                             # The worker copies it onto the attempt and fills
                             # in `tries` from its own count.
-                            "process": process_of(item)}, indent=2) + "\n",
+                            "process": process,
+                            # True only when the agent said so with
+                            # --no-process: the difference between a cost
+                            # nobody could count and one nobody counted, kept
+                            # where the attempt's record is.
+                            "process_unreported": bool(ctx.process_unreported)},
+                           indent=2) + "\n",
                 encoding="utf-8",
             )
         except OSError as exc:
