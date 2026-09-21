@@ -823,6 +823,194 @@ class AssignmentTests(PaidTestCase):
 
 
 # ---------------------------------------------------------------------------
+# The harness: registration, preflight, per-job models, wait, stdio packets
+# ---------------------------------------------------------------------------
+
+
+class HarnessTests(PaidTestCase):
+    """What a Sonnet 5 session lacked on 2026-09-21 and had to guess at."""
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE jobs SET state = 'published'")
+        # No paid names in the environment: registration alone must route.
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        os.environ.pop(models.PAID_MODELS_ENV, None)
+        self.addCleanup(self.env.stop)
+        self.addCleanup(models.remember_registered, [])
+
+    def worker(self, **kwargs):
+        devnull = open(os.devnull, "w", encoding="utf-8")
+        self.addCleanup(devnull.close)
+        kwargs.setdefault("probe", lambda: dict(test_worker.FREE_SLOT))
+        kwargs.setdefault("gate_fn", test_worker.StubGate([0]))
+        return worker.Worker(self.conn, jobs_dir=self.jobs_dir, log_stream=devnull,
+                             **kwargs)
+
+    def cli(self, *args, stdin=None):
+        return subprocess.run(
+            [sys.executable, str(CLI), *args, "--db", self.dbpath],
+            capture_output=True, text=True, check=False, input=stdin,
+        )
+
+    # -- registration --------------------------------------------------------
+
+    def test_a_registered_name_routes_with_no_environment_at_all(self):
+        db.set_paid_models(self.conn, ["claude-sonnet-5"])
+        self.assertTrue(models.is_paid("claude-sonnet-5", self.conn))
+        job = db.enqueue(self.conn, "p", "octocat", planner="claude-sonnet-5")
+        self.worker().run_once()
+        self.assertEqual(db.get_job(self.conn, job).needs, "plan")
+
+    def test_the_menus_see_names_the_request_thread_was_handed(self):
+        models.remember_registered(["claude-sonnet-5"])
+        with mock.patch.object(web.models, "catalogue", return_value=[]):
+            offered = [v for v, _ in dict(web.planner_groups())["off this node"]]
+        self.assertIn("claude-sonnet-5", offered)
+
+    def test_paid_models_add_list_remove(self):
+        result = self.cli("paid", "models", "add", "claude-sonnet-5", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["registered"], ["claude-sonnet-5"])
+        self.assertEqual(self.cli("paid", "models", "add", "gemma4:e4b").returncode, 3)
+        result = self.cli("paid", "models", "remove", "claude-sonnet-5", "--json")
+        self.assertEqual(json.loads(result.stdout)["registered"], [])
+
+    # -- preflight -----------------------------------------------------------
+
+    def preflight(self, workers=("worker",), drip=False):
+        return paid.preflight(self.conn, "claude-sonnet-5",
+                              workers=lambda: list(workers), drip=lambda: drip)
+
+    def failed(self, result):
+        return {row["check"]: row for row in result["checks"] if not row["ok"]}
+
+    def test_preflight_names_the_missing_registration_and_whose_fix_it_is(self):
+        result = self.preflight()
+        self.assertFalse(result["ready"])
+        row = self.failed(result)["registered"]
+        self.assertEqual(row["who"], "you")
+        self.assertEqual(row["fix"], "sketchgen paid models add claude-sonnet-5")
+
+    def test_preflight_is_ready_when_everything_is(self):
+        db.set_paid_models(self.conn, ["claude-sonnet-5"])
+        self.assertTrue(self.preflight()["ready"])
+        self.assertTrue(self.preflight(workers=(), drip=True)["ready"])
+
+    def test_preflight_leaves_the_operators_problems_to_the_operator(self):
+        db.set_paid_models(self.conn, ["claude-sonnet-5"])
+        db.set_control(self.conn, "paused", "a person paused it")
+        for workers, name in (((), "worker"), (("a", "b"), "worker"),
+                              (("a",), "generator")):
+            with self.subTest(workers=workers):
+                row = self.failed(self.preflight(workers=workers))[name]
+                self.assertEqual(row["who"], "operator")
+
+    def test_preflight_at_the_cli_exits_3_and_says_stop(self):
+        result = self.cli("paid", "preflight", "--as", "claude-sonnet-5")
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("NOT READY", result.stdout)
+        self.assertIn("paid models add claude-sonnet-5", result.stdout)
+
+    # -- per-job models ----------------------------------------------------------
+
+    def test_enqueue_names_the_models_for_one_job(self):
+        refused = self.cli("enqueue", "--prompt", "x", "--by", "octocat",
+                           "--planner", "claude-sonnet-5")
+        self.assertEqual(refused.returncode, 3)
+        self.assertIn("paid models add", refused.stderr)
+        db.set_paid_models(self.conn, ["claude-sonnet-5"])
+        result = self.cli("enqueue", "--prompt", "x", "--by", "octocat", "--json",
+                          "--planner", "claude-sonnet-5", "--executor", "claude-sonnet-5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        job = db.get_job(self.conn, json.loads(result.stdout)["job"])
+        self.assertEqual((job.planner, job.executor), ("claude-sonnet-5",) * 2)
+        self.assertEqual(db.get_assignment(self.conn), {})  # nobody else's jobs
+
+    # -- wait ------------------------------------------------------------------
+
+    def fake_time(self):
+        now = [0.0]
+        return (lambda seconds: now.__setitem__(0, now[0] + seconds)), (lambda: now[0])
+
+    def test_wait_returns_the_next_command_when_the_job_is_parked(self):
+        job = db.enqueue(self.conn, "p", "octocat", planner="paid")
+        db.transition(self.conn, job, "needs-laptop", needs="plan")
+        result = paid.wait_for(self.conn, job, timeout=10)
+        self.assertEqual(result["do"], "answer")
+        self.assertEqual(result["command"],
+                         f"sketchgen paid export --step plan --job {job} --out -")
+
+    def test_wait_times_out_while_the_worker_has_it(self):
+        job = db.enqueue(self.conn, "p", "octocat")
+        sleep, clock = self.fake_time()
+        result = paid.wait_for(self.conn, job, timeout=30, interval=5,
+                               sleep=sleep, clock=clock)
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["state"], "queued")
+
+    def test_wait_stops_rather_than_waiting_on_a_paused_generator(self):
+        job = db.enqueue(self.conn, "p", "octocat")
+        db.set_control(self.conn, "paused", "deploy")
+        result = paid.wait_for(self.conn, job, timeout=30)
+        self.assertEqual(result["do"], "stop")
+        self.assertIn("paused", result["say"])
+
+    # -- the whole recipe, as AGENTS.md writes it ------------------------------
+
+    def test_the_agents_md_recipe_runs_end_to_end(self):
+        """preflight → enqueue → wait → export - → answer → import - → … → held.
+
+        Only the worker is run in-process, standing in for the daemon.
+        """
+        self.cli("paid", "models", "add", "claude-sonnet-5")
+        queued = self.cli("enqueue", "--prompt", "a breathing field", "--by",
+                          "octocat", "--planner", "claude-sonnet-5",
+                          "--executor", "claude-sonnet-5", "--json")
+        job = json.loads(queued.stdout)["job"]
+        jobs = ["--jobs-dir", str(self.jobs_dir)]
+
+        for step, reply in (("plan", CLEAN_PLAN), ("execute", GOOD_SKETCH)):
+            self.worker().run_once()  # the daemon's pass
+            waited = self.cli("paid", "wait", "--job", str(job), "--json", *jobs)
+            self.assertEqual(json.loads(waited.stdout)["step"], step, waited.stdout)
+            exported = self.cli("paid", "export", "--step", step, "--job", str(job),
+                                "--as", "claude-sonnet-5", "--out", "-", *jobs)
+            self.assertEqual(exported.returncode, 0, exported.stderr)
+            packet = json.loads(exported.stdout)
+            self.assertEqual([i["inputs"]["job"] for i in packet["items"]], [job])
+            packet["items"][0]["answer"] = reply
+            imported = self.cli("paid", "import", "-", *jobs, stdin=json.dumps(packet))
+            self.assertEqual(json.loads(imported.stdout)["recorded"], 1, imported.stdout)
+
+        self.worker().run_once()  # the gate
+        done = json.loads(self.cli("paid", "wait", "--job", str(job), "--json",
+                                   *jobs).stdout)
+        self.assertEqual((done["do"], done["state"]), ("done", "held"))
+        entry = self.conn.execute("SELECT planner, executor FROM entries "
+                                  "WHERE job_id = ?", (job,)).fetchone()
+        self.assertEqual(tuple(entry), ("claude-sonnet-5", "claude-sonnet-5"))
+
+    def test_import_from_stdin_returns_rejected_answers_verbatim(self):
+        db.set_paid_models(self.conn, ["claude-sonnet-5"])
+        job = db.enqueue(self.conn, "p", "octocat", planner="claude-sonnet-5")
+        self.worker().run_once()
+        packet = paid.export_packet(self.conn, "plan", model="claude-sonnet-5",
+                                    ctx=paid.Context(jobs_dir=self.jobs_dir, job=job))
+        packet["items"][0]["answer"] = "no headings here\n"
+        out = self.cli("paid", "import", "-", "--jobs-dir", str(self.jobs_dir),
+                       stdin=json.dumps(packet))
+        report = json.loads(out.stdout)
+        self.assertEqual(report["rejected"][0]["answer"], "no headings here\n")
+
+    def test_job_narrows_only_plan_and_execute(self):
+        with self.assertRaises(paid.PaidRefused):
+            paid.export_packet(self.conn, "critique", model="claude-sonnet-5",
+                               ctx=paid.Context(job=1))
+
+
+# ---------------------------------------------------------------------------
 # The CLI
 # ---------------------------------------------------------------------------
 
@@ -830,7 +1018,8 @@ class AssignmentTests(PaidTestCase):
 class CliTests(PaidTestCase):
 
     def test_help_exits_zero_for_every_subcommand(self):
-        for name in ("export", "import", "status", "release", "assign"):
+        for name in ("export", "import", "status", "release", "assign", "models",
+                     "preflight", "wait"):
             with self.subTest(subcommand=name):
                 result = subprocess.run(
                     [sys.executable, str(CLI), "paid", name, "--help"],

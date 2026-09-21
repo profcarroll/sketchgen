@@ -1204,6 +1204,45 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Paid model names — registered in the database, read by every process
+# ---------------------------------------------------------------------------
+
+PAID_MODELS_KEY = "paid_models"
+
+
+def get_paid_models(conn: sqlite3.Connection) -> list[str]:
+    """The paid model ids registered with ``sketchgen paid models add``.
+
+    Names only — never a key (DECIDE[credential-model] B). Kept here rather
+    than only in a unit file's environment because every process reads this
+    database and no agent at a shell can read a unit's environment: on
+    2026-09-21 a Sonnet 5 session could not tell whether its own id would be
+    routed off the node, because the only list was ``SKETCHGEN_PAID_MODELS``
+    inside two systemd units it could not see. The environment variable still
+    counts (:func:`sketchgen.models.paid_models` takes both).
+    """
+    raw = get_meta(conn, PAID_MODELS_KEY)
+    try:
+        found = json.loads(raw) if raw else []
+    except ValueError:
+        return []
+    if not isinstance(found, list):
+        return []
+    return [str(name) for name in found if isinstance(name, str) and name.strip()]
+
+
+def set_paid_models(conn: sqlite3.Connection, names: Iterable[str]) -> list[str]:
+    """Replace the registered list; order kept, duplicates dropped."""
+    kept: list[str] = []
+    for name in names:
+        text = str(name).strip()
+        if text and text not in kept:
+            kept.append(text)
+    set_meta(conn, PAID_MODELS_KEY, json.dumps(kept) if kept else None)
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # The assignment — which model runs each of the four steps by default
 # ---------------------------------------------------------------------------
 
