@@ -75,6 +75,8 @@ __all__ = [
     "release",
     "release_job",
     "start",
+    "try_for",
+    "verdict_summary",
     "wait_for",
     "sha256_file",
     "waiting",
@@ -1453,7 +1455,13 @@ def next_for(
         if job is None:
             raise PaidRefused(f"there is no job {job_id}")
         entry = conn.execute("SELECT id FROM entries WHERE job_id = ?", (job_id,)).fetchone()
-        step = next_step(job, int(entry["id"]) if entry else None)
+        step = next_step(
+            job, int(entry["id"]) if entry else None,
+            # Dossier §7.2: `done` carries what the gate found, so the agent
+            # is told whether its sketch passed rather than inferring it.
+            verdict=(kept_verdict(conn, job_id)
+                     if job.state in ("held", "published") else None),
+        )
         waited = round(clock() - started, 1)
         base: dict[str, Any] = {
             "job": job.id, "state": job.state, "needs": job.needs, "model": model,
@@ -1585,6 +1593,185 @@ def _worker_sentence(now: dict[str, Any] | None, job_id: int) -> str:
     return f"; the worker: {where} (since {now.get('since_utc')})"
 
 
+#: Tries per job before `try` refuses (DECIDE[try-budget]). A gate run is
+#: 5–15 s of the node's CPU; eight is a couple of minutes, and an agent that
+#: needs more is designing on the node's clock. Read from a `meta` row so it
+#: can change without a deploy; the verb that writes it is Packet 8's
+#: `paid budget --tries N`, because rule 4 means no row is edited by hand.
+DEFAULT_TRY_CAP = 8
+TRY_CAP_KEY = "paid_try_cap"
+
+
+def try_cap(conn: sqlite3.Connection) -> int:
+    """How many tries one job may ask for, from ``meta`` or the default."""
+    try:
+        value = int(str(db.get_meta(conn, TRY_CAP_KEY, "") or "").strip())
+    except (TypeError, ValueError):
+        return DEFAULT_TRY_CAP
+    return value if value > 0 else DEFAULT_TRY_CAP
+
+
+def try_command(job_id: int, model: str) -> str:
+    return f"sketchgen paid try --job {int(job_id)} --as {model}"
+
+
+def try_for(
+    conn: sqlite3.Connection,
+    job_id: int,
+    model: str,
+    answer: str,
+    *,
+    timeout: float = 240.0,
+    interval: float = 5.0,
+    sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+    ctx: Context | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """The node's own gate, run over a candidate that is not an attempt yet.
+
+    ``answer`` is the text the agent would have put in ``items[0].answer``:
+    the fenced ``js`` block, an optional ``html`` block and the statement. Not
+    a bare ``sketch.js``, on purpose — a try then exercises
+    :func:`executor.parse_response` too, so a reply that would be rejected at
+    ``import`` is rejected here, for free, before it reaches the worker.
+
+    Returns one object with ``do``:
+
+    - ``verdict``: the gate ran. :func:`verdict_summary`'s shape, plus the
+      node paths of the strip and the still, ``tries_used``/``tries_cap``, and
+      ``then`` — the import on a clean pass, another try otherwise.
+    - ``rejected``: the reply does not parse. Exit 0, nothing written, no try
+      spent; the reason is the one ``import`` would have given.
+    - ``wait``: ``timeout`` passed before the worker served it. Not an error:
+      run the same command again.
+    - ``stop``: exit 3. No lease, someone else's lease, or the cap is spent.
+
+    The lease is the whole permission model — no new column says who may try —
+    and this renews it, since a try is the agent's own activity. The verdict
+    is **advisory**: it writes no attempt, no entry and no transition, and the
+    gate the worker runs on the imported attempt is the one that counts.
+    Dossier 01 §5.3 is the argument; job 1286 (entry 1279, 2026-09-21) is the
+    run that made it, where the agent spent 37 minutes building a browser rig
+    that still read a third under the node's own number.
+    """
+    import time
+
+    model = _check_model(model)
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    ctx = ctx or Context()
+    job = db.get_job(conn, job_id)
+    if job is None:
+        raise PaidRefused(f"there is no job {job_id}")
+    cap = try_cap(conn)
+    used = int((db.paid_tries(conn).get(job.id) or {}).get("count") or 0)
+    base: dict[str, Any] = {"job": job.id, "state": job.state, "model": model,
+                            "tries_used": used, "tries_cap": cap}
+
+    lease = db.paid_leases(conn).get(job.id)
+    if lease is None or lease.get("model") != model:
+        holder = lease.get("model") if lease else None
+        return {**base, "do": "stop", "leased_to": holder,
+                "say": (f"job {job.id} is leased to {holder} until "
+                        f"{lease.get('until_utc')}: it is theirs, not yours"
+                        if holder else
+                        f"you hold no lease on job {job.id}: `"
+                        f"{next_command(job.id, model)}` takes one if the job "
+                        "is yours, and a try needs one")}
+
+    parsed = executor.parse_response(answer or "")
+    if parsed.js is None or not parsed.js.strip():
+        # The words `import` uses, and the same bargain: nothing is written,
+        # no try is spent, and the reply comes back to be fixed.
+        return {**base, "do": "rejected",
+                "reason": "no fenced js block",
+                "then": try_command(job.id, model),
+                "say": f"no fenced js block; nothing was written on the node "
+                       f"and job {job.id} is untouched. Fix the reply and try again"}
+
+    if used >= cap:
+        return {**base, "do": "stop",
+                "say": f"{used} of {cap} tries used on job {job.id}; import an "
+                       "attempt (`sketchgen paid import -`), or ask the operator "
+                       f"to raise `{TRY_CAP_KEY}`"}
+
+    k = used + 1
+    try_dir = ctx.jobs_dir / str(job.id) / f"try-{k}"
+    try:
+        try_dir.mkdir(parents=True, exist_ok=True)
+        # The reply lands before the request does: the worker must never find
+        # a request whose reply is not on disk yet.
+        (try_dir / worker.TRY_REPLY).write_text(answer, encoding="utf-8")
+    except OSError as exc:
+        raise PaidRefused(f"cannot write try {k} of job {job.id}: {exc}") from exc
+    db.add_paid_try(conn, job.id, model, k, str(try_dir))
+    db.lease_paid(conn, job.id, model, DEFAULT_LEASE_MINUTES)
+    base["tries_used"] = k
+    result_path = try_dir / worker.TRY_RESULT
+
+    started = clock()
+    last_said = started
+    while True:
+        verdict = _read_try_result(result_path)
+        waited = round(clock() - started, 1)
+        if verdict is not None:
+            clean = verdict.get("exit") == 0 and not verdict.get("offplan")
+            failing = ", ".join(
+                [name for name, value in (verdict.get("checks") or {}).items()
+                 if value is False]
+                + [f"{name} (assertion)" for name in verdict.get("offplan") or []]
+            )
+            return {
+                **base, "do": "verdict", "waited_s": waited, **verdict,
+                "then": ("sketchgen paid import -" if clean
+                         else try_command(job.id, model)),
+                "say": (f"job {job.id} try {k} of {cap}: {verdict.get('say')}"
+                        + ("; this is what an import would be gated on"
+                           if clean else f"; fix {failing or 'what the gate named'} "
+                           "and try again")),
+            }
+        # Every poll renews the lease, as `next` does: the agent is here.
+        db.lease_paid(conn, job.id, model, DEFAULT_LEASE_MINUTES)
+        pending = [row for row in (db.paid_tries(conn).get(job.id) or {}).get("pending") or []
+                   if int(row.get("k") or 0) == k]
+        # Read the verdict again before concluding there is none: the worker
+        # writes result.json and drops the request in that order, and this
+        # poll can land between the two.
+        if not pending and _read_try_result(result_path) is None:
+            # Dropped, then — because the lease had lapsed by the time the
+            # worker reached it. Nobody is bringing a verdict for this one.
+            return {**base, "do": "stop", "waited_s": waited,
+                    "then": try_command(job.id, model),
+                    "say": f"job {job.id} try {k} was dropped by the worker "
+                           "before it ran — your lease had lapsed. `"
+                           f"{next_command(job.id, model)}` first, then try again"}
+        if waited >= timeout:
+            return {**base, "do": "wait", "timed_out": True, "waited_s": waited,
+                    "worker": worker_now(conn),
+                    "then": try_command(job.id, model),
+                    "say": f"job {job.id} try {k} is still waiting for the gate "
+                           f"after {waited:.0f} s"
+                           + _worker_sentence(worker_now(conn), job.id)
+                           + "; run the same command again"}
+        if progress is not None and clock() - last_said >= 30:
+            last_said = clock()
+            progress(f"{waited:.0f} s: job {job.id} try {k} is with the worker"
+                     + _worker_sentence(worker_now(conn), job.id))
+        sleep(interval)
+
+
+def _read_try_result(path: Path) -> dict[str, Any] | None:
+    """The verdict in a try directory, or None until there is a whole one."""
+    try:
+        found = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(found, dict) or found.get("kind") != worker.TRY_KIND:
+        return None
+    return found
+
+
 def release_job(
     conn: sqlite3.Connection, job_id: int, *, by: str | None = None,
     reason: str | None = None,
@@ -1633,8 +1820,97 @@ def release_job(
     }
 
 
-def next_step(job: db.Job, entry_id: int | None = None) -> dict[str, Any]:
-    """What an agent does next about ``job``: a command, wait, or stop."""
+#: How many console lines a verdict carries. The evidence the worker builds
+#: for a failed attempt keeps ten (worker.MAX_CONSOLE_LINES); a try is read by
+#: an agent that is debugging rather than repairing, so it gets twenty, and
+#: ``console_total`` says how many there were.
+VERDICT_CONSOLE_LINES = 20
+
+
+def verdict_summary(report: Mapping[str, Any] | None,
+                    lines: int = VERDICT_CONSOLE_LINES) -> dict[str, Any]:
+    """One gate report, as the shape an agent reads.
+
+    Built once and used twice (docs/plans/agent-rig.md §4.4): for the verdict
+    a `paid try` returns, and for the ``verdict`` on `next`'s ``done``. An
+    agent that learns to read a try has learnt to read the end of its job.
+
+    Everything here is the gate's own: ``exit``, the QA ``checks``, each
+    assertion with the detail it gave, ``timings.ms_per_frame`` — the number
+    that decides the frame budget, and the one no laptop proxy can produce
+    (entry 1279: 9.8 ms on the node against 6.4 ms local) — the console,
+    the resources the sketch asked for and did not get, the notes, and the
+    node paths of ``strip.png`` and ``gate.png``, to be fetched with the same
+    ``scp`` the judge steps use.
+    """
+    if not report:
+        return {"exit": None, "checks": {}, "assertions": {}, "timings": {},
+                "console": [], "console_total": 0, "resources": [], "notes": [],
+                "artefacts": {}, "offplan": [],
+                "say": "the gate wrote no report"}
+    assertions = {
+        name: {"pass": bool((value or {}).get("pass")),
+               "detail": (value or {}).get("detail")}
+        for name, value in (report.get("assertions") or {}).items()
+    }
+    console = list(report.get("console") or [])
+    # Only a sketch that RAN can be off-plan, for _create_entry's reason: one
+    # that threw or froze missed its assertions of course, and calling that a
+    # divergence would put "this sketch runs" beside one that does not.
+    missed = worker.missed_assertions(report) if worker.qa_clean(report) else []
+    failed = [name for name, value in (report.get("checks") or {}).items()
+              if value is False]
+    code = report.get("exit")
+    if code == 0 and not missed:
+        say = "clean: every check and every assertion passed"
+    elif code == 0:
+        say = "it runs, and missed " + ", ".join(missed)
+    else:
+        say = "failed on " + ", ".join(failed + [f"{n} (assertion)" for n in missed]
+                                       or ["the gate's own exit"])
+    return {
+        "exit": code,
+        "checks": dict(report.get("checks") or {}),
+        "assertions": assertions,
+        "timings": dict(report.get("timings") or {}),
+        "console": console[:max(0, int(lines))],
+        "console_total": len(console),
+        "resources": list(report.get("resources") or []),
+        "notes": list(report.get("notes") or []),
+        "artefacts": dict(report.get("artefacts") or {}),
+        "offplan": missed,
+        "say": say,
+    }
+
+
+def kept_verdict(conn: sqlite3.Connection, job_id: int) -> dict[str, Any] | None:
+    """What the gate found in the attempt the entry kept, or None.
+
+    The kept attempt is the one :meth:`sketchgen.worker.Worker._create_entry`
+    shows, which on a clean pass is the last one and on an off-plan hold need
+    not be — so the ranking is the worker's own (:func:`worker.best_attempt`),
+    not a re-derivation of it.
+    """
+    attempts = db.list_attempts(conn, job_id)
+    kept = worker.best_attempt(attempts)
+    report = worker.attempt_report(kept) if kept is not None else {}
+    if not report:
+        return None
+    return {"attempt": int(kept.n), "attempts": len(attempts),
+            **verdict_summary(report)}
+
+
+def next_step(job: db.Job, entry_id: int | None = None, *,
+              verdict: dict[str, Any] | None = None) -> dict[str, Any]:
+    """What an agent does next about ``job``: a command, wait, or stop.
+
+    ``verdict`` is what the gate found in the attempt the entry kept
+    (:func:`kept_verdict`), carried on ``done``. Before 2026-09-21 ``done``
+    said only *held as entry N*, and ``held`` is reached both by a clean pass
+    and by a sketch that ran cleanly and missed an assertion once the attempts
+    were spent (gate/README.md): the agent driving job 1286 inferred its clean
+    pass from ``attempts: 1``, which is a guess that happened to be right.
+    """
     if job.state in MOVING:
         return {"do": "wait", "say": f"job {job.id} is {job.state}; the worker has it"}
     if job.state == "needs-laptop" and job.needs in ("plan", "execute"):
@@ -1648,10 +1924,11 @@ def next_step(job: db.Job, entry_id: int | None = None) -> dict[str, Any]:
         return {"do": "stop", "say": f"job {job.id} needs {job.needs or 'a person'}: "
                                      "that is the operator's, not yours"}
     if job.state in ("held", "published"):
-        return {"do": "done", "entry": entry_id,
+        return {"do": "done", "entry": entry_id, "verdict": verdict,
                 "say": f"job {job.id} is {job.state}"
                        + (f" as entry {entry_id}" if entry_id else "")
-                       + ("; a person publishes it" if job.state == "held" else "")}
+                       + ("; a person publishes it" if job.state == "held" else "")
+                       + (f"; the gate: {verdict['say']}" if verdict else "")}
     return {"do": "done", "say": f"job {job.id} {job.state}: {job.last_error or 'no reason recorded'}"}
 
 
