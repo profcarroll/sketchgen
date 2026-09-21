@@ -64,7 +64,7 @@ path uses, and gates the sketch itself. Reference: `docs/OPERATIONS.md` →
 packet's `model` to your own exact model id — it becomes the entry's public
 provenance; never write a model you are not.
 
-**A paid job is made only from this CLI, by the agent that will answer it.**
+**A paid job is made only from this CLI, by an agent that will answer it.**
 There is no paid choice on the New job page, and `paid assign` refuses a paid
 planner or executor. Two jobs made without an agent attached — one from the
 page, one inherited by a critique child — sat at `needs-laptop` for hours on
@@ -83,6 +83,8 @@ bin/sg paid start --as $ME --by profcarroll --prompt "a tide of slow lines"
 #   registers $ME (a name, not a key), runs the preflight, queues one job with
 #   you as planner and executor, and leases it to you. Prints `next: …`.
 #   NOT READY (exit 3): nothing was queued. Report the checks verbatim; stop.
+#   --planner / --executor: `local`, an Ollama tag, or another *registered*
+#   paid model (see "Two agents on one job" below). At least one step is yours.
 
 bin/sg paid next --job N --as $ME > packet.json     # returns within 4 minutes
 #   one JSON object, with "do":
@@ -90,8 +92,11 @@ bin/sg paid next --job N --as $ME > packet.json     # returns within 4 minutes
 #             then:  bin/sg paid import - < packet.json
 #     wait    the worker has it; "worker" says what it is doing and "say" says
 #             where your job is. Not an error. Run the same command again.
+#             (On a split job, also: the other agent is still planning.)
 #     done    held (report the entry id; a person publishes it), or failed
 #             (report last_error). You are finished.
+#     handoff the rest of a split job is the other paid model's. "then" is
+#             that agent's command; report it and stop — you are finished.
 #     stop    exit 3: a person is needed, the generator is paused, or another
 #             agent holds the job. Report "say" verbatim; stop.
 
@@ -114,6 +119,35 @@ and starts no idle work (no judge, no critique, no spawned child) while you
 are driving; every `next` and `import` renews it, and it lapses twenty minutes
 after your last one. **If `next` says `wait`, run `next` again.** Do not read
 the node's logs, list its processes, or start anything to hurry it.
+
+### Two agents on one job
+
+The operator may want one paid model to plan and another to execute — the
+split the New job page gives two local models. One agent cannot be both (the
+model id on a packet is public provenance; never write one you are not), so it
+is two sessions and a handoff, and `next` carries it:
+
+```bash
+# in a session that is claude-sonnet-5:
+bin/sg paid start --as claude-sonnet-5 --by profcarroll --executor claude-opus-4-6 \
+    --prompt "hot air balloons"
+bin/sg paid next --job N --as claude-sonnet-5      # answer → import → next: handoff
+# in a session that is claude-opus-4-6 (the operator opens it):
+bin/sg paid next --job N --as claude-opus-4-6      # answer → import → … → done
+```
+
+The other model must already be registered — `bin/sg paid models list` shows
+the exact ids; if the one you were asked for is not there, `start` refuses
+(exit 3) and names the `paid models add` for the operator. Do not guess an
+id: the second agent has to answer as exactly that name. The planner's `next`
+says `handoff` as soon as its plan is in, and drops its lease; the executor's
+`next` says `wait` while the other agent plans, then takes the attempts. If
+the executor starts the job (`--planner` names the other), the same holds the
+other way round. The other session has twenty minutes from the job parking
+to run its `next`; after that the worker hands the job to this node's models,
+as for any agent who left. `paid preflight` lists a job parked for another
+agent with that agent's `next` command, and `paid release --job N` if no such
+agent is coming; a job `leased to X` is being driven and has no command.
 
 ### Leaving
 

@@ -70,6 +70,7 @@ __all__ = [
     "import_packet",
     "next_for",
     "next_step",
+    "partner_of",
     "preflight",
     "release",
     "release_job",
@@ -77,6 +78,7 @@ __all__ = [
     "wait_for",
     "sha256_file",
     "waiting",
+    "whose_turn",
     "worker_now",
 ]
 
@@ -1175,13 +1177,15 @@ def worker_now(conn: sqlite3.Connection) -> dict[str, Any] | None:
 def parked_jobs(conn: sqlite3.Connection, model: str | None = None) -> list[dict[str, Any]]:
     """Every job parked for a plan or an attempt, and what to do about each.
 
-    ``yours`` is whether ``model`` is the job's planner or executor. A job
-    that is yours and has no live lease is one an earlier session of yours
-    left behind: answer it (`paid next`) or hand it back (`paid release`).
-    A job that is nobody's — its model has no agent — is the operator's to
-    release; the command is the same, and the worker runs it itself once the
-    job has sat a lease's length with no lease (``Worker.sweep_unattended``).
-    A job leased to another agent has no command: it is theirs.
+    ``yours`` is whether the parked step is ``model``'s to answer. A job that
+    is yours and has no live lease is one an earlier session of yours left
+    behind: answer it (`paid next`) or hand it back (`paid release`). A job
+    leased to another agent has no command: it is theirs, being driven. A job
+    parked for another paid model that nobody holds names that model's `next`
+    as ``command``, so an operator reading the preflight knows which agent to
+    bring — the other half of a split job (#134) — and ``release`` is the way
+    to hand it to this node's models instead, which the worker does itself
+    once it has sat a lease's length with no lease (``Worker.sweep_unattended``).
     """
     leases = db.paid_leases(conn)
     rows = []
@@ -1190,7 +1194,16 @@ def parked_jobs(conn: sqlite3.Connection, model: str | None = None) -> list[dict
             continue
         who = job.planner if job.needs == "plan" else job.executor
         lease = leases.get(job.id)
-        yours = bool(model) and model in (job.planner, job.executor)
+        yours = bool(model) and who in (model, models.PAID)
+        release_cmd = f"sketchgen paid release --job {job.id}"
+        if yours:
+            command = next_command(job.id, model)
+        elif lease and lease.get("model") != model:
+            command = None
+        elif who and who != models.PAID and models.is_paid(who, conn):
+            command = next_command(job.id, who)
+        else:
+            command = release_cmd
         rows.append({
             "job": job.id,
             "needs": job.needs,
@@ -1206,9 +1219,8 @@ def parked_jobs(conn: sqlite3.Connection, model: str | None = None) -> list[dict
             # any job not yours, and the preflight printed "no agent" beside
             # gemini-3.8-flash's live lease on job 1263 — an invitation to
             # take a job out from under an agent still answering it.
-            "command": (next_command(job.id, model) if yours and model
-                        else None if lease
-                        else f"sketchgen paid release --job {job.id}"),
+            "command": command,
+            "release": release_cmd,
         })
     return rows
 
@@ -1236,23 +1248,72 @@ def _check_by(by: str) -> str:
     return text
 
 
-def _job_model(word: str | None, model: str, column: str) -> str:
+def _job_model(word: str | None, model: str, column: str,
+               conn: sqlite3.Connection | None = None) -> str:
     """What ``--planner`` / ``--executor`` on `paid start` may say.
 
     Blank means the agent itself. ``local`` means this node's default. An
-    Ollama tag (it has a colon) is that model on the node. Another paid id is
-    refused: a job can be leased to one agent, and that is the one running
-    `start`.
+    Ollama tag (it has a colon) is that model on the node. A **registered**
+    paid id is another agent: the job is handed to it when its step comes
+    (:func:`next_for` answers ``handoff``), which is how an operator gets, say,
+    a Sonnet plan and an Opus attempt from off the node — the same split the
+    New job page gives two local models. Until 2026-09-21 this refused any
+    paid id but the caller's, and a Sonnet 5 session asked to queue a job with
+    Opus as executor rightly stopped rather than work around it.
+
+    The other id must already be registered (``paid models add``), by the
+    operator: it is the exact name the second agent has to answer as, and an
+    agent guessing another model's id — that session did not know it, and
+    said so — would park the job for a name nobody comes for.
     """
     text = (word or "").strip()
     if not text or text == model:
         return model
     if text == "local" or ":" in text:
         return text
+    if text != models.PAID and models.is_paid(text, conn):
+        return text
+    known = [name for name in models.paid_models(conn) if name != model]
     raise PaidRefused(
-        f"--{column} {text!r}: yourself ({model}), `local`, or an Ollama tag "
-        "(name:tag). Another paid model cannot answer a job you are driving."
+        f"--{column} {text!r}: yourself ({model}), `local`, an Ollama tag "
+        f"(name:tag), or a registered paid model"
+        + (f" ({', '.join(known)})" if known else " (none other is registered)")
+        + f". The operator registers one with: sketchgen paid models add {text}"
     )
+
+
+def partner_of(model: str, planner: str | None, executor: str | None,
+               conn: sqlite3.Connection | None = None) -> tuple[str, str] | None:
+    """The other agent on a job split between two paid models, and its step.
+
+    ``None`` when ``model`` answers every paid step of the job. Read by `start`
+    to say up front that a handoff is coming, and by `next` to tell the two
+    apart.
+    """
+    for column, step in ((planner, "plan"), (executor, "execute")):
+        if column and column not in (model, models.PAID) and models.is_paid(column, conn):
+            return column, step
+    return None
+
+
+def whose_turn(job: db.Job) -> tuple[str | None, str | None]:
+    """The model the job is at, or heading to, and that model's step.
+
+    A job that is queued with no brief goes to its planner next; with one, to
+    its executor. Parked or moving, the state says. ``(None, None)`` for a job
+    that is finished or parked for a person.
+    """
+    if job.state == "needs-laptop":
+        if job.needs == "plan":
+            return job.planner, "plan"
+        if job.needs == "execute":
+            return job.executor, "execute"
+        return None, None
+    if job.state in MOVING:
+        planning = job.state == "planning" or (
+            job.state == "queued" and not (job.brief and job.assertions))
+        return (job.planner, "plan") if planning else (job.executor, "execute")
+    return None, None
 
 
 def start(
@@ -1285,13 +1346,15 @@ def start(
     text = (prompt or "").strip()
     if not text:
         raise PaidRefused("a job needs a prompt: --prompt TEXT, or the prompt on stdin")
-    planner_col = _job_model(planner, model, "planner")
-    executor_col = _job_model(executor, model, "executor")
+    planner_col = _job_model(planner, model, "planner", conn)
+    executor_col = _job_model(executor, model, "executor", conn)
     if planner_col != model and executor_col != model:
         raise PaidRefused(
             f"neither step is yours: --planner {planner_col} --executor "
-            f"{executor_col}. Use `sketchgen enqueue` for a job this node runs."
+            f"{executor_col}. Use `sketchgen enqueue` for a job this node runs, "
+            "or have the agent that answers one of the steps start it."
         )
+    partner = partner_of(model, planner_col, executor_col, conn)
     registered_now = False
     if not models.is_paid(model, conn):
         db.set_paid_models(conn, db.get_paid_models(conn) + [model])
@@ -1310,19 +1373,31 @@ def start(
         options["rules_file"] = rules_file
     job_id = db.enqueue(conn, text, by, **options)
     lease = db.lease_paid(conn, job_id, model, DEFAULT_LEASE_MINUTES)
+    if partner is None:
+        say = (f"job {job_id} is queued for {model}; the worker claims it on its "
+               "next pass and parks it for your plan")
+    elif partner[1] == "execute":
+        say = (f"job {job_id} is queued; you plan, then `next` hands it to "
+               f"{partner[0]} for the attempt — a session that is that model runs "
+               f"`{next_command(job_id, partner[0])}`")
+    else:
+        say = (f"job {job_id} is queued for {partner[0]} to plan first — a session "
+               f"that is that model runs `{next_command(job_id, partner[0])}`; "
+               f"your `next` waits until the attempt is yours")
     return {
         "started": True,
         "job": job_id,
         "model": model,
         "planner": planner_col,
         "executor": executor_col,
+        "partner": partner[0] if partner else None,
+        "partner_step": partner[1] if partner else None,
         "registered_now": registered_now,
         "lease_until": lease["until_utc"],
         "worker_now": report["info"].get("worker_now"),
         "queued_ahead": report["info"].get("queued_ahead"),
         "then": next_command(job_id, model),
-        "say": (f"job {job_id} is queued for {model}; the worker claims it on its "
-                "next pass and parks it for your plan"),
+        "say": say,
     }
 
 
@@ -1350,8 +1425,15 @@ def next_for(
       it again. The timeout is shorter than an agent's tool call on purpose.
     - ``done``: held (``entry``), published, failed or rejected. The lease is
       dropped.
+    - ``handoff``: the job is split between two paid models and the rest of it
+      is the other one's (``to``, ``step``); ``then`` is that agent's command
+      and ``release`` the operator's if no such agent is coming. This agent is
+      finished with the job. Exit 0.
     - ``stop``: the job is parked for a person, the generator is paused, or
       another agent holds the lease. Exit 3 at the CLI: report and stop.
+
+    ``wait`` also covers the executor of a split job while the other agent
+    plans (``waiting_on``); that wait leaves the planner's lease alone.
 
     ``progress`` gets one line every 30 s of waiting, for stderr, so a tool
     that shows partial output shows life.
@@ -1378,8 +1460,65 @@ def next_for(
             "attempts": len(db.list_attempts(conn, job_id)),
             "max_attempts": job.max_attempts, "waited_s": waited,
         }
+        if step["do"] in ("done", "stop"):
+            if step["do"] == "done":
+                db.release_lease(conn, job_id)
+            return {**base, **step}
         lease = db.paid_leases(conn).get(job.id)
-        if lease and lease.get("model") != model and job.state != "held":
+        turn, turn_step = whose_turn(job)
+        theirs = (turn is not None and turn not in (model, models.PAID)
+                  and models.is_paid(turn, conn))
+        if theirs and turn_step == "plan" and model == job.executor:
+            # A job split two ways, and the other agent goes first: the plan is
+            # theirs, the attempt is this agent's. Wait, and do not touch the
+            # lease — it is the planner's while the job is at the plan.
+            control = db.get_control(conn)
+            if control is not None and control.state == "paused" and job.state == "queued":
+                return {**base, "do": "stop", "waiting_on": turn,
+                        "say": f"job {job.id} is queued for {turn} to plan but the "
+                               "generator is paused; it will not move until the "
+                               "operator resumes it"}
+            if waited >= timeout:
+                return {**base, "do": "wait", "timed_out": True, "waiting_on": turn,
+                        "then": next_command(job_id, model),
+                        "say": f"job {job.id} is waiting for {turn} to plan "
+                               f"(state {job.state}); the attempt is yours after; "
+                               "run the same command again"}
+            if progress is not None and clock() - last_said >= 30:
+                last_said = clock()
+                progress(f"{waited:.0f} s: job {job.id} is {job.state}, waiting for "
+                         f"{turn} to plan")
+            sleep(interval)
+            continue
+        if theirs:
+            # The job is at, or heading to, a step another agent answers, and
+            # nothing of it comes back to this one: either its plan is in and
+            # the attempts are the executor's, or it is not on this job at all.
+            # Drop this agent's lease — nobody is present for the job until the
+            # other one runs `next` — and say exactly who that is.
+            if lease and lease.get("model") == model:
+                db.release_lease(conn, job_id)
+            mine = model in (job.planner, job.executor)
+            return {
+                **base, "do": "handoff", "to": turn, "step": turn_step,
+                "then": next_command(job_id, turn),
+                "release": f"sketchgen paid release --job {job_id}",
+                "say": (
+                    (f"your plan for job {job.id} is in; " if mine
+                     else f"job {job.id} is not yours; ")
+                    + f"the {turn_step} is {turn}'s. A session that is that model "
+                    f"runs `{next_command(job_id, turn)}` — within "
+                    f"{DEFAULT_LEASE_MINUTES:.0f} minutes of the job parking, or the "
+                    "worker hands it to this node's models; sooner, "
+                    f"`sketchgen paid release --job {job_id}` does the same. "
+                    "You are finished with it."
+                ),
+            }
+        if (lease and lease.get("model") != model and job.state != "held"
+                and lease.get("model") not in (job.planner, job.executor)):
+            # Leased to someone who is not one of this job's two models — an
+            # earlier lease by the other agent on a split job is taken over
+            # below, since the step is this agent's now.
             return {**base, "do": "stop", "leased_to": lease.get("model"),
                     "say": f"job {job.id} is leased to {lease.get('model')} until "
                            f"{lease.get('until_utc')}: it is theirs, not yours"}
@@ -1412,10 +1551,6 @@ def next_for(
             return {**base, "do": "stop",
                     "say": f"job {job.id} is parked for {step['step']} but nothing "
                            "can be exported for it; report this"}
-        if step["do"] in ("done", "stop"):
-            if step["do"] == "done":
-                db.release_lease(conn, job_id)
-            return {**base, **step}
         # The worker has it. Say so, keep the lease warm, and look again.
         db.lease_paid(conn, job_id, model, DEFAULT_LEASE_MINUTES)
         control = db.get_control(conn)
