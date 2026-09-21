@@ -1179,7 +1179,9 @@ def parked_jobs(conn: sqlite3.Connection, model: str | None = None) -> list[dict
     that is yours and has no live lease is one an earlier session of yours
     left behind: answer it (`paid next`) or hand it back (`paid release`).
     A job that is nobody's — its model has no agent — is the operator's to
-    release; the command is the same.
+    release; the command is the same, and the worker runs it itself once the
+    job has sat a lease's length with no lease (``Worker.sweep_unattended``).
+    A job leased to another agent has no command: it is theirs.
     """
     leases = db.paid_leases(conn)
     rows = []
@@ -1199,7 +1201,13 @@ def parked_jobs(conn: sqlite3.Connection, model: str | None = None) -> list[dict
             "yours": yours,
             "leased_to": lease.get("model") if lease else None,
             "lease_until": lease.get("until_utc") if lease else None,
+            # Someone else's live lease means an agent is driving it: the
+            # command is none. Until 2026-09-21 this said `paid release` for
+            # any job not yours, and the preflight printed "no agent" beside
+            # gemini-3.8-flash's live lease on job 1263 — an invitation to
+            # take a job out from under an agent still answering it.
             "command": (next_command(job.id, model) if yours and model
+                        else None if lease
                         else f"sketchgen paid release --job {job.id}"),
         })
     return rows
@@ -1375,6 +1383,15 @@ def next_for(
             return {**base, "do": "stop", "leased_to": lease.get("model"),
                     "say": f"job {job.id} is leased to {lease.get('model')} until "
                            f"{lease.get('until_utc')}: it is theirs, not yours"}
+        if model not in (job.planner, job.executor) and job.state != "held":
+            # Handed back while the agent was away (Worker.sweep_unattended, or
+            # an operator's `release`): without this, the agent that returns
+            # waits on the local run, renews a lease that stands the idle loop
+            # down for a job that is no longer its own, and reports an entry it
+            # did not make.
+            return {**base, "do": "stop",
+                    "say": f"job {job.id} is not yours any more: "
+                           f"{job.last_error or 'its paid steps were handed back'}"}
         if step["do"] == "answer":
             packet = export_packet(conn, step["step"], model=model, ctx=ctx)
             if packet["items"]:

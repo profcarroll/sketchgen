@@ -111,6 +111,10 @@ job 6. Two rules came out of it:
     and that this process does not own — at startup and once per idle cycle. A
     worker that is killed mid-job, or a bug nobody predicted, costs a delay now
     instead of a job.
+  * :meth:`Worker.sweep_unattended` hands a job parked at ``needs-laptop``
+    for an agent back to this node's models once no lease has been on it for
+    a lease's length — every pass. An agent that runs out of quota mid-job
+    costs the job twenty minutes, not a week.
 
 **What it is doing, where another process can read it (packet 5).** The
 operator UI is ``sketchgen-web.service`` and this is ``sketchgen-worker.service``:
@@ -1442,6 +1446,10 @@ class Worker:
         if not self._swept and not result.workers:
             self._swept = True
             self.sweep_stuck()
+        # Every pass, not once: a parked job's agent can vanish at any hour,
+        # and the release puts the job on the queue this same pass claims from.
+        if not result.workers:
+            self.sweep_unattended()
 
         for name in result.models:
             self.log(f"fence: ollama has {name} resident (not a refusal)")
@@ -1602,6 +1610,59 @@ class Worker:
             )
         return swept
 
+    def sweep_unattended(self, now: str | None = None) -> list[int]:
+        """Hand to this node's models every job parked for an agent who left.
+
+        A job at ``needs-laptop`` for a plan or an attempt waits for the agent
+        whose lease is on it. When the lease lapses — twenty minutes of silence
+        after the agent's last ``next`` or ``import`` — nobody is coming, and
+        before this nothing noticed: the idle loop started again on its own,
+        but the job sat parked until a person ran ``paid release``. On
+        2026-09-21 a gemini-3.8-flash session ran out of its weekly quota
+        mid-plan on job 1263, which would have waited for the quota to reset
+        a week later. This is that ``release``, run by the worker, with
+        the same effect: the paid columns blanked, the job re-queued, and
+        ``last_error`` saying who handed it back and why.
+
+        A job is released when no live lease is on it *and* it has been
+        parked for at least one lease's length, so a job that parked a moment
+        ago for an agent still on its way is left alone. Returns the ids
+        released.
+        """
+        # Local import: paid.py imports this module for the worker's steps.
+        from . import paid
+
+        stamp = now or db.utc_now()
+        leases = db.paid_leases(self.conn, now=stamp)
+        released: list[int] = []
+        for job in db.list_jobs(self.conn, "needs-laptop"):
+            if job.needs not in paid.JOB_STEPS or job.id in leases:
+                continue
+            age = minutes_between(job.updated_utc, stamp)
+            if age is None or age < paid.DEFAULT_LEASE_MINUTES:
+                continue
+            who = job.planner if job.needs == "plan" else job.executor
+            try:
+                paid.release_job(
+                    self.conn, job.id, by="the worker",
+                    reason=f"parked {age:.0f} minutes for {who} with no agent "
+                           "holding a lease",
+                )
+            except (paid.PaidRefused, db.IllegalTransition, sqlite3.Error) as exc:
+                self.log(f"sweep: job {job.id} could not be handed back: {exc}")
+                continue
+            released.append(job.id)
+            self.log(f"sweep: job {job.id} parked {age:.0f} minutes for {who}, "
+                     "whose lease lapsed; handed to this node's models")
+        if released:
+            self._say(
+                "sweeping",
+                "Handing back jobs no agent came back for",
+                f"{len(released)} job{'' if len(released) == 1 else 's'} parked "
+                "for an agent whose lease lapsed",
+            )
+        return released
+
     # -- idle work (packet 5.4) ------------------------------------------
 
     def _idle_say(self, message: str) -> None:
@@ -1682,6 +1743,7 @@ class Worker:
         # Once per idle cycle, because this is the moment the worker has time:
         # a job stuck in a running state is a job nobody is coming back for.
         self.sweep_stuck()
+        self.sweep_unattended()
         if self._standing_by():
             return
         judged = self._idle_judge() if self.idle_judge > 0 else None
@@ -1719,7 +1781,8 @@ class Worker:
         import and the worker's claim, and the agent polls through all of it
         (2026-09-21, job 1246). So while a lease is live the worker does
         nothing but nap and look at the queue. A lease expires on its own, so
-        an agent that vanishes costs the idle loop minutes, not the night.
+        an agent that vanishes costs the idle loop minutes, not the night, and
+        :meth:`sweep_unattended` then hands its job to this node's models.
         """
         leases = db.paid_leases(self.conn)
         if not leases:
