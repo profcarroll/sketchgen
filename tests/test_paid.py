@@ -9,6 +9,8 @@ its round trip: a packet cut for the step, answered with the reply the local
 path would have got, lands the same rows the local path lands (plan §5.1).
 """
 
+import argparse
+import dataclasses
 import json
 import os
 import shutil
@@ -2141,6 +2143,86 @@ class ProcessCostTests(AgentLoopTests):
         self.assertIsNone(found["session_s"])
         self.assertIsNone(found["tool_calls"])
         self.assertNotIn("tries", found)
+
+    # -- an empty process on a --since job is declared or it is rejected --------
+
+    SINCE = "2026-09-21T20:00:00Z"
+
+    def attempt_packet(self, *, since):
+        """A job driven to its attempt packet, the sketch written in."""
+        job = self.start(since=since)["job"]
+        self.worker().run_once()
+        plan = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        plan["items"][0]["answer"] = CLEAN_PLAN
+        paid.import_packet(self.conn, plan, ctx=self.ctx)
+        self.worker().run_once()
+        packet = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        packet["items"][0]["answer"] = GOOD_SKETCH
+        return job, packet
+
+    def test_an_empty_process_on_a_since_job_is_rejected_and_nothing_is_written(self):
+        # Job 1308 (entry 1300, 2026-09-21): started with --since, never ran
+        # cost.py, landed a process of nulls in silence.
+        job, packet = self.attempt_packet(since=self.SINCE)
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(report.recorded, [])
+        self.assertEqual(len(report.rejected), 1)
+        reason = report.rejected[0]["reason"]
+        self.assertIn(f"python3 rig/cost.py --since {self.SINCE}", reason)
+        self.assertIn("--no-process", reason)
+        self.assertIn("Nothing was written", reason)
+        # kept, verbatim, and the job is exactly where it was
+        self.assertEqual(report.rejected[0]["answer"], GOOD_SKETCH)
+        self.assertEqual(db.get_job(self.conn, job).state, "needs-laptop")
+        self.assertEqual(db.list_attempts(self.conn, job), [])
+        # the export wrote the prompt into attempt-1; the landing wrote nothing
+        attempt_dir = self.jobs_dir / str(job) / "attempt-1"
+        self.assertFalse((attempt_dir / worker.PAID_REPLY).exists())
+        self.assertFalse((attempt_dir / worker.PAID_META).exists())
+        # and the same packet lands once the cost is in it: a rejection is a
+        # re-import, not a lost attempt
+        packet["items"][0]["process"] = self.PROCESS
+        again = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(len(again.recorded), 1, again.rejected)
+        self.worker().run_once()
+        found = json.loads(db.list_attempts(self.conn, job)[0].process_json)
+        self.assertEqual(found["output_tokens"], 207537)
+
+    def test_a_half_reported_process_is_reported_enough(self):
+        job, packet = self.attempt_packet(since=self.SINCE)
+        packet["items"][0]["process"] = {"output_tokens": 12000}
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(len(report.recorded), 1, report.rejected)
+
+    def test_no_process_declares_the_empty_cost_instead(self):
+        job, packet = self.attempt_packet(since=self.SINCE)
+        declared = dataclasses.replace(self.ctx, process_unreported=True)
+        report = paid.import_packet(self.conn, packet, ctx=declared)
+        self.assertEqual(len(report.recorded), 1, report.rejected)
+        meta = json.loads((self.jobs_dir / str(job) / "attempt-1" / worker.PAID_META)
+                          .read_text(encoding="utf-8"))
+        self.assertTrue(meta["process_unreported"])
+        self.assertEqual(meta["process"], paid.EMPTY_PROCESS)
+        # declared is still not reported: the rows stay null, never zero
+        self.worker().run_once()
+        self.assertIsNone(db.list_attempts(self.conn, job)[0].process_json)
+
+    def test_a_job_without_since_made_no_promise(self):
+        job, packet = self.attempt_packet(since=None)
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(len(report.recorded), 1, report.rejected)
+        meta = json.loads((self.jobs_dir / str(job) / "attempt-1" / worker.PAID_META)
+                          .read_text(encoding="utf-8"))
+        self.assertFalse(meta["process_unreported"])
+
+    def test_the_import_flag_reaches_the_context(self):
+        from sketchgen.cli import paid as cli
+        parser = argparse.ArgumentParser()
+        cli.register(parser.add_subparsers(dest="command"))
+        args = parser.parse_args(["paid", "import", "--no-process", "-"])
+        self.assertTrue(cli._ctx(args).process_unreported)
+        args = parser.parse_args(["paid", "import", "-"])
+        self.assertFalse(cli._ctx(args).process_unreported)
 
     def test_the_tries_alone_are_recorded_when_the_agent_reports_nothing(self):
         job, _report = self.drive(tries=2)

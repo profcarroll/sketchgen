@@ -1574,7 +1574,14 @@ apart (dossier 01 §6.4):
   generated · 4 tries · as reported by the agent`, an em dash per blank), goes
   into `meta.json` as `process`, and appears beside the attempt on the
   operator's job page. **Nothing measures with it** — not `pairs.py`, not the
-  judge, not a batch total.
+  judge, not a batch total. On a job with `since_utc`, an execute import whose
+  `process` is all null is *rejected* (the ordinary rejection: nothing written,
+  the answer kept, the `rig/cost.py --since` command in the reason) unless
+  `paid import --no-process` says the harness cannot report one; that
+  declaration is kept in the attempt's `paid.json` as `process_unreported`.
+  Job 1308 (entry 1300, 2026-09-21) is why: a `--since` job whose agent never
+  ran `cost.py`, landed in silence, and a page of dashes that could not say
+  whether the cost was uncountable or uncounted.
 
 Two more columns carry what only the agent knows: `jobs.since_utc` from `paid
 start --since ISO` (what its first `date -u +%FT%TZ` printed; a stamp in the
