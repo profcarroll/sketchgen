@@ -583,7 +583,7 @@ class TestTheLinePage(LineageTestCase):
         # the last generation is held, so it is on no public page
         self.assertNotIn(f'href="../e/{made[-1]}/"', page)
         self.assertIn("not published", page)
-        self.assertIn("has not been through the publication gate", page)
+        self.assertIn("This generation is not published", page)
 
     def test_a_short_line_has_no_card_that_waits(self):
         self.build_line(depth=1)

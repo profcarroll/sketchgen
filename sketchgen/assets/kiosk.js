@@ -797,9 +797,7 @@
     if (on("authors")) {
       html += "<p class=\"authors\">Prompted by <span>" + esc(entry.submitted_by) +
         "</span> · planned by <span>" + esc(entry.planner) +
-        "</span> · written by <span>" + esc(entry.executor) + "</span> under the " +
-        esc(entry.rules_file) + " rules" +
-        (entry.attempts > 1 ? ", gate passed on attempt " + esc(entry.attempts) : "") + "</p>";
+        "</span> · written by <span>" + esc(entry.executor) + "</span></p>";
     }
     if (on("generation")) {
       facts.push("<li class=\"gen\"><b>generation " + esc(entry.generation) + "</b>" +

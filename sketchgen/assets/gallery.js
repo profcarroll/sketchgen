@@ -1054,7 +1054,7 @@
   }
 
   /* A rejection is named in the reveal and nowhere else. Spec §5 blinds the
-   * human until both answers are in, and "the gate threw this one out" is the
+   * human until both answers are in, and "this one was thrown out" is the
    * loudest anchor the page could hand them, so neither side carries a REJECTED
    * chip while they are looking: a rejection is just a sketch until they vote.
    * This block sits inside [data-reveal], so it is written at load and stays
@@ -1066,7 +1066,7 @@
       if (!isRejection(sides[letter])) { return; }
       var line = document.createElement("p");
       line.className = "rejected-note";
-      line.textContent = letter + " was rejected by the gate and kept";
+      line.textContent = letter + " was rejected and kept";
       host.appendChild(line);
     });
   }
