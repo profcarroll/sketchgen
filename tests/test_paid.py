@@ -721,6 +721,108 @@ class CritiqueTests(PaidTestCase):
 
 
 # ---------------------------------------------------------------------------
+# The assignment
+# ---------------------------------------------------------------------------
+
+
+class AssignmentTests(PaidTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE jobs SET state = 'published'")
+        self.env = mock.patch.dict(os.environ, PAID_ENV)
+        self.env.start()
+        self.addCleanup(self.env.stop)
+
+    def worker(self, **kwargs):
+        devnull = open(os.devnull, "w", encoding="utf-8")
+        self.addCleanup(devnull.close)
+        kwargs.setdefault("probe", lambda: dict(test_worker.FREE_SLOT))
+        return worker.Worker(self.conn, jobs_dir=self.jobs_dir, log_stream=devnull,
+                             **kwargs)
+
+    def test_it_round_trips_and_unsets(self):
+        self.assertEqual(db.get_assignment(self.conn), {})
+        db.set_assignment(self.conn, {"plan": "claude-opus-5", "critique": "claude-opus-5"})
+        db.set_assignment(self.conn, {"plan": None})
+        self.assertEqual(db.get_assignment(self.conn), {"critique": "claude-opus-5"})
+        with self.assertRaises(ValueError):
+            db.set_assignment(self.conn, {"dream": "x"})
+
+    def test_a_job_that_names_no_planner_takes_the_assignment(self):
+        db.set_assignment(self.conn, {"plan": "claude-opus-5"})
+        blank = db.enqueue(self.conn, "a blank planner", "octocat")
+        self.worker().run_once()
+        self.assertEqual(db.get_job(self.conn, blank).state, "needs-laptop")
+
+    def test_a_job_that_says_local_does_not(self):
+        db.set_assignment(self.conn, {"plan": "claude-opus-5"})
+        local = db.enqueue(self.conn, "a local planner", "octocat", planner="local")
+        self.worker(planner_fn=test_worker.stub_plan(),
+                    executor_fn=test_worker.StubExecutor(),
+                    gate_fn=test_worker.StubGate([0])).run_once()
+        self.assertEqual(db.get_job(self.conn, local).state, "held")
+
+    def test_a_job_that_names_no_executor_takes_the_assignment(self):
+        db.set_assignment(self.conn, {"execute": "claude-opus-5"})
+        job = db.enqueue(self.conn, "p", "octocat", brief="b", assertions=["motion(idle)"])
+        self.worker(gate_fn=test_worker.StubGate([0])).run_once()
+        self.assertEqual(db.get_job(self.conn, job).needs, "execute")
+
+    def test_a_paid_critic_or_judge_assignment_keeps_the_idle_loop_off_it(self):
+        db.set_assignment(self.conn, {"judge": "claude-opus-5",
+                                      "critique": "claude-opus-5"})
+        judge_calls, critic_calls = [], []
+        run = self.worker(
+            idle_judge=1, idle_critique=1,
+            judge_fn=lambda conn, **kw: judge_calls.append(kw) or {"judged": 0},
+            critic_fn=lambda conn, eid, **kw: critic_calls.append(eid),
+        )
+        run._idle_round()
+        self.assertEqual((judge_calls, critic_calls), ([], []))
+
+    def test_a_local_model_assigned_to_the_judge_is_the_one_it_runs(self):
+        db.set_assignment(self.conn, {"judge": "gemma4:26b"})
+        calls = []
+        run = self.worker(idle_judge=1,
+                          judge_fn=lambda conn, **kw: calls.append(kw) or {"judged": 1})
+        run._idle_judge()
+        self.assertEqual(calls[0]["model"], "gemma4:26b")
+
+    def test_the_new_job_page_preselects_it_and_warns_about_the_executor(self):
+        db.set_assignment(self.conn, {"plan": "claude-sonnet-5",
+                                      "execute": "claude-opus-5"})
+        defaults, _ = web.load_defaults(self.conn)
+        self.assertEqual((defaults["planner"], defaults["executor"]),
+                         ("claude-sonnet-5", "claude-opus-5"))
+        note = web._assignment_note(self.conn)
+        self.assertIn("execute claude-opus-5", note)
+        self.assertIn("far larger difference", note)
+        db.set_assignment(self.conn, {"execute": None})
+        self.assertNotIn("far larger difference", web._assignment_note(self.conn))
+
+    def test_assign_all_at_the_cli_and_export_without_as(self):
+        result = self.run_cli("assign", "--all", "claude-opus-5", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(set(payload["assignment"].values()), {"claude-opus-5"})
+        self.assertTrue(any("second variable" in n for n in payload["notes"]))
+        out = self.tmp / "p.json"
+        result = self.run_cli("export", "--step", "critique", "--out", str(out))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        packet = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(packet["model"], "claude-opus-5")
+        result = self.run_cli("assign", "--critique", "local", "--json")
+        self.assertNotIn("critique", json.loads(result.stdout)["assignment"])
+
+    def test_export_with_neither_as_nor_an_assignment_is_refused(self):
+        result = self.run_cli("export", "--step", "plan", "--out",
+                              str(self.tmp / "x.json"))
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("paid assign", result.stderr)
+
+
+# ---------------------------------------------------------------------------
 # The CLI
 # ---------------------------------------------------------------------------
 
@@ -728,7 +830,7 @@ class CritiqueTests(PaidTestCase):
 class CliTests(PaidTestCase):
 
     def test_help_exits_zero_for_every_subcommand(self):
-        for name in ("export", "import", "status", "release"):
+        for name in ("export", "import", "status", "release", "assign"):
             with self.subTest(subcommand=name):
                 result = subprocess.run(
                     [sys.executable, str(CLI), "paid", name, "--help"],

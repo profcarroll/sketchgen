@@ -2575,6 +2575,14 @@ def load_defaults(conn: sqlite3.Connection) -> tuple[dict[str, Any], str | None]
     """
     merged = {key: list(value) if isinstance(value, list) else value
               for key, value in BUILTIN_DEFAULTS.items()}
+    # The assignment (`sketchgen paid assign`, agentic-cli §3.6) sits between
+    # the built-in defaults and the saved ones: it is the node's answer to
+    # "which model runs this step", and a person's saved defaults for this
+    # page are still theirs to keep.
+    assignment = db.get_assignment(conn)
+    for step, field in (("plan", "planner"), ("execute", "executor")):
+        if assignment.get(step):
+            merged[field] = assignment[step]
     raw = db.get_meta(conn, DEFAULTS_KEY)
     if not raw:
         return merged, None
@@ -2900,8 +2908,37 @@ def new_page(
         publication_options=_options(PUBLICATION_CHOICES, one("publication", "hold")),
         max_attempts=esc(one("max_attempts", "3")),
         queue_note=esc(_queue_note(conn, control)),
+        assignment_note=_assignment_note(conn),
         defaults_note=_defaults_note(saved_utc),
     )
+
+
+def _assignment_note(conn: sqlite3.Connection) -> str:
+    """Which model each step is assigned to, and the warning where it matters.
+
+    agentic-cli §3.5: a paid executor is a much larger second variable in the
+    A/B than two local models are, and the place to say so is where the choice
+    is made, not in a document.
+    """
+    assignment = db.get_assignment(conn)
+    parts = [
+        f"{step} {esc(assignment.get(step) or 'this node')}"
+        for step in db.ASSIGNABLE_STEPS
+    ]
+    note = (
+        '<p class="help">Assigned: ' + " · ".join(parts)
+        + " — set with <code>sketchgen paid assign</code>.</p>"
+    )
+    executor_model = assignment.get("execute")
+    if executor_model and models.is_paid(executor_model):
+        note += (
+            f'<p class="err">Every job that names no executor is written by '
+            f"{esc(executor_model)}, off this node: one round trip per attempt "
+            "through <code>sketchgen paid</code>, and each entry badged off-node. "
+            "That is a far larger difference than two local models, inside an "
+            "experiment measuring the rules file.</p>"
+        )
+    return note
 
 
 def form_from_query(
