@@ -1,17 +1,24 @@
-"""`sketchgen paid export|import|status` — any step, answered off the node.
+"""`sketchgen paid start|next|import|…` — any step, answered off the node.
 
 A drop-in subcommand (see sketchgen/cli/__init__.py). The work is in
 sketchgen/paid.py; this is the shell around it, shaped to be driven by an agent
-on a machine that holds a credential (docs/plans/agentic-cli.md §3.8):
+on a machine that holds a credential (docs/plans/agentic-cli.md §3.8).
+
+The agent's own job is three verbs, repeated:
+
+  start   register yourself, preflight, queue one job as you, lease it
+  next    what now: the packet to answer, "wait" (run it again), done, or stop
+  import  land the answered packet; the node gates it
+  release hand a parked job (or the critic's entries) back to the local path
+
+And the rest, for the per-entry steps and the operator:
 
   export  write what the node would have asked a model, for one step
-  import  land the answers that packet comes back with
   status  what is waiting for an answer from off the node, per step
-  release hand claimed subjects back to the local path (the critic's entries)
-  assign  which model runs each step by default — or all four at once
+  assign  which local model runs each step by default (paid: judge, critique)
   models  register the paid model ids this node routes off the node
   preflight  ready or not, and the fix for each thing that is not
-  wait    block until a job needs you, is done, or cannot move
+  wait    block until a job needs you (superseded by `next`, kept)
 
 Every verb takes ``--json`` and prints one object. Exit codes, as everywhere in
 this project: 0 success, 1 failure, 3 refused (no database, not a packet, a
@@ -174,6 +181,8 @@ def cmd_import(args: argparse.Namespace) -> int:
             print(f"  rejected {row['item']}: {row['reason']}")
         if saved:
             print(f"the rejected answers are kept, verbatim, in {saved}")
+        if report.then():
+            print(f"next: {report.then()}")
         return EXIT_OK
 
     return _run(args, work)
@@ -197,6 +206,20 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_release(args: argparse.Namespace) -> int:
     def work(conn: sqlite3.Connection) -> int:
+        if args.jobs:
+            results = [
+                paid_mod.release_job(conn, job_id, by=args.by, reason=args.reason)
+                for job_id in args.jobs
+            ]
+            if args.json:
+                print(json.dumps({"released": results}, sort_keys=True))
+            else:
+                for row in results:
+                    print(row["say"])
+            return EXIT_OK
+        if args.step != "critique":
+            raise paid_mod.PaidRefused("name the jobs to hand back with --job N, or "
+                                       "the critic's entries with --step critique")
         if not args.all and not args.ids:
             raise paid_mod.PaidRefused("name the ids to release, or --all")
         released = paid_mod.release(conn, args.step, None if args.all else args.ids)
@@ -251,15 +274,82 @@ def cmd_preflight(args: argparse.Namespace) -> int:
                 print(f"  {mark} {row['check']:<11} {row['detail']}")
                 if not row["ok"]:
                     print(f"       fix ({row['who']}): {row['fix']}")
-            info = result["info"]
-            if info:
-                print(f"  jobs queued ahead: {info['queued_ahead']}")
-                if info["assignment"]:
-                    print("  assignment: " + ", ".join(
-                        f"{k}={v}" for k, v in sorted(info["assignment"].items())))
+            _print_info(result["info"])
             if not result["ready"]:
                 print("Fix what is yours; report what is the operator's, and stop.")
         return EXIT_OK if result["ready"] else EXIT_REFUSED
+
+    return _run(args, work)
+
+
+def _print_info(info: dict) -> None:
+    """The lines under a preflight, text mode: what the agent is walking into."""
+    if not info:
+        return
+    print(f"  jobs queued ahead: {info.get('queued_ahead', 0)}")
+    now = info.get("worker_now")
+    if now:
+        where = now.get("headline") or now.get("step")
+        on = f" on job {now['job']}" if now.get("job") else ""
+        print(f"  worker now: {where}{on} (since {now.get('since_utc')})")
+    for lease_job, lease in sorted((info.get("leases") or {}).items()):
+        print(f"  lease: job {lease_job} is {lease.get('model')}'s until "
+              f"{lease.get('until_utc')}")
+    for row in info.get("parked") or []:
+        whose = "yours" if row["yours"] else f"{row['model']}'s, no agent"
+        print(f"  parked: job {row['job']} needs {row['needs']} ({whose}, since "
+              f"{row['since_utc']}) -> {row['command']}")
+    if info.get("assignment"):
+        print("  assignment: " + ", ".join(
+            f"{k}={v}" for k, v in sorted(info["assignment"].items())))
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    def work(conn: sqlite3.Connection) -> int:
+        prompt = args.prompt
+        if prompt is None or prompt == "-":
+            prompt = sys.stdin.read()
+        result = paid_mod.start(
+            conn, model=args.model, prompt=prompt, by=args.by,
+            planner=args.planner, executor=args.executor, rules_file=args.rules,
+            max_attempts=args.max_attempts, publication=args.publication,
+        )
+        if args.json:
+            print(json.dumps(result, sort_keys=True))
+        elif not result["started"]:
+            report = result["preflight"]
+            print("NOT READY — nothing queued")
+            for row in report["checks"]:
+                mark = "ok  " if row["ok"] else "FAIL"
+                print(f"  {mark} {row['check']:<11} {row['detail']}")
+                if not row["ok"]:
+                    print(f"       fix ({row['who']}): {row['fix']}")
+            _print_info(report["info"])
+            print("Report the failing checks to the operator, verbatim, and stop.")
+        else:
+            if result["registered_now"]:
+                print(f"registered {result['model']} as a paid model (a name, not a key)")
+            print(f"started job {result['job']}: planner {result['planner']}, "
+                  f"executor {result['executor']}, leased to {result['model']} "
+                  f"until {result['lease_until']}")
+            _print_info({"queued_ahead": result["queued_ahead"],
+                         "worker_now": result["worker_now"]})
+            print(f"next: {result['then']}")
+        return EXIT_OK if result["started"] else EXIT_REFUSED
+
+    return _run(args, work)
+
+
+def cmd_next(args: argparse.Namespace) -> int:
+    def work(conn: sqlite3.Connection) -> int:
+        result = paid_mod.next_for(
+            conn, args.job, args.model, timeout=args.timeout, interval=args.interval,
+            ctx=_ctx(args), progress=lambda line: print(line, file=sys.stderr),
+        )
+        # Always one JSON object on stdout: when `do` is `answer` it is the
+        # packet itself, to be answered and given to `paid import -`.
+        sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        return EXIT_REFUSED if result["do"] == "stop" else EXIT_OK
 
     return _run(args, work)
 
@@ -297,6 +387,16 @@ def _assign_changes(args: argparse.Namespace) -> dict[str, str | None]:
             continue
         if not paid_mod.MODEL_RE.match(value):
             raise paid_mod.PaidRefused(f"{value!r} is not a usable model id")
+        if step in paid_mod.JOB_STEPS and (value == "paid" or ":" not in value):
+            # A default paid planner or executor makes paid jobs with no agent
+            # attached — from the New job page, and from every child the idle
+            # critic spawns. 2026-09-21: two of those sat at needs-laptop for
+            # hours. A paid job is started per job, by its agent (`paid start`).
+            raise paid_mod.PaidRefused(
+                f"--{step} {value}: only an Ollama tag (name:tag) or `local` can "
+                f"be the default for {step}. A paid model runs a job it was "
+                "started for: `sketchgen paid start --as MODEL`."
+            )
         cleaned[step] = value
     return cleaned
 
@@ -414,8 +514,17 @@ def register(top: argparse._SubParsersAction) -> None:
             "answered, not reclaimed."
         ),
     )
-    rel.add_argument("--step", required=True, choices=("critique",),
-                     help="the step whose claims to release")
+    rel.add_argument("--job", dest="jobs", action="append", type=int, default=[],
+                     metavar="N",
+                     help="hand this parked job (needs-laptop, plan or execute) back "
+                          "to this node's models: its paid planner/executor is "
+                          "blanked and it is queued again. Repeatable")
+    rel.add_argument("--by", default=None, metavar="WHO",
+                     help="who is handing it back (your model id, or a username)")
+    rel.add_argument("--reason", default=None, metavar="TEXT",
+                     help="why, recorded on the job")
+    rel.add_argument("--step", default=None, choices=("critique",),
+                     help="the step whose claims to release (entries)")
     rel.add_argument("ids", nargs="*", type=int, metavar="ID",
                      help="entry ids to release")
     rel.add_argument("--all", action="store_true", help="release every claim")
@@ -465,12 +574,69 @@ def register(top: argparse._SubParsersAction) -> None:
         ),
     )
     wai.add_argument("--job", type=int, required=True, metavar="N")
-    wai.add_argument("--timeout", type=float, default=1800.0, metavar="S",
-                     help="give up after S seconds (default %(default)s)")
+    wai.add_argument("--timeout", type=float, default=240.0, metavar="S",
+                     help="give up after S seconds (default %(default)s; an agent's "
+                          "tool call allows less than it used to)")
     wai.add_argument("--interval", type=float, default=5.0, metavar="S",
                      help="poll every S seconds (default %(default)s)")
     _add_common(wai)
     wai.set_defaults(func=cmd_wait, _parser=wai)
+
+    sta_ = sub.add_parser(
+        "start",
+        help="begin one job as MODEL: register, preflight, queue, lease",
+        description=(
+            "The first of the agent's three verbs. Registers MODEL as a paid "
+            "model if it is not (a name, never a key), runs the preflight and "
+            "refuses — exit 3, nothing queued — if it is not ready, queues one "
+            "job with MODEL as planner and executor (or `local` for either), "
+            "and leases the job to MODEL so the worker takes it first and does "
+            "no idle work while MODEL is driving it. Prints the `next` command."
+        ),
+    )
+    sta_.add_argument("--as", dest="model", required=True, metavar="MODEL_ID",
+                      help="your own exact model id")
+    sta_.add_argument("--by", required=True, metavar="USERNAME",
+                      help="GitHub username the job is submitted under")
+    sta_.add_argument("--prompt", default=None, metavar="TEXT",
+                      help="what to make; omitted or `-`: read from stdin, which "
+                           "needs no quoting through ssh")
+    sta_.add_argument("--planner", default=None, metavar="MODEL",
+                      help="yourself (default), `local`, or an Ollama tag")
+    sta_.add_argument("--executor", default=None, metavar="MODEL",
+                      help="yourself (default), `local`, or an Ollama tag")
+    sta_.add_argument("--rules", choices=("control", "treatment", "random"),
+                      default=None, help="rules file for the executor")
+    sta_.add_argument("--max-attempts", dest="max_attempts", type=int, default=3,
+                      metavar="N", help="execute+gate attempts (default 3)")
+    sta_.add_argument("--publication", choices=("hold", "auto"), default="hold")
+    _add_common(sta_)
+    sta_.set_defaults(func=cmd_start, _parser=sta_)
+
+    nxt = sub.add_parser(
+        "next",
+        help="what to do next about job N: the packet, wait, done, or stop",
+        description=(
+            "The agent's loop, as one verb. Prints one JSON object with `do`: "
+            "`answer` — the object is the packet for the step the job is parked "
+            "at; write your reply into items[0].answer and `paid import -` it. "
+            "`wait` — the worker has it; `worker` says what it is doing; run "
+            "this again (exit 0). `done` — held, failed, published. `stop` — "
+            "a person is needed, the generator is paused, or another agent "
+            "holds the job (exit 3): report and stop. Renews your lease on "
+            "every poll. Returns within --timeout, which is shorter than a "
+            "tool call on purpose."
+        ),
+    )
+    nxt.add_argument("--job", type=int, required=True, metavar="N")
+    nxt.add_argument("--as", dest="model", required=True, metavar="MODEL_ID",
+                     help="your own exact model id")
+    nxt.add_argument("--timeout", type=float, default=240.0, metavar="S",
+                     help="return `wait` after S seconds (default %(default)s)")
+    nxt.add_argument("--interval", type=float, default=5.0, metavar="S",
+                     help="poll every S seconds (default %(default)s)")
+    _add_common(nxt)
+    nxt.set_defaults(func=cmd_next, _parser=nxt)
 
     asg = sub.add_parser(
         "assign",
@@ -478,7 +644,8 @@ def register(top: argparse._SubParsersAction) -> None:
         description=(
             "One setting for the four steps (agentic-cli §3.6). With no options, "
             "print it. `plan` and `execute` are what the New job page preselects "
-            "and what a job that names no model gets; `judge` and `critique` are "
+            "and what a job that names no model gets — local tags only: a paid "
+            "job is started per job by `paid start`. `judge` and `critique` are "
             "what the idle loop runs, and a paid model there means the idle loop "
             "leaves that step to `paid export`. A job's own planner and executor "
             "always win. `local` unsets a step."

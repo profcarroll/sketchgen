@@ -696,3 +696,38 @@ class TestSubmissions(DbTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPaidLeases(DbTestCase):
+    """The meta-backed lease an agent holds on the job it is driving."""
+
+    def test_a_lease_is_live_until_it_expires_and_keeps_its_start(self):
+        job = self.enqueue()
+        first = db.lease_paid(self.conn, job, "claude-sonnet-5", 20)
+        self.assertEqual({job}, set(db.paid_leases(self.conn)))
+        again = db.lease_paid(self.conn, job, "claude-sonnet-5", 20)
+        self.assertEqual(first["since_utc"], again["since_utc"])
+        self.assertGreaterEqual(again["until_utc"], first["until_utc"])
+        db.lease_paid(self.conn, job, "claude-sonnet-5", -1)
+        self.assertEqual({}, db.paid_leases(self.conn))
+
+    def test_a_lease_on_a_finished_or_missing_job_is_pruned(self):
+        job = self.enqueue()
+        db.lease_paid(self.conn, job, "claude-sonnet-5", 20)
+        db.transition(self.conn, job, "failed", last_error="x")
+        db.lease_paid(self.conn, 999_999, "claude-sonnet-5", 20)
+        self.assertEqual({}, db.paid_leases(self.conn))
+
+    def test_release_drops_it_and_says_whether_there_was_one(self):
+        job = self.enqueue()
+        db.lease_paid(self.conn, job, "claude-sonnet-5", 20)
+        self.assertTrue(db.release_lease(self.conn, job))
+        self.assertFalse(db.release_lease(self.conn, job))
+
+    def test_claim_next_prefers_the_jobs_it_is_told_to(self):
+        older = self.enqueue("first in")
+        mine = self.enqueue("the leased one")
+        claimed = db.claim_next(self.conn, prefer=[mine])
+        self.assertEqual(mine, claimed.id)
+        self.assertEqual(older, db.claim_next(self.conn).id)
+        self.assertIsNone(db.claim_next(self.conn, prefer=[mine]))

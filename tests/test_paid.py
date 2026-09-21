@@ -255,15 +255,16 @@ class PaidModelListTests(unittest.TestCase):
             self.assertEqual(models.paid_models(), [])
             self.assertTrue(models.is_paid("paid"))
 
-    def test_the_planner_menu_offers_each_named_model_off_this_node(self):
+    def test_the_planner_menu_offers_no_paid_model(self):
+        """Since 2026-09-21 a paid job is made only by `paid start`, by the
+        agent that answers it. The page lists what this node runs; a saved
+        `paid` from before resolves to the worker's default."""
         with mock.patch.dict(os.environ, PAID_ENV), \
                 mock.patch.object(web.models, "catalogue", return_value=[]):
             groups = dict(web.planner_groups())
-            offered = [value for value, _ in groups["off this node"]]
-            self.assertEqual(offered, ["paid", "claude-opus-5", "claude-sonnet-5"])
-            self.assertEqual(web.check_planner("claude-opus-5"), "claude-opus-5")
-            self.assertEqual(web.planner_column("claude-opus-5"), "claude-opus-5")
-            self.assertEqual(web.planner_column("paid"), "paid")
+            self.assertEqual([value for value, _ in groups["off this node"]], [])
+            self.assertEqual(web.planner_column("paid"), worker.DEFAULT_PLANNER_MODEL)
+            self.assertNotIn("paid", web.planner_values())
 
 
 class PlanTests(PaidTestCase):
@@ -545,12 +546,12 @@ class ExecuteTests(PaidTestCase):
         self.assertEqual(again.recorded, [])
         self.assertIn("not waiting", again.rejected[0]["reason"])
 
-    def test_the_executor_menu_offers_paid_models(self):
+    def test_the_executor_menu_offers_no_paid_model(self):
         with mock.patch.dict(os.environ, PAID_ENV), \
                 mock.patch.object(web.models, "catalogue", return_value=[]):
             offered = [v for v, _ in dict(web.executor_groups())["off this node"]]
-            self.assertIn("claude-opus-5", offered)
-            self.assertEqual(web.check_executor("claude-opus-5"), "claude-opus-5")
+            self.assertEqual(offered, [])
+            self.assertNotIn("paid", web.executor_values())
 
 
 class Migration014Tests(unittest.TestCase):
@@ -801,12 +802,26 @@ class AssignmentTests(PaidTestCase):
         db.set_assignment(self.conn, {"execute": None})
         self.assertNotIn("far larger difference", web._assignment_note(self.conn))
 
-    def test_assign_all_at_the_cli_and_export_without_as(self):
-        result = self.run_cli("assign", "--all", "claude-opus-5", "--json")
+    def test_a_paid_default_for_plan_or_execute_is_refused_at_the_cli(self):
+        """A default paid planner makes paid jobs with no agent attached — from
+        the page and from every child the idle critic spawns (2026-09-21)."""
+        for flags in (("--all", "claude-opus-5"), ("--plan", "claude-opus-5"),
+                      ("--execute", "paid")):
+            result = self.run_cli("assign", *flags, "--json")
+            self.assertEqual(result.returncode, 3, result.stdout)
+            self.assertIn("paid start", result.stderr)
+        self.assertEqual(db.get_assignment(self.conn), {})
+        result = self.run_cli("assign", "--all", "gemma4:e4b", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(json.loads(result.stdout)["assignment"].values()),
+                         {"gemma4:e4b"})
+
+    def test_assign_the_idle_steps_at_the_cli_and_export_without_as(self):
+        result = self.run_cli("assign", "--judge", "claude-opus-5",
+                              "--critique", "claude-opus-5", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(set(payload["assignment"].values()), {"claude-opus-5"})
-        self.assertTrue(any("second variable" in n for n in payload["notes"]))
         out = self.tmp / "p.json"
         result = self.run_cli("export", "--step", "critique", "--out", str(out))
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -863,11 +878,12 @@ class HarnessTests(PaidTestCase):
         self.worker().run_once()
         self.assertEqual(db.get_job(self.conn, job).needs, "plan")
 
-    def test_the_menus_see_names_the_request_thread_was_handed(self):
+    def test_the_page_sees_names_the_request_thread_was_handed(self):
+        """Not for the menus any more, but the parent picker still needs to
+        know a paid parent when it sees one: its child is made here."""
         models.remember_registered(["claude-sonnet-5"])
-        with mock.patch.object(web.models, "catalogue", return_value=[]):
-            offered = [v for v, _ in dict(web.planner_groups())["off this node"]]
-        self.assertIn("claude-sonnet-5", offered)
+        self.assertEqual(web._model_word("claude-sonnet-5"), "local")
+        self.assertEqual(web._model_word("gemma4:e4b"), "gemma4:e4b")
 
     def test_paid_models_add_list_remove(self):
         result = self.cli("paid", "models", "add", "claude-sonnet-5", "--json")
@@ -1078,3 +1094,245 @@ class CliTests(PaidTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# The agent's loop: start, next, import, release — and the lease under it
+# ---------------------------------------------------------------------------
+
+
+class AgentLoopTests(PaidTestCase):
+    """What the second Sonnet 5 session of 2026-09-21 needed and did not have.
+
+    Its job sat queued behind an idle-spawned child for ten minutes while
+    `wait` blocked longer than a tool call allows, and nothing told the worker
+    an agent was at the other end. `start` leases the job, the worker takes
+    it first and does no idle work, and `next` returns within a tool call
+    with either the packet or the reason there is none yet.
+    """
+
+    MODEL = "claude-sonnet-5"
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE jobs SET state = 'published'")
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        os.environ.pop(models.PAID_MODELS_ENV, None)
+        self.addCleanup(self.env.stop)
+        self.addCleanup(models.remember_registered, [])
+        self.one_worker = dict(workers=lambda: ["4242 sketchgen worker"],
+                               drip=lambda: False)
+
+    def worker(self, **kwargs):
+        devnull = open(os.devnull, "w", encoding="utf-8")
+        self.addCleanup(devnull.close)
+        kwargs.setdefault("probe", lambda: dict(test_worker.FREE_SLOT))
+        kwargs.setdefault("gate_fn", test_worker.StubGate([0]))
+        return worker.Worker(self.conn, jobs_dir=self.jobs_dir, log_stream=devnull,
+                             **kwargs)
+
+    def cli(self, *args, stdin=None):
+        return subprocess.run(
+            [sys.executable, str(CLI), *args, "--db", self.dbpath],
+            capture_output=True, text=True, check=False, input=stdin,
+        )
+
+    def fake_time(self):
+        now = [0.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        return sleep, lambda: now[0]
+
+    def start(self, **kwargs):
+        options = dict(model=self.MODEL, prompt="a breathing field", by="octocat",
+                       **self.one_worker)
+        options.update(kwargs)
+        return paid.start(self.conn, **options)
+
+    # -- start -----------------------------------------------------------------
+
+    def test_start_registers_preflights_queues_and_leases(self):
+        result = self.start()
+        self.assertTrue(result["started"], result)
+        self.assertTrue(result["registered_now"])
+        self.assertIn(self.MODEL, db.get_paid_models(self.conn))
+        job = db.get_job(self.conn, result["job"])
+        self.assertEqual((job.state, job.planner, job.executor),
+                         ("queued", self.MODEL, self.MODEL))
+        self.assertEqual(db.paid_leases(self.conn)[job.id]["model"], self.MODEL)
+        self.assertEqual(result["then"], f"sketchgen paid next --job {job.id} --as {self.MODEL}")
+
+    def test_start_queues_nothing_when_the_preflight_is_not_ready(self):
+        before = len(db.list_jobs(self.conn, "queued"))
+        result = self.start(workers=lambda: [])
+        self.assertFalse(result["started"])
+        self.assertFalse(result["preflight"]["ready"])
+        self.assertEqual(before, len(db.list_jobs(self.conn, "queued")))
+        self.assertEqual({}, db.paid_leases(self.conn))
+
+    def test_start_takes_local_for_a_step_and_refuses_another_paid_model(self):
+        result = self.start(executor="local")
+        self.assertEqual(db.get_job(self.conn, result["job"]).executor, "local")
+        with self.assertRaises(paid.PaidRefused):
+            self.start(planner="claude-opus-5")
+        with self.assertRaises(paid.PaidRefused):
+            self.start(planner="local", executor="qwen3-coder:30b-a3b-q4_K_M")
+        with self.assertRaises(paid.PaidRefused):
+            self.start(prompt="   ")
+        with self.assertRaises(paid.PaidRefused):
+            self.start(by="not a username")
+
+    def test_a_started_job_is_claimed_ahead_of_the_queue(self):
+        older = db.enqueue(self.conn, "an idle child", "octocat", planner="stub")
+        mine = self.start()["job"]
+        self.worker().run_once()
+        self.assertEqual(db.get_job(self.conn, mine).needs, "plan")
+        self.assertEqual(db.get_job(self.conn, older).state, "queued")
+
+    # -- next --------------------------------------------------------------------
+
+    def test_next_hands_over_the_packet_and_import_says_what_follows(self):
+        job = self.start()["job"]
+        self.worker().run_once()
+        result = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        self.assertEqual((result["do"], result["step"]), ("answer", "plan"))
+        self.assertEqual([i["inputs"]["job"] for i in result["items"]], [job])
+        self.assertEqual(result["then"], "sketchgen paid import -")
+        result["items"][0]["answer"] = CLEAN_PLAN
+        db.lease_paid(self.conn, job, self.MODEL, -1)  # let it lapse: import renews it
+        report = paid.import_packet(self.conn, result, ctx=self.ctx)
+        self.assertEqual(report.jobs, [job])
+        self.assertEqual(report.then(), f"sketchgen paid next --job {job} --as {self.MODEL}")
+        self.assertIn(job, db.paid_leases(self.conn))
+        self.assertEqual(db.get_job(self.conn, job).state, "queued")
+
+    def test_next_says_wait_and_what_the_worker_is_doing_on_timeout(self):
+        job = self.start()["job"]
+        db.begin_step(self.conn, step="planning", headline="Turning the prompt into a brief",
+                      job_id=job - 1, pid=os.getpid())
+        sleep, clock = self.fake_time()
+        said = []
+        result = paid.next_for(self.conn, job, self.MODEL, timeout=90, interval=5,
+                               sleep=sleep, clock=clock, progress=said.append)
+        self.assertEqual((result["do"], result["state"]), ("wait", "queued"))
+        self.assertTrue(result["timed_out"])
+        self.assertEqual(result["worker"]["job"], job - 1)
+        self.assertIn(f"the worker is on job {job - 1}", result["say"])
+        self.assertEqual(result["then"], f"sketchgen paid next --job {job} --as {self.MODEL}")
+        self.assertTrue(said and all("is queued" in line for line in said), said)
+
+    def test_next_stops_on_a_paused_generator_and_on_another_agents_job(self):
+        job = self.start()["job"]
+        db.set_control(self.conn, "paused", "deploy")
+        result = paid.next_for(self.conn, job, self.MODEL, timeout=10)
+        self.assertEqual(result["do"], "stop")
+        self.assertIn("paused", result["say"])
+        db.set_control(self.conn, "running", None)
+        db.lease_paid(self.conn, job, "claude-opus-5", 20)
+        result = paid.next_for(self.conn, job, self.MODEL, timeout=10)
+        self.assertEqual((result["do"], result["leased_to"]), ("stop", "claude-opus-5"))
+
+    def test_next_is_done_when_held_and_drops_the_lease(self):
+        job = db.enqueue(self.conn, "p", "octocat", brief="b", assertions=["motion(idle)"])
+        db.lease_paid(self.conn, job, self.MODEL, 20)
+        self.worker(executor_fn=test_worker.StubExecutor()).run_once()
+        result = paid.next_for(self.conn, job, self.MODEL, timeout=10)
+        self.assertEqual((result["do"], result["state"]), ("done", "held"))
+        self.assertIsNotNone(result["entry"])
+        self.assertEqual({}, db.paid_leases(self.conn))
+
+    # -- release -----------------------------------------------------------------
+
+    def test_release_hands_a_parked_job_to_this_node(self):
+        job = self.start()["job"]
+        self.worker().run_once()
+        result = paid.release_job(self.conn, job, by=self.MODEL, reason="out of budget")
+        after = db.get_job(self.conn, job)
+        self.assertEqual((after.state, after.needs, after.planner, after.executor),
+                         ("queued", None, None, None))
+        self.assertIn("handed to the local path by claude-sonnet-5: out of budget",
+                      after.last_error)
+        self.assertEqual({}, db.paid_leases(self.conn))
+        self.assertEqual(result["was"]["planner"], self.MODEL)
+        with self.assertRaises(paid.PaidRefused):
+            paid.release_job(self.conn, job)  # queued, not parked
+
+    def test_release_keeps_a_local_executor_as_it_was(self):
+        job = self.start(executor="qwen3-coder:30b-a3b-q4_K_M")["job"]
+        self.worker().run_once()
+        paid.release_job(self.conn, job)
+        self.assertEqual(db.get_job(self.conn, job).executor, "qwen3-coder:30b-a3b-q4_K_M")
+
+    def test_preflight_lists_parked_jobs_and_whose_they_are(self):
+        mine = self.start()["job"]
+        self.worker().run_once()
+        db.set_paid_models(self.conn, [self.MODEL, "claude-opus-5"])
+        theirs = db.enqueue(self.conn, "a child nobody comes for", "octocat",
+                            planner="claude-opus-5")
+        self.worker().run_once()
+        report = paid.preflight(self.conn, self.MODEL, **self.one_worker)
+        parked = {row["job"]: row for row in report["info"]["parked"]}
+        self.assertTrue(parked[mine]["yours"])
+        self.assertEqual(parked[mine]["command"],
+                         f"sketchgen paid next --job {mine} --as {self.MODEL}")
+        self.assertFalse(parked[theirs]["yours"])
+        self.assertEqual(parked[theirs]["command"], f"sketchgen paid release --job {theirs}")
+        self.assertEqual(report["info"]["leases"][str(mine)]["model"], self.MODEL)
+
+    # -- the whole recipe, as AGENTS.md writes it now ------------------------------
+
+    def test_the_agents_md_recipe_runs_end_to_end_over_the_cli(self):
+        """start → next → answer → import → next → … → done, held.
+
+        Only the worker is run in-process, standing in for the daemon; its
+        status card is what the preflight in `start` sees.
+        """
+        db.begin_step(self.conn, step="idle", headline="Nothing to do", pid=os.getpid())
+        jobs = ["--jobs-dir", str(self.jobs_dir)]
+        started = self.cli("paid", "start", "--as", self.MODEL, "--by", "octocat",
+                           "--json", *jobs, stdin="a breathing field\n")
+        self.assertEqual(started.returncode, 0, started.stderr + started.stdout)
+        job = json.loads(started.stdout)["job"]
+        self.assertEqual(db.get_job(self.conn, job).prompt, "a breathing field")
+
+        for step, reply in (("plan", CLEAN_PLAN), ("execute", GOOD_SKETCH)):
+            self.worker().run_once()  # the daemon's pass
+            asked = self.cli("paid", "next", "--job", str(job), "--as", self.MODEL,
+                             "--timeout", "1", *jobs)
+            self.assertEqual(asked.returncode, 0, asked.stderr)
+            packet = json.loads(asked.stdout)
+            self.assertEqual((packet["do"], packet["step"]), ("answer", step), packet)
+            packet["items"][0]["answer"] = reply
+            imported = self.cli("paid", "import", "-", *jobs, stdin=json.dumps(packet))
+            self.assertEqual(imported.returncode, 0, imported.stderr)
+            self.assertEqual(json.loads(imported.stdout)["recorded"], 1, imported.stdout)
+
+        self.worker().run_once()  # the gate
+        done = json.loads(self.cli("paid", "next", "--job", str(job), "--as",
+                                   self.MODEL, "--timeout", "1", *jobs).stdout)
+        self.assertEqual((done["do"], done["state"]), ("done", "held"), done)
+        entry = self.conn.execute("SELECT planner, executor FROM entries "
+                                  "WHERE job_id = ?", (job,)).fetchone()
+        self.assertEqual(tuple(entry), (self.MODEL, self.MODEL))
+        self.assertEqual({}, db.paid_leases(self.conn))
+
+    def test_start_at_the_cli_prints_the_checks_and_exits_3_when_not_ready(self):
+        result = self.cli("paid", "start", "--as", self.MODEL, "--by", "octocat",
+                          "--prompt", "x", "--jobs-dir", str(self.jobs_dir))
+        self.assertEqual(result.returncode, 3, result.stdout)
+        self.assertIn("NOT READY", result.stdout)
+        self.assertIn("worker", result.stdout)
+        self.assertEqual([], db.list_jobs(self.conn, "queued"))
+
+    def test_release_at_the_cli_takes_jobs(self):
+        job = self.start()["job"]
+        self.worker().run_once()
+        result = self.cli("paid", "release", "--job", str(job), "--by", self.MODEL,
+                          "--reason", "stopping", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["released"][0]["state"], "queued")
+        result = self.cli("paid", "release", "--json")
+        self.assertEqual(result.returncode, 3)

@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -59,6 +60,7 @@ from . import planner
 from . import worker
 
 __all__ = [
+    "DEFAULT_LEASE_MINUTES",
     "PACKET_KIND",
     "STEPS",
     "Context",
@@ -66,12 +68,16 @@ __all__ = [
     "Rejected",
     "export_packet",
     "import_packet",
+    "next_for",
     "next_step",
     "preflight",
     "release",
+    "release_job",
+    "start",
     "wait_for",
     "sha256_file",
     "waiting",
+    "worker_now",
 ]
 
 PACKET_KIND = "sketchgen-paid"
@@ -82,6 +88,15 @@ STEPS = ("plan", "execute", "judge", "critique")
 
 #: The same shape the judge accepts for a model id: a model id, not a sentence.
 MODEL_RE = judge.MODEL_RE
+
+#: How long a paid verb's touch on a job keeps the worker standing by for it
+#: (db.paid_leases). Long enough to write a sketch between `next` and
+#: `import`; short enough that an agent that vanished costs the idle loop
+#: minutes. Every verb the agent runs on the job renews it.
+DEFAULT_LEASE_MINUTES = float(os.environ.get("SKETCHGEN_PAID_LEASE_MINUTES", "") or 20)
+
+#: The steps an agent answers per job. The judge and the critic are per entry.
+JOB_STEPS = ("plan", "execute")
 
 
 class PaidRefused(Exception):
@@ -804,6 +819,10 @@ def export_packet(
     if ctx.job is not None and step not in ("plan", "execute"):
         raise PaidRefused(f"--job narrows plan and execute; {step} is not per job")
     items = adapter.offer(conn, model=model, limit=max(0, int(limit)), ctx=ctx)
+    if ctx.job is not None and db.get_job(conn, ctx.job) is not None:
+        # The agent is here for this job: the worker serves it first and does
+        # no idle work until the lease runs out or the job is finished.
+        db.lease_paid(conn, ctx.job, model, DEFAULT_LEASE_MINUTES)
     return {
         "packet": PACKET_KIND,
         "version": PACKET_VERSION,
@@ -833,6 +852,16 @@ class ImportReport:
     recorded: list[str] = field(default_factory=list)
     rejected: list[dict[str, str]] = field(default_factory=list)
     skipped: int = 0
+    #: The jobs a plan or execute import put back on the queue.
+    jobs: list[int] = field(default_factory=list)
+    #: The model the packet was cut for, for the `then` line.
+    model: str = ""
+
+    def then(self) -> str | None:
+        """The one command that follows this import, or None."""
+        if self.step in JOB_STEPS and self.jobs:
+            return next_command(self.jobs[0], self.model)
+        return None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -843,6 +872,8 @@ class ImportReport:
                 {"item": row["item"], "reason": row["reason"]} for row in self.rejected
             ],
             "skipped": self.skipped,
+            "jobs": list(self.jobs),
+            "then": self.then(),
         }
 
 
@@ -892,8 +923,8 @@ def import_packet(
     if not isinstance(items, list):
         raise PaidRefused("the packet has no 'items' list")
 
-    report = ImportReport(step=step)
     envelope_model = str(packet.get("model") or "").strip()
+    report = ImportReport(step=step, model=envelope_model)
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -912,6 +943,16 @@ def import_packet(
         else:
             report.recorded.append(line)
             say(f"landed {line}")
+            if step in JOB_STEPS:
+                # Back on the queue, and the agent is waiting for the gate:
+                # keep the worker on this job (db.paid_leases).
+                try:
+                    job_id = int((item.get("inputs") or {}).get("job"))
+                except (TypeError, ValueError):
+                    job_id = None
+                if job_id is not None:
+                    db.lease_paid(conn, job_id, who, DEFAULT_LEASE_MINUTES)
+                    report.jobs.append(job_id)
             continue
         report.rejected.append(
             {"item": key, "reason": reason, "answer": str(item.get("answer") or "")}
@@ -950,6 +991,21 @@ def _systemd_timer_active() -> bool:
     except (OSError, subprocess.SubprocessError):
         return False
     return out.stdout.strip() == "active"
+
+
+def _card_worker(conn: sqlite3.Connection) -> int | None:
+    """The pid on the worker's open status-card step, if that pid is alive."""
+    row = db.current_activity(conn)
+    if row is None:
+        return None
+    try:
+        pid = int(row["pid"])
+        os.kill(pid, 0)
+    except (TypeError, ValueError, ProcessLookupError):
+        return None
+    except PermissionError:
+        pass  # alive, and not ours to signal: still a worker
+    return pid
 
 
 def preflight(
@@ -1000,8 +1056,15 @@ def preflight(
     )
 
     running = workers()
+    card = _card_worker(conn)
     if len(running) == 1:
         check("worker", True, "one resident worker; it claims a queued job within ~30 s")
+    elif not running and card is not None:
+        # /proc showed no worker argv but the status card has a step open under
+        # a pid that is alive: the console's own liveness test, and the one
+        # that holds where /proc is not this machine's (a container, a test).
+        check("worker", True, f"one resident worker (status card, pid {card}); "
+                              "it claims a queued job within ~30 s")
     elif not running and drip():
         check("worker", True, "drip mode: the timer starts a worker every 5 minutes")
     elif not running:
@@ -1023,12 +1086,348 @@ def preflight(
         "assignment": db.get_assignment(conn),
         "queued_ahead": int(queued),
         "waiting": {step: row.get("count") for step, row in waiting(conn).items()},
+        "parked": parked_jobs(conn, model),
+        "leases": {str(k): v for k, v in sorted(db.paid_leases(conn).items())},
+        "worker_now": worker_now(conn),
     }
     return {
         "ready": all(row["ok"] for row in checks),
         "model": model,
         "checks": checks,
         "info": info,
+    }
+
+
+def next_command(job_id: int, model: str) -> str:
+    return f"sketchgen paid next --job {int(job_id)} --as {model}"
+
+
+def worker_now(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    """What the resident worker is doing this second, from its status card.
+
+    The answer to "why is my job still queued": the worker is on job 1245,
+    planning, since 05:41. An agent that can read this waits; one that cannot
+    starts investigating, and AGENTS.md rule 1 is about where that ends.
+    """
+    row = db.current_activity(conn)
+    if row is None:
+        return None
+    return {
+        "step": row["step"],
+        "headline": row["headline"],
+        "detail": row["detail"],
+        "job": row["job_id"],
+        "model": row["model"],
+        "since_utc": row["started_utc"],
+    }
+
+
+def parked_jobs(conn: sqlite3.Connection, model: str | None = None) -> list[dict[str, Any]]:
+    """Every job parked for a plan or an attempt, and what to do about each.
+
+    ``yours`` is whether ``model`` is the job's planner or executor. A job
+    that is yours and has no live lease is one an earlier session of yours
+    left behind: answer it (`paid next`) or hand it back (`paid release`).
+    A job that is nobody's — its model has no agent — is the operator's to
+    release; the command is the same.
+    """
+    leases = db.paid_leases(conn)
+    rows = []
+    for job in db.list_jobs(conn, "needs-laptop"):
+        if job.needs not in JOB_STEPS:
+            continue
+        who = job.planner if job.needs == "plan" else job.executor
+        lease = leases.get(job.id)
+        yours = bool(model) and model in (job.planner, job.executor)
+        rows.append({
+            "job": job.id,
+            "needs": job.needs,
+            "model": who,
+            "planner": job.planner,
+            "executor": job.executor,
+            "since_utc": job.updated_utc,
+            "yours": yours,
+            "leased_to": lease.get("model") if lease else None,
+            "lease_until": lease.get("until_utc") if lease else None,
+            "command": (next_command(job.id, model) if yours and model
+                        else f"sketchgen paid release --job {job.id}"),
+        })
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# start, next, release: the three verbs an agent's whole job is made of
+# ---------------------------------------------------------------------------
+#
+# 2026-09-21, second Sonnet 5 session. The recipe was preflight, enqueue,
+# wait, export, answer, import, wait, … — six verbs and a shell function that
+# quoted the prompt twice. The session got the first four right and then sat
+# in `wait` for ten minutes (the tool's own timeout) behind an idle-spawned job
+# whose planner was timing out, and was killed. Nothing was wrong with the
+# node. What was wrong: `wait` blocked longer than an agent's tool call may;
+# nothing told the worker an agent was waiting; and there were too many verbs
+# between "I want a sketch" and "here is the packet". `start` and `next` are
+# the same flow with the seams removed: one verb to begin, one verb to ask
+# "what now", `import` to answer, and a lease so the worker knows.
+
+
+def _check_by(by: str) -> str:
+    text = (by or "").strip()
+    if not lineage.USERNAME_RE.match(text):
+        raise PaidRefused(f"--by {by!r}: a GitHub username, nothing else")
+    return text
+
+
+def _job_model(word: str | None, model: str, column: str) -> str:
+    """What ``--planner`` / ``--executor`` on `paid start` may say.
+
+    Blank means the agent itself. ``local`` means this node's default. An
+    Ollama tag (it has a colon) is that model on the node. Another paid id is
+    refused: a job can be leased to one agent, and that is the one running
+    `start`.
+    """
+    text = (word or "").strip()
+    if not text or text == model:
+        return model
+    if text == "local" or ":" in text:
+        return text
+    raise PaidRefused(
+        f"--{column} {text!r}: yourself ({model}), `local`, or an Ollama tag "
+        "(name:tag). Another paid model cannot answer a job you are driving."
+    )
+
+
+def start(
+    conn: sqlite3.Connection,
+    *,
+    model: str,
+    prompt: str,
+    by: str,
+    planner: str | None = None,
+    executor: str | None = None,
+    rules_file: str | None = None,
+    max_attempts: int = 3,
+    publication: str = "hold",
+    workers: Callable[[], list[str]] = worker.worker_processes,
+    drip: Callable[[], bool] = _systemd_timer_active,
+) -> dict[str, Any]:
+    """One job, made by an agent, for the agent: register, preflight, queue, lease.
+
+    Returns ``{"started": True, "job": N, "then": …}`` or, when the preflight
+    is not ready, ``{"started": False, "preflight": …}`` with nothing queued —
+    the CLI exits 3 and prints the checks, and the stop rule applies.
+
+    Registration happens here rather than being the agent's one `fix (you)`,
+    because it is a name and not a key and there is no reason to make an agent
+    run two commands to say who it is. It is reported, so the operator can
+    `paid models remove` it.
+    """
+    model = _check_model(model)
+    by = _check_by(by)
+    text = (prompt or "").strip()
+    if not text:
+        raise PaidRefused("a job needs a prompt: --prompt TEXT, or the prompt on stdin")
+    planner_col = _job_model(planner, model, "planner")
+    executor_col = _job_model(executor, model, "executor")
+    if planner_col != model and executor_col != model:
+        raise PaidRefused(
+            f"neither step is yours: --planner {planner_col} --executor "
+            f"{executor_col}. Use `sketchgen enqueue` for a job this node runs."
+        )
+    registered_now = False
+    if not models.is_paid(model, conn):
+        db.set_paid_models(conn, db.get_paid_models(conn) + [model])
+        registered_now = True
+    report = preflight(conn, model, workers=workers, drip=drip)
+    if not report["ready"]:
+        return {"started": False, "model": model, "registered_now": registered_now,
+                "preflight": report}
+    options: dict[str, Any] = {
+        "planner": planner_col,
+        "executor": executor_col,
+        "max_attempts": int(max_attempts),
+        "publication": publication,
+    }
+    if rules_file:
+        options["rules_file"] = rules_file
+    job_id = db.enqueue(conn, text, by, **options)
+    lease = db.lease_paid(conn, job_id, model, DEFAULT_LEASE_MINUTES)
+    return {
+        "started": True,
+        "job": job_id,
+        "model": model,
+        "planner": planner_col,
+        "executor": executor_col,
+        "registered_now": registered_now,
+        "lease_until": lease["until_utc"],
+        "worker_now": report["info"].get("worker_now"),
+        "queued_ahead": report["info"].get("queued_ahead"),
+        "then": next_command(job_id, model),
+        "say": (f"job {job_id} is queued for {model}; the worker claims it on its "
+                "next pass and parks it for your plan"),
+    }
+
+
+def next_for(
+    conn: sqlite3.Connection,
+    job_id: int,
+    model: str,
+    *,
+    timeout: float = 240.0,
+    interval: float = 5.0,
+    sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+    ctx: Context | None = None,
+    progress: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    """What the agent does next about its job — and, if it is a packet, the packet.
+
+    Read-only apart from the lease, which every poll renews. Returns one object
+    with ``do``:
+
+    - ``answer``: the object *is* the export packet for the step the job is
+      parked at, cut for this job only, with ``then`` naming the import.
+    - ``wait``: ``timeout`` passed while the worker had it; ``worker`` says what
+      the worker is doing and ``then`` is this same command. Not an error: run
+      it again. The timeout is shorter than an agent's tool call on purpose.
+    - ``done``: held (``entry``), published, failed or rejected. The lease is
+      dropped.
+    - ``stop``: the job is parked for a person, the generator is paused, or
+      another agent holds the lease. Exit 3 at the CLI: report and stop.
+
+    ``progress`` gets one line every 30 s of waiting, for stderr, so a tool
+    that shows partial output shows life.
+    """
+    import time
+
+    model = _check_model(model)
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    base_ctx = ctx or Context()
+    ctx = Context(jobs_dir=base_ctx.jobs_dir, lineage_depth=base_ctx.lineage_depth,
+                  job=int(job_id))
+    started = clock()
+    last_said = started
+    while True:
+        job = db.get_job(conn, job_id)
+        if job is None:
+            raise PaidRefused(f"there is no job {job_id}")
+        entry = conn.execute("SELECT id FROM entries WHERE job_id = ?", (job_id,)).fetchone()
+        step = next_step(job, int(entry["id"]) if entry else None)
+        waited = round(clock() - started, 1)
+        base: dict[str, Any] = {
+            "job": job.id, "state": job.state, "needs": job.needs, "model": model,
+            "attempts": len(db.list_attempts(conn, job_id)),
+            "max_attempts": job.max_attempts, "waited_s": waited,
+        }
+        lease = db.paid_leases(conn).get(job.id)
+        if lease and lease.get("model") != model and job.state != "held":
+            return {**base, "do": "stop", "leased_to": lease.get("model"),
+                    "say": f"job {job.id} is leased to {lease.get('model')} until "
+                           f"{lease.get('until_utc')}: it is theirs, not yours"}
+        if step["do"] == "answer":
+            packet = export_packet(conn, step["step"], model=model, ctx=ctx)
+            if packet["items"]:
+                item = packet["items"][0]
+                packet.update(base)
+                packet["do"] = "answer"
+                packet["attempt"] = (item.get("inputs") or {}).get("attempt")
+                packet["then"] = "sketchgen paid import -"
+                packet["say"] = (
+                    f"job {job.id} is waiting for your {step['step']}"
+                    + (f" (attempt {packet['attempt']} of {job.max_attempts})"
+                       if packet["attempt"] else "")
+                    + ": answer items[0] and import the packet"
+                )
+                return packet
+            # Parked, but nothing to offer: the prompt file is missing or the
+            # job moved under us. Say so rather than spin.
+            return {**base, "do": "stop",
+                    "say": f"job {job.id} is parked for {step['step']} but nothing "
+                           "can be exported for it; report this"}
+        if step["do"] in ("done", "stop"):
+            if step["do"] == "done":
+                db.release_lease(conn, job_id)
+            return {**base, **step}
+        # The worker has it. Say so, keep the lease warm, and look again.
+        db.lease_paid(conn, job_id, model, DEFAULT_LEASE_MINUTES)
+        control = db.get_control(conn)
+        if control is not None and control.state == "paused" and job.state == "queued":
+            return {**base, "do": "stop",
+                    "say": f"job {job.id} is queued but the generator is paused"
+                           f"{' (' + control.reason + ')' if control.reason else ''}; "
+                           "it will not move until the operator resumes it"}
+        now = worker_now(conn)
+        if waited >= timeout:
+            return {**base, "do": "wait", "timed_out": True, "worker": now,
+                    "then": next_command(job_id, model),
+                    "say": f"job {job.id} is still {job.state} after {waited:.0f} s"
+                           + _worker_sentence(now, job.id)
+                           + "; run the same command again"}
+        if progress is not None and clock() - last_said >= 30:
+            last_said = clock()
+            progress(f"{waited:.0f} s: job {job.id} is {job.state}"
+                     + _worker_sentence(now, job.id))
+        sleep(interval)
+
+
+def _worker_sentence(now: dict[str, Any] | None, job_id: int) -> str:
+    if not now:
+        return "; the worker has written no status"
+    where = now.get("headline") or now.get("step") or "busy"
+    if now.get("job") and int(now["job"]) != int(job_id):
+        return (f"; the worker is on job {now['job']} ({where}, since "
+                f"{now.get('since_utc')}) and takes yours next")
+    if now.get("job"):
+        return f"; the worker is on it ({where}, since {now.get('since_utc')})"
+    return f"; the worker: {where} (since {now.get('since_utc')})"
+
+
+def release_job(
+    conn: sqlite3.Connection, job_id: int, *, by: str | None = None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    """Hand a parked job to this node's models: the local path finishes it.
+
+    Only a job at ``needs-laptop`` for a plan or an attempt. Whichever of its
+    two model columns is paid is blanked — the worker then reads the
+    assignment, else its default — and the job goes back on the queue with
+    ``last_error`` saying who handed it back and why. Provenance stays honest:
+    nobody had answered, and the model that does answer is the one recorded.
+    The lease, if any, is dropped.
+
+    This is how an agent leaves a job it cannot finish, and how an operator
+    clears a job parked for an agent that is not coming (job 1246, whose
+    session was killed on 2026-09-21; job 1252, spawned for a model that was
+    never there).
+    """
+    job = db.get_job(conn, job_id)
+    if job is None:
+        raise PaidRefused(f"there is no job {job_id}")
+    if job.state != "needs-laptop" or job.needs not in JOB_STEPS:
+        raise PaidRefused(
+            f"job {job_id} is {job.state}"
+            + (f" (needs {job.needs})" if job.needs else "")
+            + ": only a job parked for a plan or an attempt can be handed back"
+        )
+    was = {"planner": job.planner, "executor": job.executor}
+    fields: dict[str, Any] = {"needs": None}
+    for column in ("planner", "executor"):
+        if models.is_paid(getattr(job, column), conn):
+            fields[column] = None
+    who = f" by {by}" if by else ""
+    why = f": {reason}" if reason else ""
+    fields["last_error"] = f"handed to the local path{who}{why}"
+    db.transition(conn, job_id, "queued", **fields)
+    db.release_lease(conn, job_id)
+    after = db.get_job(conn, job_id)
+    return {
+        "job": job_id,
+        "state": after.state,
+        "was": was,
+        "now": {"planner": after.planner, "executor": after.executor},
+        "say": (f"job {job_id} is back on the queue for this node's models; "
+                f"the worker claims it on its next pass"),
     }
 
 

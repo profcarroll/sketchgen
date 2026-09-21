@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from sketchgen import db
+from sketchgen import models
 
 __all__ = [
     "CRITIQUE_BY_RE",
@@ -298,6 +299,14 @@ def split_prompt(prompt: str) -> tuple[str, list[str]]:
     return root, revisions
 
 
+def _inheritable(conn: sqlite3.Connection, model: Any) -> str | None:
+    """The parent's model, or None when it is paid (see :func:`spawn`)."""
+    text = str(model or "").strip()
+    if not text or models.is_paid(text, conn):
+        return None
+    return text
+
+
 def spawn(
     conn: sqlite3.Connection,
     *,
@@ -329,6 +338,16 @@ def spawn(
     it. The two model columns joined that rule on 2026-09-19, when the New job
     page began letting an operator choose them — a child written by a different
     model than its parent is a revision of nothing.
+
+    **Except a paid model, which is never inherited.** A paid planner or
+    executor is answered off the node by an agent that is present for *that*
+    job (``sketchgen paid start``); a child queued by the idle critic hours
+    later has no such agent, so it would park at ``needs-laptop`` and stay
+    there. That is job 1252 on 2026-09-21: the critic revised an entry Sonnet 5
+    had planned, the child took the paid planner, and nobody ever came for it.
+    The child of a paid entry is written by this node's models (blank column:
+    the assignment, else the worker's default), and its entry says so. A
+    caller that names a paid model on purpose still gets it.
     """
     text = " ".join((critique or "").split())
     if not text:
@@ -354,8 +373,8 @@ def spawn(
         "critique": text,
         "critique_by": by,
         "publication": "hold" if at_limit else publication,
-        "planner": planner if planner is not None else parent["planner"],
-        "executor": executor if executor is not None else parent["executor"],
+        "planner": planner if planner is not None else _inheritable(conn, parent["planner"]),
+        "executor": executor if executor is not None else _inheritable(conn, parent["executor"]),
         "rules_file": rules_file if rules_file is not None else parent["rules_file"],
     }
     if at_limit:
