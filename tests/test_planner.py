@@ -18,6 +18,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
+from sketchgen import db  # noqa: E402
 from sketchgen import planner  # noqa: E402
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "planner"
@@ -248,6 +249,150 @@ class CliTests(unittest.TestCase):
         result = run_cli("plan", "--help")
         self.assertEqual(result.returncode, 0)
         self.assertIn("--stub", result.stdout)
+
+
+class PlanJobWriteBackTests(unittest.TestCase):
+    """`plan --job N`: the return leg of the paid planner path.
+
+    `--planner paid` parks a job at needs-laptop and until 2026-09-21 nothing
+    brought it back — the paid model's reply could be parsed with `--stub` and
+    then had nowhere to go, so an agent told to test the path had to hand-write
+    the columns and reach for a second worker to make the node act.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.db_path = str(self.root / "sketchgen.db")
+        db.init(self.db_path)
+        self.conn = db.connect(self.db_path)
+        self.addCleanup(self.conn.close)
+        self.jobs_dir = self.root / "jobs"
+
+    def park(self, prompt="a grid of pale squares", by="octocat", needs="plan"):
+        """One job waiting for the laptop, as `--planner paid` leaves it."""
+        job_id = db.enqueue(self.conn, prompt, by, planner="paid")
+        db.transition(self.conn, job_id, "needs-laptop", needs=needs)
+        return job_id
+
+    def plan_job(self, job_id, *extra, stub="clean", model="claude-sonnet-5"):
+        return run_cli(
+            "plan", "--job", str(job_id), "--model", model,
+            "--stub", str(FIXTURES / f"{stub}.txt"),
+            "--jobs-dir", str(self.jobs_dir), "--db", self.db_path, *extra,
+        )
+
+    def test_a_parked_job_is_planned_and_goes_back_on_the_queue(self):
+        job_id = self.park()
+        result = self.plan_job(job_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        job = db.get_job(self.conn, job_id)
+        # queued, not executing: `claim_next` selects on `state = 'queued'`
+        # alone, so a job moved straight to a running state by something that
+        # is not the worker waits there for the stuck-sweep instead.
+        self.assertEqual("queued", job.state)
+        self.assertTrue(job.brief)
+        self.assertEqual(["motion(idle)", "responds(click)", "size(800,600)"],
+                         json.loads(job.assertions_json))
+        # provenance is the model that answered, not the word it was queued
+        # under: the judge's rule, applied to the planner
+        self.assertEqual("claude-sonnet-5", job.planner)
+        # a job left needs='plan' while executing reads as still waiting
+        self.assertIsNone(job.needs)
+
+    def test_the_prompt_comes_from_the_job(self):
+        job_id = self.park(prompt="sixty drifting circles")
+        result = self.plan_job(job_id, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(job_id, json.loads(result.stdout)["job"])
+
+    def test_the_plan_lands_beside_the_job_by_default(self):
+        job_id = self.park()
+        self.assertEqual(self.plan_job(job_id).returncode, 0)
+        out = self.jobs_dir / str(job_id)
+        self.assertTrue((out / "plan.json").exists())
+        self.assertEqual(load("clean"),
+                         (out / "response.txt").read_text(encoding="utf-8"))
+
+    def test_a_job_the_worker_is_attending_is_refused(self):
+        """A second writer of jobs.brief is a second worker by another name."""
+        job_id = db.enqueue(self.conn, "a field", "octocat")
+        db.transition(self.conn, job_id, "planning")
+        result = self.plan_job(job_id)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("not needs-laptop", result.stderr)
+        self.assertEqual("planning", db.get_job(self.conn, job_id).state)
+        self.assertIsNone(db.get_job(self.conn, job_id).brief)
+
+    def test_a_job_waiting_for_something_else_is_refused(self):
+        job_id = self.park(needs="review")
+        result = self.plan_job(job_id)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("'review'", result.stderr)
+        self.assertEqual("needs-laptop", db.get_job(self.conn, job_id).state)
+
+    def test_an_unknown_job_is_refused(self):
+        result = self.plan_job(9999)
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("no job 9999", result.stderr)
+
+    def test_a_reply_that_will_not_parse_leaves_the_job_parked(self):
+        """A bad reply is one to hand back again, not a job to fail."""
+        job_id = self.park()
+        stub = self.root / "headless.txt"
+        stub.write_text("motion(idle)\n", encoding="utf-8")
+        result = run_cli(
+            "plan", "--job", str(job_id), "--model", "claude-sonnet-5",
+            "--stub", str(stub), "--jobs-dir", str(self.jobs_dir),
+            "--db", self.db_path,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("still needs-laptop", result.stderr)
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual("needs-laptop", job.state)
+        self.assertEqual("plan", job.needs)
+        self.assertIsNone(job.brief)
+        self.assertEqual("paid", job.planner)  # not overwritten by a failure
+        raw = self.jobs_dir / str(job_id) / "response.txt"
+        self.assertEqual("motion(idle)\n", raw.read_text(encoding="utf-8"))
+
+    def test_a_prompt_and_a_job_are_mutually_exclusive(self):
+        result = run_cli("plan", "--prompt", "x", "--job", "1",
+                         "--model", "m", "--db", self.db_path)
+        self.assertEqual(result.returncode, 2)
+
+    def test_one_of_them_is_required(self):
+        self.assertEqual(run_cli("plan", "--model", "m").returncode, 2)
+
+    def test_out_is_still_required_without_a_job(self):
+        result = run_cli("plan", "--prompt", "x", "--model", "gemma4:e4b",
+                         "--stub", str(FIXTURES / "clean.txt"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("--out is required", result.stderr)
+
+    def test_planning_twice_is_refused_by_the_state_machine(self):
+        """The second run finds the job queued, which is the first guard."""
+        job_id = self.park()
+        self.assertEqual(self.plan_job(job_id).returncode, 0)
+        again = self.plan_job(job_id)
+        self.assertEqual(again.returncode, 3)
+        self.assertIn("not needs-laptop", again.stderr)
+
+    def test_the_worker_claims_it_straight_into_executing(self):
+        """The point of queueing it: the next pass resumes the job.
+
+        `claim_next` reads the brief this command wrote and skips planning, so
+        the paid plan is executed rather than re-planned locally.
+        """
+        job_id = self.park()
+        self.assertEqual(self.plan_job(job_id).returncode, 0)
+        claimed = db.claim_next(self.conn)
+        self.assertIsNotNone(claimed)
+        self.assertEqual(job_id, claimed.id)
+        self.assertEqual("executing", claimed.state)
+        self.assertEqual("claude-sonnet-5", claimed.planner)
 
 
 class TestLenientParse(unittest.TestCase):
