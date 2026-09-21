@@ -1176,11 +1176,15 @@ class AgentLoopTests(PaidTestCase):
         self.assertEqual(before, len(db.list_jobs(self.conn, "queued")))
         self.assertEqual({}, db.paid_leases(self.conn))
 
-    def test_start_takes_local_for_a_step_and_refuses_another_paid_model(self):
+    def test_start_takes_local_for_a_step_and_refuses_an_unregistered_paid_model(self):
         result = self.start(executor="local")
         self.assertEqual(db.get_job(self.conn, result["job"]).executor, "local")
-        with self.assertRaises(paid.PaidRefused):
+        self.assertIsNone(result["partner"])
+        with self.assertRaises(paid.PaidRefused) as caught:
             self.start(planner="claude-opus-5")
+        self.assertIn("sketchgen paid models add claude-opus-5", str(caught.exception))
+        with self.assertRaises(paid.PaidRefused):
+            self.start(executor="paid")
         with self.assertRaises(paid.PaidRefused):
             self.start(planner="local", executor="qwen3-coder:30b-a3b-q4_K_M")
         with self.assertRaises(paid.PaidRefused):
@@ -1282,7 +1286,11 @@ class AgentLoopTests(PaidTestCase):
         self.assertEqual(parked[mine]["command"],
                          f"sketchgen paid next --job {mine} --as {self.MODEL}")
         self.assertFalse(parked[theirs]["yours"])
-        self.assertEqual(parked[theirs]["command"], f"sketchgen paid release --job {theirs}")
+        # Parked for another paid model: the command is that agent's `next`,
+        # so the operator knows whom to bring; release stays one line away.
+        self.assertEqual(parked[theirs]["command"],
+                         f"sketchgen paid next --job {theirs} --as claude-opus-5")
+        self.assertEqual(parked[theirs]["release"], f"sketchgen paid release --job {theirs}")
         self.assertEqual(report["info"]["leases"][str(mine)]["model"], self.MODEL)
 
     # -- an agent that never comes back (job 1263, 2026-09-21) ---------------------
@@ -1348,6 +1356,116 @@ class AgentLoopTests(PaidTestCase):
         self.assertIn("leased to gemini-3.8-flash until", line)
         self.assertNotIn("no agent", line)
         self.assertNotIn("release", line)
+
+    # -- a job split between two agents -------------------------------------------
+
+    OTHER = "claude-opus-5"
+
+    def test_start_takes_a_registered_paid_executor_and_names_the_handoff(self):
+        """2026-09-21: an operator asked Sonnet 5 to queue a job with Opus as
+        executor, the split the New job page gives two local models, and the
+        paid path had no way to say it. Now `start` takes the other agent's
+        registered id and says up front who runs what."""
+        db.set_paid_models(self.conn, [self.OTHER])
+        result = self.start(executor=self.OTHER)
+        self.assertTrue(result["started"], result)
+        self.assertEqual((result["planner"], result["executor"]), (self.MODEL, self.OTHER))
+        self.assertEqual((result["partner"], result["partner_step"]), (self.OTHER, "execute"))
+        self.assertIn(f"sketchgen paid next --job {result['job']} --as {self.OTHER}",
+                      result["say"])
+        self.assertEqual(db.paid_leases(self.conn)[result["job"]]["model"], self.MODEL)
+
+    def test_a_split_job_is_handed_from_the_planner_to_the_executor(self):
+        """start (Sonnet) → next → plan → import → next: handoff → next (Opus)
+        → attempt → import → gate → done. Two agents, one job, one lease at a
+        time, and provenance per step."""
+        db.set_paid_models(self.conn, [self.OTHER])
+        job = self.start(executor=self.OTHER)["job"]
+        self.worker().run_once()  # parks for the plan
+        asked = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        self.assertEqual((asked["do"], asked["step"]), ("answer", "plan"))
+        asked["items"][0]["answer"] = CLEAN_PLAN
+        paid.import_packet(self.conn, asked, ctx=self.ctx)
+
+        # The plan is in: the planner's part is over, before the worker even
+        # claims the job again, and its lease is dropped — nobody is present.
+        handed = paid.next_for(self.conn, job, self.MODEL, timeout=10)
+        self.assertEqual((handed["do"], handed["to"], handed["step"]),
+                         ("handoff", self.OTHER, "execute"))
+        self.assertEqual(handed["then"], f"sketchgen paid next --job {job} --as {self.OTHER}")
+        self.assertEqual(handed["release"], f"sketchgen paid release --job {job}")
+        self.assertIn("your plan for job", handed["say"])
+        self.assertEqual({}, db.paid_leases(self.conn))
+
+        self.worker().run_once()  # parks for the attempt
+        parked = {row["job"]: row for row in paid.parked_jobs(self.conn, self.MODEL)}
+        self.assertFalse(parked[job]["yours"])
+        self.assertEqual(parked[job]["command"], handed["then"])
+        # A stale lease of the planner's, had it been kept, is taken over: the
+        # step is the executor's now.
+        db.lease_paid(self.conn, job, self.MODEL, 20)
+        theirs = paid.next_for(self.conn, job, self.OTHER, ctx=self.ctx)
+        self.assertEqual((theirs["do"], theirs["step"]), ("answer", "execute"), theirs)
+        self.assertEqual(db.paid_leases(self.conn)[job]["model"], self.OTHER)
+        theirs["items"][0]["answer"] = GOOD_SKETCH
+        paid.import_packet(self.conn, theirs, ctx=self.ctx)
+        self.worker().run_once()  # the gate
+        done = paid.next_for(self.conn, job, self.OTHER, timeout=10)
+        self.assertEqual((done["do"], done["state"]), ("done", "held"), done)
+        entry = self.conn.execute("SELECT planner, executor FROM entries "
+                                  "WHERE job_id = ?", (job,)).fetchone()
+        self.assertEqual(tuple(entry), (self.MODEL, self.OTHER))
+        self.assertEqual({}, db.paid_leases(self.conn))
+
+    def test_the_executor_of_a_split_job_waits_for_the_other_agents_plan(self):
+        """Opus starts the job with Sonnet as planner: Opus's `next` waits
+        (without touching the planner's lease) until the attempt is its own,
+        and Sonnet's `next` takes the plan over the starter's lease."""
+        db.set_paid_models(self.conn, [self.MODEL, self.OTHER])
+        started = self.start(model=self.OTHER, planner=self.MODEL)
+        job = started["job"]
+        self.assertEqual((started["partner"], started["partner_step"]), (self.MODEL, "plan"))
+        self.worker().run_once()  # parks for the plan
+        sleep, clock = self.fake_time()
+        waiting = paid.next_for(self.conn, job, self.OTHER, timeout=60, interval=5,
+                                sleep=sleep, clock=clock)
+        self.assertEqual((waiting["do"], waiting["waiting_on"]), ("wait", self.MODEL))
+        self.assertIn(f"waiting for {self.MODEL} to plan", waiting["say"])
+        self.assertEqual(db.paid_leases(self.conn)[job]["model"], self.OTHER)
+        mine = paid.next_for(self.conn, job, self.MODEL, ctx=self.ctx)
+        self.assertEqual((mine["do"], mine["step"]), ("answer", "plan"), mine)
+        self.assertEqual(db.paid_leases(self.conn)[job]["model"], self.MODEL)
+        mine["items"][0]["answer"] = CLEAN_PLAN
+        paid.import_packet(self.conn, mine, ctx=self.ctx)
+        handed = paid.next_for(self.conn, job, self.MODEL, timeout=10)
+        self.assertEqual((handed["do"], handed["to"]), ("handoff", self.OTHER))
+        self.worker().run_once()  # parks for the attempt
+        theirs = paid.next_for(self.conn, job, self.OTHER, ctx=self.ctx)
+        self.assertEqual((theirs["do"], theirs["step"]), ("answer", "execute"), theirs)
+
+    def test_a_split_job_over_the_cli_exits_0_on_handoff(self):
+        db.begin_step(self.conn, step="idle", headline="Nothing to do", pid=os.getpid())
+        db.set_paid_models(self.conn, [self.OTHER])
+        jobs = ["--jobs-dir", str(self.jobs_dir)]
+        started = self.cli("paid", "start", "--as", self.MODEL, "--by", "octocat",
+                           "--executor", self.OTHER, "--prompt", "hot air balloons", *jobs)
+        self.assertEqual(started.returncode, 0, started.stderr + started.stdout)
+        self.assertIn(f"execute is {self.OTHER}'s", started.stdout)
+        job = db.list_jobs(self.conn, "queued")[-1].id
+        self.worker().run_once()
+        packet = json.loads(self.cli("paid", "next", "--job", str(job), "--as", self.MODEL,
+                                     "--timeout", "1", *jobs).stdout)
+        packet["items"][0]["answer"] = CLEAN_PLAN
+        self.cli("paid", "import", "-", *jobs, stdin=json.dumps(packet))
+        handed = self.cli("paid", "next", "--job", str(job), "--as", self.MODEL,
+                          "--timeout", "1", *jobs)
+        self.assertEqual(handed.returncode, 0, handed.stderr)
+        self.assertEqual(json.loads(handed.stdout)["do"], "handoff")
+        # And the preflight, run by anyone, names the agent to bring.
+        self.worker().run_once()
+        pre = self.cli("paid", "preflight", "--as", self.MODEL, *jobs)
+        self.assertIn(f"sketchgen paid next --job {job} --as {self.OTHER}", pre.stdout)
+        self.assertIn(f"sketchgen paid release --job {job}", pre.stdout)
 
     # -- the whole recipe, as AGENTS.md writes it now ------------------------------
 
