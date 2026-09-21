@@ -77,6 +77,16 @@ class FactsTableTests(unittest.TestCase):
         self.assert_stated("IDLE_FRAMES", str(self.gate.IDLE_FRAMES))
         self.assert_stated("PROBE_FRAMES", str(self.gate.PROBE_FRAMES))
 
+    def test_the_ghost_window_s_caps_are_the_gate_s(self):
+        # Added 2026-09-21 with the window itself. A number in this table that
+        # has drifted is worse than a missing one: the next agent designs a
+        # pointer script against it. The milliseconds are written the way the
+        # rest of the file writes a four-figure number, with the comma.
+        self.assert_stated("GHOST_MAX_EVENTS", str(self.gate.GHOST_MAX_EVENTS))
+        self.assert_stated("GHOST_MAX_MS", "{:,} ms".format(self.gate.GHOST_MAX_MS))
+        # And the three scripts it can play are named where an agent looks.
+        self.assert_stated("GHOST_BUILTINS", "ghost.png")
+
     def test_the_budgets_are_the_gate_s(self):
         self.assert_stated("DEFAULT_FRAME_BUDGET_MS",
                            "%g ms" % self.gate.DEFAULT_FRAME_BUDGET_MS)

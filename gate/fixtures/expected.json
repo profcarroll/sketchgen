@@ -81,7 +81,27 @@
     },
     "notes": "The cost bug from job 166 with nothing else wrong: every check this gate had before 2026-09-15 passes and the sketch still takes about a third of a second to draw one frame. is_looping and frame_advancing are deliberately NOT listed here. Both are read at the end of the idle window, and this run does not reach the end of it \u2014 the budget stops it early \u2014 so on a slow machine they are null and on a fast one they are true, and neither is what the fixture is for. exit 1 and frame_budget false hold on both. The run still writes gate.png \u2014 the frame it stopped on \u2014 so the operator UI has a still to draw a play button on."
   },
+  "ghost-echo": {
+    "exit": 0,
+    "checks": {
+      "console_clean": true,
+      "is_looping": true,
+      "frame_advancing": true,
+      "sound_lib_ok": null,
+      "audio_context_running": null,
+      "frame_budget": true
+    },
+    "ghost": {
+      "source": "executor",
+      "events": 8,
+      "played": 8
+    },
+    "notes": "The sketch that only exists when somebody touches it (auto-mouse.md §5, 2026-09-21). Idle it is four identical frames and a judge learns nothing from strip.png; it writes its own ghost.json, and the ghost window plays every one of its eight events, so ghost.png carries a dot where the pointer clicked and a line where it dragged. \"ghost\" here is what proves the gate's player read the sketch's own script rather than falling back to a built-in: source executor, and played equal to events."
+  },
   "assertions_expected": {
+    "ghost-echo": {
+      "no_motion": true
+    },
     "bad-frozen": {
       "motion(idle)": false
     },

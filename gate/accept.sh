@@ -12,6 +12,9 @@
 # A fixture's expected "checks" object need not name every check: only the keys
 # it lists are compared.  bad-frame-budget uses that, because the budget stops
 # its run before the two checks read at the end of the idle window are read.
+# An optional "ghost" object is compared the same way, key by key, against
+# report.json's own: ghost-echo uses it to say that the gate played the
+# sketch's own script and played all of it (auto-mouse.md section 5).
 #
 # fixtures_dir defaults to ./fixtures next to this script; artefact_dir
 # defaults to a fresh directory under $TMPDIR so the fixtures are not written
@@ -104,6 +107,20 @@ for name in names:
             problems.append("%s %r, expected %r"
                             % (key, got_checks.get(key), want["checks"][key]))
 
+    # The ghost window, for the one fixture that is about it. Only the keys
+    # the expectation lists are compared, as for the checks: "ms" is the
+    # script's own last millisecond and nobody should have to restate it here.
+    want_ghost = want.get("ghost")
+    if want_ghost:
+        got_ghost = report.get("ghost")
+        if not isinstance(got_ghost, dict):
+            problems.append("ghost %r, expected an object" % (got_ghost,))
+        else:
+            for key in sorted(want_ghost):
+                if got_ghost.get(key) != want_ghost[key]:
+                    problems.append("ghost.%s %r, expected %r"
+                                    % (key, got_ghost.get(key), want_ghost[key]))
+
     # Run 2: the assertions the planner would have chosen for this fixture.
     want_asserts = asserts_expected.get(name, {})
     if want_asserts:
@@ -130,10 +147,18 @@ for name in names:
         print("MISMATCH  %-24s %.1fs  %s" % (name, took, "; ".join(problems)))
     else:
         rate = (report.get("timings") or {}).get("ms_per_frame")
-        print("PASS      %-24s %.1fs  exit %d%s%s"
+        # The ghost window is on the PASS line because it is the one thing in
+        # the report nothing else here would ever mention: it fails no fixture,
+        # so without this a run that quietly stopped playing scripts at all
+        # would look exactly like a run that played every one of them.
+        ghost = report.get("ghost") or {}
+        print("PASS      %-24s %.1fs  exit %d%s%s%s"
               % (name, took, p.returncode,
                  "" if rate is None else ", %g ms/frame" % rate,
-                 ", %d assertion(s)" % len(want_asserts) if want_asserts else ""))
+                 ", %d assertion(s)" % len(want_asserts) if want_asserts else "",
+                 ", ghost %s %s/%s" % (ghost.get("script") or ghost.get("source"),
+                                       ghost.get("played"), ghost.get("events"))
+                 if ghost else ", no ghost"))
 
 print()
 print("accept: %d fixture(s), %d mismatch(es), %.1fs total"

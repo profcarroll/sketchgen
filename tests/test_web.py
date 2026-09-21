@@ -417,6 +417,25 @@ class TestPages(WebTestCase):
         self.assertIn("responds(click)", page)
         self.assertIn(f"/jobs/{self.held_id}/attempt-1/.gate/strip.png", page)
 
+    def test_the_attempt_shows_the_ghost_frames_when_it_has_them(self):
+        """auto-mouse.md §5.3: the fourth artefact, per attempt.
+
+        Written here rather than in the shared fixture, and taken away again,
+        because an attempt gated before 2026-09-21 has no ghost.png and the
+        page for one must go on saying nothing about it.
+        """
+        gate_dir = self.jobs_dir / str(self.held_id) / "attempt-1" / ".gate"
+        ghost = gate_dir / "ghost.png"
+        before = self.text(f"/job/{self.held_id}")
+        self.assertNotIn("ghost.png", before)
+        ghost.write_bytes(PNG_BYTES)
+        self.addCleanup(ghost.unlink)
+        page = self.text(f"/job/{self.held_id}")
+        self.assertIn(f"/jobs/{self.held_id}/attempt-1/.gate/ghost.png", page)
+        self.assertIn("with the ghost pointer", page)
+        # Third, after the two every attempt has.
+        self.assertLess(page.index("strip.png"), page.index("ghost.png"))
+
     def test_unknown_path_is_404_and_wrong_method_is_405(self):
         self.assertEqual(self.get("/nope")[0], 404)
         self.assertEqual(self.get(f"/job/{self.held_id}/cancel")[0], 405)

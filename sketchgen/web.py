@@ -3404,7 +3404,11 @@ PREVIEW_SCRIPT = """<script>
 def _artefacts(app: App, job_id: int, attempt_n: int) -> str:
     shots = []
     gate_dir = app.jobs_root / str(job_id) / f"attempt-{attempt_n}" / ".gate"
-    for name, caption in (("strip.png", "four frames"), ("gate.png", "last frame")):
+    # ghost.png is third because it is youngest and because it is the one an
+    # attempt need not have: only runs gated since 2026-09-21 wrote one, and a
+    # window the budget stopped wrote none (auto-mouse.md §5.3).
+    for name, caption in (("strip.png", "four frames"), ("gate.png", "last frame"),
+                          ("ghost.png", "with the ghost pointer")):
         if (gate_dir / name).is_file():
             url = f"/jobs/{job_id}/attempt-{attempt_n}/.gate/{name}"
             shots.append(
