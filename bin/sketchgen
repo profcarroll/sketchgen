@@ -26,6 +26,7 @@ from sketchgen import console  # noqa: E402
 from sketchgen import db  # noqa: E402
 from sketchgen import executor  # noqa: E402
 from sketchgen import lineage  # noqa: E402
+from sketchgen import models  # noqa: E402
 from sketchgen import paid  # noqa: E402
 from sketchgen import planner  # noqa: E402
 from sketchgen import publish as publication  # noqa: E402
@@ -193,8 +194,22 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
     if conn is None:
         return EXIT_FAIL
     options: dict = {"max_attempts": args.max_attempts, "publication": args.publication}
-    if args.planner:
-        options["planner"] = args.planner
+    for column in ("planner", "executor"):
+        named = (getattr(args, column) or "").strip()
+        if not named:
+            continue
+        # A model id with no Ollama tag that the node does not route off it
+        # would be sent to Ollama and fail with a 404 minutes later. Say so
+        # now, before anything is queued.
+        if named not in ("local", "paid") and ":" not in named \
+                and not models.is_paid(named, conn):
+            conn.close()
+            print(f"sketchgen: refused: {named} is not a registered paid model and "
+                  "has no Ollama tag, so the worker would send it to Ollama. "
+                  f"Register it first: sketchgen paid models add {named}",
+                  file=sys.stderr)
+            return EXIT_REFUSED
+        options[column] = named
     if args.rules:
         options["rules_file"] = args.rules
     if args.parent is not None:
@@ -206,7 +221,12 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
         return EXIT_FAIL
     finally:
         conn.close()
-    print(f"queued job {job_id}: {args.prompt}")
+    if args.json:
+        print(json.dumps({"job": job_id, "prompt": args.prompt,
+                          "planner": options.get("planner"),
+                          "executor": options.get("executor")}))
+    else:
+        print(f"queued job {job_id}: {args.prompt}")
     return EXIT_OK
 
 
@@ -817,9 +837,18 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="what to make")
     enqueue_parser.add_argument("--by", required=True, metavar="USERNAME",
                                 help="GitHub username of the submitter")
-    enqueue_parser.add_argument("--planner", choices=("local", "paid"), default=None,
-                                help="who writes the brief; 'paid' stops the job at "
-                                     "needs-laptop (DECIDE[credential-model] B)")
+    enqueue_parser.add_argument("--planner", default=None, metavar="MODEL",
+                                help="who writes the brief: an Ollama tag, `local` "
+                                     "(the worker's), `paid`, or a registered paid "
+                                     "model id (`paid models`), which parks the job "
+                                     "at needs-laptop for it (DECIDE[credential-model] "
+                                     "B). Unset: the assignment, else the worker's")
+    enqueue_parser.add_argument("--executor", default=None, metavar="MODEL",
+                                help="who writes the sketch, with the same choices "
+                                     "as --planner; a paid one is one round trip "
+                                     "per attempt through `sketchgen paid`")
+    enqueue_parser.add_argument("--json", action="store_true",
+                                help="print the job as JSON")
     enqueue_parser.add_argument("--rules", choices=("control", "treatment", "random"),
                                 default=None,
                                 help="rules file for the executor; 'random' resolves "

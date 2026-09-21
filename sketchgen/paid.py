@@ -54,6 +54,7 @@ from . import db
 from . import executor
 from . import judge
 from . import lineage
+from . import models
 from . import planner
 from . import worker
 
@@ -65,7 +66,10 @@ __all__ = [
     "Rejected",
     "export_packet",
     "import_packet",
+    "next_step",
+    "preflight",
     "release",
+    "wait_for",
     "sha256_file",
     "waiting",
 ]
@@ -98,6 +102,9 @@ class Context:
 
     jobs_dir: Path = field(default_factory=lambda: Path("~/sketchgen/jobs").expanduser())
     lineage_depth: int = worker.DEFAULT_LINEAGE_DEPTH
+    #: Offer only this job (plan and execute): an agent running its own job
+    #: should not be handed everybody else's parked ones.
+    job: int | None = None
 
 
 def sha256_file(path: str | Path) -> str:
@@ -356,16 +363,16 @@ class PlanAdapter(Adapter):
         except planner.PlannerRefused as exc:
             raise PaidRefused(str(exc)) from exc
 
-    def _parked(self, conn: sqlite3.Connection) -> list[db.Job]:
+    def _parked(self, conn: sqlite3.Connection, only: int | None = None) -> list[db.Job]:
         return [
             job for job in db.list_jobs(conn, "needs-laptop")
-            if job.needs in (None, "plan")
+            if job.needs in (None, "plan") and (only is None or job.id == only)
         ]
 
     def offer(self, conn, *, model, limit, ctx):
         version = self.prompt_version()
         items = []
-        for job in self._parked(conn)[:limit]:
+        for job in self._parked(conn, ctx.job)[:limit]:
             items.append(
                 {
                     "key": f"job {job.id}",
@@ -467,9 +474,10 @@ class ExecuteAdapter(Adapter):
         except executor.ExecutorRefused as exc:
             raise PaidRefused(str(exc)) from exc
 
-    def _parked(self, conn: sqlite3.Connection) -> list[db.Job]:
+    def _parked(self, conn: sqlite3.Connection, only: int | None = None) -> list[db.Job]:
         return [
-            job for job in db.list_jobs(conn, "needs-laptop") if job.needs == "execute"
+            job for job in db.list_jobs(conn, "needs-laptop")
+            if job.needs == "execute" and (only is None or job.id == only)
         ]
 
     @staticmethod
@@ -479,7 +487,7 @@ class ExecuteAdapter(Adapter):
     def offer(self, conn, *, model, limit, ctx):
         version = self.prompt_version()
         items = []
-        for job in self._parked(conn)[:limit]:
+        for job in self._parked(conn, ctx.job)[:limit]:
             done = db.list_attempts(conn, job.id)
             n = len(done) + 1
             evidence = done[-1].evidence if done else None
@@ -792,7 +800,10 @@ def export_packet(
     """
     adapter = adapter_for(step)
     model = _check_model(model)
-    items = adapter.offer(conn, model=model, limit=max(0, int(limit)), ctx=ctx or Context())
+    ctx = ctx or Context()
+    if ctx.job is not None and step not in ("plan", "execute"):
+        raise PaidRefused(f"--job narrows plan and execute; {step} is not per job")
+    items = adapter.offer(conn, model=model, limit=max(0, int(limit)), ctx=ctx)
     return {
         "packet": PACKET_KIND,
         "version": PACKET_VERSION,
@@ -907,3 +918,184 @@ def import_packet(
         )
         say(f"rejected {key}: {reason}")
     return report
+
+
+# ---------------------------------------------------------------------------
+# Preflight and wait: the harness an agent drives the flow with
+# ---------------------------------------------------------------------------
+#
+# Both exist because of 2026-09-21. A Sonnet 5 session asked to make one
+# sketch as itself spent its budget piecing together, by hand, whether the node
+# could route its model at all (it could not: the only list of paid names was
+# in two systemd units no shell can read) and then how long to wait for a
+# worker it must not start. Neither question should need investigating.
+
+
+#: The oldest schema the paid path runs on: 014 gave `needs` its 'execute'.
+MIN_SCHEMA = 14
+
+#: States in which a job needs nothing from an agent and will move by itself.
+MOVING = frozenset({"queued", "planning", "executing", "gating", "repairing"})
+
+
+def _systemd_timer_active() -> bool:
+    """Whether the worker runs in drip mode, where no worker is resident."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["systemctl", "--user", "is-active", "sketchgen-worker.timer"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.stdout.strip() == "active"
+
+
+def preflight(
+    conn: sqlite3.Connection,
+    model: str,
+    *,
+    workers: Callable[[], list[str]] = worker.worker_processes,
+    drip: Callable[[], bool] = _systemd_timer_active,
+) -> dict[str, Any]:
+    """Can ``model`` run a job end to end right now? Every check, and its fix.
+
+    ``ready`` is true only when every check passes. Each failed check carries
+    ``fix``: the one command that repairs it, and ``who`` may run it — ``you``
+    for the one thing an agent may do for itself (register its own name, which
+    is a name and not a key), ``operator`` for everything else, which the agent
+    reports rather than attempts (AGENTS.md: report and stop).
+    """
+    checks: list[dict[str, Any]] = []
+
+    def check(name: str, ok: bool, detail: str, fix: str = "", who: str = "operator") -> None:
+        row: dict[str, Any] = {"check": name, "ok": bool(ok), "detail": detail}
+        if not ok:
+            row["fix"] = fix
+            row["who"] = who
+        checks.append(row)
+
+    try:
+        model = _check_model(model)
+        check("model id", True, model)
+    except PaidRefused as exc:
+        check("model id", False, str(exc), "name your own exact model id with --as",
+              who="you")
+        return {"ready": False, "model": model, "checks": checks, "info": {}}
+
+    version = db.schema_version(conn)
+    check("schema", version >= MIN_SCHEMA, f"schema {version}, needs {MIN_SCHEMA}",
+          "deploy main to the node: bash ~/sketchgen/app/update.sh")
+
+    registered = models.is_paid(model, conn)
+    check(
+        "registered",
+        registered,
+        f"{model} is {'' if registered else 'not '}a registered paid model — "
+        + ("the worker parks its steps for you" if registered
+           else "the worker would send it to Ollama, which answers 404"),
+        f"sketchgen paid models add {model}",
+        who="you",
+    )
+
+    running = workers()
+    if len(running) == 1:
+        check("worker", True, "one resident worker; it claims a queued job within ~30 s")
+    elif not running and drip():
+        check("worker", True, "drip mode: the timer starts a worker every 5 minutes")
+    elif not running:
+        check("worker", False, "no worker is running, so nothing will claim the job",
+              "systemctl --user start sketchgen-worker.service")
+    else:
+        check("worker", False, f"{len(running)} workers are running; there must be one",
+              "stop the extra worker (see AGENTS.md rule 1); never start another")
+
+    control = db.get_control(conn)
+    state = control.state if control is not None else "running"
+    check("generator", state == "running",
+          f"control is {state}"
+          + (f" ({control.reason})" if control is not None and control.reason else ""),
+          "sketchgen control resume")
+
+    queued = conn.execute("SELECT COUNT(*) FROM jobs WHERE state = 'queued'").fetchone()[0]
+    info = {
+        "assignment": db.get_assignment(conn),
+        "queued_ahead": int(queued),
+        "waiting": {step: row.get("count") for step, row in waiting(conn).items()},
+    }
+    return {
+        "ready": all(row["ok"] for row in checks),
+        "model": model,
+        "checks": checks,
+        "info": info,
+    }
+
+
+def next_step(job: db.Job, entry_id: int | None = None) -> dict[str, Any]:
+    """What an agent does next about ``job``: a command, wait, or stop."""
+    if job.state in MOVING:
+        return {"do": "wait", "say": f"job {job.id} is {job.state}; the worker has it"}
+    if job.state == "needs-laptop" and job.needs in ("plan", "execute"):
+        return {
+            "do": "answer",
+            "step": job.needs,
+            "command": f"sketchgen paid export --step {job.needs} --job {job.id} --out -",
+            "say": f"job {job.id} is waiting for your {job.needs}",
+        }
+    if job.state == "needs-laptop":
+        return {"do": "stop", "say": f"job {job.id} needs {job.needs or 'a person'}: "
+                                     "that is the operator's, not yours"}
+    if job.state in ("held", "published"):
+        return {"do": "done", "entry": entry_id,
+                "say": f"job {job.id} is {job.state}"
+                       + (f" as entry {entry_id}" if entry_id else "")
+                       + ("; a person publishes it" if job.state == "held" else "")}
+    return {"do": "done", "say": f"job {job.id} {job.state}: {job.last_error or 'no reason recorded'}"}
+
+
+def wait_for(
+    conn: sqlite3.Connection,
+    job_id: int,
+    *,
+    timeout: float = 1800.0,
+    interval: float = 5.0,
+    sleep: Callable[[float], None] | None = None,
+    clock: Callable[[], float] | None = None,
+) -> dict[str, Any]:
+    """Block until ``job_id`` needs something, is finished, or cannot move.
+
+    This is the whole of "wait, don't act" as a verb: it only reads. It returns
+    when the job is parked for a step an agent answers, when it is held,
+    published, failed or rejected, when it is parked for a person, or — so a
+    wait never outlives the reason it would end — when the generator is paused
+    and the job is queued behind the pause.
+    """
+    import time
+
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    started = clock()
+    while True:
+        job = db.get_job(conn, job_id)
+        if job is None:
+            raise PaidRefused(f"there is no job {job_id}")
+        entry = conn.execute("SELECT id FROM entries WHERE job_id = ?", (job_id,)).fetchone()
+        step = next_step(job, int(entry["id"]) if entry else None)
+        waited = round(clock() - started, 1)
+        result = {"job": job.id, "state": job.state, "needs": job.needs,
+                  "attempts": len(db.list_attempts(conn, job_id)),
+                  "max_attempts": job.max_attempts, "waited_s": waited,
+                  "timed_out": False, **step}
+        if step["do"] != "wait":
+            return result
+        control = db.get_control(conn)
+        if control is not None and control.state == "paused" and job.state == "queued":
+            result.update(do="stop", say=f"job {job.id} is queued but the generator "
+                          "is paused; it will not move until the operator resumes it")
+            return result
+        if waited >= timeout:
+            result.update(timed_out=True, say=f"job {job.id} is still {job.state} "
+                          f"after {waited:.0f} s; wait again, or report it")
+            return result
+        sleep(interval)
