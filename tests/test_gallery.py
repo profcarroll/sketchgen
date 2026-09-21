@@ -628,7 +628,7 @@ class EntryPageTests(GalleryTestCase):
         self.assertIn("seed 1", self.page)
         self.assertIn(
             "Prompt by profcarroll. Planned by gemma4:e4b, written by "
-            "qwen3-coder:30b-a3b-q4_K_M, passed the gate on attempt 1.",
+            "qwen3-coder:30b-a3b-q4_K_M.",
             self.page,
         )
         self.assertIn(
@@ -1117,7 +1117,7 @@ class IndexTests(GalleryTestCase):
         self.assertIn(f'data-entry="{three}"', self.failed)
         self.assertNotIn(f'data-entry="{one}"', self.failed)
         # The chip says whose rejection it is, not just that there was one.
-        self.assertIn("rejected · gate", self.failed)
+        self.assertIn("rejected · automatic", self.failed)
         self.assertIn("AudioContext is suspended", self.failed)
 
     def test_the_cards_carry_what_the_grid_shows(self):
@@ -1459,22 +1459,26 @@ class OffPlanTests(GalleryTestCase):
 
     def test_an_off_plan_entry_is_not_called_a_rejection(self):
         page = self.page_for(offplan_json=json.dumps(["motion(idle)"]))
-        self.assertNotIn("REJECTED BY THE GATE", page)
+        self.assertNotIn("REJECTED —", page)
         self.assertIn("OFF-PLAN", page)
         self.assertIn("this sketch runs", page)
-        self.assertIn("motion(idle)", page)
         # and it must not borrow the rejection colour
         self.assertIn('class="chip offplan"', page)
 
-    def test_several_missed_assertions_read_as_a_sentence(self):
+    def test_the_missed_assertions_are_not_named_to_a_visitor(self):
+        # motion(idle) is the plan's own notation. The chip says the sketch
+        # diverged; which rule it diverged on is under Provenance.
         page = self.page_for(
             offplan_json=json.dumps(["motion(idle)", "responds(click)", "responds(drag)"])
         )
-        self.assertIn("motion(idle), responds(click) and responds(drag)", page)
+        body = page.split('<h2>Provenance</h2>')[0]
+        for name in ("motion(idle)", "responds(click)", "responds(drag)"):
+            with self.subTest(name=name):
+                self.assertNotIn(name, body)
 
-    def test_a_real_gate_failure_is_still_called_one(self):
+    def test_a_real_failure_is_still_called_a_rejection(self):
         page = self.page_for()
-        self.assertIn("REJECTED BY THE GATE", page)
+        self.assertIn("REJECTED —", page)
         self.assertNotIn("OFF-PLAN", page)
 
     def test_a_row_written_before_the_column_existed_is_not_off_plan(self):
@@ -1512,12 +1516,10 @@ class CritiqueFormTests(GalleryTestCase):
             "<h2>Critique this sketch</h2>",
             "Sign in with GitHub</a> to ask for a revision. "
             "One sentence becomes the next generation's prompt.",
-            "One sentence, under 40 words, no code — the same contract the critic "
-            "model works under. Your sentence is appended to this entry's prompt "
-            "and the child is queued.",
+            "One sentence, under 40 words, no code.",
             ">Say what should change, not how to write it.</label>",
             '<span class="label">the child\'s prompt</span>',
-            ">Queue the child</button>",
+            ">Submit Critique</button>",
         ):
             with self.subTest(line=line):
                 self.assertIn(flat(line), page)
@@ -1535,22 +1537,16 @@ class CritiqueFormTests(GalleryTestCase):
         self.assertIn('<span class="label">what you asked for</span>', page)
         self.assertNotIn("Child job #", self.page)
 
-    def test_the_note_counts_the_child_s_generation_not_this_one_s(self):
-        # entry two is generation 2, so a critique of it makes generation 3 —
-        # which is the number the mockup drew, computed rather than written.
+    def test_the_form_does_not_explain_itself_to_the_pipeline(self):
+        # The depth the critique lands at is still recorded; it is simply not
+        # a thing the button has to say out loud.
         meta = json.loads(
             (self.dest / "e" / str(self.entry_id) / "meta.json").read_text()
         )
         self.assertEqual(2, meta["lineage"]["generation"])
-        self.assertIn(
-            "generation 3 · a person's critique, so the line does not stall here",
-            flat(self.form()),
-        )
-        # and the root, generation 1, offers generation 2
-        root = (self.dest / "e" / str(self.ids[0]) / "index.html").read_text(
-            encoding="utf-8"
-        )
-        self.assertIn("generation 2 · a person's critique", flat(self.form(root)))
+        form = flat(self.form())
+        self.assertNotIn("a person's critique, so the line does not stall here", form)
+        self.assertNotIn("generation 3 ·", form)
 
     def test_the_preview_shows_the_prompt_the_child_would_carry(self):
         form = flat(self.form())
@@ -1786,8 +1782,8 @@ class OperatorRejectionTests(GalleryTestCase):
         self.assertIn(
             "Rejected by the operator: drifted from the prompt", page
         )
-        # The gate's own wording is not borrowed for a decision a person made.
-        self.assertNotIn("REJECTED BY THE GATE", page)
+        # The automatic wording is not borrowed for a decision a person made.
+        self.assertNotIn("REJECTED —", page)
         self.assertEqual(
             "rejected",
             json.loads(
@@ -1802,7 +1798,7 @@ class OperatorRejectionTests(GalleryTestCase):
         page = (self.dest / "rejections.html").read_text(encoding="utf-8")
         self.assertIn(f'data-entry="{gate}"', page)
         self.assertIn(f'data-entry="{operator}"', page)
-        self.assertIn("rejected · gate", page)
+        self.assertIn("rejected · automatic", page)
         self.assertIn("rejected · operator", page)
         # Each card's own reason, from its own source: the entry's column for
         # the operator's, the job's last_error for the gate's.
@@ -3740,7 +3736,7 @@ class HeavyStageTests(GalleryTestCase):
         self.reported(self.ids[0], total_s=42.0)
         page = self.page_of(self.ids[0])
         self.assertIn("data-stage-run", page)
-        self.assertIn("heavy · 42 s in the gate", html.unescape(page))
+        self.assertIn("heavy · 42 s to run", html.unescape(page))
 
     def test_the_budget_is_a_ceiling_not_a_target(self):
         # Exactly at the budget is not over it.
