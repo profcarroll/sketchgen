@@ -1307,8 +1307,14 @@ python3 bin/sketchgen plan --job 1228 --model claude-sonnet-5 --stub reply.txt
 
 That parses the reply through the same parser the local planner uses, writes
 `plan.json` and `response.txt` into the job's own directory, and puts the brief,
-the assertions and the model on the job as it moves to `executing`. The worker
-picks it up on its next pass and executes it locally, as it would any other job.
+the assertions and the model on the job as it goes back on the **queue**. The
+worker claims it on its next pass and — because it now has a brief — takes it
+straight to `executing` without re-planning it.
+
+Queued rather than executing on purpose: `db.claim_next` selects on
+`state = 'queued'` alone, so a job moved directly into a running state by
+anything that is not the worker sits there with nobody attending it until the
+stuck-sweep notices, `SKETCHGEN_STUCK_MINUTES` later.
 
 Three things worth knowing:
 
