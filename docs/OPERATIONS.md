@@ -1461,6 +1461,47 @@ object: the packet itself when the job is parked for the agent (`do: answer`),
 `handoff` (below), or `stop` (exit 3). `import` puts the job back on the queue
 as before and prints the `next` command.
 
+**A try is the node's gate, lent to the agent.** Between `next` and `import`
+an agent can have the real gate look at a candidate:
+
+```bash
+bin/sg paid try --job N --as claude-sonnet-5 < answer.txt   # do: verdict|rejected|wait|stop
+```
+
+Stdin is the text the agent would put in `items[0].answer`, so a reply that
+would be rejected at `import` is rejected here too, without reaching the
+worker. What comes back is `sketch_gate.py`'s own verdict — the exit, every
+check, each assertion with its detail, `timings.ms_per_frame`, the console,
+the unreachable resources, and the node paths of `strip.png` and `gate.png`
+to `scp` — in the same shape `paid next`'s `done` now carries for the attempt
+an entry kept (`paid.verdict_summary`). It is **advisory**: it writes no
+`attempts` row, no entry, no transition and touches no job column, it spends
+none of the job's three attempts, and `HARNESS_VERSION` is untouched, because
+the gate did not change — only who asked it.
+
+It runs **inside the worker's loop**, not beside it (DECIDE[try-where],
+dossier 01 §5.3). The CLI writes the reply to `<jobs_dir>/N/try-K/reply.txt`
+and a request into the `meta` row `paid_tries`, then polls for
+`try-K/result.json` the way `next` polls; the worker serves pending requests
+at the top of every pass before it claims, once per idle round while it is
+standing by, and every five seconds of its nap while any lease is live — so a
+try costs the gate's own 5–15 s plus at most five, not a 30 s poll. Because
+the worker is one thread and never serves a try from inside a job, a try can
+never overlap a real gate run: nothing measures `ms_per_frame` beside the
+referee, and no unrelated job fails on frame budget because an agent was
+looking at something. The lease is the whole permission model — a job leased
+to somebody else, or to nobody, refuses with exit 3 — and every try renews
+it. A request whose lease has lapsed by the time the worker reaches it is
+dropped, unrun: nothing gates for an agent who left.
+
+Tries are capped per job at the `meta` key **`paid_try_cap`**, default **8**
+(a gate run is 5–15 s of the node's CPU; an agent that needs more is designing
+on the node's clock). The ninth refuses with exit 3 and the count. The verb
+that changes the cap is Packet 8's `paid budget --tries N`; until it lands the
+default stands, and nothing edits the row by hand (rule 4). The count itself
+is kept per job because Packet 8 records it on the attempt: a first-attempt
+pass after four tries is not a first-attempt pass.
+
 **Two paid models on one job.** `--planner` / `--executor` also take another
 *registered* paid id, so an operator can have one model plan and another
 execute from off the node — the split the New job page gives two local models.

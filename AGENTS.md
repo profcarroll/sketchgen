@@ -94,11 +94,32 @@ bin/sg paid next --job N --as $ME > packet.json     # returns within 4 minutes
 #             where your job is. Not an error. Run the same command again.
 #             (On a split job, also: the other agent is still planning.)
 #     done    held (report the entry id; a person publishes it), or failed
-#             (report last_error). You are finished.
+#             (report last_error). You are finished. "verdict" says what the
+#             gate found in the attempt the entry kept — a clean pass, or a
+#             sketch that ran and missed an assertion; do not infer it.
 #     handoff the rest of a split job is the other paid model's. "then" is
 #             that agent's command; report it and stop — you are finished.
 #     stop    exit 3: a person is needed, the generator is paused, or another
 #             agent holds the job. Report "say" verbatim; stop.
+
+bin/sg paid try --job N --as $ME < answer.txt       # returns within 4 minutes
+#   the node's own gate over a candidate, before you commit to it. Stdin is
+#   the text you would put in items[0].answer — the fenced js block, an
+#   optional html block, the statement — so a reply `import` would reject is
+#   rejected here too, for free. One JSON object, with "do":
+#     verdict the gate ran: `exit`, every check, each assertion with its
+#             detail, `timings.ms_per_frame` (the number that decides the
+#             frame budget; a laptop proxy reads about a third under it),
+#             the console, and the node paths of strip.png and gate.png —
+#             `scp sld-cloud:<path> .` and look. `then` is the import on a
+#             clean pass, and another try otherwise.
+#     rejected no fenced js block. Nothing was written, no try spent.
+#     wait    the worker has not reached it yet. Run the same command again.
+#     stop    exit 3: you hold no lease, another agent does, or the cap is
+#             spent (8 tries a job). Report "say" verbatim; stop.
+#   It is advisory and capped: it writes no attempt, no entry and no row on
+#   your job, and it uses none of your three attempts. It renews your lease,
+#   and the gate it runs is the one that gates your import.
 
 bin/sg paid import - < packet.json                  # JSON: recorded / rejected
 #   then `next` again. The gate runs on the node; a failed gate comes back as
@@ -106,8 +127,10 @@ bin/sg paid import - < packet.json                  # JSON: recorded / rejected
 #   max_attempts (3).
 ```
 
-That is the whole loop: `start` once, then `next` → answer → `import` until
-`next` says `done`. Nothing else is needed for your own job.
+That is the whole loop: `start` once, then `next` → answer → `try` until the
+verdict is clean → `import`, until `next` says `done`. Nothing else is needed
+for your own job. A `try` is seconds of the node's time and is how you find
+out what the gate thinks; an attempt is one of three.
 
 ### While you wait
 

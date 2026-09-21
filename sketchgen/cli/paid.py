@@ -8,6 +8,7 @@ The agent's own job is three verbs, repeated:
 
   start   register yourself, preflight, queue one job as you, lease it
   next    what now: the packet to answer, "wait" (run it again), done, or stop
+  try     run the node's own gate over a candidate before you commit to it
   import  land the answered packet; the node gates it
   release hand a parked job (or the critic's entries) back to the local path
 
@@ -369,6 +370,27 @@ def cmd_next(args: argparse.Namespace) -> int:
     return _run(args, work)
 
 
+def cmd_try(args: argparse.Namespace) -> int:
+    def work(conn: sqlite3.Connection) -> int:
+        stdin = args.file in (None, "-")
+        path = Path("stdin") if stdin else Path(os.path.expanduser(args.file))
+        try:
+            answer = sys.stdin.read() if stdin else path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise paid_mod.PaidRefused(f"cannot read {path}: {exc}") from exc
+        result = paid_mod.try_for(
+            conn, args.job, args.model, answer, timeout=args.timeout,
+            interval=args.interval, ctx=_ctx(args),
+            progress=lambda line: print(line, file=sys.stderr),
+        )
+        # One JSON object on stdout, as `next` does: the verdict, the reason
+        # the reply was rejected, or why there is nothing to report yet.
+        sys.stdout.write(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        return EXIT_REFUSED if result["do"] == "stop" else EXIT_OK
+
+    return _run(args, work)
+
+
 def cmd_wait(args: argparse.Namespace) -> int:
     def work(conn: sqlite3.Connection) -> int:
         result = paid_mod.wait_for(conn, args.job, timeout=args.timeout,
@@ -660,6 +682,36 @@ def register(top: argparse._SubParsersAction) -> None:
                      help="poll every S seconds (default %(default)s)")
     _add_common(nxt)
     nxt.set_defaults(func=cmd_next, _parser=nxt)
+
+    tri = sub.add_parser(
+        "try",
+        help="run the node's own gate over a candidate, without spending an attempt",
+        description=(
+            "Read the text you would have put in items[0].answer — the fenced "
+            "js block, an optional html block, the statement — from stdin or "
+            "FILE, and have the worker replay and gate it in a scratch "
+            "directory beside job N's attempts. Prints one JSON object with "
+            "`do`: `verdict` (the gate's exit, every check, each assertion "
+            "with its detail, timings.ms_per_frame, the console, and the node "
+            "paths of strip.png and gate.png to scp), `rejected` (the reply "
+            "does not parse; nothing was written), `wait` (the worker has not "
+            "reached it yet; run it again), or `stop` (exit 3: no lease, "
+            "another agent's lease, or the per-job cap is spent). Advisory: it "
+            "writes no attempt, no entry and no row on the job, and it renews "
+            "your lease."
+        ),
+    )
+    tri.add_argument("file", metavar="FILE", nargs="?", default="-",
+                     help="the candidate reply; - or omitted reads stdin")
+    tri.add_argument("--job", type=int, required=True, metavar="N")
+    tri.add_argument("--as", dest="model", required=True, metavar="MODEL_ID",
+                     help="your own exact model id; it must hold the job's lease")
+    tri.add_argument("--timeout", type=float, default=240.0, metavar="S",
+                     help="return `wait` after S seconds (default %(default)s)")
+    tri.add_argument("--interval", type=float, default=5.0, metavar="S",
+                     help="poll every S seconds (default %(default)s)")
+    _add_common(tri)
+    tri.set_defaults(func=cmd_try, _parser=tri)
 
     asg = sub.add_parser(
         "assign",
