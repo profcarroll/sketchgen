@@ -6,7 +6,7 @@ the judge and the critic see the sketch a viewer would have seen. Grounded in th
 stands at `main` 1c39d24 (#139). Written for Opus builders; one packet per branch, one PR each,
 numbering continues from `docs/plans/held-batch.md` (packets 10–12).
 
-*Status: Packet 13 is built — branch `feat/ghost-shim`, PR #TBD: `sketchgen/ghostshim.py`,
+*Status: Packet 13 is built — branch `feat/ghost-shim`, PR #143: `sketchgen/ghostshim.py`,
 the kiosk's `?ghost=` and `responds` in `kiosk.json`. Packets 14–16 are still a draft for
 the operator's review. One thing in §1 was wrong and is corrected where it stands:
 `DECIDE[ghost-off]` says the key is `G`, and `G` is the generation overlay — the key
