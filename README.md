@@ -10,6 +10,12 @@ to a static gallery on GitHub Pages — with full provenance, paired human/agent
 judgments under blind conditions, and a self-prompting lineage that lets the
 gallery grow on its own.
 
+Every model runs on the node by default. Any of the four model steps — plan,
+execute, judge, critique — can instead be answered by a model elsewhere, through
+`sketchgen paid`, without a credential ever reaching the node; an entry any of
+whose models ran off the node is badged **off-node** in the gallery, and its
+provenance names the model that answered.
+
 Built for **PSAM 5600 B: Small Linux Devices, Large Language Models** (Parsons
 School of Design, Fall 2026). The design note is
 `dossiers/sketchgen-gallery.md` in the class repo and the build order is
@@ -122,7 +128,7 @@ From the console's production telemetry, after the first day of running:
 | cost per sketch (16/96) | $0.006 |
 | total tokens (in / out) | 118k / 75k |
 | prefill / decode | 94.8 / 25.4 tok/s |
-| API calls | 0 — all inference local |
+| API calls | 0 — all inference local (for these runs; see off-node above) |
 
 ## File map
 
