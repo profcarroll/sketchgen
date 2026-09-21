@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from sketchgen import db  # noqa: E402
+from sketchgen import executor  # noqa: E402
 from sketchgen import judge  # noqa: E402
 from sketchgen import lineage  # noqa: E402
 from sketchgen import models  # noqa: E402
@@ -45,6 +46,18 @@ GOOD_CRITIQUE = "Let one of the drifting dots fall out of step with the others.\
 TWO_SENTENCES = "It is fine. Make the dots red.\n"
 
 CLEAN_PLAN = test_planner.load("clean")
+
+GOOD_SKETCH = """Here it is.
+
+```js
+function setup() { createCanvas(400, 400); }
+function draw() { background(frameCount % 255); circle(200, 200, 80); }
+```
+
+## Statement
+
+A grey field that breathes, with one circle held still in the middle of it.
+"""
 PAID_ENV = {models.PAID_MODELS_ENV: "claude-opus-5, claude-sonnet-5"}
 
 
@@ -362,6 +375,217 @@ class PlanTests(PaidTestCase):
         again = paid.import_packet(self.conn, packet, ctx=self.ctx)
         self.assertEqual(again.recorded, [])
         self.assertEqual(len(again.rejected), 1)
+
+
+# ---------------------------------------------------------------------------
+# The executor
+# ---------------------------------------------------------------------------
+
+
+class ExecuteTests(PaidTestCase):
+
+    def setUp(self):
+        super().setUp()
+        self.conn.execute("UPDATE jobs SET state = 'published'")
+        self.gate = test_worker.StubGate([0])
+
+    def worker(self, gate=None, executor_fn=None):
+        devnull = open(os.devnull, "w", encoding="utf-8")
+        self.addCleanup(devnull.close)
+        return worker.Worker(
+            self.conn, jobs_dir=self.jobs_dir, log_stream=devnull,
+            gate_fn=gate or self.gate, executor_fn=executor_fn,
+            probe=lambda: dict(test_worker.FREE_SLOT),
+        )
+
+    def queue(self, executor_model="claude-opus-5", max_attempts=3, rules="random"):
+        # 'random' by default, so the export has to resolve the coin the way
+        # the worker will; the like-for-like test below pins one side.
+        return db.enqueue(self.conn, "a breathing field", "octocat",
+                          brief="A grey field that brightens and dims, forever.",
+                          assertions=["motion(idle)"], executor=executor_model,
+                          rules_file=rules, max_attempts=max_attempts)
+
+    def park(self, **kwargs):
+        job_id = self.queue(**kwargs)
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.assertEqual(self.worker().run_once(), 0)
+        return job_id
+
+    def export(self):
+        return paid.export_packet(self.conn, "execute", model="claude-opus-5",
+                                  limit=5, ctx=self.ctx)
+
+    def answer(self, reply=GOOD_SKETCH, model=None):
+        packet = self.export()
+        packet["items"][0]["answer"] = reply
+        if model:
+            packet["model"] = model
+        return packet, paid.import_packet(self.conn, packet, ctx=self.ctx)
+
+    def test_a_paid_executor_parks_the_job_before_attempt_one(self):
+        job_id = self.park()
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual((job.state, job.needs), ("needs-laptop", "execute"))
+        self.assertEqual(db.list_attempts(self.conn, job_id), [])
+        self.assertEqual(self.gate.calls, [])
+
+    def test_the_needs_column_takes_execute_after_migration_014(self):
+        job_id = self.queue()
+        self.conn.execute("UPDATE jobs SET state = 'needs-laptop', needs = 'execute' "
+                          "WHERE id = ?", (job_id,))
+        with self.assertRaises(Exception):
+            self.conn.execute("UPDATE jobs SET needs = 'dream' WHERE id = ?", (job_id,))
+
+    def test_the_node_gates_the_reply_and_holds_the_entry(self):
+        job_id = self.park()
+        packet, report = self.answer(model="claude-sonnet-5")
+        self.assertEqual(report.rejected, [])
+        self.assertEqual(db.get_job(self.conn, job_id).state, "queued")
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.assertEqual(self.worker().run_once(), 0)
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual(job.state, "held")
+        self.assertEqual(len(self.gate.calls), 1)
+        attempt = db.list_attempts(self.conn, job_id)[0]
+        self.assertEqual(attempt.model, "claude-sonnet-5")  # who answered
+        self.assertEqual(attempt.gate_exit, 0)
+        attempt_dir = self.jobs_dir / str(job_id) / "attempt-1"
+        # the prompt the worker rendered is the one the laptop was shown
+        self.assertEqual((attempt_dir / "prompt.txt").read_text(encoding="utf-8"),
+                         packet["items"][0]["prompt"])
+        entry = self.conn.execute("SELECT executor FROM entries WHERE job_id = ?",
+                                  (job_id,)).fetchone()
+        self.assertEqual(entry["executor"], "claude-sonnet-5")
+
+    def test_it_lands_what_the_local_path_lands_for_the_same_reply(self):
+        """Plan §5.1 for the executor: the attempt row and the sketch."""
+        paid_job = self.park(rules="control")
+        self.answer()
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.worker().run_once()
+
+        reply = self.tmp / "reply.txt"
+        reply.write_text(GOOD_SKETCH, encoding="utf-8")
+
+        def replay(*, brief, assertions, rules_file, out_dir, model, host):
+            return worker.Execution.from_result(executor.run(
+                brief=brief, assertions=assertions, rules_file=rules_file,
+                model="claude-opus-5", host=host, out_dir=out_dir, stub=reply))
+
+        local_job = self.queue(executor_model="qwen3-coder:30b", rules="control")
+        self.worker(executor_fn=replay).run_once()
+
+        keep = ("n", "model", "rules_file", "prompt_version", "gate_exit",
+                "evidence", "statement")
+        rows = [
+            {k: getattr(a, k) for k in keep}
+            for job in (paid_job, local_job)
+            for a in db.list_attempts(self.conn, job)
+        ]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0], rows[1])
+        for name in ("sketch.js", "index.html", "statement.md", "prompt.txt"):
+            with self.subTest(file=name):
+                self.assertEqual(
+                    (self.jobs_dir / str(paid_job) / "attempt-1" / name).read_bytes(),
+                    (self.jobs_dir / str(local_job) / "attempt-1" / name).read_bytes(),
+                )
+
+    def test_a_failed_gate_reparks_with_the_evidence_and_numbering_goes_on(self):
+        """Plan §5.5: one round trip per attempt."""
+        self.gate = test_worker.StubGate([1, 0])
+        job_id = self.park()
+        self.answer()
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.worker().run_once()
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual((job.state, job.needs), ("needs-laptop", "execute"))
+        first = db.list_attempts(self.conn, job_id)
+        self.assertEqual([a.n for a in first], [1])
+
+        item = self.export()["items"][0]
+        self.assertEqual(item["inputs"]["attempt"], 2)
+        self.assertIn(worker.EVIDENCE_HEADING, item["prompt"])
+        self.assertIn(first[0].evidence.splitlines()[0], item["prompt"])
+
+        self.answer()
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.worker().run_once()
+        self.assertEqual(db.get_job(self.conn, job_id).state, "held")
+        self.assertEqual([a.n for a in db.list_attempts(self.conn, job_id)], [1, 2])
+
+    def test_evidence_that_moved_under_the_packet_is_rejected(self):
+        self.gate = test_worker.StubGate([1])
+        job_id = self.park()
+        self.answer()
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.worker().run_once()
+        packet = self.export()
+        packet["items"][0]["answer"] = GOOD_SKETCH
+        self.conn.execute("UPDATE attempts SET evidence = 'something else' "
+                          "WHERE job_id = ?", (job_id,))
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertIn("evidence", report.rejected[0]["reason"])
+        self.assertEqual(db.get_job(self.conn, job_id).state, "needs-laptop")
+
+    def test_a_reply_with_no_sketch_leaves_the_job_parked(self):
+        job_id = self.park()
+        _, report = self.answer(reply="I would love to help!\n")
+        self.assertIn("no fenced js block", report.rejected[0]["reason"])
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual((job.state, job.needs), ("needs-laptop", "execute"))
+        self.assertFalse((self.jobs_dir / str(job_id) / "attempt-1" /
+                          worker.PAID_REPLY).exists())
+
+    def test_the_same_answer_cannot_land_twice(self):
+        self.park()
+        packet, _ = self.answer()
+        again = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(again.recorded, [])
+        self.assertIn("not waiting", again.rejected[0]["reason"])
+
+    def test_the_executor_menu_offers_paid_models(self):
+        with mock.patch.dict(os.environ, PAID_ENV), \
+                mock.patch.object(web.models, "catalogue", return_value=[]):
+            offered = [v for v, _ in dict(web.executor_groups())["off this node"]]
+            self.assertIn("claude-opus-5", offered)
+            self.assertEqual(web.check_executor("claude-opus-5"), "claude-opus-5")
+
+
+class Migration014Tests(unittest.TestCase):
+    """The jobs rebuild keeps every row, column and reference it found."""
+
+    def test_a_database_at_013_keeps_its_jobs_and_learns_execute(self):
+        tmp = Path(tempfile.mkdtemp(prefix="sketchgen-014-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        before = tmp / "migrations"
+        before.mkdir()
+        for sql in sorted(db.MIGRATIONS_DIR.glob("*.sql")):
+            if not sql.name.startswith("014"):
+                shutil.copy(sql, before / sql.name)
+        conn = db.connect(tmp / "old.db")
+        self.addCleanup(conn.close)
+        db.migrate(conn, before)
+        self.assertEqual(db.schema_version(conn), 13)
+        parent_job = db.enqueue(conn, "a root", "octocat", brief="b",
+                                assertions=["motion(idle)"])
+        parent = db.create_entry(conn, parent_job, state="published", prompt="a root")
+        job_id = db.enqueue(conn, "a child", "octocat", planner="paid",
+                            executor="qwen3-coder:30b", rules_file="random",
+                            parent_entry_id=parent, critique="slower",
+                            critique_by="gemma4:e4b", needs="review")
+        db.add_attempt(conn, job_id, 1, model="qwen3-coder:30b", evidence="e")
+        was = dict(conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
+
+        self.assertEqual(db.migrate(conn), [14])
+        now = dict(conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone())
+        self.assertEqual(was, now)
+        self.assertEqual(list(was), list(now), "column order changed")
+        self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+        conn.execute("UPDATE jobs SET state = 'needs-laptop', needs = 'execute' "
+                     "WHERE id = ?", (job_id,))
+        self.assertEqual(db.get_job(conn, job_id).needs, "execute")
 
 
 # ---------------------------------------------------------------------------

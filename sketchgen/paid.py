@@ -51,6 +51,7 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from . import db
+from . import executor
 from . import judge
 from . import lineage
 from . import planner
@@ -425,6 +426,155 @@ class PlanAdapter(Adapter):
                 f"{', '.join(ok) or '-'}; back on the queue")
 
 
+class ExecuteAdapter(Adapter):
+    """The executor: one attempt at the sketch, gated on the node as always.
+
+    Offering is the jobs parked at ``needs-laptop`` with ``needs='execute'`` —
+    the worker parks one there at the top of every attempt whose executor is
+    ``paid`` or a named paid model. Rendering is :func:`executor.render_prompt`
+    over the brief the worker would have sent this attempt, which for attempt
+    *n* > 1 is the brief plus the gate's evidence from attempt *n*−1
+    (:func:`worker.brief_with_evidence`), and the rules file the worker would
+    have resolved for it.
+
+    Landing is **not** the gate. It checks the reply has a fenced js block —
+    :func:`executor.parse_response`, the parser the worker uses — writes the
+    reply into ``attempt-N/`` beside the job and puts the job back on the
+    queue. The resident worker claims it, finds the reply where the model's
+    answer would have been, and runs the rest of the attempt exactly as for a
+    local model: the parse into ``sketch.js``, the real gate, the evidence, the
+    repair or the hold. The gate is the referee and it does not move off the
+    node. A failed gate parks the job again for attempt *n*+1, with the new
+    evidence in the next export: one round trip per attempt.
+
+    The guard is a digest of the attempt number and the previous attempt's
+    evidence (plan §3.3): attempt *n* is a reply to attempt *n*−1's gate
+    output, and an answer written against evidence the job no longer holds is
+    an answer to a different question.
+    """
+
+    step = "execute"
+    how_to_answer = (
+        "Send the model the item's prompt. Put its reply, verbatim, in "
+        "'answer': it must contain a fenced ```js block (and may contain an "
+        "```html block and a statement), as the prompt asks. The node gates "
+        "it; a failed gate comes back as the next attempt, evidence included."
+    )
+
+    def prompt_version(self) -> str:
+        try:
+            return executor.prompt_version()
+        except executor.ExecutorRefused as exc:
+            raise PaidRefused(str(exc)) from exc
+
+    def _parked(self, conn: sqlite3.Connection) -> list[db.Job]:
+        return [
+            job for job in db.list_jobs(conn, "needs-laptop") if job.needs == "execute"
+        ]
+
+    @staticmethod
+    def guard(n: int, evidence: str | None) -> str:
+        return sha256_text(f"attempt {int(n)}\n{evidence or ''}")
+
+    def offer(self, conn, *, model, limit, ctx):
+        version = self.prompt_version()
+        items = []
+        for job in self._parked(conn)[:limit]:
+            done = db.list_attempts(conn, job.id)
+            n = len(done) + 1
+            evidence = done[-1].evidence if done else None
+            rules = worker.resolve_rules(job.rules_file, job.id)
+            brief = worker.brief_with_evidence(job.brief or job.prompt, evidence)
+            try:
+                rules_text = executor.resolve_rules(rules).read_text(encoding="utf-8")
+                prompt = executor.render_prompt(
+                    brief, executor.normalise_assertions(job.assertions),
+                    rules_text, executor.DEFAULT_SEED,
+                )
+            except (executor.ExecutorRefused, OSError) as exc:
+                raise PaidRefused(f"job {job.id}: {exc}") from exc
+            previous = (
+                str(Path(done[-1].source_dir) / "sketch.js")
+                if done and done[-1].source_dir else None
+            )
+            items.append(
+                {
+                    "key": f"job {job.id} attempt {n}",
+                    "prompt": prompt,
+                    "images": [],
+                    "guard": self.guard(n, evidence),
+                    "prompt_version": version,
+                    "inputs": {
+                        "job": job.id,
+                        "attempt": n,
+                        "max_attempts": job.max_attempts,
+                        "rules_file": rules,
+                        "assertions": job.assertions,
+                        "previous_sketch": previous,
+                    },
+                    "answer": "",
+                }
+            )
+        return items
+
+    def waiting(self, conn):
+        parked = self._parked(conn)
+        return {
+            "count": len(parked),
+            "jobs": [job.id for job in parked],
+            "summary": f"{len(parked)} job(s) parked for an attempt",
+        }
+
+    def land(self, conn, item, *, model, ctx):
+        inputs = item.get("inputs") or {}
+        try:
+            job_id = int(inputs["job"])
+            n = int(inputs["attempt"])
+        except (KeyError, TypeError, ValueError):
+            raise Rejected("the item names no job and attempt") from None
+        job = db.get_job(conn, job_id)
+        if job is None:
+            raise Rejected(f"there is no job {job_id}")
+        if job.state != "needs-laptop" or job.needs != "execute":
+            raise Rejected(f"job {job_id} is {job.state}"
+                           + (f" (needs {job.needs})" if job.needs else "")
+                           + ", not waiting for an attempt")
+        done = db.list_attempts(conn, job_id)
+        if len(done) + 1 != n:
+            raise Rejected(f"job {job_id} is on attempt {len(done) + 1}, not {n}")
+        evidence = done[-1].evidence if done else None
+        if str(item.get("guard") or "") != self.guard(n, evidence):
+            raise Rejected("the previous attempt's evidence no longer matches")
+        version = str(item.get("prompt_version") or "")
+        if version != self.prompt_version():
+            raise Rejected(
+                f"cut under {version or 'no prompt version'}, and the executor is "
+                f"now {self.prompt_version()}: export again"
+            )
+        raw = str(item.get("answer") or "")
+        parsed = executor.parse_response(raw)
+        if parsed.js is None or not parsed.js.strip():
+            raise Rejected(f"no fenced js block; job {job_id} is unchanged, still "
+                           "needs-laptop")
+        attempt_dir = ctx.jobs_dir / str(job_id) / f"attempt-{n}"
+        try:
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+            (attempt_dir / worker.PAID_REPLY).write_text(raw, encoding="utf-8")
+            (attempt_dir / worker.PAID_META).write_text(
+                json.dumps({"model": model, "prompt_version": version,
+                            "guard": item.get("guard"),
+                            "imported_utc": db.utc_now()}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            raise Rejected(f"cannot write attempt {n} of job {job_id}: {exc}") from exc
+        # Queued, not executing, for the reason requeue_planned gives: only the
+        # worker moves a job into a running state, or nobody attends it.
+        db.transition(conn, job_id, "queued", needs=None)
+        return (f"job {job_id} attempt {n}: written by {model}; back on the "
+                "queue for the gate")
+
+
 class CritiqueAdapter(Adapter):
     """The critic: one sentence about one published entry, which becomes a child.
 
@@ -581,6 +731,7 @@ class CritiqueAdapter(Adapter):
 #: One adapter per step. A step not listed here refuses at the CLI.
 ADAPTERS: dict[str, Adapter] = {
     "plan": PlanAdapter(),
+    "execute": ExecuteAdapter(),
     "judge": JudgeAdapter(),
     "critique": CritiqueAdapter(),
 }
