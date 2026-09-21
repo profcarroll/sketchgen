@@ -1469,6 +1469,17 @@ round trip costs one worker pass, not a pass plus ten minutes of filler. Every
 so an agent that vanishes holds the idle loop for minutes, not the night. The
 worker's card says `standing by for job N (model)` while it waits.
 
+**What an off-node step costs is recorded, honestly.** The node cannot meter a
+model it did not run, so it measures what it can and records what it is told:
+`round_trip_s`, export to import, goes on the attempt as `wall_s` (and into
+`plan.json` for the plan), and the token counts an agent puts in an item's
+`usage` land as `prompt_tokens` / `completion_tokens`; unreported counts stay
+null, never zero. The entry page says "as reported by the model" and "round
+trip, export to import" beside those numbers, and an off-node entry's shape
+reads `off-node (MODEL) · gated on SHAPE` — the node only gated it. A local
+entry's shape is the IMDS-identified one (`meta.node_shape`, e.g.
+`VM.Standard.A1.Flex 16/96`) when the node has identified itself.
+
 **A paid job is made only by `paid start`.** The New job page lists what this
 node runs and nothing else; `paid assign --plan/--execute` take local tags
 only; and a critique child never inherits a paid planner or executor

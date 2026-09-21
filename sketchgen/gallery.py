@@ -2014,6 +2014,12 @@ def _provenance_rows(meta: dict[str, Any]) -> str:
         # headline, this is the fact.
         return " · answered off this node" if step in away else ""
 
+    def reported(step: str) -> str:
+        return " · as reported by the model" if step in away else ""
+
+    def timed(step: str) -> str:
+        return " · round trip, export to import" if step in away else ""
+
     gate_lines = "<br>".join(
         _esc(
             f"attempt {item['attempt']}: gate exit "
@@ -2052,9 +2058,12 @@ def _provenance_rows(meta: dict[str, Any]) -> str:
         ("Assertions", _esc(", ".join(meta["assertions"])) or "none"),
         ("Gate", gate_lines),
         ("Attempts", _dash(meta["attempts"])),
-        ("Prompt tokens", _dash(meta["prompt_tokens"])),
-        ("Completion tokens", _dash(meta["completion_tokens"])),
-        ("Wall seconds", _dash(meta["wall_s"])),
+        # Off the node the counts are what the model reported of itself and
+        # the seconds are the round trip the node timed, export to import:
+        # said here so a reader does not compare them with Ollama's meter.
+        ("Prompt tokens", _dash(meta["prompt_tokens"]) + reported("executor")),
+        ("Completion tokens", _dash(meta["completion_tokens"]) + reported("executor")),
+        ("Wall seconds", _dash(meta["wall_s"]) + timed("executor")),
         ("Node shape", _dash(meta["shape"])),
         ("Seed", _dash(meta["seed"])),
         (

@@ -434,9 +434,13 @@ class PlanAdapter(Adapter):
         except planner.PlannerFailed as exc:
             raise Rejected(f"{exc}; job {job_id} is unchanged, still needs-laptop") from exc
         ok, rejected, defaulted = planner.validate_detailed(words)
+        usage = usage_of(item)
+        trip = round_trip_s(item.get("_exported_utc"))
         result = planner.Plan(
-            brief=brief, assertions=ok, prompt_version=version, tokens={},
-            durations={}, raw=raw, rejected=rejected, defaulted=defaulted,
+            brief=brief, assertions=ok, prompt_version=version,
+            tokens={k: v for k, v in usage.items() if v is not None},
+            durations={"round_trip_s": trip} if trip is not None else {},
+            raw=raw, rejected=rejected, defaulted=defaulted,
         )
         try:
             save_plan(ctx.jobs_dir / str(job_id), result,
@@ -583,10 +587,17 @@ class ExecuteAdapter(Adapter):
         try:
             attempt_dir.mkdir(parents=True, exist_ok=True)
             (attempt_dir / worker.PAID_REPLY).write_text(raw, encoding="utf-8")
+            landed = db.utc_now()
             (attempt_dir / worker.PAID_META).write_text(
                 json.dumps({"model": model, "prompt_version": version,
                             "guard": item.get("guard"),
-                            "imported_utc": db.utc_now()}, indent=2) + "\n",
+                            "exported_utc": item.get("_exported_utc"),
+                            "imported_utc": landed,
+                            # The node's own clock: export to import. The
+                            # worker writes it on the attempt as wall_s, where
+                            # a local attempt's model time goes.
+                            "round_trip_s": round_trip_s(item.get("_exported_utc"), landed),
+                            "usage": usage_of(item)}, indent=2) + "\n",
                 encoding="utf-8",
             )
         except OSError as exc:
@@ -834,11 +845,47 @@ def export_packet(
             adapter.how_to_answer
             + " Leave an item's 'answer' empty to skip it. Set 'model' (here, or "
             "on one item) to the model that actually answered: that is what the "
-            "node records. Change nothing else — 'guard' is how the node knows "
-            "the answer is still about what it asked."
+            "node records. If you know the token counts of your own reply, put "
+            "them in the item's 'usage' (prompt_tokens, completion_tokens); "
+            "leave what you do not know null, never an estimate. Change nothing "
+            "else — 'guard' is how the node knows the answer is still about "
+            "what it asked."
         ),
-        "items": items,
+        "items": [dict(item, usage=dict(EMPTY_USAGE)) for item in items],
     }
+
+
+#: What an item carries for the counts only the answering side knows. The node
+#: measures the round trip itself (`round_trip_s`, export to import); tokens
+#: it can only be told. Null means not known, and stays null: a page that says
+#: "—" is truer than one that says a guess (2026-09-21, entry 1246's blanks).
+EMPTY_USAGE: dict[str, int | None] = {"prompt_tokens": None, "completion_tokens": None}
+
+
+def usage_of(item: Mapping[str, Any]) -> dict[str, int | None]:
+    """The item's reported token counts, as integers or None."""
+    raw = item.get("usage") if isinstance(item.get("usage"), Mapping) else {}
+    out: dict[str, int | None] = {}
+    for key in EMPTY_USAGE:
+        value = raw.get(key)
+        try:
+            out[key] = int(value) if value is not None and str(value).strip() != "" else None
+        except (TypeError, ValueError):
+            out[key] = None
+        if out[key] is not None and out[key] < 0:
+            out[key] = None
+    return out
+
+
+def round_trip_s(packet_created_utc: Any, landed_utc: str | None = None) -> float | None:
+    """Seconds from the packet being cut to its answer landing, or None.
+
+    The node's own measurement of a paid step: it includes the model's
+    thinking and the agent's handling, which is the honest wall time of work
+    done off the node, and it needs nothing reported.
+    """
+    seconds = worker.minutes_between(str(packet_created_utc or ""), landed_utc or db.utc_now())
+    return None if seconds is None else round(max(0.0, seconds * 60.0), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -933,6 +980,9 @@ def import_packet(
             continue
         key = str(item.get("key") or "?")
         who = str(item.get("model") or envelope_model).strip()
+        # The envelope's cut time travels with the item, so the adapter can
+        # record how long this answer took to come back.
+        item = dict(item, _exported_utc=packet.get("created_utc"))
         try:
             _check_model(who)
             line = adapter.land(conn, item, model=who, ctx=ctx)
