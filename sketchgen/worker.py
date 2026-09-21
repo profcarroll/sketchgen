@@ -127,7 +127,8 @@ about what that meant, and an idle worker looked exactly like a stopped one.
 the boundaries this loop already has, in the operator's vocabulary rather than
 the state machine's: *writing*, *evaluating*, *correcting*, while ``jobs.state``
 goes on saying ``executing``, ``gating``, ``repairing``. Two vocabularies on
-purpose.
+purpose. *Trying* is the one step that answers to no job state at all: a paid
+agent's dry run on the gate (:meth:`Worker._serve_tries`), which moves nothing.
 
 Three consequences worth writing down. There is **no thread and no second
 timer**: this process blocks inside one non-streaming HTTP call for a whole step
@@ -272,6 +273,26 @@ DEFAULT_RULES = "treatment"
 #: attempt from these instead of calling a model (see Worker._paid_execution).
 PAID_REPLY = "paid-response.txt"
 PAID_META = "paid.json"
+
+#: What `sketchgen paid try` leaves in a `try-K/` directory beside the
+#: attempts: the candidate reply the agent would have imported, and — once the
+#: worker has replayed and gated it — the verdict it reads back. A try writes
+#: no attempt row, no entry and no transition; the directory and the `meta`
+#: row `paid_tries` are the whole record of it (docs/plans/agent-rig.md §4.3).
+TRY_REPLY = "reply.txt"
+TRY_RESULT = "result.json"
+#: executor.run writes its own result.json into the directory it works in, and
+#: for a try that is the same directory the verdict lands in. The replay's is
+#: moved aside rather than lost: the agent polls for a file called result.json
+#: and must never read the executor's as a verdict.
+TRY_EXECUTION = "execution.json"
+#: The marker on a try's result.json, so a half-written or foreign file in the
+#: directory is not mistaken for a verdict.
+TRY_KIND = "sketchgen-try"
+#: How often the nap looks for a try while an agent holds a lease. The nap is
+#: thirty seconds and the agent is watching; five is the slice that makes a
+#: try cost the gate's own seconds and little else.
+TRY_POLL_S = 5.0
 
 #: The heading the previous attempt's evidence is filed under in the next
 #: attempt's brief. The executor template needs no new slot for this and its
@@ -720,6 +741,53 @@ def missed_assertions(report: dict[str, Any] | None) -> list[str]:
         return []
     return [name for name, value in (report.get("assertions") or {}).items()
             if not (value or {}).get("pass")]
+
+
+def attempt_report(attempt: Any) -> dict[str, Any]:
+    """One attempt's gate report, or {} when it never reached the gate."""
+    path = getattr(attempt, "gate_report_path", None)
+    if not path:
+        return {}
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def best_attempt(attempts: list[Any]) -> Any | None:
+    """The attempt worth keeping, which is usually not the last one.
+
+    Ranked on what a visitor would care about, in order: it runs at all (no
+    QA check false), then how much of the plan it managed, then recency as
+    the tiebreak.
+
+    The entry used to take attempts[-1] unconditionally. Across the first 66
+    failed jobs the last attempt was not the best one 9 times (14%), and on
+    the 45 kept entries the repair moves 7 of them. A minority — but entry
+    429 is in it, and is the reason the ranking is worth having: it publishes
+    a blank canvas because its tenth attempt fetched an image that never
+    arrived, while its second drew a working puzzle from an image it made
+    itself. The rest of the kept entries were already showing their best
+    attempt and this leaves them exactly where they are.
+
+    A job whose gate run passed is unaffected. That attempt is QA-clean with
+    every assertion satisfied, which is the maximum, and the recency tiebreak
+    picks it over any earlier one — so one path serves both outcomes.
+
+    Module-level since 2026-09-21 so that `paid next`'s `done` can say which
+    attempt the entry kept and what the gate found in it (dossier 01 §7.2),
+    without a Worker to ask.
+    """
+    if not attempts:
+        return None
+
+    def rank(attempt: Any) -> tuple[int, int, int]:
+        report = attempt_report(attempt)
+        assertions = report.get("assertions") or {}
+        passed = sum(1 for v in assertions.values() if (v or {}).get("pass"))
+        return (1 if qa_clean(report) else 0, passed, int(attempt.n))
+
+    return max(attempts, key=rank)
 
 
 def _notes_for_check(name: str, notes: list[str]) -> list[str]:
@@ -1466,6 +1534,12 @@ class Worker:
             else "fence: the inference slot is free"
         )
 
+        # Before the claim, because a try is seconds and the agent that asked
+        # for it is polling: after the fence (the slot must be free) and after
+        # the sweeps (a request whose job was just handed back is dropped, not
+        # served), and before this pass commits to a job of its own.
+        self._serve_tries()
+
         self._say("claiming", "Picking up the next job")
         # A job under a live paid lease first: an agent is waiting on it, and
         # every pass it spends behind an idle-spawned child is a pass the agent
@@ -1745,6 +1819,10 @@ class Worker:
         self.sweep_stuck()
         self.sweep_unattended()
         if self._standing_by():
+            # Standing by is precisely the state a try is asked for from: an
+            # agent is driving a job and looking at a candidate. Serve before
+            # the round ends, or the request waits for the nap's next slice.
+            self._serve_tries()
             return
         judged = self._idle_judge() if self.idle_judge > 0 else None
         # Between the two steps, not only around the pair. Each one can sit on
@@ -2057,16 +2135,24 @@ class Worker:
         does.
         """
         note, self._idle_note = self._idle_note, None
-        self._say(
-            "idle",
-            "Nothing to do",
-            " · ".join(filter(None, [note, f"next wake in {human_gap(seconds)}"])),
-        )
+        detail = " · ".join(filter(None, [note, f"next wake in {human_gap(seconds)}"]))
+        self._say("idle", "Nothing to do", detail)
         deadline = time.monotonic() + seconds
+        # The latency that matters. A try costs the gate's 5–15 s; polled here
+        # every five seconds of the nap it costs that plus at most five, rather
+        # than the thirty-second sleep the agent would otherwise wait out.
+        next_try = time.monotonic()
         while not self._terminating:
             left = deadline - time.monotonic()
             if left <= 0:
                 return
+            if time.monotonic() >= next_try:
+                next_try = time.monotonic() + TRY_POLL_S
+                if db.paid_leases(self.conn) and self._serve_tries():
+                    # The try opened its own step on the card; say what the
+                    # worker went back to, or the console would show it
+                    # trying for the rest of the nap.
+                    self._say("idle", "Nothing to do", detail)
             time.sleep(min(1.0, left))
 
     def _pause_after_attempt(self, job_id: int) -> None:
@@ -2082,43 +2168,12 @@ class Worker:
 
     @staticmethod
     def _attempt_report(attempt: Any) -> dict[str, Any]:
-        """One attempt's gate report, or {} when it never reached the gate."""
-        path = getattr(attempt, "gate_report_path", None)
-        if not path:
-            return {}
-        try:
-            return json.loads(Path(path).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {}
+        """:func:`attempt_report`, kept as a method for the call sites here."""
+        return attempt_report(attempt)
 
     def _best_attempt(self, attempts: list[Any]) -> Any | None:
-        """The attempt worth keeping, which is usually not the last one.
-
-        Ranked on what a visitor would care about, in order: it runs at all (no
-        QA check false), then how much of the plan it managed, then recency as
-        the tiebreak.
-
-        The entry used to take attempts[-1] unconditionally. Across the first 66
-        failed jobs the last attempt was not the best one 9 times (14%), and on
-        the 45 kept entries the repair moves 7 of them. A minority — but entry
-        429 is in it, and is the reason the ranking is worth having: it publishes
-        a blank canvas because its tenth attempt fetched an image that never
-        arrived, while its second drew a working puzzle from an image it made
-        itself. The rest of the kept entries were already showing their best
-        attempt and this leaves them exactly where they are.
-
-        A job whose gate run passed is unaffected. That attempt is QA-clean with
-        every assertion satisfied, which is the maximum, and the recency tiebreak
-        picks it over any earlier one — so one path serves both outcomes.
-        """
-        if not attempts:
-            return None
-        def rank(attempt: Any) -> tuple[int, int, int]:
-            report = self._attempt_report(attempt)
-            assertions = report.get("assertions") or {}
-            passed = sum(1 for v in assertions.values() if (v or {}).get("pass"))
-            return (1 if qa_clean(report) else 0, passed, int(attempt.n))
-        return max(attempts, key=rank)
+        """:func:`best_attempt`, kept as a method for the call sites here."""
+        return best_attempt(attempts)
 
     def _create_entry(self, job_id: int, state: str, rules: str) -> int | None:
         """The gallery-visible row, written when the job stops moving.
@@ -2464,6 +2519,163 @@ class Worker:
                 if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                     setattr(execution, key, value)
         return execution
+
+    # -- tries: the agent's dry run, on the node's own gate -----------------
+
+    def _serve_tries(self) -> int:
+        """Gate the candidates agents have asked about, between claims.
+
+        `sketchgen paid try` writes a reply into ``try-K/`` beside the job's
+        attempts and a request into the `meta` row ``paid_tries``; this is the
+        half that answers. Returns how many it served.
+
+        **Why it is here and not in a process of its own** (dossier 01 §5.3,
+        DECIDE[try-where]): the worker owns the inference slot and is one
+        thread, so a try served from inside this loop can never overlap a real
+        gate run — the ordering acceptance 2 asks for holds by construction,
+        with no lock. A gate measures ``ms_per_frame`` on the same machine as
+        the model, so a second gate beside the worker's would perturb the
+        referee's own number and could fail an unrelated job on frame budget.
+        And while a lease is live this worker is standing by for that agent
+        with nothing else to do (:meth:`_standing_by`), which is exactly when
+        a try arrives.
+
+        **What a try is not.** It writes no ``attempts`` row, no entry, no
+        transition and touches no job column: the gate stays the referee
+        (agentic-cli §8) and a try's verdict never lands on an entry.
+        ``HARNESS_VERSION`` is untouched — the gate did not change, only who
+        asked it. The count is kept for Packet 8, which records it on the
+        attempt, because a first-attempt pass after four tries is not a
+        first-attempt pass.
+
+        Never called from :meth:`_run_job`: a job in flight finishes first.
+        """
+        try:
+            requests = db.paid_tries(self.conn)
+        except sqlite3.Error as exc:
+            self.log(f"try: the request row could not be read: {exc}")
+            return 0
+        if not requests:
+            return 0
+        served = 0
+        for job_id, row in sorted(requests.items()):
+            for request in list(row.get("pending") or []):
+                # Read the leases afresh per request: a gate run takes seconds,
+                # and the agent two requests down may have left in between.
+                lease = db.paid_leases(self.conn).get(int(job_id))
+                model = str(request.get("model") or "")
+                if not lease or lease.get("model") != model:
+                    # Nobody is at the other end. Drop it rather than spend the
+                    # node's CPU on a verdict no one will read.
+                    self.log(f"try: job {job_id} try {request.get('k')} dropped — "
+                             f"{model or 'its agent'} holds no lease on it any more")
+                    db.drop_paid_try(self.conn, int(job_id), int(request.get("k") or 0))
+                    continue
+                self._serve_one_try(int(job_id), request)
+                served += 1
+        return served
+
+    def _serve_one_try(self, job_id: int, request: dict[str, Any]) -> None:
+        """One try: replay the reply, run the gate, write ``result.json``.
+
+        Never raises. A try that cannot be served is a verdict the agent does
+        not get; it is not a reason to drop the queue, the same bargain
+        :meth:`_idle_round` makes for the judge and the critic.
+        """
+        # Imported here rather than at the top: paid.py imports this module for
+        # the executor replay and the prompts, so the summary comes the other
+        # way at call time. One helper builds the shape an agent reads, in a
+        # try and in `next`'s `done` alike (docs/plans/agent-rig.md §4.4).
+        from . import paid as paid_mod
+
+        k = int(request.get("k") or 0)
+        model = str(request.get("model") or "")
+        try_dir = Path(request.get("dir") or (self.jobs_dir / str(job_id) / f"try-{k}"))
+        job = db.get_job(self.conn, job_id)
+        self._say(
+            "trying",
+            "Trying a sketch for the agent",
+            f"{model} · job {job_id}, try {k} · the real gate, no attempt recorded",
+            job_id=job_id,
+            model=model,
+        )
+        notes: list[str] = []
+        summary: dict[str, Any] = {}
+        error: str | None = None
+        assertions: list[str] = []
+        try:
+            if job is None:
+                raise OSError(f"there is no job {job_id}")
+            assertions = job.assertions
+            if not assertions:
+                # A try before the plan is in: the gate can still say whether
+                # the sketch runs, and that is worth having, but it cannot
+                # check a plan that does not exist yet. Say so rather than let
+                # an empty `assertions` read as "everything passed".
+                notes.append("the job has no assertions yet (it is not planned): "
+                             "this try is the QA checks only")
+            rules = resolve_rules(job.rules_file, job.id)
+            result = executor.run(
+                brief=job.brief or job.prompt,
+                assertions=assertions,
+                rules_file=rules,
+                model=model,
+                host=self.host,
+                out_dir=str(try_dir),
+                stub=str(try_dir / TRY_REPLY),
+            )
+            # The replay's own result.json is not the verdict; see TRY_EXECUTION.
+            replay = try_dir / TRY_RESULT
+            if replay.is_file():
+                replay.replace(try_dir / TRY_EXECUTION)
+            if not result.ok:
+                error = result.error or "the reply did not parse"
+            else:
+                outcome = self.gate_fn(
+                    source_dir=str(try_dir),
+                    assertions=assertions,
+                    out_dir=str(try_dir / ".gate"),
+                )
+                summary = paid_mod.verdict_summary(outcome.report)
+                if outcome.report is None:
+                    summary["exit"] = outcome.exit_code
+                    error = (outcome.stderr or "the gate wrote no report").strip()
+        except StopNow:
+            raise
+        except Exception as exc:  # noqa: BLE001 - deliberately everything
+            error = f"{type(exc).__name__}: {' '.join(f'{exc}'.split())}"
+        payload = {
+            "kind": TRY_KIND,
+            "try": k,
+            "job": job_id,
+            "model": model,
+            "served_utc": db.utc_now(),
+            "assertions_checked": assertions,
+            "error": error,
+            **summary,
+        }
+        payload["notes"] = notes + list(payload.get("notes") or [])
+        self._write_try_result(try_dir, payload)
+        db.drop_paid_try(self.conn, job_id, k)
+        self.log(f"job {job_id}: try {k} for {model} — "
+                 + (f"gate exit {payload.get('exit')}" if error is None
+                    else f"no verdict: {error}"))
+
+    def _write_try_result(self, try_dir: Path, payload: dict[str, Any]) -> None:
+        """``result.json``, written whole or not at all.
+
+        The agent polls for this file, so a half-written one would be read as
+        a verdict: it is written beside and renamed, which is atomic on the
+        node's filesystem.
+        """
+        try:
+            try_dir.mkdir(parents=True, exist_ok=True)
+            temporary = try_dir / (TRY_RESULT + ".part")
+            temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n",
+                                 encoding="utf-8")
+            temporary.replace(try_dir / TRY_RESULT)
+        except OSError as exc:
+            self.log(f"try: the verdict for {try_dir} could not be written: {exc}")
 
     def _preflight_lines(self, job_id: int, n: int, attempt_dir: Path) -> list[str]:
         """The pre-flight scan over one attempt directory, as evidence lines.

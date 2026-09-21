@@ -1491,6 +1491,100 @@ def release_lease(conn: sqlite3.Connection, job_id: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Paid tries — "an agent has a candidate it would like the gate to look at"
+# ---------------------------------------------------------------------------
+
+PAID_TRIES_KEY = "paid_tries"
+
+
+def paid_tries(conn: sqlite3.Connection) -> dict[int, dict[str, Any]]:
+    """``{job id: {"count": K, "pending": [request, …]}}`` — the try record.
+
+    A request is ``{"k", "model", "asked_utc", "dir"}``: the agent holding the
+    lease on that job has written a candidate reply into ``dir`` and would like
+    the worker to run the real gate over it (``sketchgen paid try``). The
+    worker serves them between claims and drops each one as it goes; ``count``
+    is every try the job has ever been asked for, which is what the cap is
+    measured against and what Packet 8 records on the attempt — a
+    first-attempt pass after four tries is not a first-attempt pass.
+
+    No migration, for :func:`paid_leases`' reason: a `meta` row of JSON, read
+    whole and written whole. The verdicts themselves live in the try
+    directories, not here.
+    """
+    raw = get_meta(conn, PAID_TRIES_KEY)
+    try:
+        found = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    if not isinstance(found, dict):
+        return {}
+    rows: dict[int, dict[str, Any]] = {}
+    for key, value in found.items():
+        try:
+            job_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        pending = [row for row in (value.get("pending") or []) if isinstance(row, dict)]
+        try:
+            count = int(value.get("count") or 0)
+        except (TypeError, ValueError):
+            count = len(pending)
+        rows[job_id] = {"count": count, "pending": pending}
+    return rows
+
+
+def _write_paid_tries(conn: sqlite3.Connection, rows: dict[int, dict[str, Any]]) -> None:
+    # A job that no longer exists (a test database rebuilt under us, a row
+    # deleted by hand before rule 4 existed) is the only thing pruned: the
+    # count outlives the job's movement through the queue, because the attempt
+    # it is finally recorded on is written after the last try.
+    kept = {
+        job_id: row for job_id, row in rows.items()
+        if conn.execute("SELECT 1 FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    }
+    set_meta(
+        conn,
+        PAID_TRIES_KEY,
+        json.dumps({str(k): v for k, v in sorted(kept.items())}, sort_keys=True)
+        if kept else None,
+    )
+
+
+def add_paid_try(
+    conn: sqlite3.Connection, job_id: int, model: str, k: int, directory: str
+) -> dict[str, Any]:
+    """Record try ``k`` of ``job_id`` as pending for the worker. Returns it."""
+    rows = paid_tries(conn)
+    row = rows.setdefault(int(job_id), {"count": 0, "pending": []})
+    request = {"k": int(k), "model": str(model), "asked_utc": utc_now(),
+               "dir": str(directory)}
+    row["pending"] = [r for r in row["pending"] if int(r.get("k") or 0) != int(k)]
+    row["pending"].append(request)
+    row["count"] = max(int(row["count"]), int(k))
+    _write_paid_tries(conn, rows)
+    return request
+
+
+def drop_paid_try(conn: sqlite3.Connection, job_id: int, k: int) -> bool:
+    """Take try ``k`` off the pending list — served, or nobody left to serve it.
+
+    The count stays: a try that ran cost the node a gate run whether or not
+    its verdict was ever collected.
+    """
+    rows = paid_tries(conn)
+    row = rows.get(int(job_id))
+    if row is None:
+        return False
+    before = len(row["pending"])
+    row["pending"] = [r for r in row["pending"] if int(r.get("k") or 0) != int(k)]
+    _write_paid_tries(conn, rows)
+    return len(row["pending"]) != before
+
+
+# ---------------------------------------------------------------------------
 # Billing — migration 013's daily meter readings
 # ---------------------------------------------------------------------------
 

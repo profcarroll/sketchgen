@@ -44,6 +44,19 @@ GOOD_JUDGE_REPLY = test_judge.GOOD_REPLY
 PNG_BYTES = test_judge.PNG_BYTES
 
 GOOD_CRITIQUE = "Let one of the drifting dots fall out of step with the others.\n"
+
+
+def gate_report(**kwargs):
+    """A stub gate report carrying the number only the node can produce.
+
+    9.8 ms a frame is what the gate measured for entry 1279, where the
+    agent's laptop proxy read 6.4 (docs/plans/agent-rig.md §0): the frame time
+    is the reason a try runs on the node rather than beside the agent.
+    """
+    report = test_worker.make_report(kwargs.pop("sketch_dir", "/attempt"), **kwargs)
+    report["timings"]["ms_per_frame"] = 9.8
+    return report
+
 TWO_SENTENCES = "It is fine. Make the dots red.\n"
 
 CLEAN_PLAN = test_planner.load("clean")
@@ -1038,7 +1051,7 @@ class CliTests(PaidTestCase):
 
     def test_help_exits_zero_for_every_subcommand(self):
         for name in ("export", "import", "status", "release", "assign", "models",
-                     "preflight", "wait"):
+                     "preflight", "wait", "start", "next", "try"):
             with self.subTest(subcommand=name):
                 result = subprocess.run(
                     [sys.executable, str(CLI), "paid", name, "--help"],
@@ -1245,11 +1258,23 @@ class AgentLoopTests(PaidTestCase):
     def test_next_is_done_when_held_and_drops_the_lease(self):
         job = db.enqueue(self.conn, "p", "octocat", brief="b", assertions=["motion(idle)"])
         db.lease_paid(self.conn, job, self.MODEL, 20)
-        self.worker(executor_fn=test_worker.StubExecutor()).run_once()
+        gate = test_worker.StubGate([0], reports=[gate_report(
+            assertions={"motion(idle)": {"pass": True, "detail": "idle 0->120 frames"}})])
+        self.worker(executor_fn=test_worker.StubExecutor(), gate_fn=gate).run_once()
         result = paid.next_for(self.conn, job, self.MODEL, timeout=10)
         self.assertEqual((result["do"], result["state"]), ("done", "held"))
         self.assertIsNotNone(result["entry"])
         self.assertEqual({}, db.paid_leases(self.conn))
+        # Dossier 01 §7.2: `held` is reached by a clean pass and by a sketch
+        # that ran and missed an assertion once the attempts were spent, so
+        # `done` says which of the two this was and what the gate measured.
+        verdict = result["verdict"]
+        self.assertEqual((verdict["exit"], verdict["offplan"], verdict["attempt"]),
+                         (0, [], 1))
+        self.assertTrue(verdict["assertions"]["motion(idle)"]["pass"])
+        self.assertEqual(verdict["timings"]["ms_per_frame"], 9.8)
+        self.assertIn("clean", verdict["say"])
+        self.assertIn("the gate: clean", result["say"])
 
     # -- release -----------------------------------------------------------------
 
@@ -1521,6 +1546,291 @@ class AgentLoopTests(PaidTestCase):
         self.assertEqual(json.loads(result.stdout)["released"][0]["state"], "queued")
         result = self.cli("paid", "release", "--json")
         self.assertEqual(result.returncode, 3)
+
+
+class TryTests(AgentLoopTests):
+    """`paid try`: the node's own gate over a candidate that is not an attempt.
+
+    Job 1286 (entry 1279, 2026-09-21) passed the gate first time after the
+    agent spent thirty-seven minutes standing up a browser rig on the laptop,
+    which still read a third under the node's frame time. The gate is here;
+    this is the verb that lends it, between claims, without spending an
+    attempt or touching a row (docs/plans/agent-rig.md §4).
+    """
+
+    def leased(self, assertions=("motion(idle)",), **kwargs):
+        """A job of this agent's, parked for its attempt, with a live lease.
+
+        The lease is deliberately short, so that the renewal every `try` does
+        is visible in ``until_utc`` rather than hidden by a second's rounding.
+        """
+        job = db.enqueue(self.conn, "a breathing field", "octocat",
+                         brief="A grey field that brightens and dims, forever.",
+                         assertions=list(assertions), planner=self.MODEL,
+                         executor=self.MODEL, rules_file="treatment", **kwargs)
+        db.set_paid_models(self.conn, [self.MODEL])
+        db.transition(self.conn, job, "needs-laptop", needs="execute")
+        db.lease_paid(self.conn, job, self.MODEL, 5)
+        return job
+
+    def gate(self, verdicts=(0,), **report):
+        return test_worker.StubGate(list(verdicts), reports=[gate_report(**report)])
+
+    def drive(self, run, job, answer=GOOD_SKETCH, timeout=60, **kwargs):
+        """One `paid try`, with the worker's nap standing in for the daemon.
+
+        The daemon serves tries from inside its own loop, so the agent's poll
+        is exactly where the worker gets its turn: this sleep is that turn.
+        """
+        now = [0.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+            run._nap(0.2)
+
+        return paid.try_for(self.conn, job, self.MODEL, answer, ctx=self.ctx,
+                            sleep=sleep, clock=lambda: now[0], timeout=timeout,
+                            **kwargs)
+
+    def try_dir(self, job, k=1):
+        return self.jobs_dir / str(job) / f"try-{k}"
+
+    def job_row(self, job):
+        return tuple(self.conn.execute("SELECT * FROM jobs WHERE id = ?",
+                                       (job,)).fetchone())
+
+    def steps(self):
+        """Every activity row the worker wrote, oldest first, by step name."""
+        return [row["step"] for row in
+                self.conn.execute("SELECT step FROM activity ORDER BY id")]
+
+    # -- 1: the plumbing ---------------------------------------------------
+
+    def test_the_nap_serves_a_try_and_the_job_is_untouched_by_it(self):
+        job = self.leased()
+        before = self.job_row(job)
+        was = db.paid_leases(self.conn)[job]["until_utc"]
+        gate = self.gate(assertions={"motion(idle)": {"pass": True,
+                                                      "detail": "idle 0->120 frames"}})
+        run = self.worker(gate_fn=gate)
+        result = self.drive(run, job)
+
+        self.assertEqual(result["do"], "verdict", result)
+        self.assertEqual((result["exit"], result["offplan"]), (0, []))
+        self.assertEqual(result["timings"]["ms_per_frame"], 9.8)
+        self.assertTrue(result["assertions"]["motion(idle)"]["pass"])
+        self.assertTrue(result["artefacts"]["strip"].endswith("strip.png"))
+        self.assertEqual((result["tries_used"], result["tries_cap"]), (1, 8))
+        self.assertEqual(result["then"], "sketchgen paid import -")
+        self.assertEqual(len(gate.calls), 1)
+
+        # The record is the directory and the meta row, and nothing else.
+        written = self.try_dir(job)
+        self.assertEqual(
+            json.loads((written / "result.json").read_text())["kind"], "sketchgen-try")
+        for name in ("reply.txt", "sketch.js", "index.html", "execution.json"):
+            self.assertTrue((written / name).is_file(), name)
+        self.assertEqual(before, self.job_row(job))
+        self.assertEqual([], db.list_attempts(self.conn, job))
+        self.assertEqual([], list(self.conn.execute(
+            "SELECT id FROM entries WHERE job_id = ?", (job,))))
+        self.assertEqual([], db.paid_tries(self.conn)[job]["pending"])
+        self.assertGreater(db.paid_leases(self.conn)[job]["until_utc"], was)
+
+    def test_a_second_try_is_its_own_directory_and_counts_up(self):
+        job = self.leased()
+        run = self.worker(gate_fn=test_worker.StubGate([1, 0]))
+        first = self.drive(run, job)
+        self.assertEqual((first["do"], first["exit"]), ("verdict", 1))
+        self.assertEqual(first["then"], paid.try_command(job, self.MODEL))
+        self.assertIn("fix", first["say"])
+        second = self.drive(run, job)
+        self.assertEqual((second["tries_used"], second["exit"]), (2, 0))
+        self.assertTrue(self.try_dir(job, 2).is_dir())
+        self.assertEqual(2, db.paid_tries(self.conn)[job]["count"])
+
+    def test_a_try_before_the_plan_says_it_checked_no_assertions(self):
+        job = self.leased(assertions=())
+        run = self.worker(gate_fn=self.gate())
+        result = self.drive(run, job)
+        self.assertEqual(result["assertions_checked"], [])
+        self.assertTrue(any("not planned" in note for note in result["notes"]),
+                        result["notes"])
+
+    # -- 2: it never overlaps a real gate run ------------------------------
+
+    def test_a_try_asked_for_mid_attempt_waits_for_the_attempt(self):
+        """Acceptance 2: the worker is one thread, so ordering needs no lock."""
+        mine = self.leased()
+        theirs = db.enqueue(self.conn, "the node's own job", "octocat",
+                            brief="b", assertions=["motion(idle)"])
+
+        def midway(n):
+            self.try_dir(mine).mkdir(parents=True, exist_ok=True)
+            (self.try_dir(mine) / "reply.txt").write_text(GOOD_SKETCH, encoding="utf-8")
+            db.add_paid_try(self.conn, mine, self.MODEL, 1, str(self.try_dir(mine)))
+
+        run = self.worker(executor_fn=test_worker.StubExecutor(on_call=midway),
+                          gate_fn=test_worker.StubGate([0, 0]))
+        run.run_once()          # the attempt the worker was already in
+        self.assertEqual("held", db.get_job(self.conn, theirs).state)
+        self.assertNotIn("trying", self.steps())
+        run.run_once()          # the next pass, before it claims anything
+        steps = self.steps()
+        self.assertIn("trying", steps)
+        self.assertLess(steps.index("evaluating"), steps.index("trying"))
+        self.assertEqual(
+            json.loads((self.try_dir(mine) / "result.json").read_text())["exit"], 0)
+
+    # -- 3: the lease is the permission ------------------------------------
+
+    def test_without_a_lease_a_try_stops_and_writes_nothing(self):
+        job = self.leased()
+        db.release_lease(self.conn, job)
+        result = paid.try_for(self.conn, job, self.MODEL, GOOD_SKETCH, ctx=self.ctx)
+        self.assertEqual(result["do"], "stop")
+        self.assertIn("no lease", result["say"])
+        db.lease_paid(self.conn, job, "claude-opus-5", 20)
+        result = paid.try_for(self.conn, job, self.MODEL, GOOD_SKETCH, ctx=self.ctx)
+        self.assertEqual((result["do"], result["leased_to"]), ("stop", "claude-opus-5"))
+        self.assertFalse(self.try_dir(job).exists())
+        self.assertEqual({}, db.paid_tries(self.conn))
+
+    def test_a_request_whose_lease_lapsed_is_dropped_rather_than_gated(self):
+        job = self.leased()
+        self.try_dir(job).mkdir(parents=True)
+        (self.try_dir(job) / "reply.txt").write_text(GOOD_SKETCH, encoding="utf-8")
+        db.add_paid_try(self.conn, job, self.MODEL, 1, str(self.try_dir(job)))
+        db.lease_paid(self.conn, job, self.MODEL, -1)   # the agent left
+        gate = test_worker.StubGate([0])
+        run = self.worker(gate_fn=gate)
+        self.assertEqual(0, run._serve_tries())
+        self.assertEqual([], gate.calls)
+        self.assertFalse((self.try_dir(job) / "result.json").exists())
+        self.assertEqual([], db.paid_tries(self.conn)[job]["pending"])
+
+    def test_an_agent_polling_after_its_request_was_dropped_is_told_to_stop(self):
+        job = self.leased()
+        run = self.worker(gate_fn=test_worker.StubGate([0]))
+
+        def sleep(seconds):
+            db.drop_paid_try(self.conn, job, 1)   # the worker found no lease
+
+        result = paid.try_for(self.conn, job, self.MODEL, GOOD_SKETCH, ctx=self.ctx,
+                              sleep=sleep, clock=lambda: 0.0, timeout=60)
+        self.assertEqual(result["do"], "stop")
+        self.assertIn("dropped by the worker", result["say"])
+
+    # -- 4: the cap --------------------------------------------------------
+
+    def test_the_ninth_try_is_refused_and_the_cap_comes_from_meta(self):
+        job = self.leased()
+        db.add_paid_try(self.conn, job, self.MODEL, 8, str(self.try_dir(job, 8)))
+        db.drop_paid_try(self.conn, job, 8)
+        result = paid.try_for(self.conn, job, self.MODEL, GOOD_SKETCH, ctx=self.ctx)
+        self.assertEqual(result["do"], "stop")
+        self.assertIn("8 of 8 tries used", result["say"])
+        self.assertFalse(self.try_dir(job, 9).exists())
+
+        db.set_meta(self.conn, "paid_try_cap", "2")
+        other = self.leased()
+        db.add_paid_try(self.conn, other, self.MODEL, 2, str(self.try_dir(other, 2)))
+        db.drop_paid_try(self.conn, other, 2)
+        result = paid.try_for(self.conn, other, self.MODEL, GOOD_SKETCH, ctx=self.ctx)
+        self.assertEqual((result["do"], result["tries_cap"]), ("stop", 2))
+        self.assertIn("2 of 2 tries used", result["say"])
+
+    # -- 5: a bad reply costs nothing --------------------------------------
+
+    def test_a_reply_with_no_sketch_is_rejected_and_spends_no_try(self):
+        job = self.leased()
+        result = paid.try_for(self.conn, job, self.MODEL, "I would love to help!\n",
+                              ctx=self.ctx)
+        self.assertEqual((result["do"], result["reason"]),
+                         ("rejected", "no fenced js block"))
+        self.assertEqual(result["tries_used"], 0)
+        self.assertEqual({}, db.paid_tries(self.conn))
+        self.assertFalse(self.try_dir(job).exists())
+
+    # -- the verb, over the CLI --------------------------------------------
+
+    def test_try_at_the_cli_prints_one_object_and_exits_3_on_a_stop(self):
+        job = self.leased()
+        jobs = ["--jobs-dir", str(self.jobs_dir)]
+        rejected = self.cli("paid", "try", "--job", str(job), "--as", self.MODEL,
+                            *jobs, stdin="nothing fenced here\n")
+        self.assertEqual(rejected.returncode, 0, rejected.stderr)
+        self.assertEqual(json.loads(rejected.stdout)["do"], "rejected")
+
+        db.release_lease(self.conn, job)
+        stopped = self.cli("paid", "try", "--job", str(job), "--as", self.MODEL,
+                           *jobs, stdin=GOOD_SKETCH)
+        self.assertEqual(stopped.returncode, 3, stopped.stdout)
+        self.assertEqual(json.loads(stopped.stdout)["do"], "stop")
+
+    def test_a_try_that_the_worker_has_not_reached_says_wait(self):
+        job = self.leased()
+        result = paid.try_for(self.conn, job, self.MODEL, GOOD_SKETCH, ctx=self.ctx,
+                              sleep=lambda s: None, clock=iter_clock([0, 0, 300]),
+                              timeout=240)
+        self.assertEqual((result["do"], result["timed_out"]), ("wait", True))
+        self.assertEqual(result["then"], paid.try_command(job, self.MODEL))
+
+    # -- 6: the same referee, on the node only -----------------------------
+
+    @unittest.skip(
+        "needs the node: the real gate is Playwright and headless Chromium, "
+        "which the laptop does not have. The operator runs it once on "
+        "sld-cloud after the deploy and pastes the lines into the PR."
+    )
+    def test_the_gate_fixtures_through_try_return_their_expected_verdict(self):
+        """Acceptance 6 of docs/plans/agent-rig.md §4.5: same gate, same answer.
+
+        Run on the node, against a temporary database in a temporary
+        directory, with:
+
+            cd ~/sketchgen/app && ~/sketchgen/.venv/bin/python3 -m unittest \\
+                tests.test_paid.TryTests.test_the_gate_fixtures_through_try_\\
+                return_their_expected_verdict
+
+        This is **not** a second worker (AGENTS.md rule 1): it claims nothing,
+        calls no model and touches no real database. It calls the gate — the
+        one part of a job that is safe to run beside the daemon, because it is
+        CPU and a browser rather than the inference slot.
+        """
+        expected = json.loads((REPO_ROOT / "gate" / "fixtures" /
+                               "expected.json").read_text(encoding="utf-8"))
+        asserted = expected.get("assertions_expected") or {}
+        for name, want in sorted(expected.items()):
+            if name == "assertions_expected":
+                continue
+            with self.subTest(fixture=name):
+                fixture = REPO_ROOT / "gate" / "fixtures" / name
+                reply = (
+                    "```js\n" + (fixture / "sketch.js").read_text(encoding="utf-8")
+                    + "\n```\n\n```html\n"
+                    + (fixture / "index.html").read_text(encoding="utf-8")
+                    + "\n```\n\n## Statement\n\nA gate fixture.\n"
+                )
+                job = self.leased(assertions=tuple(asserted.get(name, {})))
+                run = self.worker(gate_fn=None,
+                                  gate_path=str(REPO_ROOT / "gate" / "sketch_gate.py"))
+                result = self.drive(run, job, answer=reply, timeout=600)
+                self.assertEqual(result["exit"], want["exit"], result)
+                for check, value in (want.get("checks") or {}).items():
+                    self.assertEqual(result["checks"].get(check), value, check)
+                for word, passed in (asserted.get(name) or {}).items():
+                    self.assertEqual(result["assertions"][word]["pass"], passed, word)
+
+
+def iter_clock(values):
+    """A clock that reads each of ``values`` in turn, then stays at the last."""
+    remaining = list(values)
+
+    def clock():
+        return remaining.pop(0) if len(remaining) > 1 else remaining[0]
+
+    return clock
 
 
 class UsageTests(AgentLoopTests):
