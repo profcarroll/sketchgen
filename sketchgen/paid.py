@@ -46,8 +46,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -66,14 +68,20 @@ __all__ = [
     "Context",
     "PaidRefused",
     "Rejected",
+    "budget",
+    "elapsed_of",
     "export_packet",
     "import_packet",
     "next_for",
     "next_step",
+    "parse_since",
     "partner_of",
     "preflight",
+    "process_of",
     "release",
     "release_job",
+    "set_budget",
+    "spend_of",
     "start",
     "try_for",
     "verdict_summary",
@@ -156,6 +164,10 @@ class Adapter:
     step = ""
     #: What the agent on the laptop is told, in the envelope, about this step.
     how_to_answer = ""
+    #: Whether this step's items offer a `process` slot: only where there is a
+    #: row to record it on (the attempt), so a cost an agent writes into a
+    #: packet is never silently dropped.
+    records_process = False
 
     def prompt_version(self) -> str:  # pragma: no cover - abstract
         raise NotImplementedError
@@ -484,6 +496,9 @@ class ExecuteAdapter(Adapter):
     """
 
     step = "execute"
+    #: The one step whose answer has an attempt row to carry a process cost
+    #: (migration 015), so the one step whose items offer `process`.
+    records_process = True
     how_to_answer = (
         "Send the model the item's prompt. Put its reply, verbatim, in "
         "'answer': it must contain a fenced ```js block (and may contain an "
@@ -601,7 +616,12 @@ class ExecuteAdapter(Adapter):
                             # worker writes it on the attempt as wall_s, where
                             # a local attempt's model time goes.
                             "round_trip_s": round_trip_s(item.get("_exported_utc"), landed),
-                            "usage": usage_of(item)}, indent=2) + "\n",
+                            "usage": usage_of(item),
+                            # Beside the reply's cost, never added to it: what
+                            # the agent says the work around this reply cost.
+                            # The worker copies it onto the attempt and fills
+                            # in `tries` from its own count.
+                            "process": process_of(item)}, indent=2) + "\n",
                 encoding="utf-8",
             )
         except OSError as exc:
@@ -854,8 +874,21 @@ def export_packet(
             "leave what you do not know null, never an estimate. Change nothing "
             "else — 'guard' is how the node knows the answer is still about "
             "what it asked."
+            + (
+                " If your harness can report what the work around this reply "
+                "cost — session seconds, tokens generated, thinking, tool "
+                "calls, screenshots, the effort level — put those in the "
+                "item's 'process'. Same rule: leave out what you do not know. "
+                "It is recorded beside the entry, as reported by you, and "
+                "never enters any measure."
+                if adapter.records_process else ""
+            )
         ),
-        "items": [dict(item, usage=dict(EMPTY_USAGE)) for item in items],
+        "items": [
+            dict(item, usage=dict(EMPTY_USAGE),
+                 **({"process": dict(EMPTY_PROCESS)} if adapter.records_process else {}))
+            for item in items
+        ],
     }
 
 
@@ -879,6 +912,83 @@ def usage_of(item: Mapping[str, Any]) -> dict[str, int | None]:
         if out[key] is not None and out[key] < 0:
             out[key] = None
     return out
+
+
+#: What an item carries about the work *around* the reply, when the agent's
+#: harness can report it (migration 015). Two costs, kept apart (dossier 01
+#: §6.4): `usage` and `wall_s` above are the reply — what the node was sent
+#: and how long the round trip took, the numbers that compare with a local
+#: model's prompt and decode — and this is everything the agent did before and
+#: between those replies. Job 1286's reply cost 111 s; its process cost was 42
+#: minutes and about 207,000 generated tokens, and only the first was recorded.
+#:
+#: `tries` is not here: the node counts those itself (db.paid_tries) and fills
+#: it in at the attempt, because it is the one field of the object the node
+#: can check for itself.
+EMPTY_PROCESS: dict[str, Any] = {
+    "session_s": None,
+    "output_tokens": None,
+    "thinking_tokens": None,
+    "tool_calls": None,
+    "screenshots": None,
+    "effort": None,
+}
+
+#: Every key a stored process object may carry: the agent's six, and the
+#: node's count of the tries that went into the attempt.
+PROCESS_KEYS = tuple(EMPTY_PROCESS) + ("tries",)
+
+#: The counts, which are whole numbers and never negative. ``session_s`` is a
+#: duration and may be fractional; ``effort`` is the word the harness uses for
+#: itself ('max', 'high'), not a vocabulary this node owns.
+PROCESS_COUNTS = ("output_tokens", "thinking_tokens", "tool_calls", "screenshots")
+
+#: An effort longer than this is a sentence, and a sentence in a field read as
+#: one word would print across the provenance table.
+EFFORT_MAX = 40
+
+
+def process_of(item: Mapping[str, Any]) -> dict[str, Any]:
+    """The item's reported process cost, every field validated or None.
+
+    Never defaulted to zero, for ``usage``'s reason and with more force: a
+    harness that cannot count its own tool calls has not made zero of them.
+    A field that is not a number, or is negative, becomes None rather than a
+    refusal — the answer is what an import is about, and no sketch should be
+    rejected over a cost line.
+    """
+    raw = item.get("process") if isinstance(item.get("process"), Mapping) else {}
+    out: dict[str, Any] = dict(EMPTY_PROCESS)
+    for key in PROCESS_COUNTS:
+        value = raw.get(key)
+        try:
+            number = (int(value) if value is not None and str(value).strip() != ""
+                      else None)
+        except (TypeError, ValueError):
+            number = None
+        out[key] = number if number is None or number >= 0 else None
+    seconds = raw.get("session_s")
+    try:
+        out["session_s"] = (round(float(seconds), 1)
+                            if seconds is not None and str(seconds).strip() != ""
+                            else None)
+    except (TypeError, ValueError):
+        out["session_s"] = None
+    if out["session_s"] is not None and out["session_s"] < 0:
+        out["session_s"] = None
+    effort = raw.get("effort")
+    if isinstance(effort, str) and effort.strip():
+        out["effort"] = effort.strip()[:EFFORT_MAX]
+    return out
+
+
+def process_reported(process: Mapping[str, Any] | None) -> bool:
+    """Whether anything at all is known about the process cost.
+
+    An object of nothing but nulls is not recorded: the row would say the
+    agent reported its cost, and it did not.
+    """
+    return bool(process) and any(value is not None for value in process.values())
 
 
 def round_trip_s(packet_created_utc: Any, landed_utc: str | None = None) -> float | None:
@@ -907,6 +1017,10 @@ class ImportReport:
     jobs: list[int] = field(default_factory=list)
     #: The model the packet was cut for, for the `then` line.
     model: str = ""
+    #: `elapsed`, as `next` echoes it, for the job this import moved — with
+    #: the over-budget line when there is one. Advisory: an import is never
+    #: refused over a budget (DECIDE[agent-budget]).
+    elapsed: dict[str, Any] | None = None
 
     def then(self) -> str | None:
         """The one command that follows this import, or None."""
@@ -925,6 +1039,7 @@ class ImportReport:
             "skipped": self.skipped,
             "jobs": list(self.jobs),
             "then": self.then(),
+            "elapsed": self.elapsed,
         }
 
 
@@ -1007,12 +1122,280 @@ def import_packet(
                 if job_id is not None:
                     db.lease_paid(conn, job_id, who, DEFAULT_LEASE_MINUTES)
                     report.jobs.append(job_id)
+                    landed_job = db.get_job(conn, job_id)
+                    if landed_job is not None and report.elapsed is None:
+                        # The attempt row for this answer is the worker's to
+                        # write, after the gate; the count it carries is here
+                        # now, so the line this import prints counts it.
+                        report.elapsed = spend_of(
+                            conn, landed_job,
+                            extra_tokens=process_of(item).get("output_tokens"),
+                        )
             continue
         report.rejected.append(
             {"item": key, "reason": reason, "answer": str(item.get("answer") or "")}
         )
         say(f"rejected {key}: {reason}")
     return report
+
+
+# ---------------------------------------------------------------------------
+# The agent's own cost: --since, the budget, and what checkout the node is on
+# ---------------------------------------------------------------------------
+#
+# Packet 8 of docs/plans/agent-rig.md. The node cannot meter a session it did
+# not start, so it asks for the one number the agent always has — when the
+# work began — and prints an advisory budget against it. Never enforced
+# (DECIDE[agent-budget]): refusing an over-budget import would reward not
+# reporting, and the only thing worse than an expensive entry is an expensive
+# entry whose cost is blank.
+
+
+#: How far ahead of the node's clock a declared start may be. The agent runs
+#: `date -u` on its own machine, and two clocks that agree to the minute are
+#: as much as ssh and NTP promise; further ahead than this is a typo.
+SINCE_SKEW_MINUTES = 2.0
+
+#: And how far behind. A sketch is a few minutes' work; a `--since` from
+#: yesterday is last session's stamp pasted into this one, which would make
+#: every `elapsed` line nonsense and the budget unreadable.
+SINCE_MAX_HOURS = 24.0
+
+#: A `--note` is a line on the job and the entry page, not a document: what
+#: the node cannot see about how this one was made. Entry 1279's would have
+#: been `skill=algorithmic-art; local prototype`, 38 characters.
+NOTE_MAX = 500
+
+
+def parse_since(text: str | None, *, now: str | None = None) -> str | None:
+    """A declared start, as this system's UTC stamp. Refuses a typo.
+
+    Takes what `date -u +%FT%TZ` prints, and anything else
+    :func:`datetime.fromisoformat` reads, converting an offset to UTC; a
+    stamp with no zone is read as UTC, because the instruction that produced
+    it says ``-u``.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    try:
+        moment = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        raise PaidRefused(
+            f"--since {raw!r}: a UTC ISO stamp, as `date -u +%FT%TZ` prints it "
+            "(2026-09-21T14:03:22Z)"
+        ) from None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    moment = moment.astimezone(timezone.utc)
+    clock = (datetime.strptime(now, db.UTC_FORMAT).replace(tzinfo=timezone.utc)
+             if now else datetime.now(timezone.utc))
+    ahead = (moment - clock).total_seconds() / 60.0
+    if ahead > SINCE_SKEW_MINUTES:
+        raise PaidRefused(
+            f"--since {raw!r} is {ahead:.0f} min ahead of this node's clock "
+            f"({clock.strftime(db.UTC_FORMAT)}): a task cannot have begun in the "
+            "future. Run `date -u +%FT%TZ` and pass what it prints"
+        )
+    if -ahead > SINCE_MAX_HOURS * 60.0:
+        raise PaidRefused(
+            f"--since {raw!r} is {-ahead / 60.0:.0f} h old, and a sketch is a few "
+            "minutes' work: that is last session's stamp. Run `date -u +%FT%TZ` "
+            "again"
+        )
+    return moment.strftime(db.UTC_FORMAT)
+
+
+#: The `meta` row `paid budget` writes, and what it says when nobody has
+#: (DECIDE[agent-budget]): job 1286's job phase alone was 4 min 26 s and
+#: 14,798 tokens, so ten minutes and thirty thousand is that with headroom.
+#: To be re-set when MEASURE[freenode-baseline] is read.
+BUDGET_KEY = "paid_budget"
+DEFAULT_BUDGET_MINUTES = 10.0
+DEFAULT_BUDGET_TOKENS = 30000
+
+
+def budget(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The advisory budget: minutes, generated tokens, and the try cap.
+
+    Tries come from :data:`TRY_CAP_KEY`, where packet 7 put them, rather than
+    being copied into this row: one number, one place, and `paid budget
+    --tries N` writes it.
+    """
+    raw = db.get_meta(conn, BUDGET_KEY)
+    try:
+        found = json.loads(raw) if raw else {}
+    except ValueError:
+        found = {}
+    if not isinstance(found, dict):
+        found = {}
+
+    def number(key: str, fallback: float | int) -> float | int:
+        value = found.get(key)
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return fallback
+        return value if value > 0 else fallback
+
+    return {
+        "minutes": float(number("minutes", DEFAULT_BUDGET_MINUTES)),
+        "tokens": int(number("tokens", DEFAULT_BUDGET_TOKENS)),
+        "tries": try_cap(conn),
+    }
+
+
+def set_budget(
+    conn: sqlite3.Connection,
+    *,
+    minutes: float | None = None,
+    tokens: int | None = None,
+    tries: int | None = None,
+) -> dict[str, Any]:
+    """Write the budget. Returns it as :func:`budget` reads it back.
+
+    The verb rule 4 asks for: the two `meta` rows the paid flow reads have
+    somewhere to be written from, so nobody opens sqlite3 on them.
+    """
+    for name, value in (("minutes", minutes), ("tokens", tokens), ("tries", tries)):
+        if value is not None and float(value) <= 0:
+            raise PaidRefused(f"--{name} {value}: a budget is a positive number")
+    current = budget(conn)
+    if minutes is not None or tokens is not None:
+        db.set_meta(conn, BUDGET_KEY, json.dumps({
+            "minutes": float(current["minutes"] if minutes is None else minutes),
+            "tokens": int(current["tokens"] if tokens is None else tokens),
+        }, sort_keys=True))
+    if tries is not None:
+        db.set_meta(conn, TRY_CAP_KEY, str(int(tries)))
+    return budget(conn)
+
+
+def budget_line(limits: Mapping[str, Any]) -> str:
+    """The one line `start` prints, and every word of it is advisory."""
+    return (f"budget: held within {float(limits['minutes']):.0f} min of --since, "
+            f"under {int(limits['tokens']):,} tokens generated, "
+            f"{int(limits['tries'])} tries · advisory")
+
+
+def elapsed_of(conn: sqlite3.Connection, job: db.Job) -> dict[str, Any] | None:
+    """How long the agent has been at ``job``, and which clock says so.
+
+    ``--since`` when the agent declared one, else the lease's own start, which
+    is when this job was first touched by an agent and is a floor on the real
+    answer. Said which, because the two are different measurements: the first
+    includes the reading and prototyping before the job existed, which is
+    where job 1286's 37 minutes went, and the second cannot.
+    """
+    lease = db.paid_leases(conn).get(job.id) or {}
+    if job.since_utc:
+        started, source = job.since_utc, "--since"
+    elif lease.get("since_utc"):
+        started, source = str(lease["since_utc"]), "the lease"
+    else:
+        return None
+    minutes = worker.minutes_between(started, db.utc_now())
+    if minutes is None:
+        return None
+    minutes = max(0.0, minutes)
+    return {
+        "since_utc": started,
+        "from": source,
+        "minutes": round(minutes, 1),
+        "s": round(minutes * 60.0),
+        "say": f"elapsed {worker.human_gap(minutes * 60.0)}, from {source}",
+    }
+
+
+def tokens_generated(conn: sqlite3.Connection, job_id: int) -> int | None:
+    """What the agent has reported generating on this job, or None.
+
+    ``output_tokens`` only: a harness that reports thinking tokens reports
+    them *inside* output (the transcript's ``output_tokens_details``), and
+    adding the two would count the thinking twice.
+    """
+    total = None
+    for attempt in db.list_attempts(conn, job_id):
+        try:
+            found = json.loads(attempt.process_json or "")
+        except ValueError:
+            continue
+        value = found.get("output_tokens") if isinstance(found, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            total = value if total is None else total + value
+    return total
+
+
+def spend_of(conn: sqlite3.Connection, job: db.Job,
+             *, extra_tokens: int | None = None) -> dict[str, Any] | None:
+    """``elapsed``, as `next` and `import` echo it, with the budget beside it.
+
+    ``over_budget`` is one line past either number and None otherwise. It is
+    never a refusal: an agent that is late is asked to finish and say so.
+
+    ``extra_tokens`` is the count on an answer that has just been imported and
+    has no attempt row yet — the worker writes that row when it gates — so the
+    line an import prints is about the reply the agent just sent, not the one
+    before it.
+    """
+    elapsed = elapsed_of(conn, job)
+    if elapsed is None:
+        return None
+    limits = budget(conn)
+    tokens = tokens_generated(conn, job.id)
+    if extra_tokens is not None:
+        tokens = int(extra_tokens) + (tokens or 0)
+    over: list[str] = []
+    if elapsed["minutes"] > float(limits["minutes"]):
+        over.append(f"{elapsed['minutes'] - float(limits['minutes']):.0f} min")
+    if tokens is not None and tokens > int(limits["tokens"]):
+        over.append(f"{tokens - int(limits['tokens']):,} tokens generated")
+    row = dict(elapsed)
+    row["tokens_generated"] = tokens
+    row["budget"] = limits
+    row["over_budget"] = (
+        f"over budget by {' and '.join(over)}; finish, and report it" if over else None
+    )
+    return row
+
+
+def node_commit() -> str | None:
+    """The commit of the checkout this code is running from, or None.
+
+    DECIDE[freshness]. An agent reads AGENTS.md in its own clone and drives a
+    node that may be ahead of it: on 2026-09-21 a session read the file at
+    #131 and answered packets the node had cut under #132, whose items carried
+    a `usage` slot nothing had told it about. Null is a fine answer — a
+    tarball deploy, no git, a checkout it cannot read — and it is never a
+    failure: this is a line of information, not a check.
+    """
+    import subprocess
+
+    root = Path(__file__).resolve().parent.parent
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    sha = (out.stdout or "").strip()
+    if out.returncode != 0 or not re.fullmatch(r"[0-9a-f]{7,40}", sha):
+        return None
+    return sha
+
+
+def agents_md_sha256() -> str | None:
+    """The digest of the AGENTS.md this node is running with, or None.
+
+    The other half of the freshness check, for the agent whose clone has no
+    common history with the node (a worktree, a tarball): the same file has
+    the same digest, and a different one is a different file.
+    """
+    try:
+        return sha256_file(Path(__file__).resolve().parent.parent / "AGENTS.md")
+    except OSError:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1026,8 +1409,11 @@ def import_packet(
 # worker it must not start. Neither question should need investigating.
 
 
-#: The oldest schema the paid path runs on: 014 gave `needs` its 'execute'.
-MIN_SCHEMA = 14
+#: The oldest schema the paid path runs on: 015 gave the job its `since_utc`
+#: and `note` and the attempt its `process_json`, which `start` and `import`
+#: write. Before it, a paid verb would fail on an unknown column rather than
+#: say the node is behind, which is what this check is for.
+MIN_SCHEMA = 15
 
 #: States in which a job needs nothing from an agent and will move by itself.
 MOVING = frozenset({"queued", "planning", "executing", "gating", "repairing"})
@@ -1138,6 +1524,12 @@ def preflight(
     queued = conn.execute("SELECT COUNT(*) FROM jobs WHERE state = 'queued'").fetchone()[0]
     info = {
         "assignment": db.get_assignment(conn),
+        # DECIDE[freshness]: which checkout the node is running, so an agent
+        # can tell whether the file it read is the file the node cut its
+        # packets under. Both may be null and neither is a check.
+        "node_commit": node_commit(),
+        "agents_md_sha256": agents_md_sha256(),
+        "budget": budget(conn),
         "queued_ahead": int(queued),
         "waiting": {step: row.get("count") for step, row in waiting(conn).items()},
         "parked": parked_jobs(conn, model),
@@ -1228,7 +1620,7 @@ def parked_jobs(conn: sqlite3.Connection, model: str | None = None) -> list[dict
 
 
 # ---------------------------------------------------------------------------
-# start, next, release: the three verbs an agent's whole job is made of
+# start, next, try, import, release: the verbs an agent's whole job is made of
 # ---------------------------------------------------------------------------
 #
 # 2026-09-21, second Sonnet 5 session. The recipe was preflight, enqueue,
@@ -1329,6 +1721,8 @@ def start(
     rules_file: str | None = None,
     max_attempts: int = 3,
     publication: str = "hold",
+    since: str | None = None,
+    note: str | None = None,
     workers: Callable[[], list[str]] = worker.worker_processes,
     drip: Callable[[], bool] = _systemd_timer_active,
 ) -> dict[str, Any]:
@@ -1342,9 +1736,22 @@ def start(
     because it is a name and not a key and there is no reason to make an agent
     run two commands to say who it is. It is reported, so the operator can
     `paid models remove` it.
+
+    ``since`` is what `date -u +%FT%TZ` printed when the agent began — the
+    first command AGENTS.md asks for — and ``note`` is anything about how this
+    job is being made that the node cannot see (a skill, a local prototype).
+    Both are refused before anything is queued, so a typo costs nothing.
     """
     model = _check_model(model)
     by = _check_by(by)
+    since_utc = parse_since(since)
+    note_text = str(note or "").strip() or None
+    if note_text and len(note_text) > NOTE_MAX:
+        raise PaidRefused(
+            f"--note is {len(note_text)} characters and the limit is {NOTE_MAX}: "
+            "a note is a line about how this job was made (`skill=algorithmic-art; "
+            "local prototype`), not the story of it"
+        )
     text = (prompt or "").strip()
     if not text:
         raise PaidRefused("a job needs a prompt: --prompt TEXT, or the prompt on stdin")
@@ -1370,6 +1777,10 @@ def start(
         "executor": executor_col,
         "max_attempts": int(max_attempts),
         "publication": publication,
+        # Declared, never inferred: the node's clock cannot see a session it
+        # did not start (migration 015).
+        "since_utc": since_utc,
+        "note": note_text,
     }
     if rules_file:
         options["rules_file"] = rules_file
@@ -1386,12 +1797,23 @@ def start(
         say = (f"job {job_id} is queued for {partner[0]} to plan first — a session "
                f"that is that model runs `{next_command(job_id, partner[0])}`; "
                f"your `next` waits until the attempt is yours")
+    limits = budget(conn)
     return {
         "started": True,
         "job": job_id,
         "model": model,
         "planner": planner_col,
         "executor": executor_col,
+        "since_utc": since_utc,
+        "note": note_text,
+        # Advisory, and said so in the line itself. An agent with no number to
+        # hold itself to spent 37 minutes on entry 1279 without noticing.
+        "budget": limits,
+        "budget_say": budget_line(limits),
+        # DECIDE[freshness], both halves, so an agent that only ever runs
+        # `start` is told which checkout it is driving.
+        "node_commit": report["info"].get("node_commit"),
+        "agents_md_sha256": report["info"].get("agents_md_sha256"),
         "partner": partner[0] if partner else None,
         "partner_step": partner[1] if partner else None,
         "registered_now": registered_now,
@@ -1467,6 +1889,10 @@ def next_for(
             "job": job.id, "state": job.state, "needs": job.needs, "model": model,
             "attempts": len(db.list_attempts(conn, job_id)),
             "max_attempts": job.max_attempts, "waited_s": waited,
+            # How long this has been going on, from `--since` if the agent
+            # declared one and the lease if not, said which; and one line when
+            # it is past the budget. Never a refusal (DECIDE[agent-budget]).
+            "elapsed": spend_of(conn, job),
         }
         if step["do"] in ("done", "stop"):
             if step["do"] == "done":

@@ -72,11 +72,20 @@ page, one inherited by a critique child — sat at `needs-laptop` for hours on
 
 ### Before you start
 
-**Budget.** Your first command is `date -u +%FT%TZ`; keep it, Packet 8 takes it
-as `--since`. A sketch is a few minutes' work: read this file, plan, write under
-150 lines, check it, import. The executor prompt says "no second chance". That
-is written for local models, which get one reply per attempt. You have three
-attempts and a verdict takes seconds.
+**Budget.** Your first command is `date -u +%FT%TZ`; pass what it prints to
+`paid start --since`. Every `next` and `import` then says how long you have been
+at it, and `start` prints the budget you are holding yourself to — ten minutes
+and 30,000 generated tokens by default, advisory, never enforced. A sketch is a
+few minutes' work: read this file, plan, write under 150 lines, check it,
+import. The executor prompt says "no second chance". That is written for local
+models, which get one reply per attempt. You have three attempts and a verdict
+takes seconds.
+
+**Freshness.** `bin/sg paid preflight --as $ME` prints `node_commit`; if `git
+merge-base --is-ancestor <it> HEAD` fails in your checkout, pull before reading
+further — the node is ahead of the file you are reading, and its packets may
+carry fields nothing here mentions (2026-09-21: a session read this file at #131
+and answered packets cut under #132).
 
 **Looking.** `rig/README.md` is a browser rig for looking at a sketch on the
 laptop. It is a floor, not the gate. (Packet 7 replaces most of it with `paid
@@ -85,7 +94,7 @@ try`, which runs the real gate.)
 **One session, both steps.** `--executor` with your own id is accepted and runs
 as one session; you are not expected to hand off to yourself.
 
-### The three verbs
+### The verbs
 
 `bin/sg` runs one sketchgen command on the node over ssh. Every argument is
 quoted once, by it; a prompt with spaces or quotes needs nothing more. Stdin
@@ -93,13 +102,21 @@ and stdout pass through, so a packet travels with no scp.
 
 ```bash
 ME=claude-sonnet-5                                  # your own exact model id
+SINCE=$(date -u +%FT%TZ)                            # when your work began
 
-bin/sg paid start --as $ME --by profcarroll --prompt "a tide of slow lines"
+bin/sg paid start --as $ME --by profcarroll --since $SINCE \
+    --note "skill=algorithmic-art; local prototype" \
+    --prompt "a tide of slow lines"
 #   registers $ME (a name, not a key), runs the preflight, queues one job with
-#   you as planner and executor, and leases it to you. Prints `next: …`.
+#   you as planner and executor, and leases it to you. Prints `next: …`, the
+#   budget line, and the node's commit.
 #   NOT READY (exit 3): nothing was queued. Report the checks verbatim; stop.
 #   --planner / --executor: `local`, an Ollama tag, or another *registered*
 #   paid model (see "Two agents on one job" below). At least one step is yours.
+#   --since  what your first `date -u +%FT%TZ` printed. A stamp in the future,
+#            or more than a day old, is refused (exit 3) and nothing is queued.
+#   --note   what the node cannot see about how you are making this one — a
+#            skill, a local prototype. It goes on the entry page.
 
 bin/sg paid next --job N --as $ME > packet.json     # returns within 4 minutes
 #   one JSON object, with "do":
@@ -145,7 +162,9 @@ bin/sg paid import - < packet.json                  # JSON: recorded / rejected
 That is the whole loop: `start` once, then `next` → answer → `try` until the
 verdict is clean → `import`, until `next` says `done`. Nothing else is needed
 for your own job. A `try` is seconds of the node's time and is how you find
-out what the gate thinks; an attempt is one of three.
+out what the gate thinks; an attempt is one of three. `next` and `import` each
+print one `elapsed` line, and one more when the job is past the budget: that is
+a nudge to finish and say so, never a refusal.
 
 ### While you wait
 
@@ -212,7 +231,14 @@ driving it — never release one of those — and as `no agent` once nobody is.
   put them in the item's `usage` (`prompt_tokens`, `completion_tokens`); leave
   what you do not know `null`. Never estimate: a blank on the entry page is
   true, a guess is not. The node times the round trip itself.
-- **Change nothing in a packet but `answer`, `usage` and `model`.** `guard`,
+- **`process` is optional too, and it is the other cost.** An attempt item
+  carries a `process` slot for what the work *around* the reply cost you:
+  `session_s`, `output_tokens`, `thinking_tokens`, `tool_calls`, `screenshots`,
+  `effort`. Same rule as `usage` — leave out what your harness cannot tell you,
+  and never estimate. The node adds the tries it ran for you and shows the line
+  on the entry page as *as reported by the agent*; nothing in the A/B or any
+  judgment reads it. `rig/cost.py` prints the object to paste.
+- **Change nothing in a packet but `answer`, `usage`, `process` and `model`.** `guard`,
   `prompt_version` and `inputs` are how the node knows the answer is still
   about what it asked; a stale packet is refused — run `next` again.
 - **Rejected is safe.** An answer that does not parse writes nothing, uses no

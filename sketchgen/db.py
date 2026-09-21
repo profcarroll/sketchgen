@@ -210,6 +210,13 @@ class Job:
     # on; see sketchgen/lineage.py.
     critique: str | None = None
     critique_by: str | None = None
+    # Migration 015: what the node cannot see about how this job was made.
+    # `since_utc` is when the agent says its work began — declared, never
+    # inferred — and `note` is free text from `paid start --note` (a skill, a
+    # local prototype). Entry 1279, 2026-09-21, is the case: 37 minutes of
+    # work before the job existed, invisible to every column above.
+    since_utc: str | None = None
+    note: str | None = None
 
     @property
     def assertions(self) -> list[str]:
@@ -237,6 +244,11 @@ class Attempt:
     gate_report_path: str | None = None
     evidence: str | None = None
     statement: str | None = None
+    # Migration 015: what the agent reports of its own work around this reply
+    # — session seconds, tokens generated, tool calls, tries — as JSON. The
+    # columns above are the reply's cost, measured or reported; this is the
+    # process cost, and the two are never added together.
+    process_json: str | None = None
 
 
 @dataclass
@@ -412,6 +424,8 @@ _JOB_FIELDS = (
     "last_error",
     "critique",
     "critique_by",
+    "since_utc",
+    "note",
 )
 
 
@@ -619,6 +633,10 @@ _ENTRY_FIELDS = (
     # Migration 007: why a person rejected it, in a column of its own rather
     # than overloading the job's last_error, which belongs to the executor.
     "reject_reason",
+    # Migration 015: the job's note and the kept attempt's process cost,
+    # copied here by the worker so the entry page and meta.json read one row.
+    "note",
+    "process_json",
 )
 
 

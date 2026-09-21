@@ -104,6 +104,9 @@ SPEC_7_KEYS = {
     "publish_commit",
     "licence",
     "attribution",
+    # migration 015: the process cost the agent reported and the note it left
+    "process",
+    "note",
 }
 
 
@@ -4158,3 +4161,82 @@ class MicSketchTests(GalleryTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProcessCostTests(GalleryTestCase):
+    """Migration 015 on the page: what the agent said the work cost.
+
+    Entry 1279 (2026-09-21) shows a 111 s round trip and nothing about the 37
+    minutes before it. The row says both numbers are the agent's word, dashes
+    what it did not report, and sits after Wall seconds so a reader meets the
+    node's own measurements first.
+    """
+
+    PROCESS = {
+        "session_s": 2520, "output_tokens": 207537, "thinking_tokens": None,
+        "tool_calls": None, "screenshots": None, "effort": None, "tries": 4,
+    }
+    NOTE = "skill=algorithmic-art; local prototype"
+
+    def record(self, process=None, note=None):
+        # The columns the worker fills at _create_entry; written here directly
+        # because this test is about the page, not about how they got there.
+        self.conn.execute(
+            "UPDATE entries SET process_json = ?, note = ? WHERE id = ?",
+            (json.dumps(process) if process is not None else None, note, self.ids[0]),
+        )
+        self.render()
+        where = self.dest / "e" / str(self.ids[0])
+        return (where / "index.html").read_text(encoding="utf-8"), json.loads(
+            (where / "meta.json").read_text(encoding="utf-8")
+        )
+
+    def test_the_process_row_follows_wall_seconds_and_says_who_reported_it(self):
+        page, meta = self.record(self.PROCESS, self.NOTE)
+        self.assertIn('<th scope="row">Process</th>', page)
+        self.assertIn(
+            "42 min · 207,537 tokens generated · 4 tries · as reported by the agent",
+            html.unescape(page),
+        )
+        self.assertLess(page.index('>Wall seconds<'), page.index('>Process<'))
+        self.assertLess(page.index('>Process<'), page.index('>Node shape<'))
+        self.assertEqual(meta["process"], self.PROCESS)
+        self.assertEqual(meta["note"], self.NOTE)
+
+    def test_a_field_the_agent_left_out_is_a_dash_and_not_a_zero(self):
+        page, meta = self.record({"session_s": None, "output_tokens": None, "tries": 1})
+        self.assertIn("— min · — tokens generated · 1 try · as reported by the agent",
+                      html.unescape(page))
+        self.assertIsNone(meta["process"]["session_s"])
+        self.assertNotIn("0 tokens", html.unescape(page))
+
+    def test_the_effort_is_printed_when_the_harness_named_one(self):
+        page, _meta = self.record({"session_s": 600, "effort": "max"})
+        self.assertIn("10 min · — tokens generated · — tries · effort max · as "
+                      "reported by the agent", html.unescape(page))
+
+    def test_an_entry_nobody_reported_on_has_neither_row(self):
+        page, meta = self.record(None, None)
+        self.assertNotIn('<th scope="row">Process</th>', page)
+        self.assertNotIn('<th scope="row">Note</th>', page)
+        self.assertIsNone(meta["process"])
+        self.assertIsNone(meta["note"])
+        # and the rest of the table is where it was
+        self.assertIn('<th scope="row">Wall seconds</th>', page)
+
+    def test_the_note_stands_on_its_own_and_is_escaped(self):
+        page, meta = self.record(None, "skill=<b>algorithmic-art</b>")
+        self.assertIn('<th scope="row">Note</th>', page)
+        self.assertNotIn("<b>algorithmic-art</b>", page)
+        self.assertEqual(meta["note"], "skill=<b>algorithmic-art</b>")
+        self.assertLess(page.index('>Wall seconds<'), page.index('>Note<'))
+
+    def test_unreadable_json_is_no_row_rather_than_half_a_row(self):
+        self.conn.execute("UPDATE entries SET process_json = ? WHERE id = ?",
+                          ("{not json", self.ids[0]))
+        self.render()
+        where = self.dest / "e" / str(self.ids[0])
+        page = (where / "index.html").read_text(encoding="utf-8")
+        meta = json.loads((where / "meta.json").read_text(encoding="utf-8"))
+        self.assertNotIn('<th scope="row">Process</th>', page)
+        self.assertIsNone(meta["process"])
