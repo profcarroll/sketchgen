@@ -98,6 +98,14 @@ so the control row still holds only the three values migration 001 allows;
 `sketchgen/worker.py`'s docstring says why. A job paused mid-repair is re-queued
 rather than stranded, so `db status` after a pause shows it back under `queued`.
 
+**A pause asked for during idle work takes effect between its steps.** An idle
+round judges a pair and then critiques an entry, and either call can sit on the
+model host for as long as its timeout allows. Until 2026-09-21 the control row
+was read once per pass and not again, so a stop asked for in the middle of a
+round was not seen until the round had finished — and the round would start its
+next step first. The row is now read after the judge and after the critic, so
+the worker settles into `paused` there. Worst case is one step, not one round.
+
 ## Deploying a change
 
 The whole deploy is one script — pull, pause, re-install units, migrate,
@@ -133,10 +141,32 @@ systemctl --user restart sketchgen-web.service
 
 ## Watching one job
 
+**Stop the unit first.** `worker --once` is a second worker, and two workers
+against one database claim the same jobs and overwrite each other's
+transitions — the symptom is `IllegalTransition: <state> -> <state>` in the
+journal, and a job left in flight by whichever one lost. The fence refuses this
+since 2026-09-21, so the second worker now exits 3 with `another sketchgen
+worker is running` rather than racing; before that it ran, and on 2026-09-21 it
+did.
+
 ```
-python3 bin/sketchgen worker --once            # one job, then exit
-tail -f ~/sketchgen/jobs/<id>/job.log          # the same lines the unit logs
+systemctl --user stop sketchgen-worker.service   # or the timer
+python3 bin/sketchgen worker --once              # one job, then exit
+tail -f ~/sketchgen/jobs/<id>/job.log            # the same lines the unit logs
+systemctl --user start sketchgen-worker.service  # put it back
 ```
+
+Pausing is not a substitute: `control pause` stops the *worker* from claiming,
+and `worker --once` reads the same row, so a paused node makes the hand-run
+worker claim nothing either. Stopping the unit is the thing that frees the
+queue for one process.
+
+While a second worker is visible the sweep is held back too — a job in a
+running state then belongs to a process that is alive and coming back for it,
+and re-queueing it is how one worker takes a job out from under the other. That
+is why the refusal is worth reading rather than working around: `db status`
+showing jobs in flight while the fence refuses is the healthy shape of this,
+not a stuck queue.
 
 Each job has a directory under `$SKETCHGEN_JOBS` (default `~/sketchgen/jobs`):
 `job.log`, then `attempt-1/`, `attempt-2/` … holding the prompt, the raw response,
