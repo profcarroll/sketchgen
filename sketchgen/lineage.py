@@ -365,6 +365,24 @@ def spawn(
     )
 
 
+def parent_rules_file(conn: sqlite3.Connection, entry_row: Any) -> str | None:
+    """The rules file the parent's JOB named, not the one it resolved to.
+
+    ``entries.rules_file`` holds the resolved side of the A/B ('control' or
+    'treatment'); the job may have said 'random'. A line inherits the
+    *setting*, so a random line stays random and the coin is tossed again per
+    child (spec §9). Shared by the worker's idle critic and the paid one, so a
+    child is queued the same way whoever wrote the critique.
+    """
+    job_id = _get(entry_row, "job_id")
+    if job_id is None:
+        return None
+    row = conn.execute(
+        "SELECT rules_file FROM jobs WHERE id = ?", (int(job_id),)
+    ).fetchone()
+    return row["rules_file"] if row is not None else None
+
+
 def record_child(conn: sqlite3.Connection, child_entry_id: int, job: Any) -> int | None:
     """Copy a job's pending critique into `lineage`. Called by the worker.
 
