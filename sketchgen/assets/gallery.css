@@ -946,6 +946,12 @@ body.kiosk .facts {
 }
 body.kiosk .facts li b { color: var(--ink); font-weight: 500; }
 body.kiosk .facts li.gen b { color: var(--accent); }
+/* The ghost pointer's tag, in the colour swipe gives its touch facts: a
+ * viewer who walks past a sketch that is moving by itself should be able to
+ * tell that nobody is at the keyboard (docs/plans/auto-mouse.md §3.2). The
+ * caption is pointer-events: none above and stays that way; this is a word,
+ * not a control. */
+body.kiosk .facts li.ghost { color: var(--agent); }
 
 /* ---- side columns: code left, words right ---- */
 body.kiosk .column {

@@ -36,11 +36,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from sketchgen import lineage  # noqa: E402
+from sketchgen import ghostshim, lineage  # noqa: E402
 
 HARNESS = Path(__file__).resolve().parent / "js" / "run_in_place.js"
 KIOSK_HARNESS = Path(__file__).resolve().parent / "js" / "kiosk.js"
 SWIPE_HARNESS = Path(__file__).resolve().parent / "js" / "swipe.js"
+GHOST_HARNESS = Path(__file__).resolve().parent / "js" / "ghostshim.js"
 DOM = Path(__file__).resolve().parent / "js" / "dom.js"
 SCRIPT = Path(__file__).resolve().parent.parent / "sketchgen" / "assets" / "gallery.js"
 KIOSK_SCRIPT = Path(__file__).resolve().parent.parent / "sketchgen" / "assets" / "kiosk.js"
@@ -838,6 +839,77 @@ class KioskTests(unittest.TestCase):
         self.assertEqual(1, frame["framesAfterAdvance"])
         self.assertEqual("./e/22/sketch/", frame["srcAfterAdvance"])
 
+    # ---- the ghost pointer (docs/plans/auto-mouse.md §3.2) ---------------
+
+    def test_an_entry_that_responds_is_seated_with_the_ghost_parameter(self):
+        # The kiosk's whole part in this: one query string on one src. It
+        # cannot do more — the frame is an opaque origin, so nothing this page
+        # dispatches could ever reach inside it (kiosk.md §1.7, rewritten).
+        responds = self.report["ghost"]["responds"]
+        self.assertEqual(
+            "./e/11/sketch/?ghost=click,drag&ghost_loop=6000", responds["src"]
+        )
+        # And nothing else about the frame changed: still one, still sandboxed
+        # to scripts, still the four attributes kiosk.md §5 pins.
+        self.assertEqual(1, responds["frames"])
+        self.assertEqual("allow-scripts", responds["sandbox"])
+        self.assertEqual(["class", "sandbox", "src", "title"], responds["attributes"])
+
+    def test_audio_is_never_ghosted(self):
+        # The fixture entry responds to click, drag and audio. No synthetic
+        # event is a user gesture, so an AudioContext cannot be resumed by one
+        # and a sketch that only makes sound would be given a pointer that
+        # does nothing (DECIDE[ghost-who]).
+        self.assertNotIn("audio", self.report["ghost"]["responds"]["src"])
+
+    def test_an_entry_with_nothing_to_respond_to_is_seated_bare(self):
+        silent = self.report["ghost"]["silent"]
+        self.assertEqual("./e/22/sketch/", silent["src"])
+        self.assertIsNone(silent["caption"])
+
+    def test_the_caption_says_so_while_a_sketch_is_being_ghosted(self):
+        # A viewer who sees a sketch moving by itself is owed the two words.
+        self.assertEqual("ghost pointer", self.report["ghost"]["responds"]["caption"])
+
+    def test_m_turns_it_off_and_the_frame_is_re_seated_without_it(self):
+        off = self.report["ghost"]["off"]
+        self.assertEqual("./e/11/sketch/", off["src"])
+        self.assertIsNone(off["caption"])
+        self.assertEqual("off", off["state"])
+        self.assertEqual("", off["row"])
+        self.assertEqual(1, off["frames"], "still one frame, re-seated")
+        # It is a setting, in the one key this page may touch, beside every
+        # and order — so a projector comes back up the way it was left.
+        self.assertIs(False, off["stored"])
+        back = self.report["ghost"]["backOn"]
+        self.assertEqual("./e/11/sketch/?ghost=click,drag&ghost_loop=6000", back["src"])
+        self.assertEqual("on", back["state"])
+        self.assertIs(True, back["stored"])
+        self.assertEqual("./e/11/sketch/", self.report["ghost"]["fromStorage"])
+
+    def test_the_url_switch_turns_it_off_and_rides_in_the_launch_link(self):
+        # As ?views=0 does, and for the same reason: persist() rewrites the
+        # address bar from query(), so a parameter that is not in it is one
+        # the first acting key throws away.
+        off = self.report["ghost"]["urlOff"]
+        self.assertEqual("./e/11/sketch/", off["src"])
+        self.assertIsNone(off["caption"])
+        self.assertEqual("off", off["state"])
+        self.assertTrue(off["link"].endswith("&ghost=0"), off["link"])
+        self.assertTrue(off["bar"].endswith("&ghost=0"), off["bar"])
+
+    def test_the_gallery_switch_turns_it_off_with_no_deploy(self):
+        # One line in the gallery checkout's config.json and a render-index.
+        configOff = self.report["ghost"]["configOff"]
+        self.assertEqual("./e/11/sketch/", configOff["src"])
+        self.assertIsNone(configOff["caption"])
+
+    def test_the_gap_is_the_gallery_s_to_set(self):
+        self.assertEqual(
+            "./e/11/sketch/?ghost=click,drag&ghost_loop=20000",
+            self.report["ghost"]["loop"],
+        )
+
     def test_the_code_column_names_the_file_its_size_and_that_it_is_unedited(self):
         frame = self.report["frame"]
         self.assertEqual("e/33/sketch/sketch.js · 78 bytes, unedited", frame["codeHeading"])
@@ -895,6 +967,9 @@ class KioskTests(unittest.TestCase):
                 "order": "liked",
                 "size": "native",
                 "show": {"prompt": True, "code": True},
+                # Beside every and order, in the same key and nowhere else
+                # (auto-mouse.md §3.2). On unless somebody pressed M.
+                "ghost": True,
             },
             settings["stored"],
         )
@@ -1155,6 +1230,177 @@ def _without_comments(source: str) -> str:
     return re.sub(r"(?m)^\s*//.*$", "", source)
 
 
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+class GhostShimTests(unittest.TestCase):
+    """The ghost pointer, run for real (docs/plans/auto-mouse.md §3.4).
+
+    The script under test is ``ghostshim.script_js()`` itself, written to a
+    file and loaded into the stub DOM: the shim lives inside every published
+    ``sketch/index.html`` and nothing else in the suite runs it, so without
+    this it would only ever have been read as text. The expected coordinates
+    are recomputed here from ``ghostshim.BUILTINS``, which is the other end of
+    the one-definition rule — a built-in that moved in Python and not in the
+    rendered script fails here rather than on a projector.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory()
+        script = Path(cls.tmp.name) / "ghostshim.js"
+        script.write_text(ghostshim.script_js(), encoding="utf-8")
+        done = subprocess.run(
+            [shutil.which("node"), str(GHOST_HARNESS), str(DOM), str(script)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if done.returncode != 0:
+            raise AssertionError(done.stdout + done.stderr)
+        cls.report = json.loads(done.stdout.strip().splitlines()[-1])
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def expected(self, name):
+        """What ``BUILTINS[name]`` should come out as on the harness's canvas."""
+        rect = self.report["rect"]
+        out = []
+        for event in ghostshim.BUILTINS[name]:
+            x = rect["left"] + rect["width"] * event["x"]
+            y = rect["top"] + rect["height"] * event["y"]
+            if event["type"] == "move":
+                out.append(["mousemove", x, y, 0])
+            elif event["type"] == "down":
+                out.append(["mousedown", x, y, 1])
+            elif event["type"] == "up":
+                out.append(["mouseup", x, y, 0])
+            else:
+                # click is the three in order, because p5 sets mouseIsPressed
+                # from mousedown and calls mouseClicked from click, and a
+                # sketch may be reading either.
+                out.append(["mousedown", x, y, 1])
+                out.append(["mouseup", x, y, 0])
+                out.append(["click", x, y, 0])
+        return out
+
+    def assertPlayed(self, name):
+        played = self.report[name]
+        want = self.expected(name)
+        self.assertEqual([one[0] for one in want], [one[0] for one in played],
+                         "the kinds, in order")
+        for at, (mine, theirs) in enumerate(zip(want, played)):
+            with self.subTest(event=at):
+                # The rect is not at the origin and is not square, so a shim
+                # that forgot box.left or swapped the axes lands elsewhere.
+                self.assertAlmostEqual(mine[1], theirs[1], places=6)
+                self.assertAlmostEqual(mine[2], theirs[2], places=6)
+                # buttons is 1 while the button is down and 0 otherwise:
+                # p5 reads it through _setMouseButton.
+                self.assertEqual(mine[3], theirs[3])
+
+    def test_the_click_script_plays_where_the_built_in_says(self):
+        self.assertPlayed("click")
+
+    def test_the_drag_script_plays_where_the_built_in_says(self):
+        self.assertPlayed("drag")
+
+    def test_the_wander_script_plays_where_the_built_in_says(self):
+        self.assertPlayed("wander")
+
+    def test_every_event_is_synthetic_and_every_event_bubbles(self):
+        # The recorder listens on the document, not on the canvas: p5 attaches
+        # its handlers to window, so an event that did not bubble would be
+        # dispatched at a canvas nobody is listening to.
+        self.assertTrue(self.report["bubbled"])
+        # And isTrusted is false on all of them, which is why audio cannot be
+        # started this way and why the yield below cannot be self-inflicted.
+        self.assertEqual(0, self.report["trusted"])
+
+    def test_a_comma_list_is_played_one_after_another(self):
+        # What the kiosk seats for an entry that answers to both.
+        pair = self.report["pair"]
+        self.assertEqual(52, pair["count"])
+        self.assertEqual(ghostshim.BUILTINS["click"][0]["t"], pair["first"])
+        # The second script starts after the first has finished, gap included,
+        # and the whole thing is still inside the eight-second cap.
+        self.assertEqual(3320 + 600 + 2920, pair["last"])
+        self.assertLessEqual(pair["last"], ghostshim.MAX_MS)
+
+    def test_nothing_happens_without_the_parameter(self):
+        # The whole guarantee that the entry page, swipe and the operator's
+        # preview load the same bytes and are never ghosted.
+        inert = self.report["inert"]
+        self.assertEqual(0, inert["noParam"])
+        self.assertTrue(inert["noParamYield"], "it returned before the DOM")
+        self.assertEqual(0, inert["zero"], "?ghost=0 is inert")
+        self.assertTrue(inert["zeroYield"])
+        self.assertEqual(0, inert["unknownName"])
+        # A name it does not know is dropped and the rest is still played.
+        self.assertEqual(22, inert["unknownThenKnown"])
+        self.assertTrue(inert["knownYield"])
+
+    def test_a_hand_ends_the_run_and_a_ghost_does_not(self):
+        yields = self.report["yields"]
+        # isTrusted false is what its own events carry, so it must not stop on
+        # one: a run that stopped itself would stop after its first move.
+        self.assertTrue(yields["grewBeforeTheHand"])
+        # One trusted pointerdown, and it never plays again in this load —
+        # not for the rest of this run and not on any loop after it.
+        self.assertEqual(yields["atTheHand"], yields["afterTheHand"])
+
+    def test_it_plays_again_after_the_gap_and_not_before(self):
+        loops = self.report["loops"]
+        self.assertEqual(22, loops["once"])
+        self.assertEqual(22, loops["inTheGap"], "nothing during the gap")
+        self.assertEqual(44, loops["twice"])
+        self.assertEqual(66, loops["thrice"])
+
+    def test_the_gap_is_six_seconds_when_nobody_says_otherwise(self):
+        # kiosk.js carries the same default for a config.json that predates
+        # the field, and gallery.Config the same number again.
+        default = self.report["defaultLoop"]
+        self.assertEqual(6000, ghostshim.DEFAULT_LOOP_MS)
+        self.assertEqual(22, default["once"])
+        self.assertEqual(22, default["beforeSix"])
+        self.assertEqual(44, default["after"])
+
+    def test_an_inlined_script_beats_the_built_in_and_is_capped_the_same(self):
+        # Packet 14 writes window.__ghostScript; accepting it now costs
+        # nothing and means that packet changes no player.
+        rect = self.report["rect"]
+        self.assertEqual(
+            [
+                ["mousemove", rect["left"], rect["top"]],
+                ["mousedown", rect["right"], rect["bottom"]],
+                ["mouseup", rect["right"], rect["bottom"]],
+                ["click", rect["right"], rect["bottom"]],
+            ],
+            self.report["own"],
+        )
+
+    def test_a_handler_that_throws_is_a_debug_line_and_not_an_error(self):
+        # A sketch whose mousePressed throws is the sketch's problem. If the
+        # shim let it out as an error it would fail console_clean in the gate
+        # for a sketch that passed it before the ghost existed.
+        throwing = self.report["throwing"]
+        self.assertEqual(0, throwing["error"])
+        self.assertEqual(0, throwing["warn"])
+        self.assertEqual(0, throwing["log"])
+        self.assertEqual(4, throwing["debug"], "one per press that threw")
+        # And it kept playing: the three later presses still arrived.
+        self.assertEqual(4, throwing["kinds"].count("mousedown"))
+
+    def test_it_waits_for_a_canvas_and_gives_up_quietly(self):
+        # A preload() sketch has none until its assets arrive.
+        late = self.report["late"]
+        self.assertEqual(0, late["whileWaiting"])
+        self.assertEqual(22, late["afterItArrives"])
+        # And one that never arrives says so once, at debug, and stops.
+        self.assertEqual(0, late["neverEvents"])
+        self.assertEqual(["ghost pointer: no canvas after 10000 ms"],
+                         late["neverDebug"])
+        self.assertEqual(0, late["neverError"])
+
+
 class KioskScriptTextTests(unittest.TestCase):
     """What kiosk.js must not contain (spec §4.5). Read as text, no node."""
 
@@ -1218,9 +1464,13 @@ class KioskScriptTextTests(unittest.TestCase):
         for call in re.findall(r"fetch\(([^)]*)", self.code):
             self.assertNotIn("qr", call, call)
         self.assertNotIn("encodeURIComponent(entry.url", self.code)
-        # And it adds no parameter to anything: the only "?kiosk" in the
-        # gallery is in the payload the generator encoded.
+        # And it adds no parameter to a code: the only "?kiosk" in the
+        # gallery is in the payload the generator encoded. The frame's
+        # ?ghost= is the one parameter this file writes, and it goes on the
+        # sketch's src, never on a QR path or a fetch.
         self.assertNotIn("?kiosk", self.code)
+        for call in re.findall(r"fetch\(([^)]*)", self.code):
+            self.assertNotIn("ghost", call, call)
 
     def test_it_is_es5_like_the_rest_of_the_gallery(self):
         # No build step means the file is the file the browser gets.
