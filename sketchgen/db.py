@@ -104,7 +104,13 @@ TRANSITIONS: dict[str, frozenset[str]] = {
     "executing": frozenset({"gating", "repairing", "failed", "queued"}),
     "gating": frozenset({"held", "repairing", "failed", "queued"}),
     "repairing": frozenset({"executing", "needs-laptop", "failed", "queued"}),
-    "needs-laptop": frozenset({"planning", "executing", "repairing", "failed"}),
+    # needs-laptop -> queued is the laptop's way back in (`plan --job`): the
+    # laptop has done its half and the job belongs to the queue again, not to a
+    # running state with nobody in it. `claim_next` sends a job that now has a
+    # brief straight to `executing`, so the worker resumes it on its next pass
+    # instead of the sweep having to notice it half an hour later.
+    "needs-laptop": frozenset({"queued", "planning", "executing", "repairing",
+                               "failed"}),
     "held": frozenset({"published", "rejected"}),
     # terminal
     "published": frozenset(),
