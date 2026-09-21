@@ -227,6 +227,12 @@ driving it — never release one of those — and as `no agent` once nobody is.
   for. The gate is headless Chromium on the node and is not negotiable: on a
   failure, read the evidence at the end of the next prompt and fix what it
   names.
+- **Optionally, a fenced ```` ```ghost ```` block:** the pointer script the
+  kiosk and the gate play when nobody is at the keyboard, in canvas fractions
+  (`[{"t": 800, "type": "move", "x": 0.5, "y": 0.5}, …]`, types
+  `move`/`down`/`up`/`click`), at most 64 events over 8 s. Write the gestures
+  you tested. Without it the entry gets the built-in script for its
+  assertions. An invalid block is dropped and the reply still counts.
 - **`usage` is optional.** If you know the token counts of your own reply,
   put them in the item's `usage` (`prompt_tokens`, `completion_tokens`); leave
   what you do not know `null`. Never estimate: a blank on the entry page is

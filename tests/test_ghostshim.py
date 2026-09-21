@@ -110,6 +110,93 @@ class WithShimTests(unittest.TestCase):
                 self.assertGreater(body.index(call), returns)
 
 
+def inlined(page: str) -> str:
+    """The JSON out of the one line :func:`ghostshim.with_script` writes."""
+    line = [l for l in page.splitlines()
+            if l.startswith(ghostshim.SCRIPT_MARKER)][0]
+    return line[len(ghostshim.SCRIPT_MARKER):-len(";</script>")]
+
+
+class WithScriptTests(unittest.TestCase):
+    """The executor's own script, inlined above the player that reads it."""
+
+    EVENTS = [{"t": 100, "type": "move", "x": 0.5, "y": 0.5},
+              {"t": 400, "type": "click", "x": 0.25, "y": 0.75}]
+
+    def page(self):
+        return ghostshim.with_shim(executor.DEFAULT_INDEX_HTML)
+
+    def test_it_goes_immediately_before_the_marker(self):
+        # Before, because the player reads the global the moment ?ghost= sends
+        # it looking; a page whose own script came second would quietly play
+        # the built-in instead.
+        out = ghostshim.with_script(self.page(), self.EVENTS)
+        tag = ghostshim.SCRIPT_MARKER
+        self.assertLess(out.index('src="sketch.js"'), out.index(tag))
+        self.assertLess(out.index(tag), out.index(ghostshim.MARKER))
+        # immediately: nothing but the one line between them
+        between = out[out.index(tag):out.index(ghostshim.MARKER)]
+        self.assertEqual(1, between.count("\n"))
+        self.assertTrue(between.endswith("</script>\n"))
+
+    def test_the_events_are_there_as_the_shim_will_read_them(self):
+        out = ghostshim.with_script(self.page(), self.EVENTS)
+        data = inlined(out)
+        self.assertEqual(self.EVENTS, json.loads(data))
+
+    def test_a_page_that_has_a_script_is_left_alone(self):
+        # A render-all rewrites every published page; a second pass over one
+        # this wrote last time must be a no-op or 910 entries show up as a
+        # diff for nothing.
+        once = ghostshim.with_script(self.page(), self.EVENTS)
+        self.assertEqual(once, ghostshim.with_script(once, self.EVENTS))
+        # and a different script does not stack on top of the first
+        twice = ghostshim.with_script(once, [{"t": 0, "type": "down", "x": 0, "y": 0}])
+        self.assertEqual(once, twice)
+        self.assertEqual(1, once.count(ghostshim.SCRIPT_MARKER))
+
+    def test_a_page_with_no_shim_is_untouched(self):
+        # No marker means no player: a page with no sketch.js tag never got
+        # one, and a global nothing reads is litter in somebody's file.
+        for page in ("<!DOCTYPE html>\n<html><body></body></html>\n",
+                     executor.DEFAULT_INDEX_HTML,
+                     '<html><body><script src="other.js"></script></body></html>'):
+            with self.subTest(page=page[:40]):
+                self.assertEqual(page, ghostshim.with_script(page, self.EVENTS))
+
+    def test_a_closing_tag_cannot_escape_the_script_element(self):
+        # The HTML parser ends a <script> at the first "</script", whatever
+        # the JavaScript around it meant. validate_ghost cannot pass a string
+        # like this through — every value is a number or one of four words —
+        # but the inliner is handed a list, not a promise.
+        out = ghostshim.with_script(
+            self.page(), [{"t": 0, "type": "</script><b>", "x": 0, "y": 0}])
+        line = [l for l in out.splitlines()
+                if l.startswith(ghostshim.SCRIPT_MARKER)][0]
+        self.assertNotIn("</script><b>", line)
+        self.assertIn("<\\/script>", line)
+        self.assertTrue(line.rstrip().endswith("</script>"))
+        self.assertEqual(1, line.count("</script>"))
+
+    def test_the_page_it_writes_is_byte_stable(self):
+        page = self.page()
+        self.assertEqual(ghostshim.with_script(page, self.EVENTS),
+                         ghostshim.with_script(page, self.EVENTS))
+
+    def test_the_global_it_writes_is_the_one_the_shim_reads(self):
+        # One name, spelled once. A typo in either half would be a page whose
+        # own script is silently ignored, which looks exactly like a working
+        # page.
+        self.assertIn("if (%s) {" % ghostshim.GLOBAL, ghostshim.SHIM)
+        self.assertIn("clean(%s)" % ghostshim.GLOBAL, ghostshim.script_js())
+        self.assertTrue(ghostshim.SCRIPT_MARKER.startswith(ghostshim.MARKER[:12]))
+        # The assignment, not the name: the shim itself mentions the name, so
+        # a page with the shim and no script of its own must not read as one
+        # that already has one.
+        self.assertNotIn(ghostshim.SCRIPT_MARKER, ghostshim.SHIM)
+        self.assertIn(ghostshim.GLOBAL, ghostshim.SHIM)
+
+
 class BuiltinTests(unittest.TestCase):
     """The three default scripts (DECIDE[ghost-script])."""
 

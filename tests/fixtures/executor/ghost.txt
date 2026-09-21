@@ -1,0 +1,72 @@
+```js
+// A jigsaw: one image cut into nine, dragged back into place. Nothing moves
+// on its own, so the only thing worth watching is somebody solving it.
+
+let pieces = [];
+let held = null;
+
+function setup() {
+  createCanvas(800, 600);
+  noStroke();
+  for (let i = 0; i < 9; i++) {
+    pieces.push({
+      x: 60 + (i % 3) * 230,
+      y: 40 + floor(i / 3) * 180,
+      w: 200,
+      h: 150,
+      hue: 20 + i * 24
+    });
+  }
+  noLoop();
+}
+
+function draw() {
+  background(12, 14, 20);
+  for (const p of pieces) {
+    fill(p.hue, 150, 90);
+    rect(p.x, p.y, p.w, p.h, 6);
+  }
+}
+
+function mousePressed() {
+  for (let i = pieces.length - 1; i >= 0; i--) {
+    const p = pieces[i];
+    if (mouseX > p.x && mouseX < p.x + p.w && mouseY > p.y && mouseY < p.y + p.h) {
+      held = p;
+      break;
+    }
+  }
+  redraw();
+}
+
+function mouseDragged() {
+  if (held) {
+    held.x += movedX;
+    held.y += movedY;
+    redraw();
+  }
+}
+
+function mouseReleased() {
+  held = null;
+  redraw();
+}
+```
+
+```ghost
+[
+  {"t": 1200, "type": "move", "x": 0.2, "y": 0.25},
+  {"t": 400, "type": "move", "x": 0.5, "y": 0.5},
+  {"t": 1400, "type": "down", "x": 0.2, "y": 0.25},
+  {"t": 1900, "type": "move", "x": 0.55, "y": 0.6},
+  {"t": 2100, "type": "up", "x": 0.55, "y": 0.6},
+  {"t": 2800, "type": "click", "x": 0.8, "y": 0.75}
+]
+```
+
+## Statement
+
+Nine rectangles that hold still until a hand arrives, then go wherever it puts
+them. I wrote the pointer script from the two gestures I actually tested: pick
+up the top-left piece, carry it to the middle, let go, and tap the one in the
+corner to show that a click alone does nothing but choose.

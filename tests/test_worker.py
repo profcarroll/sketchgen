@@ -1938,6 +1938,91 @@ class TestEvidence(unittest.TestCase):
         self.assertIn("no such directory", text)
 
 
+class TestGhostEvidence(WorkerTestCase):
+    """A dropped ghost block gets one sentence, and changes nothing else.
+
+    auto-mouse.md §4.1. An invalid block is not a failed sketch, so this is
+    the only trace it leaves: the next attempt is the author's one chance to
+    write the script again, and a block that vanished without a word would be
+    rewritten identically.
+    """
+
+    def with_ghost(self, ghost):
+        """A stub executor that leaves the ``result.json`` a real run leaves.
+
+        The seam on purpose: ``ghost_rejection`` reads the attempt directory,
+        because every path that makes an attempt writes that file there — the
+        local executor, the paid replay and this.
+        """
+        inner = StubExecutor()
+
+        def run(**kwargs):
+            execution = inner(**kwargs)
+            (Path(kwargs["out_dir"]) / "result.json").write_text(
+                json.dumps({"ok": True, "ghost": ghost}), encoding="utf-8")
+            return execution
+
+        return run
+
+    def evidence(self, ghost, verdicts=(1, 0)):
+        job_id = self.enqueue()
+        run = self.make_worker(executor_fn=self.with_ghost(ghost),
+                               gate_fn=StubGate(list(verdicts)))
+        self.assertEqual(0, run.run_once())
+        return job_id, db.list_attempts(self.conn, job_id)
+
+    def test_the_line_is_under_the_gate_s_own_evidence(self):
+        job_id, rows = self.evidence({"rejected": "event 2: x is 1.4, outside [0, 1]"})
+        first = rows[0].evidence
+        self.assertIn(
+            "ghost script dropped: event 2: x is 1.4, outside [0, 1] (a fenced "
+            "block tagged ghost, at most 64 events over 8 s, keys t/type/x/y)",
+            first,
+        )
+        # Under: the gate is what the model reads first, and this is a note.
+        self.assertLess(first.index("gate exit 1"), first.index("ghost script"))
+        self.assertEqual([first.splitlines()[-1]],
+                         [l for l in first.splitlines() if "ghost script" in l])
+
+    def test_the_caps_in_the_sentence_are_the_shim_s_own(self):
+        from sketchgen import ghostshim
+        _, rows = self.evidence({"rejected": "not a JSON list"})
+        self.assertIn("at most %d events over %d s" % (ghostshim.MAX_EVENTS,
+                                                       ghostshim.MAX_MS // 1000),
+                      rows[0].evidence)
+
+    def test_it_changes_neither_the_exit_nor_where_the_job_goes(self):
+        job_id, rows = self.evidence({"rejected": "not a JSON list"})
+        job = db.get_job(self.conn, job_id)
+        self.assertEqual("held", job.state)
+        self.assertEqual([1, 0], [row.gate_exit for row in rows])
+        # jobs.last_error and the summary line are the gate's, as ever
+        self.assertTrue(rows[0].evidence.startswith("gate exit 1:"))
+
+    def test_a_script_that_was_accepted_says_nothing(self):
+        _, rows = self.evidence({"events": 12})
+        self.assertNotIn("ghost script", rows[0].evidence)
+
+    def test_an_attempt_with_no_ghost_block_says_nothing(self):
+        _, rows = self.evidence(None)
+        self.assertNotIn("ghost script", rows[0].evidence)
+
+    def test_a_passing_gate_writes_no_evidence_at_all(self):
+        _, rows = self.evidence({"rejected": "not a JSON list"}, verdicts=(0,))
+        self.assertIsNone(rows[0].evidence)
+
+    def test_an_unreadable_result_json_is_not_an_error(self):
+        # The reader is a sentence's worth of nicety; it never fails a job.
+        self.assertIsNone(worker.ghost_rejection(None))
+        self.assertIsNone(worker.ghost_rejection(self.jobs / "no-such-dir"))
+        broken = self.jobs / "broken"
+        broken.mkdir(parents=True)
+        (broken / "result.json").write_text("{ not json", encoding="utf-8")
+        self.assertIsNone(worker.ghost_rejection(broken))
+        (broken / "result.json").write_text('{"ghost": "a string"}', encoding="utf-8")
+        self.assertIsNone(worker.ghost_rejection(broken))
+
+
 if __name__ == "__main__":
     unittest.main()
 
