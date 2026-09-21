@@ -4171,3 +4171,56 @@ class TestPlannerMenuWithNoModelHost(PlannerMenuTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProcessCostTests(unittest.TestCase):
+    """The operator's job page says what the agent reported (migration 015).
+
+    Its own database, because the page is read here rather than over the
+    server and nothing else in this file should see these rows.
+    """
+
+    PROCESS = {"session_s": 2520, "output_tokens": 207537, "thinking_tokens": 42000,
+               "tool_calls": 41, "screenshots": 9, "effort": "max", "tries": 4}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="sketchgen-process-")
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.db_path = root / "sketchgen.db"
+        self.jobs_dir = root / "jobs"
+        self.jobs_dir.mkdir()
+        db.init(self.db_path)
+        self.conn = db.connect(self.db_path)
+        self.addCleanup(self.conn.close)
+        self.app = web.App(db_path=str(self.db_path), jobs_dir=str(self.jobs_dir))
+
+    def page(self, process=None, note=None, since=None):
+        job_id = db.enqueue(self.conn, "a tide of slow lines", "profcarroll",
+                            executor="claude-sonnet-5", since_utc=since, note=note)
+        db.transition(self.conn, job_id, "executing")
+        db.transition(self.conn, job_id, "gating")
+        db.add_attempt(self.conn, job_id, 1, model="claude-sonnet-5",
+                       prompt_tokens=2100, completion_tokens=3300, wall_s=111.0,
+                       gate_exit=0,
+                       process_json=json.dumps(process) if process else None)
+        db.transition(self.conn, job_id, "held")
+        return web.job_page(self.app, self.conn, db.get_job(self.conn, job_id))
+
+    def test_the_attempt_carries_what_the_agent_said_it_cost(self):
+        page = self.page(self.PROCESS, note="skill=algorithmic-art",
+                         since="2026-09-21T13:20:00Z")
+        self.assertIn("2100 in / 3300 out", page)
+        self.assertIn("process: 42m 00s session · 207,537 generated · 42,000 thinking "
+                      "· 41 tool calls · 9 screenshots · 4 tries · effort max "
+                      "(as reported by the agent)", page)
+        self.assertIn("2026-09-21T13:20:00Z", page)
+        self.assertIn("skill=algorithmic-art", page)
+
+    def test_a_local_attempt_says_nothing_about_a_process(self):
+        page = self.page()
+        self.assertNotIn("as reported by the agent", page)
+        self.assertIn("since (UTC, declared)", page)
+        self.assertEqual(web.process_line(db.Attempt(id=1, job_id=1, n=1)), "")
+        self.assertEqual(
+            web.process_line(db.Attempt(id=1, job_id=1, n=1, process_json="{oops")), "")
