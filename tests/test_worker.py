@@ -1940,3 +1940,57 @@ class TestEvidence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPaidLease(IdleTestCase):
+    """A live paid lease (db.paid_leases) means an agent is driving a job:
+    the worker takes that job first and does no idle work meanwhile."""
+
+    def parked(self, model="claude-sonnet-5"):
+        job_id = self.enqueue("a paid plan", planner=model)
+        db.transition(self.conn, job_id, "needs-laptop", needs="plan")
+        self.states.clear()
+        return job_id
+
+    def test_idle_work_stands_by_while_a_lease_is_live_and_resumes_after(self):
+        self.publish(prompt="a field of dots")
+        self.publish(prompt="a second field")
+        job_id = self.parked()
+        db.lease_paid(self.conn, job_id, "claude-sonnet-5", 20)
+        judge_fn = StubJudge(judged=1)
+        critic_fn = StubCritic()
+        run = self.make_worker(judge_fn=judge_fn, critic_fn=critic_fn,
+                               idle_judge=1, idle_critique=1)
+        self.assertEqual(0, run.run_once())
+        self.assertEqual(([], []), (judge_fn.calls, critic_fn.calls))
+        self.assertIn("standing by", run._idle_note)
+        self.assertEqual([], self.child_jobs())
+        # the lease ran out: the agent is gone, and the night goes on
+        db.lease_paid(self.conn, job_id, "claude-sonnet-5", -1)
+        self.assertEqual({}, db.paid_leases(self.conn))
+        self.assertEqual(0, run.run_once())
+        self.assertEqual(1, len(judge_fn.calls))
+        self.assertEqual(1, len(critic_fn.calls))
+
+    def test_a_lease_on_a_finished_job_means_nothing(self):
+        self.publish(prompt="a field of dots")
+        job_id = self.parked()
+        db.lease_paid(self.conn, job_id, "claude-sonnet-5", 20)
+        db.transition(self.conn, job_id, "failed", last_error="cancelled by operator")
+        judge_fn = StubJudge(judged=1)
+        run = self.make_worker(judge_fn=judge_fn, critic_fn=StubCritic(),
+                               idle_judge=1, idle_critique=0)
+        run.run_once()
+        self.assertEqual(1, len(judge_fn.calls))
+
+    def test_a_leased_job_is_claimed_ahead_of_older_queued_work(self):
+        older = self.enqueue("an idle-spawned child", planner="stub")
+        # no brief: the worker would plan it, and its planner is paid
+        mine = db.enqueue(self.conn, "the agent's job", "octocat",
+                          planner="claude-sonnet-5")
+        db.set_paid_models(self.conn, ["claude-sonnet-5"])
+        db.lease_paid(self.conn, mine, "claude-sonnet-5", 20)
+        run = self.make_worker()
+        self.assertEqual(0, run.run_once())
+        self.assertEqual("needs-laptop", db.get_job(self.conn, mine).state)
+        self.assertEqual("queued", db.get_job(self.conn, older).state)

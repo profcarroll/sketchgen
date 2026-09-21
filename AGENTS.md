@@ -28,6 +28,9 @@ SG="$HOME/sketchgen/.venv/bin/python3 $HOME/sketchgen/app/bin/sketchgen"
 $SG <command> --db ~/sketchgen/sketchgen.db
 ```
 
+From the laptop, `bin/sg <command>` runs exactly that over ssh, with every
+argument quoted once for you and stdin/stdout passed through.
+
 ## Rules that are not negotiable
 
 1. **Never run a second worker.** No `worker --once`, no `worker` of any kind,
@@ -35,7 +38,7 @@ $SG <command> --db ~/sketchgen/sketchgen.db
    fence refuses it (exit 3), but a stray one before that wedged two
    `llama-server`s at 800 % CPU for half an hour. Nothing you need requires a
    worker: the daemon claims queued jobs every ~30 s. **If you are waiting for
-   the node, wait** — poll, don't act.
+   the node, wait** — `paid next` is how; poll, don't act.
 2. **No paid credential ever goes on the node** (DECIDE[credential-model] branch
    B). Paid models are reached only through `sketchgen paid` — see below.
 3. **Never move a job into a running state by hand** (`planning`, `executing`,
@@ -48,7 +51,7 @@ $SG <command> --db ~/sketchgen/sketchgen.db
    write. `gh auth status` before a push that 403s. Branch, PR, never commit to
    `main`, never merge without being asked.
 
-## Driving a step with a paid model (you, if you are one)
+## Driving a job with a paid model (you, if you are one)
 
 Any of the four steps — `plan`, `execute`, `judge`, `critique` — can be
 answered by a model that is not on the node. The node writes what it would have
@@ -61,51 +64,63 @@ path uses, and gates the sketch itself. Reference: `docs/OPERATIONS.md` →
 packet's `model` to your own exact model id — it becomes the entry's public
 provenance; never write a model you are not.
 
-### The stop rule
+**A paid job is made only from this CLI, by the agent that will answer it.**
+There is no paid choice on the New job page, and `paid assign` refuses a paid
+planner or executor. Two jobs made without an agent attached — one from the
+page, one inherited by a critique child — sat at `needs-laptop` for hours on
+2026-09-21, and that is why.
 
-**Run `preflight` first. If it says NOT READY, fix only the checks marked
-`fix (you)`, run it again, and if anything is still failing, report the failing
-checks to the operator — verbatim — and stop.** Do not investigate the node,
-read unit files, restart services, resume the generator, or work around a
-failed check. The same applies at every step below: when a verb exits 3 or
-says `stop`, report what it printed and stop. Every verb here tells you what to
-do next; if you find yourself guessing, that is a missing verb — say so.
+### The three verbs
 
-### The recipe (from the laptop)
+`bin/sg` runs one sketchgen command on the node over ssh. Every argument is
+quoted once, by it; a prompt with spaces or quotes needs nothing more. Stdin
+and stdout pass through, so a packet travels with no scp.
 
 ```bash
-# every sketchgen command runs on the node; the packet travels over ssh stdio
-sg() { ssh sld-cloud "~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen $* --db ~/sketchgen/sketchgen.db"; }
 ME=claude-sonnet-5                                  # your own exact model id
 
-sg paid preflight --as $ME                          # READY, or the stop rule
-# (the only fix that is yours: `sg paid models add $ME` — a name, not a key)
+bin/sg paid start --as $ME --by profcarroll --prompt "a tide of slow lines"
+#   registers $ME (a name, not a key), runs the preflight, queues one job with
+#   you as planner and executor, and leases it to you. Prints `next: …`.
+#   NOT READY (exit 3): nothing was queued. Report the checks verbatim; stop.
 
-sg enqueue --prompt "'a tide of slow lines'" --by profcarroll \
-           --planner $ME --executor $ME --json      # → {"job": N, …}
-# the prompt crosses ssh, so it is quoted twice
+bin/sg paid next --job N --as $ME > packet.json     # returns within 4 minutes
+#   one JSON object, with "do":
+#     answer  the object IS the packet. Write your reply into items[0].answer,
+#             then:  bin/sg paid import - < packet.json
+#     wait    the worker has it; "worker" says what it is doing and "say" says
+#             where your job is. Not an error. Run the same command again.
+#     done    held (report the entry id; a person publishes it), or failed
+#             (report last_error). You are finished.
+#     stop    exit 3: a person is needed, the generator is paused, or another
+#             agent holds the job. Report "say" verbatim; stop.
 
-sg paid wait --job N                                # blocks; prints `next:`
-sg paid export --step plan --job N --as $ME --out - > plan.json
-#   write your plan into items[0].answer (see "Answers" below)
-sg paid import - < plan.json                        # JSON: recorded / rejected
-
-sg paid wait --job N                                # → next: export --step execute
-sg paid export --step execute --job N --as $ME --out - > sketch.json
-#   write your sketch into items[0].answer
-sg paid import - < sketch.json
-
-sg paid wait --job N
-# held            → done: a person publishes it. Report the entry id.
-# next: execute   → the gate failed; the new export carries its evidence in the
-#                   prompt. Answer again. Attempts count up to max_attempts (3).
-# failed          → done: report last_error.
+bin/sg paid import - < packet.json                  # JSON: recorded / rejected
+#   then `next` again. The gate runs on the node; a failed gate comes back as
+#   the next attempt, with the evidence in the prompt. Attempts count up to
+#   max_attempts (3).
 ```
 
-`wait` only reads; it is how you wait. It returns when the job needs you, is
-finished, or cannot move (the generator paused, or a person is needed) — and
-exits 3 in the last case: report and stop. It gives up after 30 minutes (exit
-1); run it again once, then report.
+That is the whole loop: `start` once, then `next` → answer → `import` until
+`next` says `done`. Nothing else is needed for your own job.
+
+### While you wait
+
+`next` returns `wait` when the worker is busy — on your job (planning takes
+under a minute, an attempt with the gate a few), or on the one job it had
+already claimed when you started (up to ten minutes when a local planner times
+out). Your lease means the worker takes your job before anything else queued
+and starts no idle work (no judge, no critique, no spawned child) while you
+are driving; every `next` and `import` renews it, and it lapses twenty minutes
+after your last one. **If `next` says `wait`, run `next` again.** Do not read
+the node's logs, list its processes, or start anything to hurry it.
+
+### Leaving
+
+If you cannot finish — out of budget, told to stop — hand the job back so this
+node's models finish it: `bin/sg paid release --job N --by $ME --reason "…"`.
+A job left parked with nobody coming is the one thing the preflight reports
+as `parked: … no agent`; the same `release` clears it.
 
 ### Answers
 
@@ -120,20 +135,29 @@ exits 3 in the last case: report and stop. It gives up after 30 minutes (exit
   names.
 - **Change nothing in a packet but `answer` and `model`.** `guard`,
   `prompt_version` and `inputs` are how the node knows the answer is still
-  about what it asked; a stale packet is refused — export again.
+  about what it asked; a stale packet is refused — run `next` again.
 - **Rejected is safe.** An answer that does not parse writes nothing, uses no
   attempt, and comes back verbatim in `import`'s output. Fix it, import again.
+
+### The stop rule
+
+Every verb here tells you what to do next. **When one exits 3 or says `stop`,
+report what it printed — verbatim — and stop.** Do not investigate the node,
+read unit files, restart services, resume the generator, or work around it.
+If you find yourself guessing, that is a missing verb — say so.
 
 ### Other steps and settings
 
 - **Judge / critique** items name images by their path on the node:
   `scp sld-cloud:<path> .` and look before answering — the local critic refuses
-  to work blind, and so should you. Export them without `--job`; a critique
-  packet claims its entries until imported (`sg paid release --step critique
-  --all` to give them back).
-- `paid assign` sets a model for every job that names none. Prefer
-  `enqueue --planner/--executor`, which touches only your job. If you did
-  assign, unset it: `sg paid assign --plan local --execute local`.
+  to work blind, and so should you. `bin/sg paid export --step judge --as $ME
+  --out -` (no `--job`); a critique packet claims its entries until imported
+  (`bin/sg paid release --step critique --all` to give them back).
+- `paid assign` sets a *local* model for `plan`/`execute` defaults and may set
+  a paid one for `judge`/`critique`, which makes the idle loop leave that step
+  for `paid export`. Never needed for your own job.
+- `paid preflight --as $ME` is what `start` runs; run it alone to see the
+  node's state (worker step, leases, parked jobs) without queuing anything.
 - Everything you make is badged **off-node**, and a paid executor is a second
   variable in the rules-file A/B the gallery measures: keep a paid run as its
   own batch and say so.

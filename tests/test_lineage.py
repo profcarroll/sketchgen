@@ -759,3 +759,46 @@ class TestCli(LineageTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PaidParentTests(unittest.TestCase):
+    """A child never inherits a paid model (2026-09-21, job 1252)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="sketchgen-lineage-paid-")
+        self.addCleanup(self._tmp.cleanup)
+        path = str(Path(self._tmp.name) / "s.db")
+        db.init(path)
+        self.conn = db.connect(path)
+        self.addCleanup(self.conn.close)
+        db.set_paid_models(self.conn, ["claude-sonnet-5"])
+        job_id = db.enqueue(self.conn, "a field of compass needles", "octocat",
+                            planner="claude-sonnet-5", executor="claude-sonnet-5",
+                            rules_file="treatment", brief="b",
+                            assertions=["motion(idle)"])
+        for state in ("executing", "gating", "held", "published"):
+            db.transition(self.conn, job_id, state)
+        self.parent = db.create_entry(
+            self.conn, job_id, state="published", prompt="a field of compass needles",
+            brief="b", statement="s", submitted_by="octocat", rules_file="treatment",
+            assertions_json=json.dumps(["motion(idle)"]),
+            planner="claude-sonnet-5", executor="claude-sonnet-5",
+        )
+
+    def test_the_idle_critics_child_is_made_on_this_node(self):
+        child = lineage.spawn(
+            self.conn, parent_entry_id=self.parent, critique="slow it down",
+            critique_by="gemma4:e4b", submitted_by="octocat",
+        )
+        job = db.get_job(self.conn, child)
+        self.assertIsNone(job.planner)
+        self.assertIsNone(job.executor)
+        self.assertEqual("treatment", job.rules_file)  # the A/B variable is kept
+
+    def test_a_paid_model_named_on_purpose_is_still_taken(self):
+        child = lineage.spawn(
+            self.conn, parent_entry_id=self.parent, critique="slow it down",
+            critique_by="claude-sonnet-5", submitted_by="octocat",
+            planner="claude-sonnet-5",
+        )
+        self.assertEqual("claude-sonnet-5", db.get_job(self.conn, child).planner)

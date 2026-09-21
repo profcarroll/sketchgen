@@ -12,7 +12,7 @@ import os
 import re
 import sqlite3
 from dataclasses import dataclass, fields as dataclass_fields
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -259,9 +259,12 @@ def _row_to(cls: type, row: sqlite3.Row | None):
 # ---------------------------------------------------------------------------
 
 
+UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
 def utc_now() -> str:
     """Now, UTC, ISO 8601 with a Z. The only clock this module reads."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(timezone.utc).strftime(UTC_FORMAT)
 
 
 def connect(path: str | os.PathLike[str] = DEFAULT_DB_PATH) -> sqlite3.Connection:
@@ -498,19 +501,39 @@ def requeue(conn: sqlite3.Connection, job_id: int, reason: str | None = None) ->
     return transition(conn, job_id, "queued", last_error=reason, needs=None)
 
 
-def claim_next(conn: sqlite3.Connection) -> Job | None:
+def claim_next(
+    conn: sqlite3.Connection, prefer: Iterable[int] | None = None
+) -> Job | None:
     """Claim the oldest queued job, or return None if there is none.
 
     Moves it to ``planning`` when it has no brief yet and ``executing`` when it
     does. The select and the update run in one IMMEDIATE transaction, so two
     workers cannot claim the same job.
+
+    ``prefer`` names jobs to take ahead of the rest, oldest first within each
+    group. The worker passes the jobs under a live paid lease
+    (:func:`paid_leases`): an agent is sitting at the other end of one of
+    those, waiting on every round trip, while the rest of the queue is
+    nobody's afternoon. On 2026-09-21 a Sonnet 5 session queued job 1246
+    behind an idle-spawned job whose planner timed out twice, and gave up
+    before its own job was ever claimed.
     """
+    wanted = sorted({int(j) for j in (prefer or ())})
     conn.execute("BEGIN IMMEDIATE")
     try:
-        row = conn.execute(
-            "SELECT id, brief FROM jobs WHERE state = 'queued' "
-            "ORDER BY created_utc, id LIMIT 1"
-        ).fetchone()
+        if wanted:
+            marks = ",".join("?" for _ in wanted)
+            row = conn.execute(
+                f"SELECT id, brief FROM jobs WHERE state = 'queued' "
+                f"ORDER BY CASE WHEN id IN ({marks}) THEN 0 ELSE 1 END, "
+                f"created_utc, id LIMIT 1",
+                wanted,
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT id, brief FROM jobs WHERE state = 'queued' "
+                "ORDER BY created_utc, id LIMIT 1"
+            ).fetchone()
         if row is None:
             conn.execute("COMMIT")
             return None
@@ -1362,6 +1385,109 @@ def release_paid(
         del claims[subject]
     _write_paid_claims(conn, step, claims)
     return released
+
+
+# ---------------------------------------------------------------------------
+# Paid leases — "an agent is driving this job right now"
+# ---------------------------------------------------------------------------
+
+PAID_LEASES_KEY = "paid_leases"
+
+#: Job states a lease can still mean something in. Anything else is finished,
+#: and a lease on it is pruned the next time the list is read or written.
+LEASABLE = frozenset({"queued", "planning", "executing", "gating", "repairing",
+                      "needs-laptop"})
+
+
+def paid_leases(conn: sqlite3.Connection, now: str | None = None) -> dict[int, dict[str, str]]:
+    """``{job id: {"model", "since_utc", "until_utc"}}`` — the live leases.
+
+    A lease says an agent with a paid model is *present* and driving that job:
+    it will answer the next parked step and wait for the gate. The worker
+    reads this to claim a leased job ahead of the queue and to do no idle work
+    while one is live (:meth:`sketchgen.worker.Worker._idle_round`), which is
+    what makes a paid round trip cost one worker pass rather than one worker
+    pass plus a judge, a critique and the child the critique spawns.
+
+    It expires (``until_utc``), so an agent that leaves without a word
+    (2026-09-21: the session driving job 1246 was killed mid-wait) holds the
+    idle loop up for minutes, not forever. Renewed by every paid verb the
+    agent runs on the job. No migration: a `meta` row of JSON, like
+    :func:`paid_claims`.
+    """
+    raw = get_meta(conn, PAID_LEASES_KEY)
+    try:
+        found = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    if not isinstance(found, dict):
+        return {}
+    stamp = now or utc_now()
+    live: dict[int, dict[str, str]] = {}
+    for key, value in found.items():
+        try:
+            job_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(value, dict):
+            continue
+        if str(value.get("until_utc") or "") <= stamp:
+            continue
+        # A job the operator cancelled, or the gate failed, while an agent held
+        # it: the lease outlives nothing. Checked on read, because the
+        # transition that finished the job did not know about the lease.
+        row = conn.execute("SELECT state FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None or row["state"] not in LEASABLE:
+            continue
+        live[job_id] = {k: str(v) for k, v in value.items()}
+    return live
+
+
+def _write_paid_leases(conn: sqlite3.Connection, leases: dict[int, dict[str, str]]) -> None:
+    # Prune what no longer means anything: a lease on a finished job would
+    # otherwise keep the idle loop standing by for a job that is not coming.
+    kept: dict[int, dict[str, str]] = {}
+    for job_id, lease in leases.items():
+        row = conn.execute("SELECT state FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is not None and row["state"] in LEASABLE:
+            kept[job_id] = lease
+    set_meta(
+        conn,
+        PAID_LEASES_KEY,
+        json.dumps({str(k): v for k, v in sorted(kept.items())}, sort_keys=True)
+        if kept else None,
+    )
+
+
+def lease_paid(
+    conn: sqlite3.Connection, job_id: int, model: str, minutes: float
+) -> dict[str, str]:
+    """Take or renew ``model``'s lease on ``job_id`` for ``minutes`` from now.
+
+    ``since_utc`` is kept from the first lease so a reader can see how long an
+    agent has been at it. Returns the lease written.
+    """
+    leases = paid_leases(conn)
+    now = datetime.now(timezone.utc)
+    until = (now + timedelta(minutes=float(minutes))).strftime(UTC_FORMAT)
+    previous = leases.get(int(job_id)) or {}
+    lease = {
+        "model": str(model),
+        "since_utc": previous.get("since_utc") or now.strftime(UTC_FORMAT),
+        "until_utc": until,
+    }
+    leases[int(job_id)] = lease
+    _write_paid_leases(conn, leases)
+    return lease
+
+
+def release_lease(conn: sqlite3.Connection, job_id: int) -> bool:
+    """Drop the lease on ``job_id``. True if there was one."""
+    leases = paid_leases(conn)
+    had = int(job_id) in leases
+    leases.pop(int(job_id), None)
+    _write_paid_leases(conn, leases)
+    return had
 
 
 # ---------------------------------------------------------------------------

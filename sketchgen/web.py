@@ -2256,22 +2256,21 @@ PAID = "paid"
 #: between a form field and a column the worker will hand to a model host.
 MODEL_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,110}$")
 
-PAID_CHOICE = (PAID, "paid — the laptop claims it (needs-laptop)")
 
+def paid_choices(*, sentinel: bool = False) -> tuple[tuple[str, str], ...]:
+    """What the menus offer off the node besides Ollama's proxied tags: nothing.
 
-def paid_choices(*, sentinel: bool) -> tuple[tuple[str, str], ...]:
-    """The paid models a menu offers, each saying where its answer comes from.
-
-    Names from :func:`sketchgen.models.paid_models` — configured, never asked:
-    the node has no credential to ask with (docs/plans/agentic-cli.md §3.7).
-    ``sentinel`` adds the bare word ``paid`` for the menus that have always had
-    it; a named model is better, because it is what the entry will record.
+    Until 2026-09-21 this listed ``paid`` and every registered paid model id,
+    so an operator could queue a job for the laptop from this page. Two jobs
+    queued that way that day (one from here, one inherited by a critique
+    child) parked at ``needs-laptop`` with no agent at the other end, and the
+    console counted them as broken for hours. A paid job only makes sense
+    with an agent present for it, and the agent is at a shell, not at this
+    page: `sketchgen paid start` is the one way such a job is made, and it
+    leases the job to the agent that made it. This page offers what this node
+    runs. ``sentinel`` is kept for callers and means nothing.
     """
-    named = tuple(
-        (name, f"{name} — paid, answered off this node (needs-laptop)")
-        for name in models.paid_models()
-    )
-    return ((PAID_CHOICE,) if sentinel else ()) + named
+    return ()
 
 
 class ModelMenu(NamedTuple):
@@ -2403,7 +2402,7 @@ def menu_selected(menu: ModelMenu, value: str, host: str | None = None) -> str:
     offered = [
         option for _, options in menu_groups(menu, host) for option, _ in options
     ]
-    resolved = PAID if value == PAID else menu_column(menu, value)
+    resolved = menu_column(menu, value)
     for candidate in (resolved, value):
         if candidate in offered:
             return candidate
@@ -2440,11 +2439,11 @@ def check_menu(menu: ModelMenu, value: str, host: str | None = None) -> str:
 
 
 def menu_column(menu: ModelMenu, value: str) -> str:
-    """The form value as the ``jobs`` column wants it: ``paid``, or the model
-    tag itself. ``local`` is resolved here and nowhere else."""
-    if value == PAID and PAID in dict(menu.off_node()):
-        return PAID
-    if value in ("", LOCAL):
+    """The form value as the ``jobs`` column wants it: the model tag itself.
+    ``local`` is resolved here and nowhere else. ``paid`` — a saved default or
+    a bookmark from before 2026-09-21 — is the worker's default now: this page
+    no longer makes paid jobs (see :func:`paid_choices`)."""
+    if value in ("", LOCAL, PAID):
         return menu.default()
     return value
 
@@ -2670,8 +2669,10 @@ def _model_word(value: str | None) -> str:
     ``local``.
     """
     text = (value or "").strip()
-    if text == PAID:
-        return PAID
+    if text == PAID or models.is_paid(text):
+        # A parent made off the node: its child is made here, as spawn() does
+        # it since 2026-09-21, so the picker preselects the worker's default.
+        return LOCAL
     return text or LOCAL
 
 

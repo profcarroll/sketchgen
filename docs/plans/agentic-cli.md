@@ -291,3 +291,30 @@ The order is 1 → 2 → 3 → (0) → 4 → 5. Packet 0 can be written at any t
 - **Automating the laptop leg from the node.** The node could hold a queue and an agent could poll
   it, and the moment that exists somebody will run it with a key on the node. Branch B is a rule
   about where credentials live, and convenience is how it erodes.
+
+## 9. Addendum, 2026-09-21: the harness, second pass
+
+Two runs by a Sonnet 5 session after packets 1–5 and #130 landed, and what each
+one taught:
+
+- **A blocking `wait` is the wrong shape for an agent.** Its tool call times out
+  at ten minutes; the job was queued behind an idle-spawned child whose local
+  planner timed out twice. `paid next` replaces it: returns within 240 s with
+  the packet, or `wait` and the worker's current step, or `done`/`stop`.
+- **The worker did not know an agent was waiting.** It ran the judge, the critic
+  and the critic's child between the agent's import and its own claim. A *lease*
+  (db.paid_leases) — taken by `start`, renewed by every verb on the job, expiring
+  on its own — makes the worker claim the leased job first and do no idle work
+  while it is live.
+- **A paid job with no agent attached is an orphan.** The page offered `paid` and
+  registered ids; `lineage.spawn` inherited a paid parent's models into the
+  idle critic's child (job 1252). Both are closed: the page lists what the node
+  runs, `assign` refuses a paid plan/execute default, `spawn` blanks a paid
+  model, and `paid start` — one verb, from the CLI, by the agent that answers —
+  is the only way a paid job is made. `paid release --job N` hands an orphan
+  back to the local path.
+- **Quoting through ssh is a trap.** `bin/sg` quotes each argument once with
+  `printf %q`; stdin and stdout pass through.
+
+§3.8 stands: the laptop leg is an agent at a shell. What changed is that the
+node now has a way to know the agent is there.
