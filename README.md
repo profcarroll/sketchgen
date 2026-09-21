@@ -233,7 +233,8 @@ python3 bin/sketchgen worker --once
 ```
 
 `worker --once` reads the control row, fences the inference slot (`pgrep -af
-opencode`; a model left resident by `KEEP_ALIVE` is not contention), claims the
+opencode`, and any other `bin/sketchgen worker` — a model left resident by
+`KEEP_ALIVE` is not contention, but a second worker is), claims the
 oldest queued job, plans it if it arrived without a brief, then executes and gates
 it up to `max_attempts` times, feeding the gate's evidence back into the next
 attempt. Every step is stamped in UTC on stderr and in `<jobs>/<id>/job.log`, and

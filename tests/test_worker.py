@@ -222,6 +222,12 @@ class StubCritic:
 FREE_SLOT = {"processes": [], "models": [], "ollama_error": None}
 BUSY_SLOT = {"processes": ["4242 node /home/ubuntu/.local/bin/opencode"],
              "models": ["qwen3-coder:30b-a3b-q4_K_M"], "ollama_error": None}
+SECOND_WORKER = {
+    "processes": [],
+    "workers": ["3077718 /home/ubuntu/sketchgen/.venv/bin/python3 "
+                "/home/ubuntu/sketchgen/app/bin/sketchgen worker --once"],
+    "models": [], "ollama_error": None,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +417,83 @@ class TestFence(WorkerTestCase):
         result = worker.fence(lambda: probe)
         self.assertTrue(result.ok)
         self.assertEqual(BUSY_SLOT["processes"], result.observed)
+
+    def test_a_second_worker_is_refused(self):
+        result = worker.fence(lambda: dict(SECOND_WORKER))
+        self.assertFalse(result.ok)
+        self.assertIn("another sketchgen worker is running", result.reason)
+        self.assertEqual(SECOND_WORKER["workers"], result.workers)
+
+    def test_a_second_worker_is_refused_even_in_test_mode(self):
+        """The one refusal `observing_probe` must not soften.
+
+        A stubbed run calls no model, so it cannot contend for inference — but
+        it still claims jobs, which is the whole of what a second worker gets
+        wrong. On 2026-09-21 that race wrote `IllegalTransition: failed ->
+        gating` into the journal.
+        """
+        probe = dict(SECOND_WORKER, observed_processes=BUSY_SLOT["processes"])
+        self.assertFalse(worker.fence(lambda: probe).ok)
+
+    def test_a_second_worker_outranks_a_busy_slot_in_the_reason(self):
+        probe = dict(SECOND_WORKER, processes=BUSY_SLOT["processes"])
+        self.assertIn("another sketchgen worker", worker.fence(lambda: probe).reason)
+
+    def test_observing_probe_softens_opencode_and_not_another_worker(self):
+        seen = dict(SECOND_WORKER, processes=BUSY_SLOT["processes"])
+        with mock.patch.object(worker, "default_probe", lambda host: dict(seen)):
+            got = worker.observing_probe()()
+        self.assertEqual([], got["processes"])
+        self.assertEqual(BUSY_SLOT["processes"], got["observed_processes"])
+        self.assertEqual(SECOND_WORKER["workers"], got["workers"])
+
+    def test_a_run_beside_another_worker_refuses_and_touches_nothing(self):
+        job_id = self.enqueue()
+        log = io.StringIO()
+        run = self.make_worker(probe=lambda: dict(SECOND_WORKER), log_stream=log)
+        self.assertEqual(3, run.run_once())
+
+        self.assertEqual("queued", db.get_job(self.conn, job_id).state)
+        self.assertEqual([], self.attempts(job_id))
+        self.assertIn("another sketchgen worker is running", log.getvalue())
+
+    def test_both_documented_invocations_read_as_a_worker(self):
+        systemd = ["/home/ubuntu/sketchgen/.venv/bin/python3",
+                   "/home/ubuntu/sketchgen/app/bin/sketchgen", "worker"]
+        by_hand = ["python3", "bin/sketchgen", "worker", "--once",
+                   "--db", "/home/ubuntu/sketchgen/sketchgen.db"]
+        self.assertTrue(worker.is_worker_argv(systemd))
+        self.assertTrue(worker.is_worker_argv(by_hand))
+
+    def test_a_shell_that_merely_talks_about_the_worker_is_not_one(self):
+        """Why this reads argv and not `pgrep -f`.
+
+        `pgrep -f` matches its pattern anywhere in the command line, so every
+        one of these would have refused the daemon for as long as it ran.
+        """
+        for argv in (
+            ["/bin/bash", "-c", "python3 bin/sketchgen worker --once"],
+            ["grep", "bin/sketchgen worker", "/home/ubuntu/sketchgen/jobs/1/job.log"],
+            ["pgrep", "-af", "bin/sketchgen worker"],
+            ["systemctl", "--user", "restart", "sketchgen-worker.service"],
+            ["journalctl", "--user", "-u", "sketchgen-worker", "-n", "50"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertFalse(worker.is_worker_argv(argv))
+
+    def test_the_other_subcommands_are_not_the_worker(self):
+        for sub in ("web", "console", "db", "control", "gallery", "billing"):
+            with self.subTest(sub=sub):
+                self.assertFalse(
+                    worker.is_worker_argv(["python3", "bin/sketchgen", sub])
+                )
+
+    def test_the_scan_does_not_count_this_process(self):
+        """The daemon must never fence itself out."""
+        self.assertEqual([], [
+            line for line in worker.worker_processes()
+            if line.startswith(f"{os.getpid()} ")
+        ])
 
 
 class TestControlPaused(WorkerTestCase):
@@ -981,6 +1064,99 @@ class TestIdleRound(IdleTestCase):
         self.assertEqual([], critic_fn.calls)
 
 
+class TestIdlePause(IdleTestCase):
+    """A pause asked for *during* idle work is taken between its steps.
+
+    Regression for 2026-09-21: the control row was read once per pass and not
+    again, so a stop that arrived while the judge sat on the model host was
+    invisible until the whole round was over — and the round started a fresh
+    critique first. On the node the stop was asked for at 02:30:56 and a new
+    critique began at 02:33:46, after the judge's ten-minute timeout.
+    """
+
+    def stopping_judge(self, reason):
+        """A judge that asks for the pause while it is running, as the operator does."""
+
+        class StopsMidJudge(StubJudge):
+            def __call__(inner, conn, **kwargs):
+                db.set_control(conn, "pausing", reason)
+                return StubJudge.__call__(inner, conn, **kwargs)
+
+        return StopsMidJudge(judged=1)
+
+    def test_a_stop_during_the_judge_is_taken_before_the_critic(self):
+        self.publish()
+        self.publish(prompt="a second field")
+        critic_fn = StubCritic()
+        log = io.StringIO()
+        run = self.make_worker(judge_fn=self.stopping_judge("stop"),
+                               critic_fn=critic_fn, idle_judge=1,
+                               idle_critique=1, log_stream=log)
+        self.assertEqual(0, run.run_once())
+
+        self.assertEqual([], critic_fn.calls)
+        self.assertEqual([], self.critiques())
+        self.assertNotIn("critiquing", self.steps())
+        self.assertEqual("paused", db.get_control(self.conn).state)
+        self.assertIn("the judge has finished", log.getvalue())
+        self.assertIn("now paused", log.getvalue())
+
+    def test_a_plain_pause_during_the_judge_is_taken_too(self):
+        """Idle work holds no attempt, so both flavours settle at once."""
+        self.publish()
+        critic_fn = StubCritic()
+        run = self.make_worker(
+            judge_fn=self.stopping_judge("someone else wants the slot"),
+            critic_fn=critic_fn, idle_judge=1, idle_critique=1)
+        self.assertEqual(0, run.run_once())
+
+        self.assertEqual([], critic_fn.calls)
+        self.assertEqual("paused", db.get_control(self.conn).state)
+
+    def test_a_stop_during_the_critic_ends_the_round_after_it(self):
+        """The critique it was in the middle of is kept — it is finished work."""
+        _, entry_id = self.publish()
+
+        class StopsMidCritique(StubCritic):
+            def __call__(inner, conn, eid, **kwargs):
+                db.set_control(conn, "pausing", "stop")
+                return StubCritic.__call__(inner, conn, eid, **kwargs)
+
+        run = self.make_worker(critic_fn=StopsMidCritique(), idle_critique=1)
+        self.assertEqual(0, run.run_once())
+
+        rows = self.critiques()
+        self.assertEqual(1, len(rows))
+        self.assertEqual(entry_id, rows[0]["entry_id"])
+        self.assertEqual("paused", db.get_control(self.conn).state)
+
+    def test_a_round_nobody_interrupts_still_judges_and_critiques(self):
+        """The check costs the round nothing when no pause was asked for."""
+        _, entry_id = self.publish()
+        self.publish(prompt="a second field")
+        critic_fn = StubCritic()
+        run = self.make_worker(judge_fn=StubJudge(judged=1), critic_fn=critic_fn,
+                               idle_judge=1, idle_critique=1)
+        self.assertEqual(0, run.run_once())
+
+        self.assertEqual([entry_id], critic_fn.calls)
+        self.assertEqual("running", db.get_control(self.conn).state)
+
+    def test_the_pause_still_holds_on_the_next_pass(self):
+        """The round settles the row, so the pass after it claims nothing."""
+        self.publish()
+        run = self.make_worker(judge_fn=self.stopping_judge("stop"),
+                               critic_fn=StubCritic(), idle_judge=1, idle_critique=1)
+        # an empty queue, so the pass reaches the idle round and pauses inside it
+        self.assertEqual(0, run.run_once())
+        self.assertEqual("paused", db.get_control(self.conn).state)
+
+        job_id = self.enqueue()  # work arriving after the pause waits for a resume
+        self.assertEqual(0, run.run_once())
+        self.assertEqual("queued", db.get_job(self.conn, job_id).state)
+        self.assertEqual([], self.attempts(job_id))
+
+
 class TestIdleCritiqueRejected(IdleTestCase):
     def test_an_invalid_critique_is_kept_and_spawns_nothing(self):
         _, entry_id = self.publish()
@@ -1320,6 +1496,24 @@ class TestSweep(WorkerTestCase):
         self.age(job_id, minutes)
         self.states.clear()
         return job_id
+
+    def test_a_live_second_worker_stops_the_sweep(self):
+        """Its jobs in flight are its own, not a dead worker's leavings.
+
+        The sweep runs ahead of the fence's refusal on purpose, so that a node
+        fenced by an `opencode` session still tidies up. A second *worker* is
+        the one refusal where that is wrong.
+        """
+        job_id = self.stuck("executing", minutes=90)
+        run = self.make_worker(probe=lambda: dict(SECOND_WORKER))
+        self.assertEqual(3, run.run_once())
+        self.assertEqual("executing", db.get_job(self.conn, job_id).state)
+
+    def test_a_busy_slot_still_sweeps(self):
+        job_id = self.stuck("executing", minutes=90)
+        run = self.make_worker(probe=lambda: dict(BUSY_SLOT))
+        self.assertEqual(3, run.run_once())
+        self.assertEqual("queued", db.get_job(self.conn, job_id).state)
 
     def test_a_job_left_in_planning_is_requeued(self):
         job_id = self.stuck("planning", minutes=90)
