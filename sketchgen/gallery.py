@@ -62,6 +62,7 @@ from string import Template
 from typing import Any, Iterable
 
 from . import pairs as pairs_mod
+from . import executor
 from . import lineage
 from . import models
 from . import qr
@@ -126,6 +127,9 @@ META_KEYS = (
     "executor_prompt_version",
     "rules_file",
     "assertions",
+    # auto-mouse.md §4.2: the pointer script this entry's page carries, and
+    # who wrote it — the executor, or the built-in its assertions chose.
+    "ghost",
     "gate",
     "attempts",
     "prompt_tokens",
@@ -814,6 +818,68 @@ def _canvas_size(row: sqlite3.Row, attempts: list[sqlite3.Row]) -> list[int] | N
     return [int(match.group(1)), int(match.group(2))]
 
 
+#: The name of ``ghost.json`` in an attempt directory and in the published
+#: entry both: ``executor.run`` writes it beside ``sketch.js`` and this copies
+#: it beside the page, so a reader who wants to know what the pointer did can
+#: fetch the same file the page is playing.
+GHOST_JSON = "ghost.json"
+
+
+def _ghost_events(source: Path | None) -> tuple[list[dict] | None, str | None]:
+    """The executor's own pointer script from the attempt directory.
+
+    Validated on the way in, through the same :func:`executor.validate_ghost`
+    that accepted it, and for the same reason :func:`_canvas_size` reads the
+    source rather than a column: the file on disk is the authority and a
+    person may have edited it. A render must not be the thing that breaks over
+    a hand edit, so a file that no longer validates is skipped exactly as an
+    absent one is, with its reason carried into ``meta.json``.
+    """
+    if source is None:
+        return None, None
+    path = source / GHOST_JSON
+    if not path.is_file():
+        return None, None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:  # pragma: no cover - unreadable ghost.json
+        return None, f"{GHOST_JSON} could not be read: {exc}"
+    return executor.validate_ghost(text)
+
+
+def _default_ghost(responds: list[str]) -> tuple[str, int]:
+    """The built-in script an entry with none of its own gets, and its length.
+
+    ``DECIDE[ghost-who]``: what the gate confirmed is what the kiosk plays.
+    ``click`` and ``drag`` are the two the gate can prove, both where both
+    hold — the shim plays a comma list one after another — and everything
+    else gets ``wander``, which presses nothing. Never ``responds(audio)``: a
+    synthetic event is not a user gesture and cannot resume an AudioContext,
+    so a ghost would only look like a sketch that ignores the microphone.
+    """
+    names = [name for name in ("click", "drag") if name in responds] or ["wander"]
+    return ",".join(names), sum(len(ghostshim.BUILTINS[name]) for name in names)
+
+
+def _ghost_meta(row: Any, source: Path | None, assertions: list[str]) -> dict[str, Any]:
+    """``meta.json``'s ``ghost``: which pointer plays this entry, and whose it is.
+
+    ``by`` is the provenance question the gallery always asks — who *made*
+    this — and the answer is either the model that wrote the sketch or this
+    module choosing a default from the gate's own verdict. A script that was
+    there and did not validate says so beside the default that replaced it, so
+    that a reader who wrote one and cannot see it is not left guessing.
+    """
+    events, why = _ghost_events(source)
+    if events is not None:
+        return {"events": len(events), "by": "executor"}
+    script, count = _default_ghost(_confirmed_responds(row, assertions))
+    out: dict[str, Any] = {"events": count, "by": "default", "script": script}
+    if why is not None:
+        out["rejected"] = why
+    return out
+
+
 # ---------------------------------------------------------------------------
 # HTML helpers
 # ---------------------------------------------------------------------------
@@ -1346,6 +1412,7 @@ def _meta(
         "executor_prompt_version": row["executor_prompt_version"],
         "rules_file": row["rules_file"],
         "assertions": _assertions(row),
+        "ghost": _ghost_meta(row, source, _assertions(row)),
         "gate": _gate_log(attempts),
         "attempts": int(row["attempts"] or len(attempts)),
         "prompt_tokens": row["prompt_tokens"],
@@ -2290,16 +2357,26 @@ def _write_entry(
         index_html = source / "index.html"
         if sketch_js.is_file() and index_html.is_file():
             written.copy(sketch_js, out / "sketch" / "sketch.js")
-            # Verbatim, with two exceptions, and they are the only two. A
+            # Verbatim, with three exceptions, and they are the only three. A
             # page that loads p5.sound gets the shim that lets it start
             # inside a sandboxed frame on WebKit (soundshim.py); every page
             # gets the ghost pointer, which is inert without ?ghost= in the
             # URL and is how the kiosk moves a sketch that waits to be
             # touched (ghostshim.py). Entries published before either existed
-            # pick them up here, on the next render-all; apart from those two
+            # pick them up here, on the next render-all; apart from those
             # scripts this is the bytes the gate ran.
             page = index_html.read_text(encoding="utf-8")
             shimmed = ghostshim.with_shim(soundshim.with_shim(page))
+            # The third, on the few entries that have one (Packet 14): the
+            # pointer script this executor wrote for this sketch, inlined
+            # above the player that reads it, and the file itself beside the
+            # page so a reader can see what the pointer was asked to do
+            # (auto-mouse.md §4.2). An entry with none gets the built-in its
+            # confirmed assertions name, which needs nothing on the page.
+            events, _ = _ghost_events(source)
+            if events is not None:
+                shimmed = ghostshim.with_script(shimmed, events)
+                written.copy(source / GHOST_JSON, out / GHOST_JSON)
             if shimmed == page:
                 written.copy(index_html, out / "sketch" / "index.html")
             else:
@@ -2764,6 +2841,21 @@ def _responds(assertions: Iterable[str]) -> list[str]:
     return out
 
 
+def _confirmed_responds(row: Any, assertions: Iterable[str]) -> list[str]:
+    """:func:`_responds` over what the gate actually confirmed.
+
+    ``assertions`` is what the planner asked for; ``offplan_json`` is what the
+    kept attempt missed and the gate published anyway. The three readers of
+    this — the swipe caption, the kiosk's manifest and the ghost script
+    :func:`_meta` names — all act on it, and doing any of it to a sketch the
+    gate proved does not respond is the one case the subtraction exists to
+    prevent. One function since Packet 14, because there are now three of them
+    and they must not drift.
+    """
+    missed = set(_offplan(row))
+    return _responds(a for a in assertions if a not in missed)
+
+
 def _manifest_base(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
@@ -2789,13 +2881,12 @@ def _manifest_base(
     """
     attempts = _attempt_rows(conn, int(row["job_id"]))
     meta = _meta(conn, row, attempts, config, parent, children)
-    missed = set(_offplan(row))
     return {
         "entry_id": int(row["id"]),
         "meta": meta,
         "canvas": _canvas_size(row, attempts),
         "mic": _needs_mic(_source_dir(row, attempts)),
-        "responds": _responds(a for a in meta["assertions"] if a not in missed),
+        "responds": _confirmed_responds(row, meta["assertions"]),
     }
 
 

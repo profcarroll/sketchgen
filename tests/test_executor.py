@@ -224,6 +224,185 @@ class TestSwappedOrder(ExecutorTestCase):
         self.assertEqual(statement, SWAPPED_STATEMENT + "\n")
 
 
+class TestGhostBlock(ExecutorTestCase):
+    """The optional pointer script (auto-mouse.md §4.1, DECIDE[ghost-dataset]).
+
+    The thing to keep true here is that it is optional in both directions: a
+    reply that carries one is the same reply plus a file, and a reply whose
+    block is nonsense is still the reply. An attempt is one of three and the
+    sketch is what it is for.
+    """
+
+    def test_the_sketch_is_the_same_sketch_and_the_script_is_beside_it(self):
+        result = self.replay("ghost.txt")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.blocks, ["js", "ghost", "statement"])
+        self.assertEqual(result.ghost, {"events": 6})
+        self.assertIn("ghost.json", self.written())
+        self.assertIn("ghost.json", result.files)
+        js = (self.out / "sketch.js").read_text(encoding="utf-8")
+        self.assertTrue(js.startswith("// A jigsaw"))
+        self.assertEqual(result.index_source, "default")
+
+    def test_the_script_is_written_sorted_by_t(self):
+        # The shim schedules one setTimeout per event, so a list that runs
+        # backwards plays backwards and nothing says so. This fixture's
+        # second event is its earliest, on purpose.
+        self.replay("ghost.txt")
+        text = (self.out / "ghost.json").read_text(encoding="utf-8")
+        events = json.loads(text)
+        self.assertEqual([400, 1200, 1400, 1900, 2100, 2800],
+                         [e["t"] for e in events])
+        self.assertEqual({"t", "type", "x", "y"}, set(events[0]))
+        self.assertTrue(text.endswith("\n"))
+        self.assertEqual(json.dumps(events, indent=2, sort_keys=True) + "\n", text)
+
+    def test_result_json_says_how_many_events_it_kept(self):
+        self.replay("ghost.txt")
+        record = json.loads((self.out / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["ghost"], {"events": 6})
+        self.assertEqual(record["extra_blocks"]["ghost"], 0)
+
+    def test_an_invalid_script_is_dropped_and_the_reply_still_stands(self):
+        # The whole of DECIDE[ghost-dataset]'s "optionally": rejecting a
+        # sketch over an extra it did not have to write would spend one of
+        # three attempts for nothing, and there is a built-in script waiting.
+        result = self.replay("ghost-invalid.txt")
+        self.assertTrue(result.ok)
+        self.assertIsNone(result.error)
+        self.assertEqual(result.ghost, {"rejected": "event 2: x is 1.4, outside [0, 1]"})
+        self.assertFalse((self.out / "ghost.json").exists())
+        self.assertTrue((self.out / "sketch.js").is_file())
+        record = json.loads((self.out / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["ghost"]["rejected"],
+                         "event 2: x is 1.4, outside [0, 1]")
+
+    def test_a_second_script_is_counted_and_the_first_is_the_one(self):
+        result = self.replay("ghost-twice.txt")
+        self.assertTrue(result.ok)
+        self.assertEqual(result.extra_blocks["ghost"], 1)
+        self.assertEqual(result.ghost, {"events": 2})
+        events = json.loads((self.out / "ghost.json").read_text(encoding="utf-8"))
+        self.assertEqual([0.25, 0.25], [events[0]["x"], events[1]["x"]])
+
+    def test_a_reply_with_no_ghost_block_says_so_in_result_json(self):
+        result = self.replay("clean.txt")
+        self.assertIsNone(result.ghost)
+        self.assertEqual(result.extra_blocks["ghost"], 0)
+        self.assertFalse((self.out / "ghost.json").exists())
+
+    def test_a_ghost_block_with_no_js_block_is_rejected_as_it_always_was(self):
+        # The ghost is an extra on an answer, never the answer.
+        bad = self.out / "ghost-only.txt"
+        bad.write_text(
+            "```ghost\n"
+            '[{"t": 100, "type": "move", "x": 0.5, "y": 0.5}]\n'
+            "```\n",
+            encoding="utf-8",
+        )
+        result = executor.run(
+            brief="a test brief", assertions=["motion(idle)"],
+            rules_file="treatment", out_dir=self.out, stub=bad,
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("no fenced js block", result.error)
+        self.assertFalse((self.out / "ghost.json").exists())
+        self.assertIsNone(result.ghost)
+
+
+class TestValidateGhost(unittest.TestCase):
+    """One reason per refusal, written for the model that wrote the block."""
+
+    GOOD = '[{"t": 100, "type": "move", "x": 0.5, "y": 0.25}]'
+
+    def test_a_good_script_comes_back_as_events(self):
+        events, why = executor.validate_ghost(self.GOOD)
+        self.assertIsNone(why)
+        self.assertEqual([{"t": 100, "type": "move", "x": 0.5, "y": 0.25}], events)
+
+    def test_every_type_the_shim_knows_is_accepted(self):
+        for kind in ghostshim.TYPES:
+            with self.subTest(type=kind):
+                events, why = executor.validate_ghost(
+                    '[{"t": 0, "type": "%s", "x": 0, "y": 1}]' % kind)
+                self.assertIsNone(why)
+                self.assertEqual(kind, events[0]["type"])
+
+    def test_the_edges_of_the_ranges_are_inside_them(self):
+        events, why = executor.validate_ghost(
+            '[{"t": %d, "type": "up", "x": 1, "y": 0}]' % ghostshim.MAX_MS)
+        self.assertIsNone(why)
+        self.assertEqual(ghostshim.MAX_MS, events[0]["t"])
+
+    def test_the_caps_are_the_shim_s_own_and_a_long_script_says_both_numbers(self):
+        one = '{"t": 1, "type": "move", "x": 0, "y": 0}'
+        at_cap = "[%s]" % ",".join([one] * ghostshim.MAX_EVENTS)
+        self.assertIsNone(executor.validate_ghost(at_cap)[1])
+        over = "[%s]" % ",".join([one] * (ghostshim.MAX_EVENTS + 7))
+        self.assertEqual(
+            "%d events, more than %d" % (ghostshim.MAX_EVENTS + 7, ghostshim.MAX_EVENTS),
+            executor.validate_ghost(over)[1],
+        )
+
+    def test_the_reasons(self):
+        for text, reason in (
+            ("not json at all", "not a JSON list"),
+            ('{"t": 1}', "not a JSON list"),
+            ("[]", "an empty list, so there is nothing to play"),
+            ("[42]", "event 1: not an object"),
+            ('[{"t": 1, "type": "move", "x": 0}]',
+             "event 1: its keys are t, type, x, not t/type/x/y"),
+            ('[{"t": 1, "type": "move", "x": 0, "y": 0, "button": 1}]',
+             "event 1: its keys are button, t, type, x, y, not t/type/x/y"),
+            ('[{"t": "soon", "type": "move", "x": 0, "y": 0}]',
+             'event 1: t is "soon", not a number'),
+            ('[{"t": -1, "type": "move", "x": 0, "y": 0}]',
+             "event 1: t is -1, outside [0, 8000] ms"),
+            ('[{"t": 12000, "type": "move", "x": 0, "y": 0}]',
+             "event 1: t is 12000, outside [0, 8000] ms"),
+            ('[{"t": 1, "type": "hover", "x": 0, "y": 0}]',
+             'event 1: type is "hover", not one of move/down/up/click'),
+            ('[{"t": 1, "type": "move", "x": 0, "y": 0}, '
+             '{"t": 2, "type": "move", "x": 1.4, "y": 0}]',
+             "event 2: x is 1.4, outside [0, 1]"),
+            ('[{"t": 1, "type": "move", "x": 0, "y": -0.5}]',
+             "event 1: y is -0.5, outside [0, 1]"),
+            # true is an int in Python and would otherwise be an x at the
+            # right-hand edge of the canvas. It is a typo, not a coordinate.
+            ('[{"t": 1, "type": "move", "x": true, "y": 0}]',
+             "event 1: x is true, not a number"),
+        ):
+            with self.subTest(text=text):
+                events, why = executor.validate_ghost(text)
+                self.assertIsNone(events)
+                self.assertEqual(reason, why)
+
+    def test_a_refusal_is_one_line_and_names_the_event(self):
+        for text in ('[{"t": 1, "type": "move", "x": 9, "y": 0}]', "[]", "{}"):
+            with self.subTest(text=text):
+                why = executor.validate_ghost(text)[1]
+                self.assertEqual([why], why.splitlines())
+
+    def test_events_at_the_same_millisecond_keep_their_order(self):
+        events, why = executor.validate_ghost(
+            '[{"t": 5, "type": "down", "x": 0.1, "y": 0.1},'
+            ' {"t": 5, "type": "up", "x": 0.2, "y": 0.2},'
+            ' {"t": 1, "type": "move", "x": 0.3, "y": 0.3}]'
+        )
+        self.assertIsNone(why)
+        self.assertEqual(["move", "down", "up"], [e["type"] for e in events])
+
+    def test_the_built_ins_are_scripts_this_would_accept(self):
+        # The floor under every entry has to clear the bar the executor's own
+        # scripts are held to, or the default would be a script the gate
+        # would refuse from a model.
+        for name, events in ghostshim.BUILTINS.items():
+            with self.subTest(script=name):
+                back, why = executor.validate_ghost(json.dumps(events))
+                self.assertIsNone(why)
+                self.assertEqual(events, back)
+
+
 class TestMalformedResponse(ExecutorTestCase):
     """No js block: failure, not a crash, and the raw text is kept."""
 

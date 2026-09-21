@@ -72,6 +72,16 @@ function draw() { background(frameCount % 255); circle(200, 200, 80); }
 
 A grey field that breathes, with one circle held still in the middle of it.
 """
+#: The same reply with the optional pointer script on it (auto-mouse.md §4.1).
+#: Nothing in paid.py reads it; the worker's replay through executor.run is
+#: what writes it, and these two tests are there to say so out loud.
+GHOST_EVENTS = [{"t": 300, "type": "move", "x": 0.5, "y": 0.5},
+                {"t": 800, "type": "click", "x": 0.5, "y": 0.5}]
+GHOST_SKETCH = GOOD_SKETCH.replace(
+    "## Statement",
+    "```ghost\n" + json.dumps(GHOST_EVENTS) + "\n```\n\n## Statement",
+)
+
 PAID_ENV = {models.PAID_MODELS_ENV: "claude-opus-5, claude-sonnet-5"}
 
 
@@ -568,6 +578,39 @@ class ExecuteTests(PaidTestCase):
         self.assertEqual((job.state, job.needs), ("needs-laptop", "execute"))
         self.assertFalse((self.jobs_dir / str(job_id) / "attempt-1" /
                           worker.PAID_REPLY).exists())
+
+    def test_a_ghost_block_in_the_answer_travels_with_no_extra_code(self):
+        """auto-mouse.md §4.2: `paid import` carries it for free.
+
+        Nothing in `paid.py` knows about the block. The worker replays the
+        reply through `executor.run(stub=…)`, which is the same parser and the
+        same writer a local attempt uses, so the script lands beside the
+        sketch the gate is about to run.
+        """
+        job_id = self.park()
+        self.answer(reply=GHOST_SKETCH)
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.worker().run_once()
+        attempt = self.jobs_dir / str(job_id) / "attempt-1"
+        self.assertEqual(GHOST_EVENTS,
+                         json.loads((attempt / "ghost.json").read_text()))
+        self.assertEqual({"events": 2},
+                         json.loads((attempt / "result.json").read_text())["ghost"])
+        self.assertEqual(db.get_job(self.conn, job_id).state, "held")
+
+    def test_an_invalid_ghost_block_is_still_a_good_attempt(self):
+        # DECIDE[ghost-dataset]: the sketch is the answer. Rejecting it over
+        # an optional extra would spend one of three attempts for nothing.
+        job_id = self.park()
+        _, report = self.answer(reply=GHOST_SKETCH.replace('"x": 0.5', '"x": 5'))
+        self.assertEqual(report.rejected, [])
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.worker().run_once()
+        attempt = self.jobs_dir / str(job_id) / "attempt-1"
+        self.assertFalse((attempt / "ghost.json").exists())
+        self.assertIn("outside [0, 1]",
+                      json.loads((attempt / "result.json").read_text())["ghost"]["rejected"])
+        self.assertEqual(db.get_job(self.conn, job_id).state, "held")
 
     def test_the_same_answer_cannot_land_twice(self):
         self.park()
@@ -1649,6 +1692,22 @@ class TryTests(AgentLoopTests):
             "SELECT id FROM entries WHERE job_id = ?", (job,))))
         self.assertEqual([], db.paid_tries(self.conn)[job]["pending"])
         self.assertGreater(db.paid_leases(self.conn)[job]["until_utc"], was)
+
+    def test_a_try_writes_the_ghost_script_the_candidate_carried(self):
+        # The same free ride the import gets: a try is executor.run(stub=…)
+        # too, so an agent can see its own script land before it commits to
+        # the attempt (auto-mouse.md §4.2).
+        job = self.leased()
+        run = self.worker(gate_fn=self.gate())
+        self.assertEqual("verdict", self.drive(run, job, answer=GHOST_SKETCH)["do"])
+        written = self.try_dir(job)
+        self.assertEqual(GHOST_EVENTS,
+                         json.loads((written / "ghost.json").read_text()))
+        # and the replay's own result.json is filed as execution.json, which
+        # is where the count of what it kept goes with it
+        self.assertEqual(
+            {"events": 2},
+            json.loads((written / "execution.json").read_text())["ghost"])
 
     def test_a_second_try_is_its_own_directory_and_counts_up(self):
         job = self.leased()
