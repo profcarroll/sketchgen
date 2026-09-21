@@ -1994,3 +1994,27 @@ class TestPaidLease(IdleTestCase):
         self.assertEqual(0, run.run_once())
         self.assertEqual("needs-laptop", db.get_job(self.conn, mine).state)
         self.assertEqual("queued", db.get_job(self.conn, older).state)
+
+
+class TestMadeOn(WorkerTestCase):
+    """`entries.shape`: the maker, and the gate when they differ."""
+
+    def test_the_identified_shape_wins_over_the_observed_one(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("SKETCHGEN_SHAPE", None)
+            observed = worker.node_shape()
+            self.assertEqual(observed, worker.node_shape(self.conn))
+            db.set_meta(self.conn, "node_shape", "VM.Standard.A1.Flex")
+            db.set_meta(self.conn, "node_ocpus", "16.0")
+            db.set_meta(self.conn, "node_memory_gb", "96.0")
+            self.assertEqual("VM.Standard.A1.Flex 16/96", worker.node_shape(self.conn))
+            self.assertEqual(observed, worker.node_shape())  # no connection, no claim
+            os.environ["SKETCHGEN_SHAPE"] = "a desk with a GPU"
+            self.assertEqual("a desk with a GPU", worker.node_shape(self.conn))
+
+    def test_an_off_node_executor_names_itself_and_the_gate(self):
+        db.set_paid_models(self.conn, ["claude-sonnet-5"])
+        here = worker.node_shape(self.conn)
+        self.assertEqual(here, worker.made_on(self.conn, "qwen3-coder:30b-a3b-q4_K_M"))
+        self.assertEqual(f"off-node (claude-sonnet-5) · gated on {here}",
+                         worker.made_on(self.conn, "claude-sonnet-5"))

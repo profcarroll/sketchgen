@@ -1550,6 +1550,14 @@ class OffNodeTests(GalleryTestCase):
         page, meta = self.publish(executor="claude-opus-5")
         self.assertEqual([o["step"] for o in meta["off_node"]], ["executor"])
         self.assertIn('written by claude-opus-5 <span class="chip offnode"', page)
+        # its numbers are not Ollama's meter, and the page says so
+        self.assertIn("as reported by the model", page)
+        self.assertIn("round trip, export to import", page)
+
+    def test_a_local_executor_has_no_such_caveat(self):
+        page, _ = self.publish()
+        self.assertNotIn("as reported by the model", page)
+        self.assertNotIn("round trip, export to import", page)
 
     def test_an_ollama_cloud_tag_is_off_the_node_too(self):
         _, meta = self.publish(executor="gpt-oss:120b-cloud")

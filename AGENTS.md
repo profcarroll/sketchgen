@@ -133,7 +133,11 @@ as `parked: … no agent`; the same `release` clears it.
   for. The gate is headless Chromium on the node and is not negotiable: on a
   failure, read the evidence at the end of the next prompt and fix what it
   names.
-- **Change nothing in a packet but `answer` and `model`.** `guard`,
+- **`usage` is optional.** If you know the token counts of your own reply,
+  put them in the item's `usage` (`prompt_tokens`, `completion_tokens`); leave
+  what you do not know `null`. Never estimate: a blank on the entry page is
+  true, a guess is not. The node times the round trip itself.
+- **Change nothing in a packet but `answer`, `usage` and `model`.** `guard`,
   `prompt_version` and `inputs` are how the node knows the answer is still
   about what it asked; a stale packet is refused — run `next` again.
 - **Rejected is safe.** An answer that does not parse writes nothing, uses no
