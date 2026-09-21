@@ -6,7 +6,11 @@ the judge and the critic see the sketch a viewer would have seen. Grounded in th
 stands at `main` 1c39d24 (#139). Written for Opus builders; one packet per branch, one PR each,
 numbering continues from `docs/plans/held-batch.md` (packets 10–12).
 
-*Status: draft for the operator's review. Nothing here is built.*
+*Status: Packet 13 is built — branch `feat/ghost-shim`, PR #143: `sketchgen/ghostshim.py`,
+the kiosk's `?ghost=` and `responds` in `kiosk.json`. Packets 14–16 are still a draft for
+the operator's review. One thing in §1 was wrong and is corrected where it stands:
+`DECIDE[ghost-off]` says the key is `G`, and `G` is the generation overlay — the key
+built is `M`.*
 
 ## 0. What is wrong, in one paragraph
 
@@ -37,7 +41,7 @@ Each is decided here unless the operator overrides; builders take the recommenda
 | `DECIDE[ghost-script]` | what a ghost script is | **A JSON list of events in canvas fractions:** `[{"t": 800, "type": "move", "x": 0.5, "y": 0.5}, {"t": 1200, "type": "down", …}, {"t": 1300, "type": "up", …}]`, `t` in milliseconds from start, `type` one of `move`, `down`, `up`, `click`, `x`/`y` in `[0, 1]` of the canvas. At most 64 events, `t` at most 8,000. Two players read it: the shim (DOM `MouseEvent`s on the canvas) and the gate (`page.mouse`). Three built-in scripts, named `click`, `drag`, `wander`, live in the shim and are what an entry gets when it carries no script of its own. |
 | `DECIDE[ghost-who]` | which entries the kiosk ghosts | **Entries whose gate-confirmed assertions include `responds(click)` or `responds(drag)`**, the rule `_swipe_entry` already applies (`sketchgen/gallery.py:2849`, off-plan misses subtracted). Never `responds(audio)`: a synthetic event is not a user gesture and cannot resume an `AudioContext`; §1.7's sentence stays true for sound and is rewritten to say so. |
 | `DECIDE[ghost-yields]` | what happens when a person touches the sketch | **The ghost stops for the rest of that entry.** The shim sees every pointer event on the document; one with `isTrusted` true ends the run. A hand always wins, and nobody watches a cursor fight them. |
-| `DECIDE[ghost-off]` | the off switches | **Three, as `kiosk_views` has:** `config.json` `kiosk_ghost: false` (a render-index, no deploy), `?ghost=0` on the kiosk URL, and a key `G` on the kiosk (free per `kiosk-fullscreen.md` §5; `Y` stays the test harness's opener). |
+| `DECIDE[ghost-off]` | the off switches | **Three, as `kiosk_views` has:** `config.json` `kiosk_ghost: false` (a render-index, no deploy), `?ghost=0` on the kiosk URL, and a key on the kiosk. ~~`G` (free per `kiosk-fullscreen.md` §5)~~ — **`M`, corrected 21 September 2026:** `G` is not free, it is the *generation and lineage* overlay (`kiosk.js` `OVERLAYS`), and `kiosk-fullscreen.md` §5 is its test section and says nothing about keys. `M` for the mouse nobody is holding; `X` and `Y` both stay the test harness's openers. |
 | `DECIDE[ghost-strip]` | whether the gate's `strip.png` changes | **No. A second artefact, `ghost.png`, four frames from the ghost window, and `strip.png` byte-for-byte what it is today.** Both judge populations and the critic see `strip.png` (`judge.py:362`, `lineage.py:202`), `pairs.artefact_hash` is over it, and every published `meta.json` names it. Changing it mid-corpus splits every measurement; adding beside it splits none. Who reads `ghost.png` is Packet 16's question. |
 | `DECIDE[ghost-dataset]` | whether the executor may supply the script | **Yes, optionally, as a fenced block tagged `ghost` in its reply — asked of paid agents first, through AGENTS.md, and of local models only as `executor-v4`.** `parse_response` already counts and ignores blocks it does not know (`executor.py:305`), so accepting one changes no contract; asking a local model for one changes the prompt file and is an arm in the rules-file A/B. |
 | `DECIDE[click-power]` | whether to fix `responds(click)` while the gate is open | **Not in this series.** Packet 15 bumps `HARNESS_VERSION` once for the ghost window; folding an assertion change into the same bump is tempting and wrong until `MEASURE[click-assertion-power]` has a number. Left in §7. |
@@ -118,7 +122,8 @@ The shim, in plain script, no module:
   is `ROOT + entry.sketch + "?ghost=" + kinds.join(",") + "&ghost_loop=" + ms`. Nothing else
   about the frame changes; the sandbox attribute is untouched. The header of the file lists
   the parameter beside `kiosk_views`.
-- `G` toggles `state.ghost`, persisted in the existing `sketchgen-kiosk` key beside `every`
+- ~~`G`~~ **`M`** toggles `state.ghost` (see `DECIDE[ghost-off]`: `G` is the generation
+  overlay), persisted in the existing `sketchgen-kiosk` key beside `every`
   and `order`; the menu shows *ghost pointer on/off*. The caption gets a two-word tag, *ghost
   pointer*, while an entry is being ghosted, in the same place *responds to touch* sits on
   swipe, so a viewer who sees movement knows nobody is at the keyboard.

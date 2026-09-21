@@ -508,14 +508,30 @@ class TreeTests(GalleryTestCase):
             with self.subTest(path=relative):
                 self.assertTrue((self.dest / relative).is_file(), relative)
 
-    def test_the_sketch_is_copied_verbatim(self):
+    def test_the_sketch_is_copied_verbatim_but_for_the_two_shims(self):
+        # sketch.js is byte for byte the bytes the gate ran, always. The page
+        # around it has exactly two additions, both of them scripts the
+        # gallery needs and the gate does not fail on: the sound shim, under
+        # the p5.sound tag when there is one, and the ghost pointer, under the
+        # sketch.js tag on every page (soundshim.py, ghostshim.py).
+        from sketchgen import ghostshim
         self.render()
         one = self.ids[0]
-        for name in ("sketch.js", "index.html"):
-            self.assertEqual(
-                (self.dest / "e" / str(one) / "sketch" / name).read_bytes(),
-                (SKETCHES / "good-motion" / name).read_bytes(),
-            )
+        self.assertEqual(
+            (self.dest / "e" / str(one) / "sketch" / "sketch.js").read_bytes(),
+            (SKETCHES / "good-motion" / "sketch.js").read_bytes(),
+        )
+        source = (SKETCHES / "good-motion" / "index.html").read_text(encoding="utf-8")
+        self.assertEqual(
+            (self.dest / "e" / str(one) / "sketch" / "index.html").read_text(
+                encoding="utf-8"),
+            ghostshim.with_shim(source),
+        )
+        # and taking the ghost back out leaves the page it arrived on
+        out = (self.dest / "e" / str(one) / "sketch" / "index.html").read_text(
+            encoding="utf-8")
+        self.assertEqual(1, out.count(ghostshim.MARKER))
+        self.assertLess(out.index('src="sketch.js"'), out.index(ghostshim.MARKER))
 
     def test_a_page_that_loads_p5_sound_gets_the_shim_and_keeps_it_once(self):
         # The one exception to verbatim: a sketch page that loads p5.sound
@@ -1221,6 +1237,10 @@ class IndexTests(GalleryTestCase):
         # The kiosk counts unless somebody says otherwise, and the saying is
         # this line (docs/plans/kiosk-views.md §3.3).
         self.assertIs(True, config["kiosk_views"])
+        # And it ghosts unless somebody says otherwise, on the same terms
+        # (docs/plans/auto-mouse.md DECIDE[ghost-off]).
+        self.assertIs(True, config["kiosk_ghost"])
+        self.assertEqual(6, config["kiosk_ghost_loop_s"])
 
     def test_the_kiosk_switch_round_trips_a_render(self):
         # It is the only lever there is: the write path has no switch of its
@@ -1240,6 +1260,40 @@ class IndexTests(GalleryTestCase):
         after = json.loads((dest / "config.json").read_text(encoding="utf-8"))
         self.assertIs(False, after["kiosk_views"])
 
+    def test_the_ghost_switch_round_trips_a_render(self):
+        # The same lever the views have, for the same reason: one line in the
+        # gallery checkout and a render-index, no deploy. A render that
+        # dropped the line would turn the pointer back on silently.
+        dest = self.tmp / "unghosted"
+        dest.mkdir()
+        (dest / "config.json").write_text(
+            json.dumps({"write_path": "https://write.example.invalid/api",
+                        "kiosk_ghost": False, "kiosk_ghost_loop_s": 20}),
+            encoding="utf-8",
+        )
+        loaded = gallery.Config.load(dest)
+        self.assertIs(False, loaded.kiosk_ghost)
+        self.assertEqual(20, loaded.kiosk_ghost_loop_s)
+        gallery.render_index(self.conn, dest, loaded)
+        after = json.loads((dest / "config.json").read_text(encoding="utf-8"))
+        self.assertIs(False, after["kiosk_ghost"])
+        self.assertEqual(20, after["kiosk_ghost_loop_s"])
+
+    def test_a_ghost_gap_nobody_could_have_meant_is_the_default(self):
+        # Clamped rather than trusted, as clampEvery in kiosk.js is: a
+        # projector should not be left ghosting once an hour, or forty times a
+        # second, by a typo in a file nobody rereads.
+        dest = self.tmp / "silly"
+        dest.mkdir()
+        for value in (0, -5, 6000, "soon", None, [6]):
+            with self.subTest(value=value):
+                (dest / "config.json").write_text(
+                    json.dumps({"kiosk_ghost_loop_s": value}), encoding="utf-8")
+                self.assertEqual(
+                    gallery.DEFAULT_GHOST_LOOP_S,
+                    gallery.Config.load(dest).kiosk_ghost_loop_s,
+                )
+
     def test_a_config_written_before_the_kiosk_counts(self):
         # Absent is on. Every checkout is in this state the first time the
         # field ships, and none of them should go quiet.
@@ -1250,6 +1304,13 @@ class IndexTests(GalleryTestCase):
             encoding="utf-8",
         )
         self.assertIs(True, gallery.Config.load(dest).kiosk_views)
+        # Absent is on for the ghost pointer too: a checkout that predates it
+        # should get it, not go without until somebody notices.
+        self.assertIs(True, gallery.Config.load(dest).kiosk_ghost)
+        self.assertEqual(
+            gallery.DEFAULT_GHOST_LOOP_S,
+            gallery.Config.load(dest).kiosk_ghost_loop_s,
+        )
 
     def test_the_line_page_shows_the_whole_line(self):
         line = (self.dest / "lines" / f"{self.ids[0]}.html").read_text(encoding="utf-8")
@@ -2391,8 +2452,11 @@ class KioskManifestTests(GalleryTestCase):
         db.record_judgment(self.conn, a, b, kind, judge_id, question, choice)
 
     #: Every key spec §2 names, written out rather than imported so that the
-    #: test is a check on the shape and not a restatement of it. ``canvas`` is
-    #: absent from the list on purpose: it is the one optional key.
+    #: test is a check on the shape and not a restatement of it. ``canvas`` and
+    #: ``responds`` are absent from the list on purpose: they are the two
+    #: optional keys, and ``responds`` arrived with the ghost pointer
+    #: (docs/plans/auto-mouse.md §3.2), which is the only thing the kiosk does
+    #: with it.
     SPEC_2_KEYS = {
         "id",
         "prompt",
@@ -2480,7 +2544,9 @@ class KioskManifestTests(GalleryTestCase):
         rows = self.rows()
         for name, entry_id in (("root", self.ids[0]), ("child", self.ids[1])):
             with self.subTest(entry=name):
-                self.assertEqual(self.SPEC_2_KEYS, set(rows[entry_id]) - {"canvas"})
+                self.assertEqual(
+                    self.SPEC_2_KEYS, set(rows[entry_id]) - {"canvas", "responds"}
+                )
 
     def test_every_row_names_its_kiosk_code_and_its_clean_url(self):
         # The manifest is read by one page and that page is the projection, so
@@ -2528,6 +2594,51 @@ class KioskManifestTests(GalleryTestCase):
         for key in gallery.KIOSK_META_KEYS:
             with self.subTest(key=key):
                 self.assertEqual(meta[key], row[key])
+
+    def test_responds_names_what_the_gate_confirmed(self):
+        # Entry one's assertions are motion(idle) and responds(click). The
+        # kiosk reads this for one thing: whether to put ?ghost= on the
+        # frame's src, so a sketch that waits to be touched moves on a wall
+        # nobody is standing at (docs/plans/auto-mouse.md §3.2).
+        self.assertEqual(["click"], self.rows()[self.ids[0]]["responds"])
+
+    def test_an_off_plan_miss_is_subtracted_before_the_kiosk_sees_it(self):
+        # assertions_json is what the planner asked for; offplan_json is what
+        # the gate published anyway with some of them missed. A projector that
+        # sent a pointer at a sketch the gate proved does not respond would be
+        # spending a minute of the room's attention on nothing.
+        one = self.ids[0]
+        self.conn.execute(
+            "UPDATE entries SET offplan_json = ? WHERE id = ?",
+            (json.dumps(["responds(click)"]), one),
+        )
+        self.conn.commit()
+        self.render()
+        self.assertNotIn("responds", self.rows()[one])
+
+    def test_a_sketch_with_nothing_to_respond_to_has_no_responds_key(self):
+        # Absent, not an empty list: one less thing for the script to test for.
+        two = self.ids[1]
+        self.conn.execute(
+            "UPDATE entries SET assertions_json = ? WHERE id = ?",
+            (json.dumps(["motion(idle)"]), two),
+        )
+        self.conn.commit()
+        self.render()
+        self.assertNotIn("responds", self.rows()[two])
+
+    def test_the_two_manifests_cannot_disagree_about_it(self):
+        # Both come out of one _manifest_base per entry, which is the whole
+        # reason responds moved there when the kiosk started reading it.
+        swipe = {
+            int(entry["id"]): entry.get("responds")
+            for entry in json.loads(
+                (self.dest / "swipe.json").read_text(encoding="utf-8"))["entries"]
+        }
+        kiosk = {
+            entry_id: row.get("responds") for entry_id, row in self.rows().items()
+        }
+        self.assertEqual(swipe, kiosk)
 
     def test_where_to_run_it_and_where_to_read_it(self):
         one = self.ids[0]
