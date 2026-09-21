@@ -608,6 +608,10 @@ class Execution:
     decode_s: float | None = None
     wall_s: float | None = None
     statement: str | None = None
+    #: Migration 015: what the agent said the work around this reply cost,
+    #: as JSON, for the attempt's `process_json`. A local run leaves it None —
+    #: there is no agent to ask, and a zero would be a claim.
+    process_json: str | None = None
 
     @classmethod
     def from_result(cls, result: executor.Result) -> "Execution":
@@ -2239,6 +2243,13 @@ class Worker:
             source_dir=kept.source_dir if kept else None,
             strip_path=artefacts.get("strip"),
             png_path=artefacts.get("png"),
+            # Migration 015. The note is the job's — what the node could not
+            # see about how this one was made — and the process cost is the
+            # kept attempt's, not a sum: the other attempts' replies are not
+            # in this entry, and adding their sessions together would double
+            # the reading time an agent spent once.
+            note=job.note,
+            process_json=kept.process_json if kept else None,
         )
         self.log(f"job {job_id}: entry {entry_id} created, state {state}")
         self._say(
@@ -2471,6 +2482,7 @@ class Worker:
     def _paid_execution(
         self,
         *,
+        job_id: int,
         brief: str,
         assertions: list[str],
         rules_file: str,
@@ -2518,7 +2530,33 @@ class Worker:
                 value = usage.get(key)
                 if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                     setattr(execution, key, value)
+            execution.process_json = self._process_json(job_id, meta.get("process"))
         return execution
+
+    def _process_json(self, job_id: int, reported: Any) -> str | None:
+        """The process cost for this attempt: the agent's fields, and ours.
+
+        Migration 015. Everything in `reported` is the agent's word about its
+        own session — `paid.process_of` has already validated the types — and
+        `tries` is the node's own count of the gate runs this job asked for
+        before it committed (packet 7's `paid try`), because a first-attempt
+        pass after four tries is not a first-attempt pass.
+
+        Null when nobody reported anything and no try was asked for: an object
+        of nulls on the entry would say the agent answered the question.
+        """
+        from . import paid as paid_mod
+
+        process = paid_mod.process_of({"process": reported})
+        try:
+            tries = int((db.paid_tries(self.conn).get(int(job_id)) or {}).get("count") or 0)
+        except sqlite3.Error:  # pragma: no cover - the meta row is unreadable
+            tries = 0
+        if tries > 0:
+            process["tries"] = tries
+        if not paid_mod.process_reported(process):
+            return None
+        return json.dumps(process, sort_keys=True)
 
     # -- tries: the agent's dry run, on the node's own gate -----------------
 
@@ -2744,8 +2782,8 @@ class Worker:
         try:
             if models.is_paid(model, self.conn):
                 execution = self._paid_execution(
-                    brief=brief, assertions=assertions, rules_file=rules,
-                    attempt_dir=attempt_dir, asked=model,
+                    job_id=job.id, brief=brief, assertions=assertions,
+                    rules_file=rules, attempt_dir=attempt_dir, asked=model,
                 )
             else:
                 execution = self.executor_fn(
@@ -2792,6 +2830,7 @@ class Worker:
                 gate_report_path=None,
                 evidence=failure,
                 statement=execution.statement,
+                process_json=execution.process_json,
             )
             self.log(f"job {job.id}: attempt {n} — {failure} (no gate run)")
             if last:
@@ -2875,6 +2914,7 @@ class Worker:
             gate_report_path=outcome.report_path,
             evidence=new_evidence,
             statement=execution.statement,
+            process_json=execution.process_json,
         )
         self.log(f"job {job.id}: attempt {n} gate exit {outcome.exit_code}")
 

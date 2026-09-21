@@ -38,8 +38,9 @@ console and run `await __probe.all()`, then paste `rig/bench.js` and run
 
 `rig/cost.py` is the other half, and has nothing to do with the browser:
 `python3 rig/cost.py --since ISO` totals what the session has cost from the
-transcript Claude Code already writes, and prints one JSON line to paste into a
-packet once Packet 8 accepts it.
+transcript Claude Code already writes, and prints one JSON line to paste into
+an attempt item's `process`, which the node records beside the entry as
+reported by you (migration 015).
 
 ## The six traps
 

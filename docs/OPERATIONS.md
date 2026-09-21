@@ -1439,12 +1439,14 @@ parked for a plan or an attempt — whose it is and the command that moves it.
 A job whose planner is one of them parks at `needs-laptop` exactly as `paid` does,
 and the entry records the model that answered.
 
-**An agent's own job is three verbs.** Since 2026-09-21 (the second Sonnet 5
-run, which sat ten minutes in a blocking `wait` behind an idle-spawned job and
-was killed) the recipe in AGENTS.md is:
+**An agent's own job is a handful of verbs.** Since 2026-09-21 (the second
+Sonnet 5 run, which sat ten minutes in a blocking `wait` behind an idle-spawned
+job and was killed) the recipe in AGENTS.md is:
 
 ```bash
-bin/sg paid start --as claude-sonnet-5 --by profcarroll --prompt "a tide of slow lines"
+SINCE=$(date -u +%FT%TZ)
+bin/sg paid start --as claude-sonnet-5 --by profcarroll --since $SINCE \
+    --prompt "a tide of slow lines"
 bin/sg paid next --job N --as claude-sonnet-5 > packet.json    # do: answer|wait|done|stop
 bin/sg paid import - < packet.json                               # then next again
 ```
@@ -1497,10 +1499,10 @@ dropped, unrun: nothing gates for an agent who left.
 Tries are capped per job at the `meta` key **`paid_try_cap`**, default **8**
 (a gate run is 5–15 s of the node's CPU; an agent that needs more is designing
 on the node's clock). The ninth refuses with exit 3 and the count. The verb
-that changes the cap is Packet 8's `paid budget --tries N`; until it lands the
-default stands, and nothing edits the row by hand (rule 4). The count itself
-is kept per job because Packet 8 records it on the attempt: a first-attempt
-pass after four tries is not a first-attempt pass.
+that changes the cap is `paid budget --tries N` (below), because rule 4 means
+nothing edits the row by hand. The count is kept per job and lands on the
+attempt as part of its process cost: a first-attempt pass after four tries is
+not a first-attempt pass.
 
 **Two paid models on one job.** `--planner` / `--executor` also take another
 *registered* paid id, so an operator can have one model plan and another
@@ -1551,6 +1553,60 @@ trip, export to import" beside those numbers, and an off-node entry's shape
 reads `off-node (MODEL) · gated on SHAPE` — the node only gated it. A local
 entry's shape is the IMDS-identified one (`meta.node_shape`, e.g.
 `VM.Standard.A1.Flex 16/96`) when the node has identified itself.
+
+**And what the work *around* the reply cost is recorded too, apart from it.**
+Migration 015, after job 1286 (entry 1279, 2026-09-21): the node saw a 111 s
+round trip, and the 37 minutes and 193,000 generated tokens the agent spent
+before `paid start` — a browser rig, a local prototype, a skill — were nowhere,
+so the entry reads as a sketch written in under two minutes. Two costs, kept
+apart (dossier 01 §6.4):
+
+- **reply cost** — `wall_s` (the round trip the node timed) and `usage`
+  (`prompt_tokens`, `completion_tokens`, as reported). This is what compares
+  with a local model's prompt and decode, and it is what every batch total,
+  the judge and the A/B read. Unchanged.
+- **process cost** — `attempts.process_json`: `session_s`, `output_tokens`,
+  `thinking_tokens`, `tool_calls`, `screenshots`, `effort` from the item's
+  optional `process` at import, plus `tries`, which the node counts itself.
+  Every field nullable and never defaulted to zero. It is copied to the entry
+  at `_create_entry` from the attempt the entry kept, shows on the entry page
+  as one **Process** row after *Wall seconds* (`42 min · 207,537 tokens
+  generated · 4 tries · as reported by the agent`, an em dash per blank), goes
+  into `meta.json` as `process`, and appears beside the attempt on the
+  operator's job page. **Nothing measures with it** — not `pairs.py`, not the
+  judge, not a batch total.
+
+Two more columns carry what only the agent knows: `jobs.since_utc` from `paid
+start --since ISO` (what its first `date -u +%FT%TZ` printed; a stamp in the
+future or over a day old is refused, exit 3, nothing queued) and `jobs.note`
+from `--note TEXT` (`skill=algorithmic-art; local prototype`), which lands on
+the entry as a **Note** row. `next` and `import` echo `elapsed`, from
+`since_utc` when there is one and from the lease's own start when there is not,
+saying which.
+
+**The budget is advisory, and it has a verb.**
+
+```bash
+python3 bin/sketchgen paid budget                       # print it
+python3 bin/sketchgen paid budget --minutes 10 --tokens 30000 --tries 8
+```
+
+It writes two `meta` rows — **`paid_budget`** (minutes and generated tokens,
+defaults 10 and 30,000) and **`paid_try_cap`** (tries, default 8) — and `paid
+start` prints them as one line. Past either number, `next` and `import` print
+`over budget by …; finish, and report it` and record the work anyway:
+refusing an over-budget import would reward not reporting
+(`DECIDE[agent-budget]`), and the numbers are a strawman from job 1286's job
+phase (4 min 26 s, 14,798 tokens) with headroom, to be re-set when
+`MEASURE[freenode-baseline]` is read.
+
+**Which checkout the node is on.** `preflight` and `start` report
+`node_commit` (git `rev-parse HEAD` in the checkout the running code lives in,
+null where there is no git and never a failure) and `agents_md_sha256` in
+`info`. An agent whose `git merge-base --is-ancestor <node_commit> HEAD` fails
+is reading an AGENTS.md older than the node's, which is how a session on
+2026-09-21 answered #132's packets having read #131's instructions
+(`DECIDE[freshness]`).
 
 **A paid job is made only by `paid start`.** The New job page lists what this
 node runs and nothing else; `paid assign --plan/--execute` take local tags
