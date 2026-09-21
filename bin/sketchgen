@@ -26,6 +26,7 @@ from sketchgen import console  # noqa: E402
 from sketchgen import db  # noqa: E402
 from sketchgen import executor  # noqa: E402
 from sketchgen import lineage  # noqa: E402
+from sketchgen import paid  # noqa: E402
 from sketchgen import planner  # noqa: E402
 from sketchgen import publish as publication  # noqa: E402
 from sketchgen import worker  # noqa: E402
@@ -345,26 +346,13 @@ def cmd_execute(args: argparse.Namespace) -> int:
 def _plan_target(conn, job_id: int):
     """The job a ``--job`` plan is for, or a refusal printed and ``None``.
 
-    Only a job parked at ``needs-laptop`` is claimable here. Anything else is
-    either finished, or in flight with the worker attending it — and a second
-    writer of ``jobs.brief`` is the same class of mistake as a second worker.
+    The rule is :func:`sketchgen.paid.plannable`, which `paid import --step
+    plan` applies too: only a job parked at ``needs-laptop`` for a plan.
     """
     job = db.get_job(conn, job_id)
-    if job is None:
-        print(f"sketchgen: no job {job_id}", file=sys.stderr)
-        return None
-    if job.state != "needs-laptop":
-        print(
-            f"sketchgen: job {job_id} is {job.state}, not needs-laptop — only a "
-            "job waiting for the laptop can be planned here",
-            file=sys.stderr,
-        )
-        return None
-    if job.needs not in (None, "plan"):
-        print(
-            f"sketchgen: job {job_id} is waiting for {job.needs!r}, not a plan",
-            file=sys.stderr,
-        )
+    why = paid.plannable(job) if job is not None else f"no job {job_id}"
+    if why:
+        print(f"sketchgen: {why}", file=sys.stderr)
         return None
     return job
 
@@ -456,51 +444,18 @@ def cmd_plan(args: argparse.Namespace) -> int:
                   file=sys.stderr)
         return done(EXIT_FAIL)
 
-    document = {
-        "brief": result.brief,
-        "assertions": result.assertions,
-        "rejected": result.rejected,
-        "defaulted": result.defaulted,
-        "prompt_version": result.prompt_version,
-        "model": args.model,
-        "tokens": result.tokens,
-        "durations": result.durations,
-        "started_utc": started,
-    }
+    document = paid.plan_document(result, args.model, started)
     try:
-        (out_dir / "response.txt").write_text(result.raw, encoding="utf-8")
-        (out_dir / "plan.json").write_text(
-            json.dumps(document, indent=2) + "\n", encoding="utf-8"
-        )
+        paid.save_plan(out_dir, result, document)
     except OSError as exc:
         print(f"sketchgen: cannot write the plan to {out_dir}: {exc}", file=sys.stderr)
         return done(EXIT_FAIL)
 
     if job is not None:
-        # The worker's own write, made from here: brief, assertions and the
-        # model that wrote them in one statement. `planner` takes the model that
-        # answered rather than the word `paid` it was queued under, for the
-        # judge's reason — provenance is who answered, not who was asked.
-        # `needs` is cleared by hand because `transition` does not clear it, and
-        # a job left `needs='plan'` reads as still waiting.
-        #
-        # The state is `queued`, not `executing`, and that is the whole of how
-        # the job gets picked up again: `db.claim_next` selects on
-        # `state = 'queued'` alone, so a job moved straight to `executing` by
-        # something that is not the worker sits in a running state with nobody
-        # in it until the stuck-sweep notices, half an hour later by default.
-        # Queued, it is claimed on the next pass — and `claim_next` sends a job
-        # that has a brief to `executing` itself.
+        # The worker's own write, made from here — see paid.requeue_planned for
+        # why the state is `queued` and why `planner` is the model that answered.
         try:
-            job = db.transition(
-                conn,
-                job.id,
-                "queued",
-                brief=result.brief,
-                assertions_json=json.dumps(result.assertions),
-                planner=args.model,
-                needs=None,
-            )
+            job = paid.requeue_planned(conn, job.id, result, args.model)
         except db.IllegalTransition as exc:
             print(f"sketchgen: the plan is written to {out_dir} but job "
                   f"{args.job} did not move: {exc}", file=sys.stderr)

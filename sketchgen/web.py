@@ -2259,6 +2259,21 @@ MODEL_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,110}$")
 PAID_CHOICE = (PAID, "paid — the laptop claims it (needs-laptop)")
 
 
+def paid_choices(*, sentinel: bool) -> tuple[tuple[str, str], ...]:
+    """The paid models a menu offers, each saying where its answer comes from.
+
+    Names from :func:`sketchgen.models.paid_models` — configured, never asked:
+    the node has no credential to ask with (docs/plans/agentic-cli.md §3.7).
+    ``sentinel`` adds the bare word ``paid`` for the menus that have always had
+    it; a named model is better, because it is what the entry will record.
+    """
+    named = tuple(
+        (name, f"{name} — paid, answered off this node (needs-laptop)")
+        for name in models.paid_models()
+    )
+    return ((PAID_CHOICE,) if sentinel else ()) + named
+
+
 class ModelMenu(NamedTuple):
     """One "which model" select on the New job page.
 
@@ -2280,9 +2295,10 @@ class ModelMenu(NamedTuple):
     #: Capabilities worth naming on a row. A menu filtered to vision does not
     #: name vision on every row; one filtered to completion does.
     mention: tuple[str, ...]
-    #: Choices under *off this node* that are not models — ``paid`` for the
-    #: planner, nothing for the executor (there is no ``needs='execute'``).
-    off_node: tuple[tuple[str, str], ...]
+    #: Choices under *off this node* that Ollama does not list — ``paid`` and
+    #: the models named in ``SKETCHGEN_PAID_MODELS`` (:func:`paid_choices`).
+    #: Asked when the menu is drawn, so a unit file's list is read, not frozen.
+    off_node: Callable[[], tuple[tuple[str, str], ...]]
     #: How the refusal sentence describes what the menu wanted.
     wanted: str
 
@@ -2294,7 +2310,7 @@ PLANNER_MENU = ModelMenu(
     # Every row is vision-capable by construction, so saying so on every row is
     # width spent on nothing. ``audio`` is worth the space: one model has it.
     mention=("audio",),
-    off_node=(PAID_CHOICE,),
+    off_node=lambda: paid_choices(sentinel=True),
     wanted="vision-capable models, or paid",
 )
 
@@ -2305,7 +2321,7 @@ EXECUTOR_MENU = ModelMenu(
     # Here vision IS news: it says which model could be shown the gate's
     # screenshot rather than the text of build_evidence().
     mention=("vision", "audio"),
-    off_node=(),
+    off_node=lambda: (),
     wanted="models that can complete",
 )
 
@@ -2370,7 +2386,7 @@ def menu_groups(
     ]
     return [
         ("on this node", here),
-        ("off this node", away + list(menu.off_node)),
+        ("off this node", away + list(menu.off_node())),
     ]
 
 
@@ -2396,7 +2412,7 @@ def menu_selected(menu: ModelMenu, value: str, host: str | None = None) -> str:
 
 def menu_values(menu: ModelMenu, host: str | None = None) -> set[str]:
     """Every value this select can carry, for the validator."""
-    values = {LOCAL, PAID} if menu.off_node else {LOCAL}
+    values = {LOCAL}
     for _, options in menu_groups(menu, host):
         values.update(option for option, _ in options)
     return values
@@ -2426,7 +2442,7 @@ def check_menu(menu: ModelMenu, value: str, host: str | None = None) -> str:
 def menu_column(menu: ModelMenu, value: str) -> str:
     """The form value as the ``jobs`` column wants it: ``paid``, or the model
     tag itself. ``local`` is resolved here and nowhere else."""
-    if value == PAID and menu.off_node:
+    if value == PAID and PAID in dict(menu.off_node()):
         return PAID
     if value in ("", LOCAL):
         return menu.default()

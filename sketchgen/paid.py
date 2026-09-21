@@ -44,6 +44,7 @@ node's own daemon does the gating and publishing as it always has.
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,6 +53,7 @@ from typing import Any, Callable, Mapping
 from . import db
 from . import judge
 from . import lineage
+from . import planner
 from . import worker
 
 __all__ = [
@@ -245,6 +247,184 @@ class JudgeAdapter(Adapter):
                 f"look={answers['look']} by {model}")
 
 
+# ---------------------------------------------------------------------------
+# The planner's write-back, shared with `sketchgen plan --job`
+# ---------------------------------------------------------------------------
+
+
+def plan_document(result: planner.Plan, model: str, started_utc: str) -> dict[str, Any]:
+    """What ``plan.json`` holds: the plan, what it threw away, who wrote it."""
+    return {
+        "brief": result.brief,
+        "assertions": result.assertions,
+        "rejected": result.rejected,
+        "defaulted": result.defaulted,
+        "prompt_version": result.prompt_version,
+        "model": model,
+        "tokens": result.tokens,
+        "durations": result.durations,
+        "started_utc": started_utc,
+    }
+
+
+def save_plan(out_dir: Path, result: planner.Plan, document: Mapping[str, Any]) -> None:
+    """``response.txt`` (the raw reply, the only evidence) and ``plan.json``."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "response.txt").write_text(result.raw, encoding="utf-8")
+    (out_dir / "plan.json").write_text(
+        json.dumps(document, indent=2) + "\n", encoding="utf-8"
+    )
+
+
+def requeue_planned(
+    conn: sqlite3.Connection, job_id: int, result: planner.Plan, model: str
+) -> db.Job:
+    """The worker's own write, made from off the node, and back on the queue.
+
+    The brief, the assertions and the model that wrote them, in the one
+    transition that also puts the job back on the queue — the columns the
+    worker writes on the local path, so a job planned off the node is
+    indistinguishable afterwards from one planned on it. ``planner`` takes the
+    model that answered rather than the word it was queued under: provenance
+    is who answered, not who was asked. ``needs`` is cleared by hand because
+    ``transition`` does not clear it.
+
+    The state is ``queued``, not ``executing``. ``db.claim_next`` selects on
+    ``state = 'queued'`` alone, so a job moved straight to ``executing`` by
+    something that is not the worker sits in a running state with nobody in it
+    until the stuck-sweep notices, half an hour later by default. Queued, it is
+    claimed on the next pass, and ``claim_next`` sends a job that has a brief
+    to ``executing`` itself.
+    """
+    return db.transition(
+        conn,
+        job_id,
+        "queued",
+        brief=result.brief,
+        assertions_json=json.dumps(result.assertions),
+        planner=model,
+        needs=None,
+    )
+
+
+def plannable(job: db.Job | None) -> str | None:
+    """Why this job cannot take a plan from off the node, or None if it can.
+
+    Only a job parked at ``needs-laptop`` for a plan. Anything else is finished
+    or in flight with the worker attending it, and a second writer of
+    ``jobs.brief`` is the same class of mistake as a second worker.
+    """
+    if job is None:
+        return "there is no such job"
+    if job.state != "needs-laptop":
+        return (f"job {job.id} is {job.state}, not needs-laptop — only a job "
+                "waiting for the laptop can be planned here")
+    if job.needs not in (None, "plan"):
+        return f"job {job.id} is waiting for {job.needs!r}, not a plan"
+    return None
+
+
+class PlanAdapter(Adapter):
+    """The planner: one prompt in, a brief and its assertions out.
+
+    Offering is the jobs parked at ``needs-laptop`` waiting for a plan — the
+    worker parks a job there when its planner is ``paid`` or a model named in
+    ``SKETCHGEN_PAID_MODELS``. Rendering is :func:`planner.build_prompt`, and
+    landing is :func:`planner.parse_response` and
+    :func:`planner.validate_detailed`, the strict parser the local path uses
+    first, then :func:`requeue_planned`. A reply that will not parse leaves the
+    job parked (plan §5.4): it is a reply to try again, not a job to fail.
+
+    **No guard**, and on purpose (plan §3.3). ``jobs.prompt`` is written once
+    by ``enqueue`` and no code in this repository updates it, so what the
+    laptop was shown is what the job still holds. The prompt *version* is
+    checked instead: a reply to an older ``planner.md`` is not a reply to the
+    prompt the node would now ask.
+    """
+
+    step = "plan"
+    how_to_answer = (
+        "Send the model the item's prompt. Put its reply, verbatim, in "
+        "'answer': a 'Brief' heading and paragraph, then an 'Assertions' "
+        "heading and one vocabulary word per line."
+    )
+
+    def prompt_version(self) -> str:
+        try:
+            return planner.prompt_version()
+        except planner.PlannerRefused as exc:
+            raise PaidRefused(str(exc)) from exc
+
+    def _parked(self, conn: sqlite3.Connection) -> list[db.Job]:
+        return [
+            job for job in db.list_jobs(conn, "needs-laptop")
+            if job.needs in (None, "plan")
+        ]
+
+    def offer(self, conn, *, model, limit, ctx):
+        version = self.prompt_version()
+        items = []
+        for job in self._parked(conn)[:limit]:
+            items.append(
+                {
+                    "key": f"job {job.id}",
+                    "prompt": planner.build_prompt(job.prompt, job.submitted_by),
+                    "images": [],
+                    "guard": "",
+                    "prompt_version": version,
+                    "inputs": {
+                        "job": job.id,
+                        "prompt": job.prompt,
+                        "queued_for": job.planner,
+                    },
+                    "answer": "",
+                }
+            )
+        return items
+
+    def waiting(self, conn):
+        parked = self._parked(conn)
+        return {
+            "count": len(parked),
+            "jobs": [job.id for job in parked],
+            "summary": f"{len(parked)} job(s) parked for a plan",
+        }
+
+    def land(self, conn, item, *, model, ctx):
+        inputs = item.get("inputs") or {}
+        try:
+            job_id = int(inputs["job"])
+        except (KeyError, TypeError, ValueError):
+            raise Rejected("the item names no job") from None
+        why = plannable(db.get_job(conn, job_id))
+        if why:
+            raise Rejected(why)
+        version = str(item.get("prompt_version") or "")
+        if version != self.prompt_version():
+            raise Rejected(
+                f"cut under {version or 'no prompt version'}, and the planner is "
+                f"now {self.prompt_version()}: export again"
+            )
+        raw = str(item.get("answer") or "")
+        try:
+            brief, words = planner.parse_response(raw)
+        except planner.PlannerFailed as exc:
+            raise Rejected(f"{exc}; job {job_id} is unchanged, still needs-laptop") from exc
+        ok, rejected, defaulted = planner.validate_detailed(words)
+        result = planner.Plan(
+            brief=brief, assertions=ok, prompt_version=version, tokens={},
+            durations={}, raw=raw, rejected=rejected, defaulted=defaulted,
+        )
+        try:
+            save_plan(ctx.jobs_dir / str(job_id), result,
+                      plan_document(result, model, db.utc_now()))
+        except OSError as exc:
+            raise Rejected(f"cannot write the plan for job {job_id}: {exc}") from exc
+        requeue_planned(conn, job_id, result, model)
+        return (f"job {job_id}: planned by {model}, assertions "
+                f"{', '.join(ok) or '-'}; back on the queue")
+
+
 class CritiqueAdapter(Adapter):
     """The critic: one sentence about one published entry, which becomes a child.
 
@@ -400,6 +580,7 @@ class CritiqueAdapter(Adapter):
 
 #: One adapter per step. A step not listed here refuses at the CLI.
 ADAPTERS: dict[str, Adapter] = {
+    "plan": PlanAdapter(),
     "judge": JudgeAdapter(),
     "critique": CritiqueAdapter(),
 }

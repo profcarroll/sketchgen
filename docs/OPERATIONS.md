@@ -215,6 +215,7 @@ Five environment variables tune it; none has to be set:
 | `SKETCHGEN_CRITIC_MODEL` | `gemma4:e4b` | the critic whose sentence becomes the next prompt |
 | `SKETCHGEN_LINEAGE_DEPTH` | 3 | generations a line runs before a person has to touch it |
 | `SKETCHGEN_STUCK_MINUTES` | 30 | how long a job may sit in a running state with nobody attending it before the sweep re-queues it; `0` never sweeps |
+| `SKETCHGEN_PAID_MODELS` | (none) | model ids answered off the node — see [Paid steps](#paid-steps-any-model-step-answered-off-the-node). Set it in the web unit too. |
 
 Set both limits to `0` to leave the node quiet between jobs — the quickest way to
 hand the inference slot to somebody else without pausing the worker at all:
@@ -1275,9 +1276,11 @@ for each one's capabilities, cached 60 s) and show the models in two groups:
 
 - **on this node** — runs here, costs electricity and nothing else. The worker's
   default is marked `(default)` and is what a job gets if nobody chooses.
-- **off this node** — a `-cloud` tag, which Ollama proxies to ollama.com, and (for the
-  planner) `paid`, which stops the job at `needs-laptop` for the laptop to claim. Both
-  send the prompt off the box, which is why they are not in the first group: the
+- **off this node** — a `-cloud` tag, which Ollama proxies to ollama.com; (for the
+  planner) `paid`, which stops the job at `needs-laptop` for the laptop to claim; and
+  every model named in `SKETCHGEN_PAID_MODELS`, which does the same under the model's
+  own name (see [Paid steps](#paid-steps-any-model-step-answered-off-the-node)). All of
+  them send the prompt off the box, which is why they are not in the first group: the
   gallery's "0 API calls" is true of the first group only.
 
 | | filtered on | default | `paid`? |
@@ -1289,7 +1292,10 @@ for each one's capabilities, cached 60 s) and show the models in two groups:
 
 `paid` parks the job and the node stops: branch B of DECIDE[credential-model]
 keeps the credential off this box, so the planning happens wherever the key is.
-`plan --job` is the way back in.
+`plan --job` is one way back in, one job at a time, and what follows is how it
+works. `paid export --step plan` / `paid import` is the same return leg for every
+parked job at once, and is what an agent should drive — see
+[Paid steps](#paid-steps-any-model-step-answered-off-the-node).
 
 ```bash
 # on the node: what is waiting, and what it was asked for
@@ -1330,7 +1336,8 @@ Three things worth knowing:
   column. Planning the same job twice is refused for the same reason: the second
   run finds it `executing`.
 
-The executor and the critic have no equivalent yet.
+The critic has its own route now (`paid export --step critique`); the executor
+does not yet.
 
 The planner menu names `vision` on no row, because every row has it; the executor menu
 does, because there it is news — a vision-capable executor is one that could be shown
@@ -1373,6 +1380,77 @@ ssh sld-cloud 'ollama pull qwen3.5:9b'
 
 and reload New job. Nothing needs restarting — the list is read per page, and the cache
 is a minute long.
+
+## Paid steps: any model step, answered off the node
+
+Four steps ask a model something — the **planner**, the **executor**, the **judge**
+and the **critic** — and any of them can be answered by a model that is not on this
+node. The node never holds the credential (DECIDE[credential-model] branch B), so a
+paid step is always two legs, driven from the CLI by an agent on a machine that
+does: the node writes down what it would have asked, the agent answers each item
+with its own model, and the node reads the answers back through the parser the
+local path uses. `docs/plans/agentic-cli.md` is the design.
+
+```bash
+# on the node: what is waiting, per step
+python3 bin/sketchgen paid status
+
+# on the node: write what it would have asked
+python3 bin/sketchgen paid export --step plan --as claude-opus-5 --out plan.json
+
+# on a machine with the credential: an agent reads each item's "prompt" (and
+# "images", by path over the tunnel), asks the model, and pastes the reply
+# verbatim into that item's "answer". It sets "model" to what actually answered.
+
+# on the node: land the answers
+python3 bin/sketchgen paid import plan.json
+```
+
+Every verb takes `--json`. An item whose answer will not parse, or whose `guard`
+no longer matches what the node holds, is **rejected with a reason and writes
+nothing**; the rejected answers are kept verbatim in `plan.json.rejected.json`. An
+item left with an empty `answer` is skipped in silence, so a packet handed back half
+done is fine.
+
+| step | offered | lands via | guard |
+|---|---|---|---|
+| `plan` | jobs at `needs-laptop`, `needs='plan'` | `planner.parse_response` → job back on the **queue** | none needed — `jobs.prompt` never changes |
+| `judge` | pairs that model has not judged | `judge.import_verdicts_detailed` | `artefact_hash` of both strips and briefs |
+| `critique` | what the idle critic would take | `lineage.validate` → `record_critique` + `spawn` | sha256 of the strip |
+
+**Which models count as paid.** `paid`, and every name in `SKETCHGEN_PAID_MODELS`
+— a comma-separated list of model ids, names only, no credential. Set it the same
+in **both** unit files, or the New job page will offer a model the worker sends to
+Ollama:
+
+```bash
+systemctl --user edit sketchgen-web.service     # Environment=SKETCHGEN_PAID_MODELS=claude-opus-5,claude-sonnet-5
+systemctl --user edit sketchgen-worker.service  # the same line
+systemctl --user restart sketchgen-web.service sketchgen-worker.service
+```
+
+A job whose planner is one of them parks at `needs-laptop` exactly as `paid` does,
+and the entry records the model that answered.
+
+**An exported critique is assigned, not raced.** `critiques` holds one row per entry
+per prompt version, so an entry in a critique packet is claimed for the model the
+packet was cut for, and the idle loop's local critic skips it until the answer is
+imported. Exporting again re-offers that model's own claims first. A packet that is
+never coming back:
+
+```bash
+python3 bin/sketchgen paid release --step critique --all   # or: 41 57
+```
+
+Unlike the idle critic, a paid critique that fails the validator writes **no**
+rejected row: the entry stays claimed and un-critiqued, for a better answer.
+
+**Never run `worker --once` to make a paid job move.** An import puts the job back
+on the queue and the resident worker claims it on its next pass. Nothing in this
+path runs a worker, and #118 is what happens when something does.
+
+`judge export|import` still work, and `paid import` reads a `judge export` packet
+too.
 
 ## The write-path sync as a timer
 

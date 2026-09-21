@@ -160,7 +160,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from . import db, executor, lineage, planner, preflight
+from . import db, executor, lineage, models, planner, preflight
 
 __all__ = [
     "DEFAULT_CRITIC_MODEL",
@@ -1997,7 +1997,9 @@ class Worker:
             brief=job.brief,
             statement=kept.statement if kept else None,
             planner=job.planner,
-            planner_prompt_version=self._planner_prompt_version,
+            planner_prompt_version=(
+                self._planner_prompt_version or self._laptop_plan_version(job_id)
+            ),
             executor=kept.model if kept else self.executor_model_for(job),
             executor_prompt_version=kept.prompt_version if kept else None,
             rules_file=(kept.rules_file if kept and kept.rules_file else rules),
@@ -2042,6 +2044,23 @@ class Worker:
                 + (f", critiqued by {job.critique_by}" if job.critique_by else "")
             )
         return entry_id
+
+    def _laptop_plan_version(self, job_id: int) -> str | None:
+        """The planner prompt version of a plan written off the node, if any.
+
+        A job planned by ``paid import`` or ``plan --job`` reaches the worker
+        with its brief already written, so this process never learned which
+        ``planner.md`` produced it. The return leg leaves ``plan.json`` in the
+        job's directory, and it says.
+        """
+        try:
+            document = json.loads(
+                (self.jobs_dir / str(job_id) / "plan.json").read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return None
+        version = document.get("prompt_version") if isinstance(document, dict) else None
+        return str(version) if version else None
 
     def _save_plan_response(self, job_id: int, n: int, raw: str) -> str | None:
         """Keep what the planner actually said, beside the job it was about.
@@ -2118,10 +2137,14 @@ class Worker:
         """
         if job.brief and job.assertions:
             return job
-        if (job.planner or "").strip() == "paid":
+        if models.is_paid(job.planner):
+            # `paid`, or a model named in SKETCHGEN_PAID_MODELS: either way it
+            # is answered off the node, by `paid export --step plan` and
+            # `paid import` (or `plan --job`), never from here.
             db.transition(self.conn, job.id, "needs-laptop", needs="plan")
-            self.log(f"job {job.id}: planner is 'paid' — needs-laptop, needs=plan "
-                     "(DECIDE[credential-model] B: no paid key on the node)")
+            self.log(f"job {job.id}: planner is {job.planner!r}, a paid model — "
+                     "needs-laptop, needs=plan (DECIDE[credential-model] B: no "
+                     "paid key on the node)")
             return None
 
         model = self.planner_model_for(job)
