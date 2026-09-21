@@ -70,6 +70,21 @@ planner or executor. Two jobs made without an agent attached — one from the
 page, one inherited by a critique child — sat at `needs-laptop` for hours on
 2026-09-21, and that is why.
 
+### Before you start
+
+**Budget.** Your first command is `date -u +%FT%TZ`; keep it, Packet 8 takes it
+as `--since`. A sketch is a few minutes' work: read this file, plan, write under
+150 lines, check it, import. The executor prompt says "no second chance". That
+is written for local models, which get one reply per attempt. You have three
+attempts and a verdict takes seconds.
+
+**Looking.** `rig/README.md` is a browser rig for looking at a sketch on the
+laptop. It is a floor, not the gate. (Packet 7 replaces most of it with `paid
+try`, which runs the real gate.)
+
+**One session, both steps.** `--executor` with your own id is accepted and runs
+as one session; you are not expected to hand off to yourself.
+
 ### The three verbs
 
 `bin/sg` runs one sketchgen command on the node over ssh. Every argument is

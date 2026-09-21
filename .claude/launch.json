@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "rig",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8173", "--bind", "127.0.0.1", "--directory", "rig"],
+      "port": 8173
+    }
+  ]
+}
