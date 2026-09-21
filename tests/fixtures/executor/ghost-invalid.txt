@@ -1,0 +1,18 @@
+Here is the sketch, and a pointer script to go with it.
+
+```js
+function setup() { createCanvas(800, 600); noLoop(); }
+function draw() { background(20); circle(mouseX, mouseY, 40); }
+function mousePressed() { redraw(); }
+```
+
+```ghost
+[
+  {"t": 200, "type": "move", "x": 0.5, "y": 0.5},
+  {"t": 600, "type": "click", "x": 1.4, "y": 0.5}
+]
+```
+
+## Statement
+
+A dot that goes where it is told and nowhere else.

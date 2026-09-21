@@ -47,6 +47,11 @@ script with its own copy on the node and cannot import this module, so it will
 carry a copy and a test will pin the two together — the arrangement
 ``executor.SOUND_RE`` and the gate's ``SOUND_RE`` are already in.
 
+An entry may carry a script of its own instead, written by the model that
+wrote the sketch and inlined above the shim by :func:`with_script` as
+:data:`GLOBAL` (``DECIDE[ghost-dataset]``, 21 September 2026). The built-ins
+are the floor under every entry that has none, which is nearly all of them.
+
 Two callers, as for the sound shim: ``executor.index_html_for``, so the gate
 runs the bytes the gallery publishes, and ``gallery._write_entry``, so entries
 published before this existed pick it up on the next ``render-all``. A page
@@ -64,12 +69,15 @@ import re
 
 __all__ = [
     "BUILTINS",
+    "GLOBAL",
     "MARKER",
     "MAX_EVENTS",
     "MAX_MS",
+    "SCRIPT_MARKER",
     "SHIM",
     "TYPES",
     "script_js",
+    "with_script",
     "with_shim",
 ]
 
@@ -196,6 +204,18 @@ def _render_builtins() -> str:
 #: The first line of the shim, which is also how a page that has it is known.
 MARKER = "    <script>/* ghost pointer */"
 
+#: Where a page carries a script of its own, written by the model that wrote
+#: the sketch (``DECIDE[ghost-dataset]``, Packet 14). One name, spelled once:
+#: :func:`with_script` writes it and the player below reads it, and a typo in
+#: either would be a page whose script is silently ignored in favour of the
+#: built-in — which looks exactly like a working page.
+GLOBAL = "window.__ghostScript"
+
+#: How a page that already carries an inlined script is known — the assignment
+#: and not the name, because the shim below *reads* the name and a page with
+#: the shim on it would otherwise look like a page that already had a script.
+SCRIPT_MARKER = "    <script>%s = " % GLOBAL
+
 SHIM = MARKER + """
     (function () {
       /* Inert without ?ghost=; see sketchgen/ghostshim.py for why it is here
@@ -266,7 +286,7 @@ SHIM = MARKER + """
         return last;
       }
 
-      /* window.__ghostScript, when a page carries one, beats the built-ins
+      /* %(global)s, when a page carries one, beats the built-ins
        * the parameter names; a comma list is played one after another. */
       function chosen(names) {
         var out = [];
@@ -275,7 +295,7 @@ SHIM = MARKER + """
         var at;
         var by;
         var step;
-        if (window.__ghostScript) { return clean(window.__ghostScript); }
+        if (%(global)s) { return clean(%(global)s); }
         parts = String(names).split(",");
         for (at = 0; at < parts.length; at += 1) {
           shifted = BUILTINS[parts[at].replace(/^\\s+|\\s+$/g, "")];
@@ -361,6 +381,7 @@ SHIM = MARKER + """
     "max_ms": MAX_MS,
     "loop_ms": DEFAULT_LOOP_MS,
     "builtins": _render_builtins(),
+    "global": GLOBAL,
 }
 
 #: The sketch's own script tag, however the page that carries it spells it.
@@ -389,6 +410,46 @@ def with_shim(html: str) -> str:
     if html[at:at + 1] == "\n":
         at += 1
     return html[:at] + SHIM + html[at:]
+
+
+def with_script(html: str, events: list[dict]) -> str:
+    """``html`` with *events* inlined just above the shim, as :data:`GLOBAL`.
+
+    The script the executor wrote for its own sketch (``DECIDE[ghost-dataset]``,
+    Packet 14). *Above* the shim, because the player reads the global at the
+    moment the parameter sends it looking, and a page whose own script came
+    second would play the built-in instead — the one failure that looks like
+    success.
+
+    Unchanged when the page already carries a script (a render-all rewrites
+    every published page and must be a no-op on one it wrote last time) and
+    when it has no shim to feed: a page with no ``sketch.js`` tag never got the
+    marker, and a global nothing reads is litter in somebody's file.
+    """
+    if SCRIPT_MARKER in html:
+        return html
+    at = html.find(MARKER)
+    if at < 0:
+        return html
+    return html[:at] + _script_tag(events) + html[at:]
+
+
+def _script_tag(events: list[dict]) -> str:
+    """The one line :func:`with_script` inserts.
+
+    ``</`` is escaped because the HTML parser ends a ``<script>`` element at
+    the first ``</script``, whatever the JavaScript around it meant, and a
+    page that ends its script early is a page that throws. A validated ghost
+    script cannot contain the sequence — every value in it is a number or one
+    of four words (``executor.validate_ghost``) — but the escaping does not
+    depend on that: this function is handed a list, not a promise, and
+    ``<\\/`` is the same string to JSON and safe to the parser both.
+
+    Compact, sorted keys, as :func:`_render_builtins` writes the built-ins, so
+    the same list renders the same bytes every render.
+    """
+    data = json.dumps(events, sort_keys=True, separators=(",", ":"))
+    return SCRIPT_MARKER + data.replace("</", "<\\/") + ";</script>\n"
 
 
 def script_js() -> str:

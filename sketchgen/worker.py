@@ -165,7 +165,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from . import db, executor, lineage, models, planner, preflight
+from . import db, executor, ghostshim, lineage, models, planner, preflight
 
 __all__ = [
     "DEFAULT_CRITIC_MODEL",
@@ -193,6 +193,7 @@ __all__ = [
     "build_evidence",
     "default_judge",
     "default_probe",
+    "evidence_with_ghost",
     "evidence_with_preflight",
     "fence",
     "human_gap",
@@ -916,6 +917,56 @@ def build_evidence(report: dict[str, Any] | None, gate_exit: int | None,
             parts.append(f"- {note.strip()}")
 
     return "\n".join(parts).rstrip() + "\n"
+
+
+#: One sentence for the next attempt when the last one's ghost block was
+#: dropped (auto-mouse.md §4.1). It names the caps rather than repeating them,
+#: because the reason beside it is already specific and a model that is told
+#: "64" twice will believe the number and not the reason.
+GHOST_EVIDENCE = (
+    "ghost script dropped: %s (a fenced block tagged ghost, at most %d events "
+    "over %d s, keys t/type/x/y)"
+)
+
+
+def ghost_rejection(source_dir: str | os.PathLike[str] | None) -> str | None:
+    """Why ``executor.run`` dropped this attempt's ghost block, if it did.
+
+    Read off ``result.json`` rather than carried on :class:`Execution`,
+    because every path that makes an attempt writes that file in the attempt
+    directory: the local executor, the paid replay (``worker._paid_execution``
+    and ``paid try``, both of which are ``executor.run(stub=…)``) and the
+    stub the tests inject. One reader, and nothing to thread through four
+    signatures for a sentence.
+    """
+    if source_dir is None:
+        return None
+    try:
+        data = json.loads(
+            (Path(source_dir) / "result.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    ghost = data.get("ghost") if isinstance(data, dict) else None
+    if isinstance(ghost, dict) and ghost.get("rejected"):
+        return str(ghost["rejected"])
+    return None
+
+
+def evidence_with_ghost(evidence: str, reason: str | None) -> str:
+    """The gate's evidence with one line about a dropped ghost script under it.
+
+    *Under*, where the pre-flight's findings go above: this is a note, not a
+    cause. Nothing about the gate's verdict, the exit code or where the job
+    goes next depends on it — an invalid ghost block is not a failed sketch
+    (``DECIDE[ghost-dataset]``) — and the summary line above is still what
+    ``jobs.last_error`` shows. It is here at all because the next attempt is
+    the only chance the author gets to write the script again, and a block
+    that vanished without a word would be rewritten identically.
+    """
+    if not reason:
+        return evidence
+    line = GHOST_EVIDENCE % (reason, ghostshim.MAX_EVENTS, ghostshim.MAX_MS // 1000)
+    return evidence.rstrip("\n") + "\n\n" + line + "\n"
 
 
 def evidence_with_preflight(evidence: str, lines: list[str]) -> str:
@@ -2894,6 +2945,10 @@ class Worker:
         if gate_evidence is not None:
             new_evidence = evidence_with_preflight(
                 gate_evidence, self._preflight_lines(job.id, n, attempt_dir)
+            )
+            new_evidence = evidence_with_ghost(
+                new_evidence,
+                ghost_rejection(execution.source_dir or attempt_dir),
             )
         db.add_attempt(
             self.conn,

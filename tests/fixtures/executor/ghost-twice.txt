@@ -1,0 +1,26 @@
+Two scripts, because I could not decide which gesture reads better on a wall.
+
+```js
+function setup() { createCanvas(800, 600); noLoop(); }
+function draw() { background(20); circle(mouseX, mouseY, 40); }
+function mousePressed() { redraw(); }
+```
+
+```ghost
+[
+  {"t": 300, "type": "move", "x": 0.25, "y": 0.25},
+  {"t": 700, "type": "click", "x": 0.25, "y": 0.25}
+]
+```
+
+Or this one, if you would rather it wandered:
+
+```ghost
+[
+  {"t": 300, "type": "move", "x": 0.75, "y": 0.75}
+]
+```
+
+## Statement
+
+A dot that goes where it is told and nowhere else.

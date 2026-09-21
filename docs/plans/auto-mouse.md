@@ -7,7 +7,9 @@ stands at `main` 1c39d24 (#139). Written for Opus builders; one packet per branc
 numbering continues from `docs/plans/held-batch.md` (packets 10–12).
 
 *Status: Packet 13 is built — branch `feat/ghost-shim`, PR #143: `sketchgen/ghostshim.py`,
-the kiosk's `?ghost=` and `responds` in `kiosk.json`. Packets 14–16 are still a draft for
+the kiosk's `?ghost=` and `responds` in `kiosk.json`. Packet 14 is built — branch
+`feat/ghost-dataset`, PR #144: the `ghost` block, `executor.validate_ghost`, `ghostshim.with_script`,
+`meta.json`'s `ghost`, and the bullet in AGENTS.md. Packets 15–16 are still a draft for
 the operator's review. One thing in §1 was wrong and is corrected where it stands:
 `DECIDE[ghost-off]` says the key is `G`, and `G` is the generation overlay — the key
 built is `M`.*

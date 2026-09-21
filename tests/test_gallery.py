@@ -107,6 +107,9 @@ SPEC_7_KEYS = {
     # migration 015: the process cost the agent reported and the note it left
     "process",
     "note",
+    # auto-mouse.md §4.2: which pointer script this entry's page plays when
+    # nobody is at the keyboard, and who wrote it
+    "ghost",
 }
 
 
@@ -743,6 +746,144 @@ class MetaTests(GalleryTestCase):
         self.assertEqual(meta["attempts"], 2)
         self.assertIn("AudioContext is suspended", meta["last_error"])
         self.assertEqual(len(meta["gate"]), 2)
+
+
+class GhostScriptTests(GalleryTestCase):
+    """The executor's own pointer script, from the attempt dir onto the page.
+
+    auto-mouse.md §4.2. No migration and no column: ``ghost.json`` sits beside
+    ``sketch.js`` in the attempt directory, which the entry row already names,
+    the way ``_canvas_size`` finds the source.
+    """
+
+    EVENTS = [{"t": 200, "type": "move", "x": 0.2, "y": 0.25},
+              {"t": 600, "type": "down", "x": 0.2, "y": 0.25},
+              {"t": 900, "type": "up", "x": 0.6, "y": 0.6}]
+
+    def source_of(self, entry_id):
+        row = gallery._entry(self.conn, int(entry_id))
+        return gallery._source_dir(row, gallery._attempt_rows(self.conn, row["job_id"]))
+
+    def give(self, entry_id, text):
+        (self.source_of(entry_id) / "ghost.json").write_text(text, encoding="utf-8")
+
+    def rendered(self, entry_id):
+        gallery.render_entry(self.conn, entry_id, self.dest, self.config)
+        base = self.dest / "e" / str(entry_id)
+        page = base / "sketch" / "index.html"
+        return (
+            page.read_text(encoding="utf-8") if page.is_file() else "",
+            json.loads((base / "meta.json").read_text(encoding="utf-8")),
+            base,
+        )
+
+    def test_an_entry_with_a_script_carries_it_above_the_player(self):
+        from sketchgen import ghostshim
+        one = self.ids[0]
+        self.give(one, json.dumps(self.EVENTS))
+        page, meta, base = self.rendered(one)
+        self.assertLess(page.index(ghostshim.SCRIPT_MARKER),
+                        page.index(ghostshim.MARKER))
+        self.assertEqual(1, page.count(ghostshim.SCRIPT_MARKER))
+        line = [l for l in page.splitlines()
+                if l.startswith(ghostshim.SCRIPT_MARKER)][0]
+        self.assertEqual(
+            self.EVENTS,
+            json.loads(line[len(ghostshim.SCRIPT_MARKER):-len(";</script>")]),
+        )
+        # and the file itself goes beside the page, for a reader who wants to
+        # know what the pointer was asked to do
+        self.assertEqual(self.EVENTS,
+                         json.loads((base / "ghost.json").read_text(encoding="utf-8")))
+        self.assertEqual({"events": 3, "by": "executor"}, meta["ghost"])
+
+    def test_rendering_the_same_entry_twice_writes_the_same_page(self):
+        # A render-all rewrites every published page and the publisher commits
+        # what changed; a script that stacked would be a diff every time.
+        one = self.ids[0]
+        self.give(one, json.dumps(self.EVENTS))
+        first, _, _ = self.rendered(one)
+        second, _, _ = self.rendered(one)
+        self.assertEqual(first, second)
+
+    def test_an_entry_with_none_says_which_built_in_it_gets(self):
+        from sketchgen import ghostshim
+        # entry 1 confirmed responds(click); entry 2 is no_motion and asked
+        # for nothing it could respond to (DECIDE[ghost-who]).
+        page, meta, base = self.rendered(self.ids[0])
+        self.assertEqual(
+            {"events": len(ghostshim.BUILTINS["click"]), "by": "default",
+             "script": "click"},
+            meta["ghost"],
+        )
+        self.assertNotIn(ghostshim.SCRIPT_MARKER, page)
+        self.assertFalse((base / "ghost.json").exists())
+        still = self.rendered(self.ids[1])[1]
+        self.assertEqual(
+            {"events": len(ghostshim.BUILTINS["wander"]), "by": "default",
+             "script": "wander"},
+            still["ghost"],
+        )
+
+    def test_an_entry_that_responds_to_both_gets_both_built_ins(self):
+        from sketchgen import ghostshim
+        entry = self.ids[0]
+        self.conn.execute(
+            "UPDATE entries SET assertions_json = ? WHERE id = ?",
+            (json.dumps(["no_motion", "responds(click)", "responds(drag)"]), entry),
+        )
+        self.conn.commit()
+        self.assertEqual(
+            {"events": len(ghostshim.BUILTINS["click"])
+                       + len(ghostshim.BUILTINS["drag"]),
+             "by": "default", "script": "click,drag"},
+            self.rendered(entry)[1]["ghost"],
+        )
+
+    def test_an_assertion_the_gate_missed_does_not_choose_the_script(self):
+        # The subtraction _swipe_entry and kiosk.json already apply: sending a
+        # click into a sketch the gate proved does not respond to one is the
+        # case it exists to prevent.
+        entry = self.ids[0]
+        self.conn.execute(
+            "UPDATE entries SET offplan_json = ? WHERE id = ?",
+            (json.dumps(["responds(click)"]), entry),
+        )
+        self.conn.commit()
+        self.assertEqual("wander", self.rendered(entry)[1]["ghost"]["script"])
+
+    def test_a_file_that_no_longer_validates_is_skipped_with_its_reason(self):
+        # A person may edit the file on disk; a render must not be the thing
+        # that breaks over it.
+        from sketchgen import ghostshim
+        one = self.ids[0]
+        self.give(one, json.dumps([{"t": 200, "type": "move", "x": 4, "y": 0}]))
+        page, meta, base = self.rendered(one)
+        self.assertNotIn(ghostshim.SCRIPT_MARKER, page)
+        self.assertFalse((base / "ghost.json").exists())
+        self.assertEqual("default", meta["ghost"]["by"])
+        self.assertEqual("click", meta["ghost"]["script"])
+        self.assertEqual("event 1: x is 4, outside [0, 1]", meta["ghost"]["rejected"])
+
+    def test_a_file_that_is_not_json_is_the_same_kind_of_skip(self):
+        one = self.ids[0]
+        self.give(one, "{ nearly")
+        page, meta, _ = self.rendered(one)
+        self.assertEqual("not a JSON list", meta["ghost"]["rejected"])
+        self.assertTrue(page.rstrip().endswith("</html>"))
+
+    def test_the_script_does_not_reach_an_entry_with_no_sketch_to_play_it(self):
+        # No sketch.js means no page, no shim and nothing to feed.
+        job = db.enqueue(self.conn, "a sketch that never landed", "profcarroll")
+        self.conn.execute("UPDATE jobs SET state = 'failed' WHERE id = ?", (job,))
+        entry = db.create_entry(
+            self.conn, job, state="failed-kept", prompt="a sketch that never landed",
+            published_utc=db.utc_now(), submitted_by="profcarroll",
+        )
+        self.conn.commit()
+        _, meta, base = self.rendered(entry)
+        self.assertFalse((base / "sketch").exists())
+        self.assertEqual("wander", meta["ghost"]["script"])
 
 
 class PublishTimeLineageTests(GalleryTestCase):
