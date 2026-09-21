@@ -8,6 +8,7 @@ on a machine that holds a credential (docs/plans/agentic-cli.md §3.8):
   import  land the answers that packet comes back with
   status  what is waiting for an answer from off the node, per step
   release hand claimed subjects back to the local path (the critic's entries)
+  assign  which model runs each step by default — or all four at once
 
 Every verb takes ``--json`` and prints one object. Exit codes, as everywhere in
 this project: 0 success, 1 failure, 3 refused (no database, not a packet, a
@@ -30,6 +31,7 @@ import sys
 from pathlib import Path
 
 from sketchgen import db
+from sketchgen import models
 from sketchgen import paid as paid_mod
 
 EXIT_OK = 0
@@ -87,8 +89,15 @@ def _run(args: argparse.Namespace, work) -> int:
 
 def cmd_export(args: argparse.Namespace) -> int:
     def work(conn: sqlite3.Connection) -> int:
+        model = args.model or db.get_assignment(conn).get(args.step)
+        if not model:
+            raise paid_mod.PaidRefused(
+                f"name the model that will answer with --as, or assign one to "
+                f"{args.step} with `paid assign --{args.step} MODEL_ID`"
+            )
+        args.model = model
         packet = paid_mod.export_packet(
-            conn, args.step, model=args.model, limit=args.limit, ctx=_ctx(args)
+            conn, args.step, model=model, limit=args.limit, ctx=_ctx(args)
         )
         count = len(packet["items"])
         out = Path(os.path.expanduser(args.out))
@@ -184,6 +193,62 @@ def cmd_release(args: argparse.Namespace) -> int:
     return _run(args, work)
 
 
+def _assign_changes(args: argparse.Namespace) -> dict[str, str | None]:
+    changes: dict[str, str | None] = {}
+    if args.all:
+        changes = {step: args.all for step in db.ASSIGNABLE_STEPS}
+    for step in db.ASSIGNABLE_STEPS:
+        value = getattr(args, step)
+        if value is not None:
+            changes[step] = value
+    cleaned: dict[str, str | None] = {}
+    for step, value in changes.items():
+        value = value.strip()
+        if value in ("", "local"):
+            cleaned[step] = None
+            continue
+        if not paid_mod.MODEL_RE.match(value):
+            raise paid_mod.PaidRefused(f"{value!r} is not a usable model id")
+        cleaned[step] = value
+    return cleaned
+
+
+def cmd_assign(args: argparse.Namespace) -> int:
+    def work(conn: sqlite3.Connection) -> int:
+        changes = _assign_changes(args)
+        assignment = (db.set_assignment(conn, changes) if changes
+                      else db.get_assignment(conn))
+        paid_names = set(models.paid_models())
+        notes = []
+        for step, model in sorted(assignment.items()):
+            if model != "paid" and model not in paid_names and ":" not in model:
+                notes.append(
+                    f"{model} has no Ollama tag and is not in "
+                    f"{models.PAID_MODELS_ENV} as this shell sees it: the worker "
+                    "parks it for the laptop only if its unit names it, and "
+                    "otherwise sends it to Ollama"
+                )
+        if models.is_paid(assignment.get("execute")) or (
+            assignment.get("execute") and ":" not in assignment["execute"]
+        ):
+            notes.append(
+                "a paid executor is a second variable in the A/B the gallery "
+                "runs on the rules file, and a much larger one than two local "
+                "models; every entry it writes is badged off-node"
+            )
+        if args.json:
+            print(json.dumps({"assignment": assignment, "notes": notes},
+                             sort_keys=True))
+            return EXIT_OK
+        for step in db.ASSIGNABLE_STEPS:
+            print(f"{step:<9} {assignment.get(step) or '(this node: the worker default)'}")
+        for note in dict.fromkeys(notes):
+            print(f"note: {note}")
+        return EXIT_OK
+
+    return _run(args, work)
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -214,8 +279,9 @@ def register(top: argparse._SubParsersAction) -> None:
     )
     exp.add_argument("--step", required=True, choices=paid_mod.STEPS,
                      help="which step to answer")
-    exp.add_argument("--as", dest="model", required=True, metavar="MODEL_ID",
-                     help="the model that will answer, e.g. claude-opus-5")
+    exp.add_argument("--as", dest="model", default=None, metavar="MODEL_ID",
+                     help="the model that will answer, e.g. claude-opus-5 "
+                          "(default: the step's assignment, `paid assign`)")
     exp.add_argument("--out", required=True, metavar="FILE",
                      help="where to write the packet")
     exp.add_argument("--limit", type=int, default=20, metavar="N",
@@ -264,3 +330,23 @@ def register(top: argparse._SubParsersAction) -> None:
     rel.add_argument("--all", action="store_true", help="release every claim")
     _add_common(rel)
     rel.set_defaults(func=cmd_release, _parser=rel)
+
+    asg = sub.add_parser(
+        "assign",
+        help="which model runs each step by default",
+        description=(
+            "One setting for the four steps (agentic-cli §3.6). With no options, "
+            "print it. `plan` and `execute` are what the New job page preselects "
+            "and what a job that names no model gets; `judge` and `critique` are "
+            "what the idle loop runs, and a paid model there means the idle loop "
+            "leaves that step to `paid export`. A job's own planner and executor "
+            "always win. `local` unsets a step."
+        ),
+    )
+    asg.add_argument("--all", metavar="MODEL_ID",
+                     help="assign every step to this model at once")
+    for step in db.ASSIGNABLE_STEPS:
+        asg.add_argument(f"--{step}", metavar="MODEL_ID", default=None,
+                         help=f"the model for {step}, or `local` to unset it")
+    _add_common(asg)
+    asg.set_defaults(func=cmd_assign, _parser=asg)

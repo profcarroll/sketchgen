@@ -1204,6 +1204,54 @@ def set_meta(conn: sqlite3.Connection, key: str, value: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# The assignment — which model runs each of the four steps by default
+# ---------------------------------------------------------------------------
+
+ASSIGNMENT_KEY = "assignment"
+#: The four steps that ask a model something, in pipeline order.
+ASSIGNABLE_STEPS = ("plan", "execute", "judge", "critique")
+
+
+def get_assignment(conn: sqlite3.Connection) -> dict[str, str]:
+    """``{step: model}`` for the steps someone assigned; the rest are unset.
+
+    docs/plans/agentic-cli.md §3.6: one setting, not four flags. The New job
+    page reads ``plan`` and ``execute`` as its defaults, the worker reads them
+    for a job whose own column is blank, and the idle loop reads ``judge`` and
+    ``critique``. An unset step means what it meant before there was an
+    assignment: the worker's configured model. A job's own ``planner`` and
+    ``executor`` columns always win.
+    """
+    raw = get_meta(conn, ASSIGNMENT_KEY)
+    try:
+        found = json.loads(raw) if raw else {}
+    except ValueError:
+        return {}
+    if not isinstance(found, dict):
+        return {}
+    return {
+        step: str(found[step]).strip()
+        for step in ASSIGNABLE_STEPS
+        if isinstance(found.get(step), str) and str(found[step]).strip()
+    }
+
+
+def set_assignment(conn: sqlite3.Connection, changes: dict[str, str | None]) -> dict[str, str]:
+    """Apply ``changes`` (a model, or ``None`` to unset) and return the result."""
+    unknown = set(changes) - set(ASSIGNABLE_STEPS)
+    if unknown:
+        raise ValueError(f"not a step: {', '.join(sorted(unknown))}")
+    current = get_assignment(conn)
+    for step, model in changes.items():
+        if model:
+            current[step] = model
+        else:
+            current.pop(step, None)
+    set_meta(conn, ASSIGNMENT_KEY, json.dumps(current, sort_keys=True) if current else None)
+    return current
+
+
+# ---------------------------------------------------------------------------
 # Paid claims — which entries a critic off the node has been handed
 # ---------------------------------------------------------------------------
 

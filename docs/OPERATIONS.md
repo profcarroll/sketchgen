@@ -1450,6 +1450,25 @@ the difference between two local models warned about under
 entry, and the entry is badged **off-node** in the gallery, so the analysis can
 control for it; it is not controlled for you.
 
+**One setting for all four steps.** `paid assign` names the model each step runs
+with by default — one flag per step, or `--all` for "a paid model runs all
+tasks":
+
+```bash
+python3 bin/sketchgen paid assign --all claude-opus-5
+python3 bin/sketchgen paid assign --judge local       # unset one step
+python3 bin/sketchgen paid assign                     # print it
+```
+
+`plan` and `execute` are what New job preselects (under any saved defaults of
+its own) and what a job that names no model gets — a job's own planner and
+executor always win, and the word `local` on a job still means the worker's
+model. `judge` and `critique` are what the idle loop runs: a local tag replaces
+`SKETCHGEN_JUDGE_MODEL` / `SKETCHGEN_CRITIC_MODEL`, and a paid model makes the
+idle loop leave that step alone for `paid export`. With a step assigned,
+`paid export --step S` needs no `--as`. New job shows the assignment under the
+Run options, and says plainly what a paid executor does to the A/B.
+
 **An exported critique is assigned, not raced.** `critiques` holds one row per entry
 per prompt version, so an entry in a critique packet is claimed for the model the
 packet was cut for, and the idle loop's local critic skips it until the answer is
