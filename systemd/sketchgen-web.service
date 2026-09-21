@@ -26,6 +26,10 @@ Environment=OLLAMA_MODELS=/mnt/models
 # asks `gh auth status` for the operator's login. Set this when gh is not on
 # the node or is signed in as somebody else.
 #Environment=SKETCHGEN_OPERATOR=profcarroll
+# Model ids answered off the node (`sketchgen paid`), offered under "off this
+# node" on New job. Names only, never a key. Must match the worker unit's line,
+# or the page offers a model the worker would send to Ollama.
+#Environment=SKETCHGEN_PAID_MODELS=claude-opus-5,claude-sonnet-5
 ExecStart=%h/sketchgen/.venv/bin/python3 %h/sketchgen/app/bin/sketchgen web --bind 127.0.0.1 --port 8081
 Restart=on-failure
 RestartSec=10
