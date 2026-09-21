@@ -70,6 +70,10 @@ const ENTRIES = [
     qr: "e/11/qr-kiosk.svg",
     url: "https://profcarroll.github.io/sketchgen-gallery/e/11/",
     canvas: [800, 600],
+    // The one entry the gate confirmed answers to something. audio is in the
+    // list on purpose: no synthetic event is a user gesture, so it must never
+    // reach the frame's ?ghost= (auto-mouse.md DECIDE[ghost-who]).
+    responds: ["click", "drag", "audio"],
     judgment: {
       human: { look: { score: 2.1, n: 2, pct: 0.9 }, brief: { score: 1.8, n: 2, pct: 0.7 } },
       agent: { look: { score: 0.4, n: 2, pct: 0.1 }, brief: { score: 0.5, n: 2, pct: 0.2 } }
@@ -243,6 +247,11 @@ function kioskPage(document) {
       el(document, "span", { text: "hide every overlay" }),
       el(document, "span", { class: "state", id: "m-hide-state" })
     ]),
+    el(document, "li", { id: "m-ghost" }, [
+      el(document, "span", { class: "keys" }, [el(document, "kbd", { text: "M" })]),
+      el(document, "span", { text: "ghost pointer" }),
+      el(document, "span", { class: "state", id: "m-ghost-state" })
+    ]),
     el(document, "li", { id: "m-size" }, [
       el(document, "span", { class: "keys" }, [el(document, "kbd", { text: "Z" })]),
       el(document, "span", {}, [
@@ -333,6 +342,10 @@ function load(options) {
       const config = { write_path: opts.writePath === null ? "" : "https://write.example.invalid/api" };
       // Absent is on, which is what a gallery that predates the kiosk sends.
       if (opts.kioskViews === false) { config.kiosk_views = false; }
+      // The same, for the ghost pointer. A run that says nothing about it is
+      // the state every checkout is in the first time the field ships.
+      if (opts.kioskGhost === false) { config.kiosk_ghost = false; }
+      if (opts.ghostLoopS) { config.kiosk_ghost_loop_s = opts.ghostLoopS; }
       return answer(config);
     }
     if (String(url).indexOf("/counts") !== -1) { return answer({ counts: COUNTS }); }
@@ -1070,6 +1083,106 @@ async function views() {
   };
 }
 
+/* ---- the ghost pointer (docs/plans/auto-mouse.md §3.2) --------------------
+ *
+ * The kiosk's whole part in this is one query string on one src. Everything
+ * else — waiting for a canvas, dispatching, yielding to a hand — is the
+ * frame's own shim, which tests/js/ghostshim.js drives. So what is asserted
+ * here is the src, the switches that take it off, and the fact that the frame
+ * is otherwise exactly the frame kiosk.md §5 pins.
+ */
+
+function frameSrc(document) {
+  const seen = frames(document);
+  return seen.length ? seen[0].getAttribute("src") : null;
+}
+
+function ghostCaption(document) {
+  const tag = document.querySelector(".caption .facts li.ghost");
+  return tag ? tag.textContent : null;
+}
+
+async function ghost() {
+  /* Oldest first: entry 11 is the one with responds, entry 22 the one
+   * without, and they are adjacent in that order. */
+  const { document, tock } = await started({ search: "?order=oldest" });
+  const responds = {
+    src: frameSrc(document),
+    caption: ghostCaption(document),
+    attributes: Object.keys(frames(document)[0].attributes).sort(),
+    sandbox: frames(document)[0].getAttribute("sandbox"),
+    frames: frames(document).length
+  };
+
+  press(document, "y");                  // opens the menu
+  press(document, "ArrowRight");         // and now advances, to entry 22
+  tock(FADE);
+  const silent = { src: frameSrc(document), caption: ghostCaption(document) };
+  press(document, "Escape");
+
+  /* M, on the entry that has one: off, and the frame re-seated without it. */
+  const toggled = await started({ search: "?order=oldest" });
+  press(toggled.document, "y");
+  press(toggled.document, "m");
+  const off = {
+    src: frameSrc(toggled.document),
+    caption: ghostCaption(toggled.document),
+    state: toggled.document.getElementById("m-ghost-state").textContent,
+    row: toggled.document.getElementById("m-ghost").className,
+    frames: frames(toggled.document).length,
+    // It is a setting, not a mode: it survives the projector being left.
+    stored: JSON.parse(toggled.window.localStorage.getItem("sketchgen-kiosk")).ghost
+  };
+  press(toggled.document, "M");          // and the capital brings it back
+  const backOn = {
+    src: frameSrc(toggled.document),
+    state: toggled.document.getElementById("m-ghost-state").textContent,
+    stored: JSON.parse(toggled.window.localStorage.getItem("sketchgen-kiosk")).ghost
+  };
+
+  /* A projector that was left with it off comes back up with it off. */
+  const stored = JSON.stringify({
+    v: 2, every: 60, order: "oldest", show: { prompt: true }, ghost: false
+  });
+  const remembered = await started({ stored: stored });
+  const fromStorage = frameSrc(remembered.document);
+
+  /* The URL switch, which is not a key and is not persisted — and which has
+   * to ride in the launch link, or the first acting key throws it away. */
+  const byUrl = await started({ search: "?order=oldest&ghost=0" });
+  press(byUrl.document, "y");
+  press(byUrl.document, "]");            // an acting key rewrites the bar
+  const urlOff = {
+    src: frameSrc(byUrl.document),
+    caption: ghostCaption(byUrl.document),
+    state: byUrl.document.getElementById("m-ghost-state").textContent,
+    link: byUrl.document.getElementById("launch").textContent,
+    bar: byUrl.window.history.lastUrl
+  };
+
+  /* And the gallery-wide one, which is a line in config.json and no deploy. */
+  const byConfig = await started({ search: "?order=oldest", kioskGhost: false });
+  const configOff = {
+    src: frameSrc(byConfig.document),
+    caption: ghostCaption(byConfig.document)
+  };
+
+  /* The gap is the gallery's to set. */
+  const slower = await started({ search: "?order=oldest", ghostLoopS: 20 });
+  const loop = frameSrc(slower.document);
+
+  return {
+    responds: responds,
+    silent: silent,
+    off: off,
+    backOn: backOn,
+    fromStorage: fromStorage,
+    urlOff: urlOff,
+    configOff: configOff,
+    loop: loop
+  };
+}
+
 async function main() {
   const report = {
     orders: await orders(),
@@ -1093,6 +1206,7 @@ async function main() {
     migration: await migration(),
     starting: await starting(),
     views: await views(),
+    ghost: await ghost(),
     source: { chars: SOURCE.length, bytes: Buffer.byteLength(SOURCE, "utf8") }
   };
   console.log(JSON.stringify(report));

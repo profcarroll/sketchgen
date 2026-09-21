@@ -72,8 +72,26 @@ an IIFE, `"use strict"`, ES5 syntax, no build step, comments that say why.
    Inside the sandboxed frame, however, that gesture does not carry: the frame gets its own
    gesture only when the viewer clicks *inside* it. A sketch with `responds(audio)` or a
    microphone will run silent in the kiosk until someone clicks the sketch, and that is accepted
-   for this packet; the kiosk does not try to forward a click. Full screen (`F`) is on the kiosk
-   document and works from the card's click onward.
+   for this packet; ~~the kiosk does not try to forward a click.~~ Full screen (`F`) is on the
+   kiosk document and works from the card's click onward.
+
+   **Rewritten 21 September 2026, and the sentence above was the right conclusion from the wrong
+   premise.** The kiosk does not forward a click because it *cannot*: the frame is
+   `sandbox="allow-scripts"` with no `allow-same-origin`, which makes it an opaque origin, and a
+   parent cannot dispatch an event into one at all. Nothing about that has changed and §4.5 still
+   forbids trying. What has changed is where the pointer comes from. `sketchgen/ghostshim.py`
+   puts a small script inside `e/<id>/sketch/index.html`, in the sketch's own document, where the
+   canvas and its `getBoundingClientRect()` are in reach; it is inert unless the page is loaded
+   with `?ghost=`, which is the only thing the kiosk says to a frame and it says it in the URL.
+   So a sketch the gate confirmed `responds(click)` or `responds(drag)` is clicked and dragged on
+   the projector by a pointer inside its own page, and a trusted event from a real hand ends the
+   run for the rest of that load. `docs/plans/auto-mouse.md` is the plan; Packet 13 built it.
+
+   **Sound still needs a hand, and that half of the sentence is now the whole of it.** A
+   synthetic `MouseEvent` carries `isTrusted: false` and is not a user gesture, so it cannot
+   resume an `AudioContext` and never will. `responds(audio)` is never ghosted. A sketch that
+   makes sound runs silent on the projector until somebody clicks inside the frame, exactly as
+   this paragraph has always said.
 8. **Settings live in the URL and in `localStorage`, in that order.** `?order=random&every=45
    &show=prompt,authors,code` sets the kiosk up with no keyboard at all, which is how a projector
    gets bookmarked; the menu footer prints the link for the current setup. Keys update both the
@@ -287,6 +305,9 @@ hours without a key or a mouse. Read `document.cookie`. Present an identity of a
 is a public read and `/view` takes an anonymous write, and a projector that presented one would
 file every sketch it played under whoever last signed in on that machine. Evaluate sketch source.
 Touch `localStorage` keys other than `sketchgen-kiosk`. Hold more than one iframe at a time.
+Dispatch anything into the frame; the frame's own shim does, on a query parameter
+(§1.7 as rewritten, `docs/plans/auto-mouse.md`). Add a parameter to anything but that one
+`src`.
 
 ## 5. Acceptance
 
