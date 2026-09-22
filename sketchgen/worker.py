@@ -552,6 +552,33 @@ def resident_models(host: str = DEFAULT_HOST, timeout: float = 5.0) -> tuple[lis
     return names, None
 
 
+def resident_contexts(
+    host: str = DEFAULT_HOST, timeout: float = 5.0
+) -> tuple[dict[str, int | None], str | None]:
+    """``GET /api/ps``: what Ollama has resident, and the context each holds.
+
+    :func:`resident_models` answers the slot fence, which only cares whether a
+    name is there. This one carries ``context_length`` too, because Ollama keys
+    a loaded runner on its context size: a model resident at 8192 does not serve
+    a request for 16384, it is torn down and loaded again. That distinction is
+    the whole of `docs/plans/child-source-num-ctx.md`, and the card would lie
+    without it -- gemma4:26b still serves the planner at 8192 and the executor
+    at 16384, which is the one such flip the executor's collapse left standing.
+    """
+    url = host.rstrip("/") + "/api/ps"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        return {}, f"{url} did not answer: {exc}"
+    found: dict[str, int | None] = {}
+    for entry in body.get("models") or []:
+        name = str(entry.get("name") or entry.get("model") or "?")
+        context = entry.get("context_length")
+        found[name] = int(context) if isinstance(context, int) else None
+    return found, None
+
+
 def default_probe(host: str = DEFAULT_HOST) -> dict[str, Any]:
     """The real probe: other clients, other workers, and what Ollama has loaded."""
     names, error = resident_models(host)
@@ -1657,6 +1684,9 @@ class Worker:
         critic_fn: Callable[..., Any] | None = None,
         spawn_fn: Callable[..., int | None] | None = None,
         probe: Callable[[], dict[str, Any]] | None = None,
+        warm_fn: Callable[..., float] | None = None,
+        resident_fn: Callable[..., tuple[dict[str, int | None], str | None]]
+        | None = None,
         log_stream=None,
     ) -> None:
         self.conn = conn
@@ -1680,6 +1710,16 @@ class Worker:
         self.critic_fn = critic_fn or default_critic
         self.spawn_fn = spawn_fn or lineage.spawn
         self.probe = probe or (lambda: default_probe(self.host))
+        #: Warming is part of calling the real executor, so it is off whenever
+        #: the executor is stubbed -- observing_probe's reasoning exactly: a
+        #: stubbed run calls no model, so it has nothing to load and must touch
+        #: no socket (the suite runs with no network). Pass either explicitly to
+        #: exercise :meth:`_warm_for` from a test.
+        _stubbed = executor_fn is not None
+        self.warm_fn = warm_fn or (None if _stubbed else executor.warm)
+        self.resident_fn = resident_fn or (
+            None if _stubbed else resident_contexts
+        )
         self.log_stream = sys.stderr if log_stream is None else log_stream
         self._log_path: Path | None = None
         self._planner_prompt_version: str | None = None
@@ -1756,6 +1796,59 @@ class Worker:
         except sqlite3.Error as exc:
             self._activity_id = None
             self.log(f"status: the card could not record {step}: {exc}")
+
+    def _warm_for(
+        self, model: str, num_ctx: int, *, job_id: int, n: int, attempts: int
+    ) -> None:
+        """Load the model before the attempt, so the card does not call it writing.
+
+        Until 2026-09-22 the card said *Writing the sketch* from the moment the
+        attempt began, and on a cold model that was a lie for minutes: job
+        1357's first attempt showed it for 377 s, of which the first 178 s was a
+        141.7 s ARM repack of laguna-xs-2.1's 19 GB and then prefill -- 47% of
+        the step, before a single token existed. Job 1364 did it for 276.1 s the
+        same afternoon. The load is real, it is often the largest term, and
+        every surface reported it as something else: Ollama leaves
+        ``load_duration`` out of both its rate denominators, so it is invisible
+        in tok/s too (`docs/plans/model-load-cost.md`).
+
+        So the step is split. When the runner is already up at this window there
+        is nothing to say and the card is unchanged; when it is not, the card
+        says *Loading a new model* for exactly as long as that takes, and
+        :meth:`_say` closes it when writing begins. The load happens either way
+        -- this only moves it in front of the sentence that describes it.
+
+        **Never raises, and never costs an attempt.** If ``/api/ps`` cannot be
+        reached, or the load-only request fails, the card keeps its old shape and
+        :func:`sketchgen.executor.run` loads the model itself exactly as before.
+        A dishonest card is a much smaller thing than a lost job.
+        """
+        if self.warm_fn is None or self.resident_fn is None:
+            return
+        resident, error = self.resident_fn(self.host)
+        if error is not None:
+            # The fence already records an unreachable Ollama; do not say
+            # "loading" on a guess, and do not fail the attempt over the card.
+            return
+        if resident.get(model) == num_ctx:
+            return
+        self._say(
+            "loading",
+            "Loading a new model",
+            f"{model} · job {job_id}, attempt {n} of {attempts} · "
+            f"not resident at ctx {num_ctx}",
+            job_id=job_id,
+            model=model,
+        )
+        try:
+            took = self.warm_fn(self.host, model, num_ctx)
+        except OSError as exc:
+            self.log(
+                f"job {job_id}: {model} could not be loaded up front ({exc}); "
+                f"the attempt will load it"
+            )
+            return
+        self.log(f"job {job_id}: {model} resident at ctx {num_ctx} in {took:.1f}s")
 
     def _say_more(
         self,
@@ -3116,6 +3209,12 @@ class Worker:
         self.log(f"job {job.id}: attempt {n}/{job.max_attempts} executing into "
                  f"{attempt_dir} with {model}"
                  + (" and the previous attempt's evidence" if evidence else ""))
+        written_off_node = models.is_paid(model, self.conn)
+        if not written_off_node:
+            # A paid model is answered off the node and loads nothing here.
+            self._warm_for(
+                model, num_ctx, job_id=job.id, n=n, attempts=job.max_attempts
+            )
         self._say(
             "writing",
             "Writing the sketch",
@@ -3125,7 +3224,6 @@ class Worker:
             job_id=job.id,
             model=model,
         )
-        written_off_node = models.is_paid(model, self.conn)
         try:
             if written_off_node:
                 execution = self._paid_execution(
