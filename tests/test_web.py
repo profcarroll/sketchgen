@@ -4459,3 +4459,181 @@ class GivenSourceTests(unittest.TestCase):
         attempt = db.Attempt(id=1, job_id=1, n=1, given_source_json="{oops")
         job = db.Job(id=1, state="held", prompt="x")
         self.assertEqual("given: nothing", web.given_line(job, attempt))
+
+
+class LoadsImageTests(unittest.TestCase):
+    """The person publishing sees where the picture comes from (§4).
+
+    Entry 1103's five attempts each fetched a photograph from picsum.photos in
+    `preload()` and no screen on this node said so — not the held card the
+    operator decided on, not the job page behind it. Publishing a sketch that
+    loads an image publishes a page that sends every viewer to a third party
+    under that party's terms, and DECIDE[image-licence] is that the gallery
+    records which one rather than resolving it: so it has to be on the card.
+
+    Its own database, as ProcessCostTests and GivenSourceTests have: these
+    pages are read here rather than over the server, and nothing else in this
+    file should see these rows.
+    """
+
+    PICSUM = {"url": "https://picsum.photos/seed/sketchgen/800/600?token=abc123",
+              "host": "picsum.photos", "type": "image/jpeg", "bytes": 61440,
+              "ms": 340}
+    WIKIMEDIA = {"url": "https://upload.wikimedia.org/w/x.png",
+                 "host": "upload.wikimedia.org", "type": "image/png",
+                 "bytes": 1_250_000, "ms": 712}
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="sketchgen-loads-")
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.db_path = root / "sketchgen.db"
+        self.jobs_dir = root / "jobs"
+        self.jobs_dir.mkdir()
+        db.init(self.db_path)
+        self.conn = db.connect(self.db_path)
+        self.addCleanup(self.conn.close)
+        self.app = web.App(db_path=str(self.db_path), jobs_dir=str(self.jobs_dir))
+
+    def job(self, *arrivals, kept=None, n=1):
+        """One held entry, ``n`` attempts, ``arrivals`` on each of them.
+
+        ``arrivals`` is a list per attempt; ``kept`` is which attempt the
+        entry points at, the last by default, as ``best_attempt`` leaves it.
+        """
+        job_id = db.enqueue(self.conn, "a jigsaw of a photograph", "profcarroll",
+                            executor="qwen3-coder:30b", rules_file="treatment")
+        db.transition(self.conn, job_id, "executing")
+        db.transition(self.conn, job_id, "gating")
+        dirs = {}
+        for k in range(1, n + 1):
+            attempt = self.jobs_dir / str(job_id) / f"attempt-{k}"
+            gate = attempt / ".gate"
+            gate.mkdir(parents=True)
+            report = report_json(attempt)
+            loaded = arrivals[k - 1] if k - 1 < len(arrivals) else []
+            if loaded is not None:
+                report["resources_loaded"] = list(loaded)
+            (gate / "report.json").write_text(json.dumps(report), encoding="utf-8")
+            (gate / "strip.png").write_bytes(PNG_BYTES)
+            (attempt / "index.html").write_text(SKETCH_INDEX, encoding="utf-8")
+            (attempt / "sketch.js").write_text(SKETCH_JS, encoding="utf-8")
+            db.add_attempt(self.conn, job_id, k, model="qwen3-coder:30b",
+                           rules_file="treatment", source_dir=str(attempt),
+                           gate_exit=0, gate_report_path=str(gate / "report.json"))
+            dirs[k] = attempt
+        db.transition(self.conn, job_id, "held")
+        chosen = dirs[kept or n]
+        entry_id = db.create_entry(
+            self.conn, job_id, "held", prompt="a jigsaw of a photograph",
+            executor="qwen3-coder:30b", rules_file="treatment", attempts=n,
+            source_dir=str(chosen), strip_path=str(chosen / ".gate" / "strip.png"),
+            submitted_by="profcarroll",
+        )
+        return job_id, entry_id
+
+    def card(self, entry_id):
+        _tray, body = web.held_page(self.app, self.conn)
+        needle = f'id="entry-{entry_id}"'
+        self.assertIn(needle, body)
+        inside = body.split(needle, 1)[1].split(">", 1)[1]
+        return inside.split("</section>", 1)[0]
+
+    def meta_line(self, entry_id):
+        return self.card(entry_id).split('<p class="meta">', 1)[1].split("</p>", 1)[0]
+
+    def page(self, job_id):
+        return web.job_page(self.app, self.conn, db.get_job(self.conn, job_id))
+
+    # -- the held card -----------------------------------------------------
+
+    def test_the_card_names_the_host_the_picture_came_from(self):
+        _job_id, entry_id = self.job([self.PICSUM])
+        self.assertIn(" · image from picsum.photos · ", self.meta_line(entry_id))
+
+    def test_two_hosts_are_both_named_on_the_card(self):
+        _job_id, entry_id = self.job([self.PICSUM, self.WIKIMEDIA])
+        # joined with "and", not the line's own middle dot, which separates
+        # the facts on it rather than the hosts in one of them
+        self.assertIn("images from picsum.photos and upload.wikimedia.org",
+                      self.meta_line(entry_id))
+
+    def test_the_card_reads_the_kept_attempt_and_not_the_last(self):
+        """The entry is one attempt, and the page it publishes is that one's."""
+        _job_id, entry_id = self.job([self.PICSUM], [], kept=1, n=2)
+        self.assertIn("image from picsum.photos", self.meta_line(entry_id))
+        _job2, entry2 = self.job([self.PICSUM], [], kept=2, n=2)
+        self.assertNotIn("image from", self.meta_line(entry2))
+
+    def test_a_card_whose_sketch_loads_nothing_says_nothing(self):
+        """Which is every entry this node has held so far."""
+        _job_id, entry_id = self.job(None)
+        line = self.meta_line(entry_id)
+        self.assertNotIn("image from", line)
+        # and the rest of the line is where it was
+        self.assertIn("treatment", line)
+        self.assertIn("qwen3-coder:30b", line)
+
+    def test_the_card_names_the_host_and_never_the_url(self):
+        _job_id, entry_id = self.job([self.PICSUM])
+        _tray, body = web.held_page(self.app, self.conn)
+        self.assertNotIn("token=abc123", body)
+
+    def test_a_host_is_escaped_on_the_card(self):
+        _job_id, entry_id = self.job([{**self.PICSUM, "host": "<b>x</b>.example"}])
+        line = self.meta_line(entry_id)
+        self.assertNotIn("<b>x</b>", line)
+        self.assertIn("&lt;b&gt;x&lt;/b&gt;.example", line)
+
+    # -- the job page ------------------------------------------------------
+
+    def test_the_job_page_says_what_each_attempt_fetched(self):
+        job_id, _entry_id = self.job([self.PICSUM], [self.WIKIMEDIA], n=2)
+        page = self.page(job_id)
+        self.assertIn("loads: picsum.photos (image/jpeg, 61.4 kB)", page)
+        self.assertIn("loads: upload.wikimedia.org (image/png, 1.2 MB)", page)
+
+    def test_two_pictures_in_one_attempt_are_joined_with_the_pages_own_dot(self):
+        job_id, _entry_id = self.job([self.PICSUM, self.WIKIMEDIA])
+        self.assertIn(
+            "loads: picsum.photos (image/jpeg, 61.4 kB) · "
+            "upload.wikimedia.org (image/png, 1.2 MB)",
+            self.page(job_id),
+        )
+
+    def test_an_attempt_that_fetched_nothing_gets_no_line_at_all(self):
+        """`given: nothing` is a fact about every attempt; this is not — a
+        `loads: nothing` under all 900 jobs on this node would say only that a
+        sketch drew what sketches draw."""
+        job_id, _entry_id = self.job(None)
+        page = self.page(job_id)
+        self.assertNotIn("loads:", page)
+        self.assertIn("given: nothing", page)
+
+    # -- the line itself ---------------------------------------------------
+
+    def test_the_line_reads_as_the_packet_wrote_it(self):
+        self.assertEqual("loads: picsum.photos (image/jpeg, 61.4 kB)",
+                         web.loads_line({"resources_loaded": [self.PICSUM]}))
+        self.assertEqual("", web.loads_line({"resources_loaded": []}))
+        self.assertEqual("", web.loads_line({}))
+        self.assertEqual("", web.loads_line(None))
+        # a report written before the word existed, and a broken one
+        self.assertEqual("", web.loads_line({"resources_loaded": "picsum.photos"}))
+        self.assertEqual([], web.loads_items({"resources_loaded": ["x", 1]}))
+        # host but nothing else, and neither
+        self.assertEqual("loads: picsum.photos",
+                         web.loads_line({"resources_loaded": [
+                             {"host": "picsum.photos"}]}))
+        self.assertEqual("loads: an unrecorded host (image/jpeg)",
+                         web.loads_line({"resources_loaded": [
+                             {"type": "image/jpeg"}]}))
+        self.assertEqual(["picsum.photos"], web.loads_hosts(
+            {"resources_loaded": [self.PICSUM, {**self.PICSUM, "bytes": 1}]}))
+
+    def test_the_size_is_kb_or_mb_with_one_decimal_and_never_a_guess(self):
+        self.assertEqual("61.4 kB", web.human_bytes(61440))
+        self.assertEqual("1.2 MB", web.human_bytes(1_250_000))
+        for missing in (None, "61440", True, -1):
+            with self.subTest(value=missing):
+                self.assertEqual("", web.human_bytes(missing))

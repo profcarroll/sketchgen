@@ -110,6 +110,10 @@ SPEC_7_KEYS = {
     # auto-mouse.md §4.2: which pointer script this entry's page plays when
     # nobody is at the keyboard, and who wrote it
     "ghost",
+    # media-assertion.md §4: where the picture the kept attempt drew came
+    # from — host, content type and size, never the URL. `[]` on every entry
+    # gated before `loads(image)` existed, which is all of them so far.
+    "loads",
 }
 
 
@@ -4717,3 +4721,258 @@ class ProcessCostTests(GalleryTestCase):
         meta = json.loads((where / "meta.json").read_text(encoding="utf-8"))
         self.assertNotIn('<th scope="row">Process</th>', page)
         self.assertIsNone(meta["process"])
+
+
+class LoadsImageTests(GalleryTestCase):
+    """Where the picture a sketch loaded came from, shown to people.
+
+    Entry 1103, the jigsaw prompted on 2026-09-20, loads
+    `https://picsum.photos/800/600` in `preload()`: five attempts, three of
+    them eleven seconds of gate time waiting for a photograph, and not one
+    word about it anywhere on its published page. Entry 429 did the same eight
+    times and drew nothing, which is why the gate records what a sketch asked
+    for at all. Since `loads(image)` (media-assertion.md §3.1) the gate also
+    records what arrived, and this is where a reader of the gallery — and the
+    person deciding whether to publish — finds out.
+
+    The report is rewritten on disk here rather than through the worker
+    because `build_db` is shared with every other test in this file and this
+    is a fixture building a gate run, not the worker writing one.
+    """
+
+    PICSUM = {"url": "https://picsum.photos/seed/sketchgen/800/600?token=abc123",
+              "host": "picsum.photos", "type": "image/jpeg", "bytes": 61440,
+              "ms": 340}
+    WIKIMEDIA = {"url": "https://upload.wikimedia.org/w/x.png",
+                 "host": "upload.wikimedia.org", "type": "image/png",
+                 "bytes": 1_250_000, "ms": 712}
+
+    def loaded(self, entry_id, *items, preload_s=None):
+        """Rewrite that entry's kept report with the arrivals it really had."""
+        row = self.conn.execute(
+            "SELECT source_dir FROM entries WHERE id=?", (entry_id,)
+        ).fetchone()
+        report = Path(row["source_dir"]) / ".gate" / "report.json"
+        data = json.loads(report.read_text(encoding="utf-8"))
+        data["resources_loaded"] = list(items)
+        if preload_s is not None:
+            data["timings"]["preload_s"] = preload_s
+        report.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+    def out(self, entry_id):
+        return gallery.render_entry(self.conn, entry_id, self.dest, self.config)
+
+    def page_and_meta(self, entry_id):
+        out = self.out(entry_id)
+        return (
+            (out / "index.html").read_text(encoding="utf-8"),
+            json.loads((out / "meta.json").read_text(encoding="utf-8")),
+        )
+
+    # -- meta.json ---------------------------------------------------------
+
+    def test_the_gate_log_carries_what_arrived_and_how_long_it_waited(self):
+        self.loaded(self.ids[0], self.PICSUM, preload_s=11.4)
+        _page, meta = self.page_and_meta(self.ids[0])
+        self.assertEqual(
+            [{"host": "picsum.photos", "type": "image/jpeg", "bytes": 61440}],
+            meta["gate"][0]["resources_loaded"],
+        )
+        self.assertEqual(11.4, meta["gate"][0]["preload_s"])
+        # and the top level is the kept attempt's own list, same shape
+        self.assertEqual(meta["gate"][0]["resources_loaded"], meta["loads"])
+        # inside gate for the per-attempt facts; META_KEYS moved once
+        self.assertEqual(set(gallery.META_KEYS), set(meta))
+
+    def test_a_report_written_before_the_word_existed_says_nothing(self):
+        """Which is every report this gallery has published."""
+        _page, meta = self.page_and_meta(self.ids[0])
+        self.assertEqual([], meta["loads"])
+        self.assertEqual([], meta["gate"][0]["resources_loaded"])
+        self.assertIsNone(meta["gate"][0]["preload_s"])
+
+    def test_the_kept_attempt_is_the_one_the_top_level_reads(self):
+        """Entry 3 kept its last of two attempts; the first loaded nothing."""
+        three = self.ids[2]
+        row = self.conn.execute(
+            "SELECT job_id, source_dir FROM entries WHERE id=?", (three,)
+        ).fetchone()
+        first = Path(str(row["source_dir"])).parent / "attempt-1"
+        data = json.loads((first / ".gate" / "report.json").read_text(encoding="utf-8"))
+        data["resources_loaded"] = []
+        (first / ".gate" / "report.json").write_text(
+            json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        self.loaded(three, self.WIKIMEDIA)
+        _page, meta = self.page_and_meta(three)
+        self.assertEqual([], meta["gate"][0]["resources_loaded"])
+        self.assertEqual(
+            [{"host": "upload.wikimedia.org", "type": "image/png",
+              "bytes": 1_250_000}],
+            meta["gate"][1]["resources_loaded"],
+        )
+        self.assertEqual(meta["gate"][1]["resources_loaded"], meta["loads"])
+
+    def test_a_malformed_item_is_dropped_and_a_missing_key_is_null(self):
+        self.loaded(self.ids[0], {"host": "picsum.photos"}, "not an object")
+        _page, meta = self.page_and_meta(self.ids[0])
+        self.assertEqual(
+            [{"host": "picsum.photos", "type": None, "bytes": None}], meta["loads"]
+        )
+
+    def test_a_resources_loaded_that_is_not_a_list_is_read_as_empty(self):
+        row = self.conn.execute(
+            "SELECT source_dir FROM entries WHERE id=?", (self.ids[0],)
+        ).fetchone()
+        report = Path(row["source_dir"]) / ".gate" / "report.json"
+        data = json.loads(report.read_text(encoding="utf-8"))
+        data["resources_loaded"] = "picsum.photos"
+        report.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+        _page, meta = self.page_and_meta(self.ids[0])
+        self.assertEqual([], meta["loads"])
+
+    # -- the URL, which is never published ---------------------------------
+
+    def test_the_url_appears_nowhere_in_the_rendered_entry(self):
+        """DECIDE[image-hosts], and the reason `guard()` scans what it writes.
+
+        A URL can carry a query string a person did not choose to publish, so
+        the gallery publishes the host and the gate keeps the URL. Asserted
+        over every byte of the written directory — the page, meta.json, the
+        sketch, the strip — and not just the page, because meta.json is the
+        machine-readable copy of the same record.
+        """
+        self.loaded(self.ids[0], self.PICSUM, self.WIKIMEDIA)
+        out = self.out(self.ids[0])
+        written = sorted(p for p in out.rglob("*") if p.is_file())
+        self.assertTrue(written)
+        for path in written:
+            with self.subTest(path=path.name):
+                blob = path.read_bytes()
+                self.assertNotIn(b"token=abc123", blob)
+                self.assertNotIn(self.PICSUM["url"].encode(), blob)
+                self.assertNotIn(self.WIKIMEDIA["url"].encode(), blob)
+        # the host is published, and so is the fact that there was one
+        self.assertIn(b"picsum.photos", (out / "meta.json").read_bytes())
+        self.assertNotIn("url", json.loads(
+            (out / "meta.json").read_text(encoding="utf-8"))["loads"][0])
+
+    # -- the entry page ----------------------------------------------------
+
+    def test_one_host_gets_a_row_and_a_line_under_the_frame(self):
+        self.loaded(self.ids[0], self.PICSUM)
+        page, _meta = self.page_and_meta(self.ids[0])
+        self.assertIn('<th scope="row">Loads</th>', page)
+        self.assertIn("a picture from picsum.photos (image/jpeg, 61.4 kB)", page)
+        self.assertIn(
+            '<p class="stage-loads">This sketch fetches an image from '
+            "picsum.photos when it runs.</p>",
+            page,
+        )
+        # the row lands directly under Gate, which says what each run found
+        self.assertLess(page.index(">Gate<"), page.index(">Loads<"))
+        # and the line is under the frame, above the seed
+        self.assertLess(page.index("stage-loads"), page.index("stage-meta"))
+
+    def test_two_hosts_are_joined_with_and(self):
+        self.loaded(self.ids[0], self.PICSUM, self.WIKIMEDIA)
+        page, _meta = self.page_and_meta(self.ids[0])
+        self.assertIn(
+            "a picture from picsum.photos (image/jpeg, 61.4 kB) and a picture "
+            "from upload.wikimedia.org (image/png, 1.2 MB)",
+            page,
+        )
+        self.assertIn(
+            '<p class="stage-loads">This sketch fetches images from '
+            "picsum.photos and upload.wikimedia.org when it runs.</p>",
+            page,
+        )
+
+    def test_two_pictures_from_one_host_name_it_once_under_the_frame(self):
+        """The row is about what arrived, the line about who gets called."""
+        self.loaded(self.ids[0], self.PICSUM, {**self.PICSUM, "bytes": 2048})
+        page, _meta = self.page_and_meta(self.ids[0])
+        self.assertIn(
+            '<p class="stage-loads">This sketch fetches an image from '
+            "picsum.photos when it runs.</p>",
+            page,
+        )
+        self.assertIn("2.0 kB", page)
+        self.assertEqual(2, page.count("a picture from picsum.photos"))
+
+    def test_the_size_is_kb_or_mb_with_one_decimal_and_never_a_guess(self):
+        self.assertEqual("61.4 kB", gallery._size_word(61440))
+        self.assertEqual("0.5 kB", gallery._size_word(512))
+        self.assertEqual("999.9 kB", gallery._size_word(999_900))
+        self.assertEqual("1.0 MB", gallery._size_word(1_000_000))
+        self.assertEqual("1.2 MB", gallery._size_word(1_250_000))
+        # no number is no words: a size the gate did not record is left out of
+        # the parenthesis rather than printed as a zero
+        for missing in (None, "61440", True, -1):
+            with self.subTest(value=missing):
+                self.assertEqual("", gallery._size_word(missing))
+        self.assertEqual(
+            "a picture from picsum.photos (image/jpeg)",
+            gallery._loads_line({"loads": [{"host": "picsum.photos",
+                                            "type": "image/jpeg",
+                                            "bytes": None}]}),
+        )
+
+    def test_the_line_itself_reads_as_the_packet_wrote_it(self):
+        self.assertEqual(
+            "a picture from picsum.photos (image/jpeg, 61.4 kB)",
+            gallery._loads_line({"loads": [self.PICSUM]}),
+        )
+        self.assertIsNone(gallery._loads_line({"loads": []}))
+        self.assertIsNone(gallery._loads_line({}))
+        # three, for the joiner's own sake
+        self.assertEqual(
+            "a, b and c",
+            gallery._join_and(["a", "b", "c"]),
+        )
+        # something arrived from a host the gate did not name: still said,
+        # because dropping it would understate what the browser is about to do
+        self.assertEqual(
+            "a picture from a host the gate did not record",
+            gallery._loads_line({"loads": [{"host": None, "type": None,
+                                            "bytes": None}]}),
+        )
+
+    def test_a_host_is_escaped_where_it_is_printed(self):
+        self.loaded(self.ids[0], {**self.PICSUM, "host": "<b>evil</b>.example"})
+        page, _meta = self.page_and_meta(self.ids[0])
+        self.assertNotIn("<b>evil</b>", page)
+        self.assertIn("&lt;b&gt;evil&lt;/b&gt;.example", page)
+
+    def test_an_entry_that_loads_nothing_renders_as_it_did_before_the_packet(self):
+        """The promise the packet makes to 910 published pages.
+
+        A row of dashes and an empty line would have been a change to every
+        one of them; absent means the render of an entry whose report has no
+        `resources_loaded` is the render it was, byte for byte. Checked
+        against the same render with the row and the line forced off, which is
+        the state of this file before packet 20 — no fixture of the old HTML
+        to go stale beside it.
+        """
+        pages = {}
+        for entry_id in self.ids[:2]:
+            pages[entry_id] = (self.out(entry_id) / "index.html").read_text(
+                encoding="utf-8")
+        shutil.rmtree(self.dest)
+        self.dest.mkdir()
+        line, note = gallery._loads_line, gallery._loads_note
+        gallery._loads_line = lambda meta: None
+        gallery._loads_note = lambda meta: ""
+        self.addCleanup(setattr, gallery, "_loads_line", line)
+        self.addCleanup(setattr, gallery, "_loads_note", note)
+        for entry_id, before in pages.items():
+            with self.subTest(entry=entry_id):
+                after = (self.out(entry_id) / "index.html").read_text(
+                    encoding="utf-8")
+                self.assertEqual(before, after)
+                self.assertNotIn("Loads", after)
+                self.assertNotIn("stage-loads", after)
+                # The template's `$loads` sits at the end of the line above
+                # the seed line, so an empty one leaves no blank line and no
+                # trailing spaces behind it: the stage of a page that loads
+                # nothing is the bytes it was before this packet.
+                self.assertIn('</iframe>\n    <p class="stage-meta">', after)

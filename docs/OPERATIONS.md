@@ -253,6 +253,49 @@ the sha256, the line count and whether it was shown. The guard covers that hash
 as well as the evidence, so a packet cut before the sketch changed under it is
 refused at import with nothing written — export again.
 
+## Where the picture a sketch loaded shows, and what is never published
+
+A sketch may fetch a photograph from a host outside itself; with
+`loads(image)` asserted the gate requires one and records what arrived
+(`report.resources_loaded`: url, host, content type, size, milliseconds).
+Entry 1103, the jigsaw of 2026-09-20, did it before the word existed — five
+attempts, three of them eleven seconds of gate time waiting for picsum.photos
+— and nothing anywhere said so. Now:
+
+- **The Held page card**, in the meta line beside the rules file and the
+  executor: *image from picsum.photos*, or both hosts when there are two. It is
+  there because publishing such an entry publishes a page that sends every
+  viewer to a third party under that party's terms
+  (`DECIDE[image-licence]`: the entry's CC BY covers the code and the
+  statement, not the photograph), and that was worth a click through to the
+  attempt. The host shown is the **kept** attempt's, which is the sketch the
+  publish will write.
+- **The job page** (`/job/<id>`), one line under each attempt, with the type
+  and the size: *loads: picsum.photos (image/jpeg, 61.4 kB)*. No line at all on
+  an attempt that fetched nothing, unlike `given:`, which every attempt has.
+- **The entry page**: a provenance row **Loads** — *a picture from
+  picsum.photos (image/jpeg, 61.4 kB)*, two or more joined with *and* — and one
+  line under the frame, *This sketch fetches an image from picsum.photos when
+  it runs*, so a reader knows their own browser is about to call a third host.
+  Both absent, never dashed, on an entry that loads nothing, which is every
+  entry published before `loads(image)` existed.
+- **`meta.json`**: each `gate[]` entry gains `resources_loaded` and
+  `preload_s`, and the kept attempt's list is lifted to a top-level `loads`.
+
+**The URL is never published.** `gallery.LOADS_KEYS` is `host`, `type`,
+`bytes`, and that is the whole record the gallery writes: a URL can carry a
+query string nobody chose to publish — a signed link, a key, a name — which is
+the same reason `guard()` scans every file the generator writes for
+email-shaped strings and for the node's own hostname. The full URL stays in the
+attempt's `report.json` on the node, which the operator UI serves under
+`/jobs/<id>/attempt-<n>/.gate/report.json`; if you need to see the picture
+itself, open it from there.
+
+There is **no allowlist of hosts** (`DECIDE[image-hosts]`): the gate reports
+where the picture came from and a person decides before publishing. If a host
+should not be on the gallery, reject the entry — the record of the rejection
+keeps the reason.
+
 ## What the worker does when the queue is empty
 
 Nothing stays idle for long. With an empty queue and `control: running`, the
