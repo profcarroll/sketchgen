@@ -80,10 +80,14 @@ few minutes' work: read this file, plan, write under 150 lines, check it,
 import. The executor prompt says "no second chance". That is written for local
 models, which get one reply per attempt. You have three attempts and a verdict
 takes seconds. Before each `import` of an attempt, run
-`python3 rig/cost.py --since $SINCE` and put its last line in
-`items[0].process`: on a `--since` job an attempt with an empty `process` is
-rejected (nothing written, answer kept) with that command in the reason, and
-`bin/sg paid import --no-process -` is how you say your harness cannot count.
+`python3 rig/cost.py --since $SINCE --reply answer.txt` (the file you wrote
+the answer to) and merge its last line into `items[0]`: it carries `process`,
+the window's total, and `usage`, the API's own counts for the message that
+wrote the reply. On a `--since` job an attempt with an empty `process` or an
+empty `usage` is rejected (nothing written, answer kept) with that command in
+the reason; `bin/sg paid import --no-process -` is how you say your harness
+cannot count, and `--no-usage` that cost.py could not find your reply in one
+message (job 1319, 2026-09-22: process recorded, both counts still blank).
 
 **Freshness.** `bin/sg paid preflight --as $ME` prints `node_commit`; if `git
 merge-base --is-ancestor <it> HEAD` fails in your checkout, pull before reading
@@ -239,10 +243,14 @@ driving it — never release one of those — and as `no agent` once nobody is.
   `move`/`down`/`up`/`click`), at most 64 events over 8 s. Write the gestures
   you tested. Without it the entry gets the built-in script for its
   assertions. An invalid block is dropped and the reply still counts.
-- **`usage` is optional.** If you know the token counts of your own reply,
-  put them in the item's `usage` (`prompt_tokens`, `completion_tokens`); leave
-  what you do not know `null`. Never estimate: a blank on the entry page is
-  true, a guess is not. The node times the round trip itself.
+- **`usage` is the reply's own counts, and `rig/cost.py --reply` reads them.**
+  The message that wrote your answer carries the API's count of what it read
+  (`prompt_tokens`: input and both caches) and what it generated
+  (`completion_tokens`, thinking included); cost.py finds that message by the
+  answer's text and prints both in its last line, beside `process`. Never
+  estimate: a blank on the entry page is true, a guess is not. If cost.py says
+  the reply was not found in one message (you edited it in place), leave the
+  nulls and import with `--no-usage`. The node times the round trip itself.
 - **`process` is optional too, and it is the other cost.** An attempt item
   carries a `process` slot for what the work *around* the reply cost you:
   `session_s`, `output_tokens`, `thinking_tokens`, `tool_calls`, `screenshots`,
@@ -252,7 +260,7 @@ driving it — never release one of those — and as `no agent` once nobody is.
   import with `--no-process` records the empty cost as declared, not
   forgotten (job 1308, 2026-09-21). The node adds the tries it ran for you and shows the line
   on the entry page as *as reported by the agent*; nothing in the A/B or any
-  judgment reads it. `rig/cost.py` prints the object to paste.
+  judgment reads it. `rig/cost.py` prints it and `usage` in one line to merge.
 - **Change nothing in a packet but `answer`, `usage`, `process` and `model`.** `guard`,
   `prompt_version` and `inputs` are how the node knows the answer is still
   about what it asked; a stale packet is refused — run `next` again.
