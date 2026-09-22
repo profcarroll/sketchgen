@@ -63,6 +63,8 @@ __all__ = [
     "normalise_assertions",
     "parse_response",
     "prompt_version",
+    "warm",
+    "WARM_TIMEOUT_S",
     "render_prompt",
     "resolve_rules",
     "run",
@@ -594,6 +596,46 @@ def _call_ollama(
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+#: A load-only request's ceiling. On this CPU-only node a load is not a file
+#: read: Ollama disables mmap (``reason=cpu``) and llama.cpp repacks the weights
+#: for ARM -- ``CPU_REPACK model buffer size = 19142.57 MiB`` and 139 s for
+#: laguna-xs-2.1 on 2026-09-22, worst seen 275.7 s. Generous on purpose; a
+#: timeout here only costs the honest card, because :func:`run` loads the model
+#: itself if this did not.
+WARM_TIMEOUT_S = 900.0
+
+
+def warm(
+    host: str, model: str, num_ctx: int, timeout: float = WARM_TIMEOUT_S
+) -> float:
+    """Load ``model`` at ``num_ctx`` and answer how many seconds it took.
+
+    Ollama's own load idiom: ``/api/generate`` with no prompt brings the runner
+    up and returns. It is here so the worker can open an honest step on the
+    process status card -- see :meth:`sketchgen.worker.Worker._warm_for`, which
+    is the only caller and explains why.
+
+    The runner is keyed on its context size, so ``num_ctx`` must be the window
+    the attempt will ask for; a different one loads a second runner and the
+    attempt reloads anyway. Raises ``OSError`` like :func:`_call_ollama`.
+    """
+    payload = {
+        "model": model,
+        "stream": False,
+        "options": {"num_ctx": num_ctx},
+    }
+    request = urllib.request.Request(
+        host.rstrip("/") + "/api/generate",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    started = time.monotonic()
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        response.read()
+    return time.monotonic() - started
 
 
 def run(
