@@ -55,6 +55,30 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(rejected, [])
         self.assertEqual(defaulted, [])
 
+    def test_image(self):
+        """A jigsaw of a photograph, which is the shape the word was written for.
+
+        media-assertion.md §3.2's own example, and the three words it carries
+        are the three the rules in `prompts/planner.md` put together:
+        `loads(image)` says nothing about liveness (DECIDE[image-liveness]), so
+        the plan still has to choose one, and a puzzle chooses `no_motion`.
+        Nothing here is defaulted — that is the point of the fixture.
+        """
+        brief, ok, rejected, defaulted = parse_and_validate("image")
+        self.assertTrue(brief.startswith("A single photograph sits"))
+        self.assertEqual(ok, ["no_motion", "responds(click)", "loads(image)"])
+        self.assertEqual(rejected, [])
+        self.assertEqual(defaulted, [])
+
+    def test_loads_image_alone_still_has_a_liveness_word_chosen_for_it(self):
+        # It is not in INTERACTIVE, so it defaults the way a plan that said
+        # nothing at all defaults: a photograph that scatters is as real a
+        # sketch as a jigsaw, and this module does not get to pick.
+        ok, rejected, defaulted = planner.validate_detailed(["loads(image)"])
+        self.assertEqual(ok, ["loads(image)", "motion(idle)"])
+        self.assertEqual(rejected, [])
+        self.assertEqual(["motion(idle)"], defaulted)
+
     def test_made_up_words_land_in_rejected(self):
         brief, ok, rejected, defaulted = parse_and_validate("made-up")
         self.assertTrue(brief.startswith("Thin vertical lines stand across"))
@@ -182,7 +206,7 @@ class PlanTests(unittest.TestCase):
             stub=FIXTURES / "clean.txt",
             by="someone",
         )
-        self.assertEqual(result.prompt_version, "planner-v1")
+        self.assertEqual(result.prompt_version, "planner-v2")
         self.assertEqual(result.assertions,
                          ["motion(idle)", "responds(click)", "size(800,600)"])
         self.assertEqual(result.raw, load("clean"))
@@ -199,6 +223,34 @@ class PlanTests(unittest.TestCase):
         self.assertIn("circles", rendered)
         self.assertNotIn("prompt_version:", rendered)
 
+    def test_the_prompt_counts_the_vocabulary_it_lists(self):
+        """The one sentence in the file that can go stale silently.
+
+        `planner.md` tells the model *these eight lines are the only assertions
+        that exist* — and a ninth word added to VOCAB without rewriting that
+        clause would leave the prompt understating its own list, which is the
+        sentence the model is being asked to trust (2026-09-22, the count went
+        from seven to eight with `loads(image)`).
+        """
+        written = {7: "seven", 8: "eight", 9: "nine", 10: "ten"}
+        rendered = planner.build_prompt("circles", "someone")
+        self.assertIn("These %s lines are the only assertions that exist"
+                      % written[len(planner.VOCAB)], rendered)
+
+    def test_the_vocabulary_is_the_gate_s_own(self):
+        """Four copies, one list; the gate is the authority.
+
+        `tests/test_executor.py`'s SOUND_RE parity test is the pattern. The
+        gate is a standalone script with its own copy on the node, so the list
+        is written out here rather than imported, and this is what says the two
+        writings are the same one.
+        """
+        gate = (REPO_ROOT / "gate" / "sketch_gate.py").read_text(encoding="utf-8")
+        for word in planner.VOCAB:
+            self.assertIn('    "%s",' % word, gate,
+                          "%s is in the planner's vocabulary and not in the "
+                          "gate's; the gate is what evaluates it" % word)
+
 
 class CliTests(unittest.TestCase):
 
@@ -212,7 +264,7 @@ class CliTests(unittest.TestCase):
             document = json.loads(result.stdout)
             self.assertEqual(document["assertions"],
                              ["motion(idle)", "responds(click)"])
-            self.assertEqual(document["prompt_version"], "planner-v1")
+            self.assertEqual(document["prompt_version"], "planner-v2")
             self.assertEqual(document["model"], "gemma4:e4b")
             self.assertTrue(document["started_utc"].endswith("Z"))
             on_disk = json.loads((Path(tmp) / "plan.json").read_text(encoding="utf-8"))

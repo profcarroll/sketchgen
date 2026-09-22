@@ -163,6 +163,7 @@ SIMPLE_ASSERTIONS = {
     "responds(drag)",
     "responds(audio)",
     "uses(webgl)",
+    "loads(image)",
 }
 SIZE_RE = re.compile(r"^size\(\s*(\d+)\s*,\s*(\d+)\s*\)$")
 VOCAB = [
@@ -173,6 +174,7 @@ VOCAB = [
     "uses(webgl)",
     "size(w,h)",
     "no_motion",
+    "loads(image)",
 ]
 
 #: One line per word, written for the model: what the gate will actually do.
@@ -195,6 +197,20 @@ MEANINGS = {
     ),
     "uses(webgl)": (
         "the sketch must be drawing in the WEBGL renderer, not the 2D one"
+    ),
+    # The longest line here, and every clause of it is a failure that has
+    # happened. Entry 429 fetched a picture eight times and drew nothing;
+    # entry 1103 fetched one and missed on five attempts; p5 1.11.3 sets
+    # crossOrigin on the image it builds, so a host without CORS headers does
+    # not taint the canvas, it fails to load at all and the console says
+    # nothing (2026-09-22, media-assertion.md section 3.2).
+    "loads(image)": (
+        "the gate watches the network: at least one image must arrive from a "
+        "host outside the sketch and be drawn before the idle window ends. "
+        "Load it in preload() from a host that serves CORS headers and a "
+        "stable URL, such as https://picsum.photos/seed/<word>/800/600 or a "
+        "file on upload.wikimedia.org; a data: URI is not the web and does not "
+        "pass; a host that does not serve CORS fails to load at all"
     ),
     "size": (
         "p5's width and height must be exactly %d by %d pixels"

@@ -40,13 +40,19 @@ from sketchgen import worker  # noqa: E402
 
 
 def make_report(sketch_dir, *, checks=None, assertions=None, notes=None,
-                console=None, resources=None, exit_code=0, ghost=None):
+                console=None, resources=None, resources_loaded=None,
+                exit_code=0, ghost=None, timings=None):
     """One report.json in sketch_gate.py's schema (see its report construction).
 
     ``ghost`` is the gate's ghost window (auto-mouse.md §5): the summary it
     writes and, when there is one, the fourth artefact beside the strip. None
     is what every report written before 2026-09-21 has, and what a run with
     --no-ghost writes, so it is the default here too.
+
+    ``resources_loaded`` is the images that arrived from outside the sketch
+    (media-assertion.md §3.1, 2026-09-22): ``{url, host, type, bytes, ms}``,
+    empty for a sketch that drew everything itself and for every report
+    written before that date.
     """
     base_checks = {
         "console_clean": True,
@@ -56,6 +62,9 @@ def make_report(sketch_dir, *, checks=None, assertions=None, notes=None,
         "audio_context_running": None,
     }
     base_checks.update(checks or {})
+    base_timings = {"launch_s": 0.0, "load_s": 0.0, "preload_s": 0.0,
+                    "total_s": 0.0}
+    base_timings.update(timings or {})
     artefacts = {
         "png": str(Path(sketch_dir) / ".gate" / "gate.png"),
         "strip": str(Path(sketch_dir) / ".gate" / "strip.png"),
@@ -68,11 +77,12 @@ def make_report(sketch_dir, *, checks=None, assertions=None, notes=None,
         "seed": 1,
         "started_utc": "1970-01-01T00:00:00.000Z",
         "chromium": "/nonexistent/chromium-for-the-stub",
-        "timings": {"launch_s": 0.0, "load_s": 0.0, "total_s": 0.0},
+        "timings": base_timings,
         "checks": base_checks,
         "assertions": assertions or {},
         "notes": notes or [],
         "resources": resources or [],
+        "resources_loaded": resources_loaded or [],
         "console": console or [],
         "ghost": ghost,
         "artefacts": artefacts,
@@ -845,7 +855,8 @@ class TestEntries(WorkerTestCase):
 
         row = self.entries(job_id)[0]
         # The referee changed what it draws, so the entry says which referee.
-        self.assertEqual(3, row["harness_version"])
+        # 4 since 2026-09-22 and loads(image); the ghost window was 3.
+        self.assertEqual(4, row["harness_version"])
         self.assertEqual(worker.HARNESS_VERSION, row["harness_version"])
         # And what it draws for the judge and the critic did not move.
         self.assertTrue(row["strip_path"].endswith(".gate/strip.png"))
@@ -894,6 +905,78 @@ class TestEntries(WorkerTestCase):
         self.assertEqual("held", row["state"])
         self.assertEqual(["responds(drag)"], json.loads(row["offplan_json"]))
         self.assertEqual("held", db.get_job(self.conn, job_id).state)
+
+    def test_a_missed_loads_image_is_off_plan_like_any_other_miss(self):
+        """media-assertion.md §3.4. The eighth word routes like the seven.
+
+        A sketch that was asked for a photograph and did not get one is not a
+        broken sketch: nothing a visitor meets went wrong, the plan simply did
+        not happen, and a person decides. The gate gained a word and gained no
+        check (`gate/README.md`, *What may fail a run*), so this test's real
+        subject is that nothing in the routing had to learn about images.
+        """
+        detail = ("no image arrived from outside the sketch: the sketch asked "
+                  "for https://picsum.photos/400/400 (image) and did not get "
+                  "it: net::ERR_FAILED")
+        offplan = make_report(
+            "/tmp/x",
+            assertions={"no_motion": {"pass": True, "detail": "0 pixels changed"},
+                        "loads(image)": {"pass": False, "detail": detail}},
+            resources=[{"url": "https://picsum.photos/400/400", "type": "image",
+                        "why": "net::ERR_FAILED"}],
+            timings={"preload_s": 10.4},
+            exit_code=1,
+        )
+        job_id = self.enqueue(max_attempts=2)
+        self.make_worker(
+            gate_fn=StubGate([1, 1], reports=[offplan, offplan])
+        ).run_once()
+
+        row = self.entries(job_id)[0]
+        self.assertEqual("held", row["state"])
+        self.assertEqual(["loads(image)"], json.loads(row["offplan_json"]))
+        self.assertEqual("held", db.get_job(self.conn, job_id).state)
+        # The referee that judged it says so: 4 since loads(image) exists.
+        self.assertEqual(worker.HARNESS_VERSION, row["harness_version"])
+        # And the evidence the second attempt was given carried the gate's own
+        # sentence, which is the one thing entry 429 never got.
+        self.assertIn(detail, worker.build_evidence(offplan, 1))
+
+    def test_an_image_that_arrived_is_published_beside_the_run(self):
+        """What Packet 20 reads. The field is the gate's, not the worker's.
+
+        `resources_loaded` gets no column and no migration: the entry names its
+        attempt directory, the report sits in that directory, and the gallery
+        folds the list into `meta.json` from there — the same seam `ghost` uses.
+        So what has to hold here is that a worker run carries the list through
+        to where the entry page will look for it.
+        """
+        from sketchgen import gallery
+
+        loaded = [{"url": "https://picsum.photos/seed/tide/800/600",
+                   "host": "picsum.photos", "type": "image/jpeg",
+                   "bytes": 61234, "ms": 340}]
+        job_id = self.enqueue()
+        source = self.jobs / str(job_id) / "attempt-1"
+        report = make_report(source, resources_loaded=loaded,
+                             assertions={"loads(image)": {
+                                 "pass": True,
+                                 "detail": "1 image arrived: picsum.photos "
+                                           "(image/jpeg, 61 kB, 340 ms); "
+                                           "canvas drawn"}},
+                             timings={"preload_s": 0.42})
+        self.make_worker(gate_fn=StubGate([0], reports=[report])).run_once()
+
+        row = self.entries(job_id)[0]
+        self.assertEqual("held", row["state"])
+        self.assertIsNone(row["offplan_json"])
+        on_disk = json.loads(
+            (Path(row["source_dir"]) / ".gate" / "report.json").read_text(
+                encoding="utf-8"))
+        self.assertEqual(loaded, on_disk["resources_loaded"])
+        self.assertEqual(0.42, on_disk["timings"]["preload_s"])
+        log = gallery._gate_log(gallery._attempt_rows(self.conn, job_id))
+        self.assertIs(True, log[0]["assertions"]["loads(image)"])
 
     def test_a_job_that_broke_the_browser_is_still_a_failure(self):
         """QA keeps its teeth. A sketch that throws is not off-plan, it is broken."""
@@ -1552,7 +1635,7 @@ class TestPlannerSeedAndRecovery(WorkerTestCase):
         self.assertIn("lenient parse", log.getvalue())
         # the entry says the plan was recovered rather than parsed
         self.assertEqual(
-            f"planner-v1{planner.LENIENT_MARK}",
+            f"planner-v2{planner.LENIENT_MARK}",
             self.entries(job_id)[0]["planner_prompt_version"],
         )
 

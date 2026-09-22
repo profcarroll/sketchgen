@@ -125,6 +125,29 @@ Four things it deliberately is not:
     other probe, and a script of 8 s at 60 fps is 480 stepped frames.  It is
     outside the counted idle window, so timings.ms_per_frame is unchanged.
 
+--------------------------------------------------------------------------
+loads(image) AND THE PRELOAD WAIT (2026-09-22, docs/plans/media-assertion.md)
+--------------------------------------------------------------------------
+The network was always open -- p5 itself comes from cdnjs on every run -- and
+ResourceLog recorded what a sketch asked for and did not get.  Nothing recorded
+what DID arrive, so no assertion could ask for a picture.  Now every off-origin
+response with an image/* content type and a 2xx status is kept, capped at
+MAX_RESOURCES_LOADED, as report.json["resources_loaded"]; like the failures
+beside it, it is evidence and never a check.
+
+loads(image) passes on that list being non-empty AND the canvas at the end of
+the idle window not being one flat colour.  The second half is the weakest
+honest check there is: this runner cannot see what is drawn, only that
+something is.  A data: URI does not pass -- it is not the web -- and the detail
+says so when that is what it finds.
+
+The wait for a canvas is the other half.  A preload() sketch has no canvas at
+all until its image arrives, and the virtual clock above does not move the
+network: entry 1103's 11 s runs are that wait, and the 10 s cap on it was a
+sketch thrown away for a slow host.  So when loads(image) is among the
+requested assertions the wait runs to the full --timeout, and
+timings.preload_s records how much of it was spent.
+
 Limits, stated rather than hidden:
   - A sketch driven by setTimeout/setInterval instead of requestAnimationFrame
     is not stepped by us and will see real wall time; its output may vary.
@@ -158,6 +181,7 @@ VOCAB = [
     "uses(webgl)",
     "size(w,h)",
     "no_motion",
+    "loads(image)",
 ]
 SIMPLE_ASSERTIONS = {
     "motion(idle)",
@@ -166,6 +190,7 @@ SIMPLE_ASSERTIONS = {
     "responds(audio)",
     "uses(webgl)",
     "no_motion",
+    "loads(image)",
 }
 SIZE_RE = re.compile(r"^size\(\s*(\d+)\s*,\s*(\d+)\s*\)$")
 SOUND_RE = re.compile(r"p5\.AudioIn|p5\.FFT|p5\.Oscillator|loadSound")
@@ -409,6 +434,21 @@ def refuse(msg):
     sys.exit(3)
 
 
+def human_bytes(size):
+    """A size for a sentence a person reads, in decimal kB, or the plain truth.
+
+    None is "size unknown" and not 0 kB: a host that served no content-length
+    and a body the run could not read back is a thing nobody measured, and the
+    entry page prints a blank for it for the same reason (media-assertion.md
+    DECIDE[image-hosts], Packet 20).
+    """
+    if size is None:
+        return "size unknown"
+    if size < 1000:
+        return "%d B" % size
+    return "%d kB" % int(round(size / 1000.0))
+
+
 # ---------------------------------------------------------------------------
 # the in-page harness
 # ---------------------------------------------------------------------------
@@ -589,6 +629,44 @@ INIT_JS = r"""
     }
     const px = n / 4;
     return { mean: sum / (px * 3), changed: changed, total: px };
+  };
+  // loads(image), the drawn half (2026-09-22): true when every pixel of the
+  // snapshot is within 2/255 of one colour -- a canvas with nothing on it but
+  // its background, which is what an image that arrived and was never drawn
+  // looks like from out here. It reads the same imageData the diffs do, and
+  // it is min/max per channel rather than a comparison against the first
+  // pixel, so "within 2 of one colour" means a colour exists that they are
+  // all within 2 of, whichever pixel happens to come first.
+  g.flat = function (name) {
+    const A = g.snaps[name];
+    if (!A) return null;
+    const d = A.data, n = d.length;
+    if (!n) return null;
+    let lo = [255, 255, 255], hi = [0, 0, 0];
+    for (let i = 0; i < n; i += 4) {
+      for (let c = 0; c < 3; c++) {
+        const v = d[i + c];
+        if (v < lo[c]) lo[c] = v;
+        if (v > hi[c]) hi[c] = v;
+      }
+    }
+    for (let c = 0; c < 3; c++) if (hi[c] - lo[c] > 2) return false;
+    return true;
+  };
+  // What the page went out for, as the browser itself recorded it. The gate
+  // cannot prove a data: URI was drawn -- a data: URI is not a resource and
+  // has no entry here -- but a page with no off-origin image entry at all did
+  // not use the web for its picture, and that is a sentence worth saying.
+  g.fetched = function () {
+    let out = [];
+    try {
+      const entries = performance.getEntriesByType('resource') || [];
+      for (const e of entries) {
+        out.push({ name: String(e.name || ''), kind: String(e.initiatorType || '') });
+        if (out.length >= 64) break;
+      }
+    } catch (err) { return out; }
+    return out;
   };
   g.rgba = function (name) {
     const A = g.snaps[name];
@@ -806,9 +884,22 @@ class BrowserLog:
 #: broken fetch can produce thousands; the first few say the same thing.
 MAX_RESOURCE_FAILURES = 8
 
+#: And at most this many distinct images that did arrive (2026-09-22,
+#: media-assertion.md section 3.1). The same number as the failures for the same
+#: reason: a collage that fetches a hundred tiles from one host says what it has
+#: to say in the first eight, and this list is read by a person deciding whether
+#: to publish a sketch that calls a third host from their visitors' browsers.
+MAX_RESOURCES_LOADED = 8
+
+#: What makes a response an image: its content-type and nothing else. The size
+#: never decides -- a 1x1 pixel is an image that arrived, and the detail says
+#: how few bytes it was rather than pretending it was not one.
+IMAGE_TYPE_PREFIX = "image/"
+
 
 class ResourceLog:
-    """Every resource the sketch asked for and did not get.
+    """Every resource the sketch asked for and did not get -- and the images
+    that did arrive.
 
     The sketch's own files come off disk through the page.route() handler on
     SKETCH_ORIGIN and cannot fail. Anything else is the sketch reaching outside
@@ -828,24 +919,66 @@ class ResourceLog:
     allowed, and a sketch that works out it can do so has worked something out.
     This is only the sentence that tells it what happened when the thing it
     reached for did not arrive.
+
+    Since 2026-09-22 (media-assertion.md section 3.1) it also keeps what DID
+    arrive, and only images: every off-origin 2xx response whose content-type
+    starts image/, as {url, host, type, bytes, ms}. That list is what
+    loads(image) is evaluated against, and what a person reads before
+    publishing a sketch that will call a third host from a visitor's browser.
+    It is still not a check: an image arriving fails nothing, and an image not
+    arriving fails nothing either unless a planner asked for one.
+
+    The sizes are deliberately not read inside the response handler. Playwright's
+    sync API is the dispatcher's own greenlet there, and a round trip for a body
+    from inside a handler is how a run hangs; :meth:`measure` reads the ones no
+    content-length header declared, afterwards, from the ordinary flow.
     """
 
     def __init__(self):
         self.failures = []
+        self.loaded = []
         self._seen = set()
+        self._seen_loaded = set()
+        self._started = {}
+        self._pending = []
 
     def attach(self, page):
+        page.on("request", self._on_request)
         page.on("requestfailed", self._on_failed)
         page.on("response", self._on_response)
 
     def _outside(self, url):
         return not str(url or "").startswith(SKETCH_ORIGIN)
 
+    def _from_the_web(self, url):
+        """Off-origin AND actually fetched over http(s).
+
+        A data: or blob: URL is neither the sketch's own file nor the web, and
+        Chromium reports a response for both. Counting one as an arrival would
+        pass loads(image) on the sketch the gate's README remembers -- the one
+        that built its own image as a data: URI when it could not fetch one --
+        which is the case DECIDE[image-pass] rules out by name.
+        """
+        text = str(url or "")
+        return self._outside(text) and (text.startswith("http://")
+                                        or text.startswith("https://"))
+
     def _add(self, url, kind, why):
         if url in self._seen or len(self.failures) >= MAX_RESOURCE_FAILURES:
             return
         self._seen.add(url)
         self.failures.append({"url": url, "type": kind, "why": why})
+
+    def _on_request(self, request):
+        # Wall time from the request leaving to its response arriving is the
+        # `ms` in the list. The page's own performance timings would be the
+        # finer number, but the virtual clock above has already made
+        # performance.now() a lie about anything that is not a stepped frame.
+        try:
+            if self._outside(request.url) and len(self._started) <= 4 * MAX_RESOURCES_LOADED:
+                self._started[request] = time.time()
+        except Exception:
+            pass
 
     def _on_failed(self, request):
         try:
@@ -858,15 +991,71 @@ class ResourceLog:
     def _on_response(self, response):
         try:
             url, status = response.url, response.status
-            kind = response.request.resource_type
+            request = response.request
+            kind = request.resource_type
         except Exception:
             return
         if status >= 400 and self._outside(url):
             self._add(url, kind, "HTTP %d" % status)
+            return
+        if 200 <= status < 300 and self._from_the_web(url):
+            self._arrived(response, request, url)
+
+    def _arrived(self, response, request, url):
+        """Keep an off-origin 2xx image. Everything else is somebody's script."""
+        # response.headers is the initializer's own dict, already lowercased:
+        # no round trip, which header_value() and all_headers() both are, and
+        # a round trip from inside a response handler is a hang.
+        try:
+            headers = response.headers or {}
+        except Exception:
+            headers = {}
+        kind = str(headers.get("content-type") or "").split(";", 1)[0].strip().lower()
+        if not kind.startswith(IMAGE_TYPE_PREFIX):
+            return
+        if url in self._seen_loaded or len(self.loaded) >= MAX_RESOURCES_LOADED:
+            return
+        self._seen_loaded.add(url)
+        declared = headers.get("content-length")
+        try:
+            size = int(declared) if declared is not None else None
+        except (TypeError, ValueError):
+            size = None
+        started = self._started.pop(request, None)
+        item = {"url": url,
+                "host": urlsplit(url).netloc,
+                "type": kind,
+                "bytes": size,
+                "ms": None if started is None else int(round((time.time() - started) * 1000))}
+        self.loaded.append(item)
+        if size is None:
+            self._pending.append((item, response))
+
+    def measure(self):
+        """Fill in the sizes no content-length declared, from the bodies.
+
+        Called from the run, not from a handler, and best effort: a host that
+        served no content-length and a body this can no longer read leaves
+        `bytes` null, which the detail and the entry page both print as
+        unknown rather than as zero.
+        """
+        while self._pending:
+            item, response = self._pending.pop()
+            try:
+                item["bytes"] = len(response.body())
+            except Exception:
+                pass
 
     def notes(self):
         return ["the sketch asked for %s (%s) and did not get it: %s"
                 % (f["url"], f["type"], f["why"]) for f in self.failures]
+
+    def arrival_notes(self):
+        """One line per image that arrived, for a person reading the report."""
+        return ["the sketch loaded an image from outside itself: %s (%s, %s, %s)"
+                % (item["url"], item["type"], human_bytes(item["bytes"]),
+                   "timing unknown" if item["ms"] is None else "%d ms" % item["ms"])
+                for item in self.loaded]
 
 
 class Recorder:
@@ -971,15 +1160,52 @@ def open_page(pw, init_js, fake_audio_wav, net_log, timeout_ms, sketch_dir):
     return browser, context, page, launch_s
 
 
-def load_sketch(page, timeout_ms):
+#: How long a sketch has to put a canvas on the page before the run goes on
+#: without one, when nothing was asserted about loading anything. Ten seconds
+#: was the only number here until 2026-09-22.
+CANVAS_WAIT_MS = 10000
+
+#: And how often the wait below looks. It is a timer and not the default,
+#: which is the whole point: see load_sketch.
+CANVAS_POLL_MS = 100
+
+
+def load_sketch(page, timeout_ms, wait_for_canvas_ms=CANVAS_WAIT_MS):
+    """Load the sketch and wait for a canvas. Returns (seconds, canvas wait).
+
+    The wait is a parameter because of preload(). A sketch that loads an image
+    before setup() runs has no canvas at all until the image arrives, and the
+    virtual clock does not move the network. When loads(image) is asserted,
+    main passes the whole --timeout instead (DECIDE[image-wait]).
+
+    `polling=CANVAS_POLL_MS` is load-bearing and was measured, not guessed
+    (2026-09-22). Playwright's default for wait_for_function is `raf`: it
+    evaluates the predicate once, and then on every animation frame. Section 2
+    of the module docstring above replaces requestAnimationFrame with a queue
+    that drains only when this runner steps it, and nothing steps it until
+    after this function returns -- so for any sketch whose canvas did not
+    already exist when the page's load event fired, the predicate was evaluated
+    exactly once, false, and the wait then sat out its whole timeout.
+
+    That is where the eleven seconds in the entry 429 and entry 1103 stories
+    came from. Both load a photograph in preload(), both were read as slow
+    hosts, and the node's own reports say otherwise: `load_s` is 10.19 s on nine
+    of entry 429's ten attempts -- the cap, to the millisecond -- while the
+    picture itself arrives in about a tenth of a second. The wait had never
+    once ended early. On a timer it does, and raising the cap to --timeout for
+    an asserted sketch costs nothing when the host is quick.
+    """
     t0 = time.time()
     page.goto(SKETCH_ORIGIN + "/index.html", wait_until="load", timeout=timeout_ms)
+    t_canvas = time.time()
     try:
         page.wait_for_function("() => !!(window.__gate && window.__gate.canvas())",
-                               timeout=min(timeout_ms, 10000))
+                               timeout=min(timeout_ms, wait_for_canvas_ms),
+                               polling=CANVAS_POLL_MS)
     except Exception:
         pass
-    return time.time() - t0
+    now = time.time()
+    return now - t0, now - t_canvas
 
 
 class BudgetExceeded(Exception):
@@ -1365,17 +1591,22 @@ def save_data_url(data_url, path):
     return True
 
 
-def silent_reference_run(pw, init_js, wav, timeout_ms, sketch_dir):
+def silent_reference_run(pw, init_js, wav, timeout_ms, sketch_dir,
+                         wait_for_canvas_ms=CANVAS_WAIT_MS):
     """Second launch, silent fake microphone, same script.
 
     Returns the canvas at the same point the tone run snaps it: the raw RGBA as
     base64 plus its size and mean brightness.  The pixels are what decides
     responds(audio); the brightness is kept for the human reading the detail.
+
+    It takes the same canvas wait as the tone run: the two runs have to differ
+    only by the microphone, and a reference run that gave up on a preload()
+    the first run waited out would compare a drawn canvas with a blank one.
     """
     browser = context = None
     try:
         browser, context, page, _ = open_page(pw, init_js, wav, None, timeout_ms, sketch_dir)
-        load_sketch(page, timeout_ms)
+        load_sketch(page, timeout_ms, wait_for_canvas_ms)
         step(page, IDLE_FRAMES)
         click_centre(page)
         step(page, PROBE_FRAMES)
@@ -1412,6 +1643,7 @@ def main(argv=None):
     wanted = normalise_assertions(a.assertions)
     want_audio = any(kind == "responds(audio)" for _, kind, _ in wanted)
     want_drag = any(kind == "responds(drag)" for _, kind, _ in wanted)
+    want_image = any(kind == "loads(image)" for _, kind, _ in wanted)
 
     out_dir = pathlib.Path(a.out).expanduser() if a.out else sketch_dir / ".gate"
     try:
@@ -1420,6 +1652,12 @@ def main(argv=None):
         refuse("cannot create --out %s (%s)" % (out_dir, e))
 
     timeout_ms = int(a.timeout * 1000)
+    # DECIDE[image-wait]: a sketch that was asked for a picture is given the
+    # whole timeout to get one, because a preload() has no canvas until the
+    # image arrives and a run that gave up at 10 s would report the sketch as
+    # having drawn nothing -- which is what entry 1103's 11 s runs were doing
+    # against the old cap. Every other run keeps the wait it always had.
+    wait_for_canvas_ms = timeout_ms if want_image else CANVAS_WAIT_MS
 
     # source scan for the sound library, before any browser work
     source = ""
@@ -1451,8 +1689,12 @@ def main(argv=None):
     assertions = {}
     rec = Recorder()
     res = ResourceLog()
-    timings = {"launch_s": None, "load_s": None, "total_s": None,
-               "ms_per_frame": None, "idle_step_s": None}
+    # preload_s is the part of load_s spent waiting for a canvas to exist, the
+    # stretch a preload() spends on the network (2026-09-22). It is recorded on
+    # every run, not only the ones that asserted loads(image): the number is
+    # what says whether a sketch's eleven seconds were the image or the code.
+    timings = {"launch_s": None, "load_s": None, "preload_s": None,
+               "total_s": None, "ms_per_frame": None, "idle_step_s": None}
     budget = Budget(a.frame_budget_ms, a.budget_s, t_start)
     chromium_path = None
     # The ghost window, and where the console stopped being read for
@@ -1485,12 +1727,32 @@ def main(argv=None):
             rec.attach(page)
             res.attach(page)
 
+            preload_s = None
             try:
-                load_s = load_sketch(page, timeout_ms)
+                load_s, preload_s = load_sketch(page, timeout_ms, wait_for_canvas_ms)
             except Exception as e:
                 notes.append("page load did not complete: %s" % e)
                 load_s = time.time() - t_start
             timings["load_s"] = round(load_s, 3)
+            if preload_s is not None:
+                timings["preload_s"] = round(preload_s, 3)
+            if want_image:
+                # Worth saying out loud in the report, because this wait is
+                # also wall time the --budget-s ceiling is counting: a host that
+                # takes most of the timeout leaves the rest of the run less of
+                # it, and a person reading a frame_budget failure should be able
+                # to see that the seconds went to the network.
+                notes.append("loads(image): the wait for a canvas ran to the whole "
+                             "%g s timeout rather than the usual %g s, because a "
+                             "preload() has no canvas until its image arrives; "
+                             "%s of it was spent waiting"
+                             % (a.timeout, CANVAS_WAIT_MS / 1000.0,
+                                "an unmeasured amount" if timings["preload_s"] is None
+                                else "%g s" % timings["preload_s"]))
+            # The sizes the hosts did not declare, read now that the run is back
+            # in its own flow: a body read from inside a response handler is how
+            # the sync API hangs (ResourceLog.measure).
+            res.measure()
 
             try:
                 state0 = page.evaluate("() => window.__gate.state()")
@@ -1608,7 +1870,8 @@ def main(argv=None):
                     write_wav(silent_wav, seconds=3.0, freq=None)
                     try:
                         silent_ref = silent_reference_run(
-                            pw, init_js, silent_wav, timeout_ms, sketch_dir)
+                            pw, init_js, silent_wav, timeout_ms, sketch_dir,
+                            wait_for_canvas_ms)
                     except Exception as e:
                         notes.append("silent reference run failed: %s" % e)
                     if silent_ref:
@@ -1617,9 +1880,14 @@ def main(argv=None):
                                      "except for the microphone because the seeds and the clock "
                                      "are fixed")
 
+                # An image can arrive after the page's load event -- a
+                # loadImage in setup() rather than preload() -- so the sizes are
+                # read once more before anything is decided on them.
+                res.measure()
                 for literal, kind, params in wanted:
                     assertions[literal] = evaluate_assertion(
-                        page, kind, params, state1, tone_brightness, silent_ref)
+                        page, kind, params, state1, tone_brightness, silent_ref,
+                        resources=res, timeout_s=a.timeout)
 
                 # ---- the ghost window ------------------------------------
                 # Last, and after every assertion, on purpose: what the ghost
@@ -1685,6 +1953,10 @@ def main(argv=None):
     # Before the verdict, because a resource that did not arrive is very often
     # the reason for the verdict, and it is never itself a reason to fail.
     notes.extend(res.notes())
+    # And what did arrive, for the same reason in reverse: a person deciding
+    # whether to publish this sketch is deciding whether to send every visitor
+    # to whatever host is named here (media-assertion.md DECIDE[image-hosts]).
+    notes.extend(res.arrival_notes())
 
     # is_looping is deliberately absent from FAILABLE_CHECKS: a sketch that
     # calls noLoop() declares itself static and the gate believes it.
@@ -1721,6 +1993,11 @@ def main(argv=None):
         "assertions": assertions,
         "notes": notes,
         "resources": res.failures,
+        # Every off-origin image that arrived: {url, host, type, bytes, ms}.
+        # Empty on a sketch that drew everything itself, and on every report
+        # written before 2026-09-22. What loads(image) reads, and what the
+        # entry page publishes as host and type only (Packet 20).
+        "resources_loaded": res.loaded,
         "console": rec.entries,
         # Which pointer played, whose it was, and how much of it got played:
         # null on a run with --no-ghost and on every report written before
@@ -1741,7 +2018,70 @@ def main(argv=None):
     return code
 
 
-def evaluate_assertion(page, kind, params, state, tone_brightness, silent_ref):
+def image_verdict(loaded, failure_notes, flat, sought_outside, timeout_s):
+    """loads(image)'s pass/fail and its sentence, from five plain facts.
+
+    Separated from :func:`evaluate_assertion` because the four ways this misses
+    are four different sentences and each one is a thing the next attempt reads
+    and acts on: entry 429 spent eight attempts rewriting handlers that already
+    worked because nothing it was shown mentioned the image. A browser is not
+    needed to check what they say, and tests/test_gate_fixtures.py does.
+
+    *loaded* is ResourceLog.loaded, *failure_notes* its notes(); *flat* is
+    g.flat('t20') -- True, False, or None for no canvas at all; *sought_outside*
+    is whether the page made any off-origin image request, which is how the
+    data: case is told from a sketch that simply never tried.
+    """
+    if flat is None:
+        # No canvas at the end of the idle window. For a preload() sketch that
+        # is the image: the sketch has not reached setup() yet, and the lines
+        # below are the sentence entry 429 never got.
+        detail = ("no canvas after %g s (preload never finished)" % timeout_s)
+        if failure_notes:
+            detail += ": " + "; ".join(failure_notes)
+        return {"pass": False, "detail": detail}
+
+    if loaded:
+        arrived = ", ".join(
+            "%s (%s, %s, %s)" % (item.get("host") or "an unnamed host",
+                                 item.get("type") or "an unnamed type",
+                                 human_bytes(item.get("bytes")),
+                                 "timing unknown" if item.get("ms") is None
+                                 else "%d ms" % item["ms"])
+            for item in loaded)
+        head = "%d image%s arrived: %s" % (len(loaded),
+                                           "" if len(loaded) == 1 else "s",
+                                           arrived)
+        if flat:
+            # The weakest honest half of the check (DECIDE[image-pass]): this
+            # runner cannot see WHAT is drawn, only that something is. One flat
+            # colour is the canvas entry 429 published -- the image arrived and
+            # nothing was done with it.
+            return {"pass": False,
+                    "detail": head + "; but the canvas at the end of the idle "
+                                     "window is one flat colour, so nothing was "
+                                     "drawn with it"}
+        return {"pass": True, "detail": head + "; canvas drawn"}
+
+    if not flat and not sought_outside and not failure_notes:
+        # Nothing arrived, nothing failed, and the page never asked anyone for
+        # an image -- yet there is something on the canvas. p5 1.11.3 sets
+        # crossOrigin, so this is not a tainted fetch; it is a picture the
+        # sketch made or carried itself. The gate cannot prove a data: URI was
+        # drawn, because a data: URI is not a resource and leaves no entry, but
+        # it can say the web was not used.
+        return {"pass": False,
+                "detail": "the only image is a data: URI, which is not the web; "
+                          "the page made no request for an image outside itself"}
+
+    detail = "no image arrived from outside the sketch"
+    if failure_notes:
+        detail += ": " + "; ".join(failure_notes)
+    return {"pass": False, "detail": detail}
+
+
+def evaluate_assertion(page, kind, params, state, tone_brightness, silent_ref,
+                       resources=None, timeout_s=None):
     def diff(a, b):
         return page.evaluate("([a,b]) => window.__gate.diff(a,b)", [a, b])
 
@@ -1796,6 +2136,26 @@ def evaluate_assertion(page, kind, params, state, tone_brightness, silent_ref):
                              frac * 100.0, AUDIO_DIFF_FRACTION * 100.0,
                              tone_brightness if tone_brightness is not None else float("nan"),
                              sb if sb is not None else float("nan"))}
+
+    if kind == "loads(image)":
+        loaded = list(resources.loaded) if resources is not None else []
+        failure_notes = resources.notes() if resources is not None else []
+        flat = page.evaluate("() => window.__gate.flat('t20')")
+        fetched = page.evaluate("() => window.__gate.fetched()") or []
+        # initiatorType 'img' is what an <img> src is, which is what p5's
+        # loadImage() builds; anything the sketch fetched by hand and decoded
+        # itself counts too, because it is still the sketch going to the web.
+        # data: and blob: are excluded for the reason ResourceLog._from_the_web
+        # excludes them: p5 1.11.3 fetches a data: URI and then hands an <img>
+        # a blob: URL, and Chromium records both, so a sketch that carried its
+        # own picture would look like a sketch that went to the web for one.
+        sought_outside = any(
+            str(entry.get("kind")) in ("img", "image", "fetch", "xmlhttprequest")
+            and str(entry.get("name") or "").startswith(("http://", "https://"))
+            and not str(entry.get("name") or "").startswith(SKETCH_ORIGIN)
+            for entry in fetched)
+        return image_verdict(loaded, failure_notes, flat, sought_outside,
+                             timeout_s if timeout_s is not None else 0.0)
 
     if kind == "uses(webgl)":
         w = state.get("webgl")
