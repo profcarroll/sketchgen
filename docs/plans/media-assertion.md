@@ -6,13 +6,14 @@ the gate can verify it arrived. Grounded in the code as it stands at `main` 1c39
 Written for Opus builders; one packet per branch, one PR each, numbering continues from
 `docs/plans/child-source.md` (packets 17–18).
 
-*Status: Packet 19 built as `feat/loads-image` (2026-09-22): the word, the
-gate's `resources_loaded`, the preload wait and `timings.preload_s`, the three
-fixtures, `planner-v2`, `HARNESS_VERSION` 4. Packet 20 is in flight beside it on
-`feat/loads-image-shown` and merges after. Section 3.5 item 3 — a real job on
-the node with the prompt "a jigsaw of a photograph" — is not done and is the
-operator's call: it needs the generator running under the deployed version, so
-it belongs after the deploy, not before the PR.*
+*Status: both packets built 2026-09-22. Packet 19 (`feat/loads-image`, PR #152, merged and
+deployed): the word, the gate's `resources_loaded`, the preload wait and
+`timings.preload_s`, the three fixtures, `planner-v2`, `HARNESS_VERSION` 4. Packet 20
+(`feat/loads-image-shown`, PR #151): where the picture came from, on the entry page, on the
+Held card, on the job page and in `meta.json`; nothing shows until a gate run under 19 has
+written `resources_loaded`. Section 3.5 item 3 — a real job on the node with the prompt "a
+jigsaw of a photograph" — is not done and is the operator's call: it needs the generator
+running under the deployed version.*
 
 ## 0. What is there today, in one paragraph
 
@@ -180,11 +181,18 @@ reaching out (`prompts/executor.md`, both rules files: the only `loadImage` ment
   strings for the same reason).
 - The entry page: a provenance row **Loads** — *a picture from picsum.photos (image/jpeg,
   61 kB)* — and, under the frame, one line *this sketch fetches an image from picsum.photos
-  when it runs*, so a viewer knows their browser will call a third host. Dashes and no line
-  when the list is empty.
+  when it runs*, so a viewer knows their browser will call a third host. ~~Dashes~~ **No row**
+  and no line when the list is empty.
+  *(2026-09-22, building it: absent rather than dashed, for the reason packet 18's **Revised
+  from** row is absent — a row of dashes on all 910 published pages would be a change to
+  every one of them and would invite a reader to wonder what the entry lost. The size is
+  printed with one decimal, `61.4 kB`, because a whole kB loses the small pictures; and the
+  line says "images" when there are two hosts.)*
 - The Held page card (`web.py`, the batch card of `docs/plans/held-batch.md` §4.1) shows
   the host in the card's meta line, so the person publishing sees it without opening the
-  attempt (`DECIDE[image-hosts]`, `DECIDE[image-licence]`).
+  attempt (`DECIDE[image-hosts]`, `DECIDE[image-licence]`). *(2026-09-22: and the job page
+  shows the same line per attempt, with the content type and the size, beside `given:` —
+  the card is the decision, the job page is the evidence behind it.)*
 - `kiosk.json` and `swipe.json` gain nothing: an opaque-origin frame fetches cross-origin
   images without help, and there is no CSP on the published site to loosen
   (`gallery.py:1682`; `web.py:230` is a framing header only).
