@@ -16,6 +16,11 @@
 # report.json's own: ghost-echo uses it to say that the gate played the
 # sketch's own script and played all of it (auto-mouse.md section 5).
 #
+# An optional "assertion_detail" object names, per assertion word, a substring
+# that word's detail line must contain.  The three image fixtures use it: they
+# miss or pass loads(image) for three different reasons, and the reason is what
+# the next attempt reads (media-assertion.md section 3.3).
+#
 # fixtures_dir defaults to ./fixtures next to this script; artefact_dir
 # defaults to a fresh directory under $TMPDIR so the fixtures are not written
 # into.  Needs the venv with playwright on PATH already:
@@ -141,6 +146,20 @@ for name in names:
                 elif bool(got.get("pass")) != bool(ok):
                     problems.append("%s %s, expected %s (%s)"
                                     % (word, got.get("pass"), ok, got.get("detail")))
+            # And, for the fixtures that are about WHICH way an assertion went,
+            # a substring its detail has to carry (media-assertion.md §3.3,
+            # 2026-09-22). The three image fixtures miss or pass loads(image)
+            # for three different reasons, and a run that gave the right
+            # verdict with the wrong sentence would hand the next attempt a
+            # network fault to chase that is not there.
+            for word, fragment in sorted((want.get("assertion_detail") or {}).items()):
+                detail = ((got_asserts.get(word) or {}).get("detail") or "")
+                if fragment not in detail:
+                    problems.append("%s detail does not mention %r: %s"
+                                    % (word, fragment, detail or "(not evaluated)"))
+    elif want.get("assertion_detail"):
+        problems.append("assertion_detail is set but no assertions_expected "
+                        "entry runs the assertions it is about")
 
     if problems:
         bad += 1

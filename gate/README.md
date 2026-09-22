@@ -11,8 +11,8 @@ and the repo is the copy that leads: the three copies — here, the node, the
 course repo at `sld-fall-2026/examples/week11-self-hosted-ai/sketch-gate/` —
 share one sha256, recorded as `GATE_SHA256` in `tests/test_gate_fixtures.py`,
 and the other two match it once this branch is deployed. The frame budget below
-changed that hash, and so did the ghost window; until `update.sh` runs on the
-node, the node's copy is the one before it.
+changed that hash, and so did the ghost window, and so did `loads(image)`;
+until `update.sh` runs on the node, the node's copy is the one before it.
 
 ## What it checks
 
@@ -77,6 +77,83 @@ Entry 429, a jigsaw puzzle, loaded `https://picsum.photos/400/400` in
 `preload()` across eight attempts. Every run took eleven seconds and drew
 nothing, and the model spent those attempts rewriting handlers that already
 worked, because nothing it was shown mentioned the image.
+
+## Images that did arrive, and `loads(image)`
+
+Added 2026-09-22 (`docs/plans/media-assertion.md`). The list above is the one
+half of the story the gate could already tell. `report.json` now also carries
+`resources_loaded`: every off-origin response with an `image/*` content type and
+a 2xx status, as `{url, host, type, bytes, ms}`, at most
+`MAX_RESOURCES_LOADED` = 8 of them. A `data:` or `blob:` URL is not in it —
+neither is the sketch's own file and neither is the web.
+
+**It is not a check either.** What it is is the evidence behind the eighth
+assertion word:
+
+    loads(image)    at least one image arrived from a host outside the sketch,
+                    and the canvas at the end of the idle window is not one
+                    flat colour
+
+The second half is the weakest honest thing that can be said here: this runner
+cannot see *what* was drawn, only that something was (`DECIDE[image-pass]`).
+A picture that arrived and was never drawn is entry 429's canvas, and one flat
+colour is what that looks like from outside.
+
+The four ways it misses are four different sentences, because the sentence is
+what the next attempt acts on:
+
+| what happened | what the detail says |
+|---|---|
+| nothing arrived | *no image arrived from outside the sketch*, then the resource lines above — the sentence entry 429 never got |
+| it arrived, nothing was drawn with it | *…but the canvas at the end of the idle window is one flat colour* |
+| there is no canvas at all | *no canvas after 60 s (preload never finished)*, then the resource lines |
+| the picture came with the sketch | *the only image is a data: URI, which is not the web* |
+
+The last one the gate cannot prove and does not claim to: a `data:` URI is not
+a resource and leaves no trace in the page's own timings, so what the gate
+actually knows is that the page never asked anyone for an image, and that is
+what it says.
+
+**The wait for a canvas moves when the word is asked for.** A `preload()`
+sketch has no canvas until its image arrives, and the virtual clock does not
+move the network. With `loads(image)` among the assertions the wait runs to the
+whole `--timeout` instead of the usual 10 s, and `timings.preload_s` records how
+much of it went by — recorded on every run, asserted or not, because it is the
+number that says whether a slow run was the image or the code
+(`DECIDE[image-wait]`).
+
+**Where the eleven seconds actually went.** Entries 429 and 1103 were both read
+as slow hosts, and they were not. Playwright's `wait_for_function` polls on
+`requestAnimationFrame` by default, and the determinism above replaces
+`requestAnimationFrame` with a queue that nothing drains until this runner steps
+it — which happens *after* the wait. So for any sketch whose canvas did not
+already exist at the page's load event, the predicate was evaluated once, false,
+and the wait then sat out its entire cap. The node's own reports say so: `load_s`
+is 10.19 s on nine of entry 429's ten attempts, the cap to the millisecond,
+while the photograph itself arrives in about a tenth of a second. The wait now
+polls on a timer (`CANVAS_POLL_MS`), so it ends when the canvas appears, and
+raising the cap to `--timeout` for an asserted sketch costs nothing when the host
+is quick. A `preload()` sketch is about ten seconds cheaper to gate than it was.
+
+**A 404 is not as quiet as this file used to think.** Measured 2026-09-22 with
+the `bad-image-missing` fixture: when an image 404s from a real host, Chromium
+logs *Failed to load resource: the server responded with a status of 404 ()*
+itself, twice — once for p5's `fetch` and once for the `<img>` it builds — and
+`Recorder` counts a console message of type `error`, so **`console_clean` is
+false**. A failed image is still not a *page* error, and p5 adds nothing when
+the sketch passes `loadImage` a failure callback; the browser's own line is what
+is read. The consequence is worth stating: a job whose picture 404s ends
+`failed-kept` on QA rather than reaching a person off-plan. What entry 429 hit
+is not known to have been a 404 — its ten attempts predate `resources` and its
+console was clean on every one — and `MEASURE[image-arrival]` is where that gets
+settled.
+
+There is no allowlist of hosts and there is not going to be one here
+(`DECIDE[image-hosts]`). The gate names the host; the entry page names it too,
+and a person reads it before publishing a sketch that will call a third party
+from every visitor's browser. The picture keeps its host's terms — an entry's
+CC BY 4.0 covers the code and the statement, not the photograph
+(`DECIDE[image-licence]`).
 
 ## The frame budget
 
@@ -195,7 +272,7 @@ where determinism stops; read it before changing any sampling window.
 
 ## The fixtures and `accept.sh`
 
-`fixtures/` holds eight sketch directories, each one a bug the gate was built to
+`fixtures/` holds eleven sketch directories, each one a bug the gate was built to
 catch (or a clean pass it must not fail), and `fixtures/expected.json` records
 for each the expected exit code, the expected value of the checks that fixture
 is about, the assertions a planner would have chosen for it, and a note saying
@@ -205,17 +282,32 @@ only by the suspended `AudioContext`; `bad-frozen` passes every fixed check
 while drawing nothing, so only `motion(idle)` catches it — which is why its
 expected exit is 0; and `bad-frame-budget` passes every check the gate had
 before 2026-09-15 and still takes about a third of a second to draw one frame,
-which is job 166's bug with nothing else wrong with it.
+which is job 166's bug with nothing else wrong with it. The three image
+fixtures are a set and only make sense together: `good-image` fetches a seeded
+picsum photograph and draws it, `bad-image-missing` asks a real host for a file
+that is not there and still passes every fixed check, and
+`bad-image-data-uri` draws a real raster image that never came from the web.
+All three expect exit 0 from the plain run, because — as with `bad-frozen` —
+only the assertion knows the difference, and each carries an
+`assertion_detail` fragment so that the right verdict for the wrong reason is
+a mismatch.
 
 A fixture's expected `checks` object need not name every check — only the keys
-it lists are compared. `bad-frame-budget` uses that: the budget stops its run
+it lists are compared. `bad-frame-budget` and `good-image` both use that;
+`good-image` because its picture comes off a real host, so what a plain run's
+10 s wait for a canvas finds depends on how quick that host is this morning.
+`bad-frame-budget` uses it because the budget stops its run
 before `is_looping` and `frame_advancing` are read at the end of the idle
 window, so on a slow machine they come back null and on a fast one true, and
 neither is what the fixture is for. An optional `ghost` object is compared the
 same way, and `ghost-echo` is the fixture that has one: a `no_motion` sketch
 that paints a dot where it is clicked and a line where it is dragged, with a
 `ghost.json` of its own, so `source: executor` and `played` equal to `events`
-is the harness saying the gate played the sketch's own script and all of it.
+is the harness saying the gate played the sketch's own script and all of it. An
+optional `assertion_detail` object names, per word, a fragment that word's
+detail line has to contain; the three image fixtures carry one each, because
+`loads(image)` missing for the wrong reason is a sentence that sends the next
+attempt after a fault that is not there.
 
 `accept.sh` is the harness: for every fixture it runs the gate twice, once plain
 for the fixed checks and once with that fixture's assertions, compares both

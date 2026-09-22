@@ -59,6 +59,7 @@ VOCAB = [
     "uses(webgl)",
     "size(w,h)",
     "no_motion",
+    "loads(image)",
 ]
 
 #: Words that stand for themselves, with no parameters to read.
@@ -69,6 +70,7 @@ SIMPLE = {
     "responds(audio)",
     "uses(webgl)",
     "no_motion",
+    "loads(image)",
 }
 
 #: Same expression the gate uses, so a word this validator passes is a word the
@@ -95,6 +97,12 @@ LIVENESS_DEFAULT = "motion(idle)"
 #: Only the DEFAULT moves. A planner that asks for both still gets both: a
 #: particle field that also scatters under the cursor is a real sketch, and this
 #: is not the place to tell it that it is not.
+#:
+#: ``loads(image)`` is deliberately NOT in this tuple (2026-09-22,
+#: media-assertion.md DECIDE[image-liveness]). A photograph says nothing about
+#: whether the sketch moves: it can scatter on its own (``motion(idle)``) or be
+#: a jigsaw of one that waits to be touched (``no_motion``), and choosing for it
+#: here would be this module deciding which of the two a planner meant.
 LIVENESS_DEFAULT_INTERACTIVE = "no_motion"
 INTERACTIVE = ("responds(click)", "responds(drag)", "responds(audio)")
 
