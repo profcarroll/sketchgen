@@ -6,7 +6,13 @@ the gate can verify it arrived. Grounded in the code as it stands at `main` 1c39
 Written for Opus builders; one packet per branch, one PR each, numbering continues from
 `docs/plans/child-source.md` (packets 17–18).
 
-*Status: draft for the operator's review. Nothing here is built.*
+*Status: Packet 19 built as `feat/loads-image` (2026-09-22): the word, the
+gate's `resources_loaded`, the preload wait and `timings.preload_s`, the three
+fixtures, `planner-v2`, `HARNESS_VERSION` 4. Packet 20 is in flight beside it on
+`feat/loads-image-shown` and merges after. Section 3.5 item 3 — a real job on
+the node with the prompt "a jigsaw of a photograph" — is not done and is the
+operator's call: it needs the generator running under the deployed version, so
+it belongs after the deploy, not before the PR.*
 
 ## 0. What is there today, in one paragraph
 
@@ -37,7 +43,7 @@ reaching out (`prompts/executor.md`, both rules files: the only `loadImage` ment
 | `DECIDE[image-hosts]` | an allowlist | **None in the gate.** The gate reports the host; a person sees it before publishing (Packet 20). The executor's meaning line (§3.2) names two hosts known to serve CORS headers and stable URLs, `picsum.photos/seed/<word>/<w>/<h>` and `upload.wikimedia.org`, because p5 1.11's `loadImage` sets `crossOrigin` and a host without the header fails to load at all rather than tainting the canvas; that failure is what `ResourceLog` already narrates, and `worker.py`'s evidence already says *use a host that serves CORS headers*. |
 | `DECIDE[image-wait]` | preload and the clock | **When `loads(image)` is asserted, the canvas wait in `load_sketch` (`:773`, capped at 10 s today) runs to `--timeout`**, and `timings.preload_s` records it. A `preload()` sketch has no canvas until the image arrives, and the virtual clock does not move the network; entry 1103's 11 s runs are that wait. A canvas that never appears fails the assertion with the resource line in its detail, which is the sentence entry 429 never got. |
 | `DECIDE[image-determinism]` | what a random picture does to the strip | **Accepted and named.** `sketch_gate.py:95` already says *anything the sketch fetches from the network is as stable as the network*. The meaning line asks for a seeded URL so two runs draw the same picture; an unseeded one is allowed and the report says `resources_loaded[].url`. |
-| `DECIDE[image-versions]` | what bumps | **`HARNESS_VERSION` 3, `planner-v2`, `GATE_SHA256`; `executor-v3` stays.** The gate gains a word, so the version that says what it fails moves. `prompts/planner.md` says *these seven lines are the only assertions that exist*, so it is rewritten and is a new planner version. `MEANINGS` in `executor.py:166` gains a line, but a meaning is rendered only when its word is asserted; a prompt without the word is byte-identical, and the template file is untouched. If `docs/plans/auto-mouse.md` Packet 15 lands first, this is version 4 and the docstring lists both. |
+| `DECIDE[image-versions]` | what bumps | **`HARNESS_VERSION` ~~3~~ 4, `planner-v2`, `GATE_SHA256`; `executor-v3` stays.** (Corrected 2026-09-22: Packet 15's ghost window landed first and took 3, which the last sentence of this cell anticipated.) The gate gains a word, so the version that says what it fails moves. `prompts/planner.md` says *these seven lines are the only assertions that exist*, so it is rewritten and is a new planner version. `MEANINGS` in `executor.py:166` gains a line, but a meaning is rendered only when its word is asserted; a prompt without the word is byte-identical, and the template file is untouched. If `docs/plans/auto-mouse.md` Packet 15 lands first, this is version 4 and the docstring lists both. |
 | `DECIDE[image-liveness]` | how the planner pairs it | **With either.** A photograph that scatters (`motion(idle)`) or a puzzle of one (`no_motion`, `responds(drag)`); the rule stays *exactly one of the two*. |
 | `DECIDE[image-licence]` | the picture's licence | **Recorded, not resolved.** An entry's `licence` (CC BY 4.0) covers the code and the statement; the picture keeps its host's terms, and the entry page says which host it came from. Wikimedia files carry their own licence per file; picsum serves Unsplash photographs under Unsplash's terms. A person publishes with that in view. |
 
@@ -87,7 +93,8 @@ reaching out (`prompts/executor.md`, both rules files: the only `loadImage` ment
   `performance.getEntriesByType('resource')` shows none either and the canvas is not flat:
   the gate cannot prove a `data:` image but can say the web was not used.
 
-- `HARNESS_VERSION = 3` in `worker.py:722` with the docstring line *3, from <date>:
+- ~~`HARNESS_VERSION = 3`~~ **`HARNESS_VERSION = 4`** (corrected 2026-09-22: 3 is the
+  ghost window's) in `worker.py` with the docstring line *4, from 2026-09-22:
   `loads(image)` exists; the gate reports `resources_loaded`; the canvas wait runs to the
   timeout when the word is asserted.* `GATE_SHA256` updated; `rig/README.md` facts table gains
   `MAX_RESOURCES_LOADED`.
@@ -147,7 +154,7 @@ reaching out (`prompts/executor.md`, both rules files: the only `loadImage` ment
 - `tests/test_worker.py`: with `StubGate` reporting `resources_loaded` and a missed
   `loads(image)`, the evidence carries the detail and the job goes to `held` off-plan when
   QA is clean, as any other missed assertion does (`gate/README.md`, *What may fail a run*);
-  `HARNESS_VERSION` is 3 on the entry.
+  `HARNESS_VERSION` is ~~3~~ 4 on the entry.
 - `tests/test_gate_fixtures.py`: `ResourceLog` is importable without Playwright (the
   `_gate_module` trick at `:154`); a synthetic response with `image/png` lands in
   `resources_loaded` and a `text/html` 200 does not; the cap holds.
@@ -208,7 +215,7 @@ number, and the docstring lists both changes under their own versions.
 
 | packet | deploy |
 | --- | --- |
-| 19 | `update.sh --no-render`; the worker restarts with the new version and the node's gate copy matches the hash. Run `accept.sh` on the node once by hand before the PR; the new fixtures need the network, which the node has. |
+| 19 | `update.sh --no-render`; the worker restarts with `HARNESS_VERSION` 4 and the node's gate copy matches the hash. Run `accept.sh` on the node once by hand before the PR; the new fixtures need the network, which the node has. |
 | 20 | `update.sh` **with** the full render: the entry page and `meta.json` changed. |
 
 Remember `update.sh` runs its old copy if the pull changes it, and resumes only what it

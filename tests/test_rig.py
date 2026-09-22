@@ -87,6 +87,13 @@ class FactsTableTests(unittest.TestCase):
         # And the three scripts it can play are named where an agent looks.
         self.assert_stated("GHOST_BUILTINS", "ghost.png")
 
+    def test_the_image_cap_is_the_gate_s(self):
+        # Added 2026-09-22 with loads(image). An agent prototyping a collage
+        # here needs to know the list stops at eight, or it will design a
+        # sketch whose evidence is silently truncated on the node.
+        self.assert_stated("MAX_RESOURCES_LOADED",
+                           str(self.gate.MAX_RESOURCES_LOADED))
+
     def test_the_budgets_are_the_gate_s(self):
         self.assert_stated("DEFAULT_FRAME_BUDGET_MS",
                            "%g ms" % self.gate.DEFAULT_FRAME_BUDGET_MS)

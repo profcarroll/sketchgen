@@ -152,6 +152,24 @@ class TestCleanResponse(ExecutorTestCase):
         gate = (REPO_ROOT / "gate" / "sketch_gate.py").read_text(encoding="utf-8")
         self.assertIn(executor.SOUND_RE.pattern, gate)
 
+    def test_the_vocabulary_is_the_gate_s_own(self):
+        """Same rule as the sound names, for the same reason.
+
+        The executor writes the sketch that the gate then evaluates. A word it
+        offers a meaning for and the gate cannot evaluate would be a promise to
+        the model that nothing checks; a word the gate has and this list does
+        not is a refusal in `normalise_assertions` on a plan the planner was
+        entitled to write.
+        """
+        gate = (REPO_ROOT / "gate" / "sketch_gate.py").read_text(encoding="utf-8")
+        for word in executor.VOCAB:
+            self.assertIn('    "%s",' % word, gate, word)
+        self.assertEqual(len(executor.VOCAB), len(set(executor.VOCAB)))
+        # And the simple words are the gate's simple words: anything in VOCAB
+        # that is not simple has to be parsed by a regex on both sides.
+        self.assertEqual(
+            set(executor.VOCAB) - executor.SIMPLE_ASSERTIONS, {"size(w,h)"})
+
     def test_statement_is_stored_verbatim(self):
         self.replay("clean.txt")
         statement = (self.out / "statement.md").read_text(encoding="utf-8")
@@ -496,6 +514,54 @@ class TestPrompt(unittest.TestCase):
         self.assertIn("exactly 800 by 600 pixels", rendered)
         self.assertIn("seeds p5 with 7", rendered)
         self.assertNotIn("${", rendered)
+
+    def test_the_image_meaning_renders_only_when_the_word_is_asserted(self):
+        """DECIDE[image-versions]: the template file is untouched.
+
+        `MEANINGS` gained a line on 2026-09-22 and `prompts/executor.md` did
+        not, so `executor-v3` still says what it always said and a prompt for
+        a sketch nobody asked for a picture from is the same bytes it was.
+        That is the whole reason the executor prompt version does not move:
+        the A/B in the gallery compares prompts, and a byte that changed for
+        every sketch would be a third variable.
+        """
+        rules = executor.resolve_rules("treatment").read_text(encoding="utf-8")
+
+        def render(words):
+            return executor.render_prompt(
+                "a jigsaw of a photograph",
+                executor.normalise_assertions(words), rules, 7)
+
+        without = render(["no_motion", "responds(click)"])
+        with_word = render(["no_motion", "responds(click)", "loads(image)"])
+        self.assertNotIn("loads(image)", without)
+        self.assertNotIn("picsum.photos", without)
+        # And the two differ by exactly the one line, in the assertions block.
+        added = [line for line in with_word.splitlines()
+                 if line not in without.splitlines()]
+        self.assertEqual(1, len(added), added)
+        self.assertTrue(added[0].startswith("- `loads(image)` — "))
+        self.assertIn("at least one image must arrive from a host outside the "
+                      "sketch", added[0])
+        self.assertIn("preload()", added[0])
+        self.assertIn("https://picsum.photos/seed/<word>/800/600", added[0])
+        self.assertIn("upload.wikimedia.org", added[0])
+        self.assertIn("a data: URI is not the web and does not pass", added[0])
+        self.assertIn("a host that does not serve CORS fails to load at all",
+                      added[0])
+
+    def test_every_vocabulary_word_has_a_meaning_to_render(self):
+        # A word in the list with no line in MEANINGS would raise a KeyError in
+        # render_prompt — on the node, mid-job, after the planner had already
+        # spent a model call on it.
+        for word in executor.VOCAB:
+            with self.subTest(word):
+                rendered = executor.render_prompt(
+                    "a brief",
+                    executor.normalise_assertions(
+                        ["size(800,600)" if word == "size(w,h)" else word]),
+                    "rules", 1)
+                self.assertIn("- `", rendered)
 
     def test_rendering_is_deterministic(self):
         rules = executor.resolve_rules("control").read_text(encoding="utf-8")

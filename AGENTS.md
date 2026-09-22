@@ -230,7 +230,8 @@ driving it — never release one of those — and as `no agent` once nobody is.
 
 - **Plan:** a line `Brief`, one paragraph describing the sketch, then a line
   `Assertions` and one word per line from the closed vocabulary in the prompt
-  (e.g. `motion(idle)`, `responds(click)`, `size(800,600)`). Anything outside
+  (e.g. `motion(idle)`, `responds(click)`, `size(800,600)`, `loads(image)`).
+  Anything outside
   the vocabulary is dropped; the gate implements nothing else.
 - **Execute:** a fenced ```` ```js ```` block with the whole sketch (p5.js,
   global mode), optionally ```` ```html ````, and the statement the prompt asks
