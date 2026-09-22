@@ -21,6 +21,7 @@ harness where it can actually run:
 
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -64,17 +65,36 @@ from sketchgen import executor, ghostshim  # noqa: E402
 #: script through page.mouse and writes ghost.png beside strip.png. It adds no
 #: check and fails no run — strip.png and gate.png are byte-for-byte what they
 #: were, the assertions are evaluated before it opens, and console_clean is
-#: read at the moment it opens. The previous value, which is the one the node
-#: and the course repo carry until this is deployed, was
-#: 88bedeb8b32eadb5522984e3ef481375e904b94a9affdd2f0a76e38ccf436d99.
-GATE_SHA256 = "f64ac446bac40ebce61bfc2811684087b23c824f70220de1dd373b56928bfcbc"
+#: read at the moment it opens.
+#:
+#: Changed 2026-09-22 by `loads(image)` (entries 429 and 1103,
+#: media-assertion.md §3.1): the vocabulary gains an eighth word, ResourceLog
+#: records the images that DID arrive as `resources_loaded`, and the wait for a
+#: canvas runs to the whole --timeout when the word is asserted, with
+#: `timings.preload_s` saying how much of it went by. It adds no check: an
+#: image arriving fails nothing, and one not arriving fails nothing either
+#: unless a planner asked for a picture.
+#:
+#: That wait also stopped being free. It polled on requestAnimationFrame, which
+#: this file replaces with a queue nothing drains until the run steps it, so it
+#: had never once ended early: entry 429's reports on the node read load_s
+#: 10.19 s on nine of ten attempts, the cap to the millisecond, for a
+#: photograph that arrives in a tenth of a second. It polls on a timer now, so
+#: every preload() sketch gates about ten seconds faster. The previous value,
+#: which is the one the node and the course repo carry until this is deployed,
+#: was
+#: f64ac446bac40ebce61bfc2811684087b23c824f70220de1dd373b56928bfcbc.
+GATE_SHA256 = "4fac3c1635269d408cc74ffd3ad02c5c2b42316e0edcb4fdf31a921ebb779925"
 
-#: How long the eight fixtures are allowed to take together. On the node a
-#: single gate run is about four seconds and the harness does fifteen of them —
-#: except bad-frame-budget, which is a third of a second a frame by design and
+#: How long the eleven fixtures are allowed to take together. On the node a
+#: single gate run is about four seconds and the harness does twenty-one of them
+#: — except bad-frame-budget, which is a third of a second a frame by design and
 #: costs tens of seconds before the budget stops it. That fixture is why this
-#: number is 900 and not 600.
-ACCEPT_TIMEOUT_S = 900
+#: number is 900 and not 600, and the three image fixtures (2026-09-22) are why
+#: it is 1200 now: they fetch from a real host, and the one that asserts
+#: loads(image) will wait out the whole 60 s timeout for a canvas if that host
+#: is having a bad morning.
+ACCEPT_TIMEOUT_S = 1200
 
 
 def _have_playwright() -> bool:
@@ -265,6 +285,388 @@ class FrameBudgetTests(unittest.TestCase):
                 want["checks"].get("frame_budget"), True,
                 f"{name} should clear the frame budget",
             )
+
+
+class FakeResponse:
+    """Enough of a Playwright Response for ResourceLog, and nothing more.
+
+    The real one needs a browser; what ResourceLog reads off it is a URL, a
+    status, the headers dict and — only from :meth:`ResourceLog.measure`, never
+    from inside a handler — the body. So a fake is honest here, and it is the
+    only way these four rules get checked on a laptop at all.
+    """
+
+    def __init__(self, url, status=200, headers=None, body=b"", request=None):
+        self.url = url
+        self.status = status
+        self.headers = dict(headers or {})
+        self._body = body
+        self.request = request or FakeRequest(url)
+
+    def body(self):
+        return self._body
+
+
+class FakeRequest:
+    def __init__(self, url, resource_type="image", failure=None):
+        self.url = url
+        self.resource_type = resource_type
+        self.failure = failure
+
+
+class ResourceLogTests(unittest.TestCase):
+    """What arrived and what did not, as the log records it.
+
+    media-assertion.md §3.1. The list is evidence and never a check, so nothing
+    here is about pass or fail; it is about the four rules that decide what goes
+    in it — off the sketch's own origin, an `image/*` content type, a 2xx
+    status, and at most MAX_RESOURCES_LOADED of them.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gate = _gate_module()
+
+    def log(self):
+        return self.gate.ResourceLog()
+
+    def png(self, url, **kwargs):
+        headers = {"content-type": "image/png", "content-length": "1234"}
+        headers.update(kwargs.pop("headers", {}))
+        return FakeResponse(url, headers=headers, **kwargs)
+
+    def test_an_off_origin_image_is_an_arrival(self):
+        log = self.log()
+        log._on_response(self.png("https://picsum.photos/seed/x/400/300"))
+        self.assertEqual(1, len(log.loaded))
+        item = log.loaded[0]
+        self.assertEqual("picsum.photos", item["host"])
+        self.assertEqual("image/png", item["type"])
+        self.assertEqual(1234, item["bytes"])
+        self.assertEqual("https://picsum.photos/seed/x/400/300", item["url"])
+        # Nothing failed, so the failures list is untouched: one response
+        # cannot be both.
+        self.assertEqual([], log.failures)
+
+    def test_a_page_is_not_an_image(self):
+        # The content type decides and nothing else does. p5 itself comes off
+        # cdnjs on every single run and must never appear in this list.
+        log = self.log()
+        log._on_response(FakeResponse("https://example.test/index.html",
+                                      headers={"content-type": "text/html"}))
+        log._on_response(FakeResponse(
+            "https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.11.3/p5.min.js",
+            headers={"content-type": "application/javascript"}))
+        self.assertEqual([], log.loaded)
+
+    def test_a_missing_image_is_a_failure_and_not_an_arrival(self):
+        log = self.log()
+        log._on_response(FakeResponse("https://example.test/gone.jpg", status=404,
+                                      headers={"content-type": "image/jpeg"}))
+        self.assertEqual([], log.loaded)
+        self.assertEqual(1, len(log.failures))
+        self.assertEqual("HTTP 404", log.failures[0]["why"])
+        self.assertIn("did not get it: HTTP 404", log.notes()[0])
+
+    def test_the_sketch_s_own_files_are_not_arrivals(self):
+        # They come off disk through the page.route() handler and cannot fail;
+        # an image inside the sketch directory is not the sketch reaching
+        # outside itself, which is what the word is about.
+        log = self.log()
+        log._on_response(self.png(self.gate.SKETCH_ORIGIN + "/tile.png"))
+        self.assertEqual([], log.loaded)
+
+    def test_a_data_uri_is_not_the_web(self):
+        # DECIDE[image-pass], and the bad-image-data-uri fixture. Chromium
+        # reports a response for a data: URL and for the blob: URL p5 hands the
+        # <img> after it; counting either would pass the word on a sketch that
+        # never left the page.
+        log = self.log()
+        log._on_response(self.png("data:image/png;base64,AAAA"))
+        log._on_response(self.png("blob:http://sketch.localhost/0-0-0"))
+        self.assertEqual([], log.loaded)
+
+    def test_the_cap_holds(self):
+        log = self.log()
+        for at in range(self.gate.MAX_RESOURCES_LOADED + 4):
+            log._on_response(self.png("https://example.test/%d.png" % at))
+        self.assertEqual(self.gate.MAX_RESOURCES_LOADED, len(log.loaded))
+        self.assertEqual("https://example.test/0.png", log.loaded[0]["url"])
+
+    def test_the_same_url_twice_is_one_arrival(self):
+        # p5 1.11.3 fetches the URL and then gives an <img> the same src, so
+        # the same picture arrives twice for one loadImage().
+        log = self.log()
+        for _ in range(3):
+            log._on_response(self.png("https://example.test/one.png"))
+        self.assertEqual(1, len(log.loaded))
+
+    def test_a_host_that_declares_no_size_is_measured_afterwards(self):
+        # And measured OUTSIDE the response handler: a body read from inside
+        # one is a round trip on the dispatcher's own greenlet.
+        log = self.log()
+        response = FakeResponse("https://example.test/plain.png",
+                                headers={"content-type": "image/png"},
+                                body=b"x" * 4096)
+        log._on_response(response)
+        self.assertIsNone(log.loaded[0]["bytes"])
+        log.measure()
+        self.assertEqual(4096, log.loaded[0]["bytes"])
+        # Idempotent: the run calls it twice, once after load and once before
+        # the assertions, because an image can arrive in setup() too.
+        log.measure()
+        self.assertEqual(4096, log.loaded[0]["bytes"])
+
+    def test_an_unreadable_body_leaves_the_size_unknown_not_zero(self):
+        class Unreadable(FakeResponse):
+            def body(self):
+                raise RuntimeError("the response is gone")
+
+        log = self.log()
+        log._on_response(Unreadable("https://example.test/plain.png",
+                                    headers={"content-type": "image/png"}))
+        log.measure()
+        self.assertIsNone(log.loaded[0]["bytes"])
+        self.assertIn("size unknown", log.arrival_notes()[0])
+
+    def test_the_timing_is_from_the_request_leaving(self):
+        log = self.log()
+        request = FakeRequest("https://example.test/timed.png")
+        log._on_request(request)
+        log._on_response(self.png("https://example.test/timed.png",
+                                  request=request))
+        self.assertIsNotNone(log.loaded[0]["ms"])
+        self.assertGreaterEqual(log.loaded[0]["ms"], 0)
+
+    def test_an_arrival_nobody_timed_says_so(self):
+        # A response whose request was never seen — the cap on the timing dict,
+        # or a redirect chain — is null ms, not 0 ms. A blank is true and a
+        # zero is a claim.
+        log = self.log()
+        log._on_response(self.png("https://example.test/untimed.png"))
+        self.assertIsNone(log.loaded[0]["ms"])
+        self.assertIn("timing unknown", log.arrival_notes()[0])
+
+    def test_a_broken_response_object_is_ignored_not_raised(self):
+        # This runs inside a Playwright event handler. An exception out of
+        # there is a run that dies for a reason no report.json can name.
+        class Broken:
+            @property
+            def url(self):
+                raise RuntimeError("no")
+
+        log = self.log()
+        log._on_response(Broken())
+        log._on_request(Broken())
+        self.assertEqual([], log.loaded)
+        self.assertEqual([], log.failures)
+
+
+class LoadsImageVerdictTests(unittest.TestCase):
+    """The four ways loads(image) misses, and the one way it passes.
+
+    Each detail is read by the next attempt and acted on, which is why they are
+    four different sentences and not one: entry 429 was handed "0 pixels
+    changed" eight times and spent every attempt rewriting a click handler that
+    already worked. `image_verdict` is factored out of `evaluate_assertion` so
+    that what they say can be checked without a browser.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gate = _gate_module()
+
+    ARRIVED = {"url": "https://picsum.photos/seed/x/800/600",
+               "host": "picsum.photos", "type": "image/jpeg",
+               "bytes": 61234, "ms": 340}
+    LINES = ["the sketch asked for https://picsum.photos/400/400 (image) and "
+             "did not get it: net::ERR_FAILED"]
+
+    def test_a_picture_that_arrived_and_was_drawn_passes(self):
+        got = self.gate.image_verdict([self.ARRIVED], [], False, True, 60.0)
+        self.assertTrue(got["pass"])
+        # The sentence media-assertion.md §3.1 writes out, to the comma.
+        self.assertEqual("1 image arrived: picsum.photos (image/jpeg, 61 kB, "
+                         "340 ms); canvas drawn", got["detail"])
+
+    def test_a_picture_that_arrived_and_was_not_drawn_misses(self):
+        got = self.gate.image_verdict([self.ARRIVED], [], True, True, 60.0)
+        self.assertFalse(got["pass"])
+        self.assertIn("picsum.photos", got["detail"])
+        self.assertIn("one flat colour", got["detail"])
+
+    def test_nothing_arrived_carries_the_resource_lines(self):
+        got = self.gate.image_verdict([], self.LINES, False, True, 60.0)
+        self.assertFalse(got["pass"])
+        self.assertTrue(got["detail"].startswith(
+            "no image arrived from outside the sketch"))
+        self.assertIn("net::ERR_FAILED", got["detail"])
+
+    def test_no_canvas_names_the_timeout_and_the_lines(self):
+        got = self.gate.image_verdict([], self.LINES, None, True, 60.0)
+        self.assertFalse(got["pass"])
+        self.assertIn("no canvas after 60 s (preload never finished)",
+                      got["detail"])
+        self.assertIn("net::ERR_FAILED", got["detail"])
+
+    def test_no_canvas_and_nothing_to_report_is_still_that_sentence(self):
+        got = self.gate.image_verdict([], [], None, False, 45.0)
+        self.assertFalse(got["pass"])
+        self.assertEqual("no canvas after 45 s (preload never finished)",
+                         got["detail"])
+
+    def test_a_data_uri_is_told_from_a_network_fault(self):
+        # Nothing arrived, nothing failed, the page asked nobody — and there is
+        # something on the canvas. Saying "no image arrived" here would send
+        # the next attempt after a fault that is not there.
+        got = self.gate.image_verdict([], [], False, False, 60.0)
+        self.assertFalse(got["pass"])
+        self.assertIn("the only image is a data: URI, which is not the web",
+                      got["detail"])
+
+    def test_a_flat_canvas_with_no_request_is_not_the_data_uri_sentence(self):
+        # A sketch that drew nothing and asked for nothing is the ordinary
+        # miss: there is no picture to have been a data: URI.
+        got = self.gate.image_verdict([], [], True, False, 60.0)
+        self.assertFalse(got["pass"])
+        self.assertEqual("no image arrived from outside the sketch",
+                         got["detail"])
+
+    def test_several_pictures_are_all_named(self):
+        second = dict(self.ARRIVED, host="upload.wikimedia.org",
+                      type="image/png", bytes=None, ms=None)
+        got = self.gate.image_verdict([self.ARRIVED, second], [], False, True, 60.0)
+        self.assertTrue(got["pass"])
+        self.assertTrue(got["detail"].startswith("2 images arrived: "))
+        self.assertIn("upload.wikimedia.org (image/png, size unknown, "
+                      "timing unknown)", got["detail"])
+
+
+class LoadsImageWiringTests(unittest.TestCase):
+    """The word in the vocabulary, and the wait that moves when it is asked for."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gate = _gate_module()
+
+    def test_the_word_is_in_the_vocabulary_and_needs_no_parsing(self):
+        self.assertIn("loads(image)", self.gate.VOCAB)
+        self.assertIn("loads(image)", self.gate.SIMPLE_ASSERTIONS)
+        self.assertEqual([("loads(image)", "loads(image)", None)],
+                         self.gate.normalise_assertions(["loads(image)"]))
+        # Eight words now, and the --help epilog is built from the same list,
+        # so an agent reading it sees what the planner was given.
+        self.assertEqual(8, len(self.gate.VOCAB))
+
+    def test_an_unknown_word_is_still_a_refusal(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.gate.normalise_assertions(["loads(video)"])
+        self.assertEqual(3, caught.exception.code)
+
+    def test_the_verdict_helper_is_what_the_branch_calls(self):
+        """The branch reads the page and hands the facts on; a fake page is
+        enough to prove which facts, and that they arrive in the right order."""
+        gate = self.gate
+        asked = []
+
+        class FakePage:
+            def evaluate(self, script, *args):
+                asked.append(script)
+                if "flat" in script:
+                    return False
+                if "fetched" in script:
+                    return [{"name": "https://picsum.photos/seed/x/800/600",
+                             "kind": "fetch"},
+                            {"name": "blob:http://sketch.localhost/1",
+                             "kind": "img"}]
+                raise AssertionError("unexpected evaluate: %s" % script)
+
+        log = gate.ResourceLog()
+        log._on_response(FakeResponse("https://picsum.photos/seed/x/800/600",
+                                      headers={"content-type": "image/jpeg",
+                                               "content-length": "61234"}))
+        got = gate.evaluate_assertion(FakePage(), "loads(image)", None, {},
+                                      None, None, resources=log, timeout_s=60.0)
+        self.assertTrue(got["pass"])
+        self.assertIn("picsum.photos (image/jpeg, 61 kB", got["detail"])
+        self.assertEqual(2, len(asked))
+
+    def test_the_canvas_wait_is_a_parameter_with_the_old_default(self):
+        # Every run that asserts nothing about images keeps the ten seconds it
+        # always had; only the asserted run waits out the whole --timeout
+        # (DECIDE[image-wait]).
+        self.assertEqual(10000, self.gate.CANVAS_WAIT_MS)
+        signature = inspect.signature(self.gate.load_sketch)
+        self.assertEqual(self.gate.CANVAS_WAIT_MS,
+                         signature.parameters["wait_for_canvas_ms"].default)
+
+    def test_the_canvas_wait_polls_on_a_timer_and_not_on_a_frame(self):
+        """The bug this packet found, pinned so it cannot come back.
+
+        Playwright's `wait_for_function` defaults to `polling='raf'`, and this
+        file replaces requestAnimationFrame with a queue that nothing drains
+        until the run steps it — after this wait. So the predicate was
+        evaluated once and the wait then sat out its whole cap: entry 429's
+        reports on the node read `load_s` 10.19 s on nine of ten attempts, for
+        a photograph that arrives in a tenth of a second. Dropping the `polling`
+        argument in a tidy-up would restore that silently, and the only symptom
+        would be every preload() sketch costing ten seconds again.
+        """
+        seen = {}
+
+        class FakePage:
+            def goto(self, url, **kwargs):
+                seen["goto"] = (url, kwargs)
+
+            def wait_for_function(self, expression, **kwargs):
+                seen["wait"] = (expression, kwargs)
+
+        load_s, preload_s = self.gate.load_sketch(FakePage(), 60000, 60000)
+        self.assertEqual(self.gate.CANVAS_POLL_MS, seen["wait"][1]["polling"])
+        self.assertEqual(60000, seen["wait"][1]["timeout"])
+        self.assertIn("canvas()", seen["wait"][0])
+        # And the wait it reports is a real measurement, not the cap.
+        self.assertLess(preload_s, 1.0)
+        self.assertGreaterEqual(load_s, preload_s)
+
+    def test_the_wait_never_runs_longer_than_the_page_timeout(self):
+        # --timeout is the ceiling on both halves: a caller asking for a 60 s
+        # canvas wait on a 5 s timeout gets 5 s, which is what the old
+        # min(timeout_ms, 10000) meant and still means.
+        seen = {}
+
+        class FakePage:
+            def goto(self, url, **kwargs):
+                pass
+
+            def wait_for_function(self, expression, **kwargs):
+                seen.update(kwargs)
+
+        self.gate.load_sketch(FakePage(), 5000, 60000)
+        self.assertEqual(5000, seen["timeout"])
+
+    def test_the_three_image_fixtures_are_in_the_repo_and_expected(self):
+        expected = json.loads((FIXTURES / "expected.json").read_text(encoding="utf-8"))
+        for name, verdict in (("good-image", True),
+                              ("bad-image-missing", False),
+                              ("bad-image-data-uri", False)):
+            with self.subTest(name):
+                self.assertTrue((FIXTURES / name / "sketch.js").is_file())
+                self.assertTrue((FIXTURES / name / "index.html").is_file())
+                self.assertIs(
+                    expected["assertions_expected"][name]["loads(image)"],
+                    verdict)
+                # Each one is about a different sentence, and accept.sh is what
+                # compares it on the node.
+                self.assertTrue(expected[name]["assertion_detail"]["loads(image)"])
+
+    def test_the_good_image_fixture_uses_a_seeded_url(self):
+        # DECIDE[image-determinism]: an unseeded picsum URL is allowed by the
+        # gate and would make this fixture's own picture a different one every
+        # run, so the strip could never be compared with itself.
+        source = (FIXTURES / "good-image" / "sketch.js").read_text(encoding="utf-8")
+        self.assertIn("https://picsum.photos/seed/sketchgen/400/300", source)
+        self.assertIn("function preload()", source)
 
 
 #: Scripts both validators are run over, and what each one is. The gate's copy

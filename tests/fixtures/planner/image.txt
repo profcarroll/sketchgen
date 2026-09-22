@@ -1,0 +1,13 @@
+Brief
+A single photograph sits in the middle of a dark field, cut into twelve
+rectangular pieces that lie a little apart from one another, each one turned by
+a degree or two so the seams catch the eye. Clicking a piece lifts it and snaps
+it back into its place in the picture, and the seam it closes disappears; the
+canvas does nothing at all between clicks, so the only movement a viewer ever
+sees is the movement they caused. The photograph fills about two thirds of the
+shorter side and the field around it stays almost black.
+
+Assertions
+no_motion
+responds(click)
+loads(image)

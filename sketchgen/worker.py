@@ -776,7 +776,10 @@ ADVISORY_CHECKS = frozenset({"is_looping"})
 #:     resource that did not arrive is named in the evidence.
 #: 3 — from 2026-09-21: the gate plays a ghost script after the probes and
 #:     writes ghost.png; nothing it fails changed.
-HARNESS_VERSION = 3
+#: 4 — from 2026-09-22: `loads(image)` exists; the gate reports
+#:     `resources_loaded`; the canvas wait runs to the timeout when the word is
+#:     asserted.
+HARNESS_VERSION = 4
 
 QA_CHECKS = frozenset({
     "console_clean", "frame_advancing", "sound_lib_ok",

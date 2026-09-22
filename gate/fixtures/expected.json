@@ -79,7 +79,7 @@
       "audio_context_running": null,
       "frame_budget": false
     },
-    "notes": "The cost bug from job 166 with nothing else wrong: every check this gate had before 2026-09-15 passes and the sketch still takes about a third of a second to draw one frame. is_looping and frame_advancing are deliberately NOT listed here. Both are read at the end of the idle window, and this run does not reach the end of it \u2014 the budget stops it early \u2014 so on a slow machine they are null and on a fast one they are true, and neither is what the fixture is for. exit 1 and frame_budget false hold on both. The run still writes gate.png \u2014 the frame it stopped on \u2014 so the operator UI has a still to draw a play button on."
+    "notes": "The cost bug from job 166 with nothing else wrong: every check this gate had before 2026-09-15 passes and the sketch still takes about a third of a second to draw one frame. is_looping and frame_advancing are deliberately NOT listed here. Both are read at the end of the idle window, and this run does not reach the end of it — the budget stops it early — so on a slow machine they are null and on a fast one they are true, and neither is what the fixture is for. exit 1 and frame_budget false hold on both. The run still writes gate.png — the frame it stopped on — so the operator UI has a still to draw a play button on."
   },
   "ghost-echo": {
     "exit": 0,
@@ -98,9 +98,62 @@
     },
     "notes": "The sketch that only exists when somebody touches it (auto-mouse.md §5, 2026-09-21). Idle it is four identical frames and a judge learns nothing from strip.png; it writes its own ghost.json, and the ghost window plays every one of its eight events, so ghost.png carries a dot where the pointer clicked and a line where it dragged. \"ghost\" here is what proves the gate's player read the sketch's own script rather than falling back to a built-in: source executor, and played equal to events."
   },
+  "good-image": {
+    "exit": 0,
+    "checks": {
+      "console_clean": true,
+      "sound_lib_ok": null,
+      "audio_context_running": null,
+      "frame_budget": true
+    },
+    "assertion_detail": {
+      "loads(image)": "picsum.photos"
+    },
+    "notes": "The clean pass for loads(image) (media-assertion.md §3.3, 2026-09-22). The word exists because of entries 429 and 1103: both fetch a photograph from picsum.photos in preload() and neither published one. This one draws it, so resources_loaded names the host and the canvas at the end of the idle window is not one flat colour. Measured on the node: the picture arrives in about 100 ms and the whole run is under a second, which is the other half of this packet — the 11 s those two entries spent was Playwright's raf-polled wait for a canvas sitting out its own 10 s cap, not the host (see load_sketch). is_looping and frame_advancing are still deliberately NOT listed, for the reason bad-frame-budget does not list them: the picture comes off a real host over the real network, and the plain run keeps the ordinary 10 s wait, so a host having a bad morning would leave it with no canvas and those two null. The assertion run is the one that matters and waits out the whole --timeout (DECIDE[image-wait]); no_motion passing there is what says noLoop() ran."
+  },
+  "bad-image-missing": {
+    "exit": 1,
+    "checks": {
+      "console_clean": false,
+      "is_looping": false,
+      "frame_advancing": null,
+      "sound_lib_ok": null,
+      "audio_context_running": null,
+      "frame_budget": true
+    },
+    "assertion_detail": {
+      "loads(image)": "HTTP 404"
+    },
+    "notes": "Entry 429's own run: the sketch asks a real host for a picture and the picture is not there. MEASURED ON THE NODE 2026-09-22, and not what media-assertion.md §3.3 predicted: console_clean is FALSE here, because Chromium logs a failed subresource itself — \"Failed to load resource: the server responded with a status of 404 ()\", twice, once for p5's fetch and once for the <img> it builds — and Recorder counts a console message of type error. A failed image is indeed not a *page* error, and the sketch's own failure callback keeps p5 from adding one; the browser's line is what console_clean reads. So a 404 is caught by QA as well as by the assertion, and a job like this ends failed-kept rather than going to a person off-plan. That is worth knowing and this fixture is what pins it. What the assertion has to do either way is miss AND carry the resource line in its detail, because that sentence is the one thing entry 429 never got."
+  },
+  "bad-image-data-uri": {
+    "exit": 0,
+    "checks": {
+      "console_clean": true,
+      "is_looping": false,
+      "frame_advancing": null,
+      "sound_lib_ok": null,
+      "audio_context_running": null,
+      "frame_budget": true
+    },
+    "assertion_detail": {
+      "loads(image)": "data: URI"
+    },
+    "notes": "The sketch that carried its own picture — one of the 39 clean attempts thrown away for an assertion built its own image as a data: URI when it could not fetch one (gate/README.md). It draws a real raster image, nothing failed to arrive, and the canvas is not flat; loads(image) still misses, because the word is about the web (DECIDE[image-pass]). The detail is what this fixture is really for: it must name the data: URI rather than say \"no image arrived\", which would send the next attempt hunting a network fault that is not there."
+  },
   "assertions_expected": {
     "ghost-echo": {
       "no_motion": true
+    },
+    "good-image": {
+      "loads(image)": true,
+      "no_motion": true
+    },
+    "bad-image-missing": {
+      "loads(image)": false
+    },
+    "bad-image-data-uri": {
+      "loads(image)": false
     },
     "bad-frozen": {
       "motion(idle)": false
