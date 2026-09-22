@@ -11,8 +11,8 @@ and the repo is the copy that leads: the three copies — here, the node, the
 course repo at `sld-fall-2026/examples/week11-self-hosted-ai/sketch-gate/` —
 share one sha256, recorded as `GATE_SHA256` in `tests/test_gate_fixtures.py`,
 and the other two match it once this branch is deployed. The frame budget below
-changed that hash; until `update.sh` runs on the node, the node's copy is the
-one before it.
+changed that hash, and so did the ghost window; until `update.sh` runs on the
+node, the node's copy is the one before it.
 
 ## What it checks
 
@@ -132,8 +132,49 @@ to do about it:
 
 Then it evaluates the small closed vocabulary of assertions the planner is
 allowed to choose from (`--assert motion(idle)`, `responds(click)`,
-`no_motion`, and the rest), and writes `gate.png`, `strip.png`, `console.log`
-and `report.json` into `--out` (default `<sketch_dir>/.gate`).
+`no_motion`, and the rest), and writes `gate.png`, `strip.png`, `ghost.png`,
+`console.log` and `report.json` into `--out` (default `<sketch_dir>/.gate`).
+
+## The ghost window
+
+Added 2026-09-21, for entry 1103 and the 27 published entries like it. A
+jigsaw puzzle asserts `no_motion`, `responds(click)` and `responds(drag)`, and
+on the kiosk it is a photograph cut into pieces that never move, because nobody
+is at the keyboard. The gate was no better off: one click at the canvas centre
+and one drag across the middle were all the interaction a sketch ever got, so
+the fourth frame of `strip.png` was the only interactive evidence a judge or a
+critic ever saw.
+
+So, after every check and every assertion has been decided, the gate plays a
+pointer script through `page.mouse` — real Chromium input, stepping the virtual
+clock between events by the gap in their timestamps — and writes four frames of
+it, at the quartiles of the script's own duration, as `ghost.png`. The script
+is the sketch's own `ghost.json` when it wrote one, and otherwise the built-in
+its requested assertions name: `click` for `responds(click)`, `drag` for
+`responds(drag)`, both where both are asked, and `wander` for a sketch that
+asked for neither. `report.json` gains a `ghost` object saying which it was and
+how much of it played.
+
+**It decides nothing, and that is the point.** `strip.png` and `gate.png` are
+byte-for-byte what they were before it existed: both judge populations and the
+critic compare against them, `pairs.artefact_hash` is over them, and every
+published `meta.json` names them, so changing one mid-corpus would split every
+measurement taken so far. The assertions are evaluated before the window opens
+and against the snapshots taken before it, so `responds(click)` is exactly as
+strong as it was. `console_clean` is read at the moment the window opens and
+not through it — a synthetic pointer clicking where the probe did not may not
+turn a sketch that passed into a failure — and a budget that runs out inside
+the window is a note and no `ghost.png`, never a failed check. The window does
+count against `--budget-s`, like every other probe, and sits outside the
+counted idle window, so `timings.ms_per_frame` is the same number it always
+was. `--no-ghost` skips it altogether.
+
+The script shape, the caps (64 events, 8,000 ms) and the three built-ins are
+`sketchgen/ghostshim.py`'s, copied into this file the way `SOUND_RE` is —
+this directory imports nothing from the package — with
+`tests/test_gate_fixtures.py` pinning the two copies together. The other player
+is the shim itself, inside the published page, which is how the kiosk moves the
+same sketch on a projector.
 
 Exit codes are the project's: **0** everything that can fail passed, **1** a
 check or an assertion failed, **3** refused — no browser, an unknown assertion
@@ -143,6 +184,7 @@ word, an unusable sketch directory.
 python3 gate/sketch_gate.py <sketch_dir> [--assert WORD ...] [--seed N]
                             [--out DIR] [--timeout S] [--json]
                             [--frame-budget-ms MS] [--budget-s S]
+                            [--no-ghost]
 ```
 
 Determinism is bought with a virtual clock, hand-stepped frames, seeded
@@ -153,7 +195,7 @@ where determinism stops; read it before changing any sampling window.
 
 ## The fixtures and `accept.sh`
 
-`fixtures/` holds seven sketch directories, each one a bug the gate was built to
+`fixtures/` holds eight sketch directories, each one a bug the gate was built to
 catch (or a clean pass it must not fail), and `fixtures/expected.json` records
 for each the expected exit code, the expected value of the checks that fixture
 is about, the assertions a planner would have chosen for it, and a note saying
@@ -169,7 +211,11 @@ A fixture's expected `checks` object need not name every check — only the keys
 it lists are compared. `bad-frame-budget` uses that: the budget stops its run
 before `is_looping` and `frame_advancing` are read at the end of the idle
 window, so on a slow machine they come back null and on a fast one true, and
-neither is what the fixture is for.
+neither is what the fixture is for. An optional `ghost` object is compared the
+same way, and `ghost-echo` is the fixture that has one: a `no_motion` sketch
+that paints a dot where it is clicked and a line where it is dragged, with a
+`ghost.json` of its own, so `source: executor` and `played` equal to `events`
+is the harness saying the gate played the sketch's own script and all of it.
 
 `accept.sh` is the harness: for every fixture it runs the gate twice, once plain
 for the fixed checks and once with that fixture's assertions, compares both

@@ -146,9 +146,11 @@ bin/sg paid try --job N --as $ME < answer.txt       # returns within 4 minutes
 #     verdict the gate ran: `exit`, every check, each assertion with its
 #             detail, `timings.ms_per_frame` (the number that decides the
 #             frame budget; a laptop proxy reads about a third under it),
-#             the console, and the node paths of strip.png and gate.png —
-#             `scp sld-cloud:<path> .` and look. `then` is the import on a
-#             clean pass, and another try otherwise.
+#             the console, and the node paths of strip.png, gate.png and
+#             ghost.png (four frames of the sketch under the pointer script,
+#             yours if you wrote a `ghost` block) — `scp sld-cloud:<path> .`
+#             and look. `then` is the import on a clean pass, and another
+#             try otherwise.
 #     rejected no fenced js block. Nothing was written, no try spent.
 #     wait    the worker has not reached it yet. Run the same command again.
 #     stop    exit 3: you hold no lease, another agent does, or the cap is

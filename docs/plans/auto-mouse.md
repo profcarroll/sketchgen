@@ -9,10 +9,13 @@ numbering continues from `docs/plans/held-batch.md` (packets 10–12).
 *Status: Packet 13 is built — branch `feat/ghost-shim`, PR #143: `sketchgen/ghostshim.py`,
 the kiosk's `?ghost=` and `responds` in `kiosk.json`. Packet 14 is built — branch
 `feat/ghost-dataset`, PR #144: the `ghost` block, `executor.validate_ghost`, `ghostshim.with_script`,
-`meta.json`'s `ghost`, and the bullet in AGENTS.md. Packets 15–16 are still a draft for
-the operator's review. One thing in §1 was wrong and is corrected where it stands:
-`DECIDE[ghost-off]` says the key is `G`, and `G` is the generation overlay — the key
-built is `M`.*
+`meta.json`'s `ghost`, and the bullet in AGENTS.md. Packet 15 is built — branch
+`feat/ghost-gate`: the gate's ghost window and `ghost.png`, `HARNESS_VERSION` 3, the
+`ghost-echo` fixture, and the file on the entry page, the attempt page and a `try`
+verdict. Packet 16 is still a draft for the operator's review. Two things are corrected
+where they stand: `DECIDE[ghost-off]` says the key is `G`, and `G` is the generation
+overlay — the key built is `M`; and §5.1 does not say what `console_clean` is read over,
+which turned out to matter (see the dated note there).*
 
 ## 0. What is wrong, in one paragraph
 
@@ -239,14 +242,28 @@ before `report` is built, the gate plays a script through `page.mouse`, real Chr
 4. The window counts against `--budget-s` like every probe (`Budget`, `:794`) but not
    against `ms_per_frame`, which stays the idle window's number. A script of 8 s at 60 fps is
    480 stepped frames, about the cost of four idle windows; `EARLY_TRIP_FACTOR` applies. A
-   `BudgetExceeded` inside the ghost window is a note and an empty `ghost.png`, never a
-   check failure: the sketch had already passed or failed on the window that matters.
+   `BudgetExceeded` inside the ghost window is a note and ~~an empty `ghost.png`~~ **no
+   `ghost.png` at all, 21 September 2026** — a nought-byte PNG is a file every reader has
+   to learn to ignore, and `artefacts.ghost` is simply absent instead — never a check
+   failure: the sketch had already passed or failed on the window that matters.
 5. `report.ghost = {"source": "executor"|"default", "script": name|null, "events": N,
    "played": M, "ms": …}`.
 
 Assertions are not evaluated against the ghost window (`DECIDE[click-power]`). The `click`
 and `drag` probes stay exactly where and what they are, so every existing fixture's
 `assertions_expected` still holds.
+
+**`console_clean` is read at the moment the window opens, not through it — added
+21 September 2026, in the build.** §5.1.4 says a `BudgetExceeded` inside the window is
+never a check failure and stops there, but `console_clean` is judged over the whole run
+at `sketch_gate.py:1220`, so a ghost that clicked where the probe did not could have
+turned a sketch that passed into a `console_clean` failure on the strength of input no
+person sent. That would contradict the one sentence §5.2 puts in the `HARNESS_VERSION`
+docstring — *nothing it fails changed* — so `Recorder.clean_through` bounds the check at
+the window, and everything the window logged is still in `console.log`, in the report's
+`console` list and in a note. Whether a sketch that throws under a synthetic pointer
+ought to fail is a real question; it is `MEASURE[click-assertion-power]`'s, not this
+packet's.
 
 ### 5.2 Version, hash, facts
 
@@ -261,8 +278,13 @@ gate plays a ghost script after the probes and writes `ghost.png`; nothing it fa
   `ghost.png` from `<source_dir>/.gate/` exactly as it falls back for `strip.png` today, and
   `_write_entry` copies it to `e/<id>/ghost.png`. `meta.json`'s `gate` array entries gain
   `ghost` from each attempt's report (`_gate_log`, `gallery.py:1250`).
-- The entry page shows `ghost.png` under `strip.png` with the caption *with the ghost pointer*
-  when it exists; the operator's job page shows it per attempt.
+- The entry page shows `ghost.png` ~~under `strip.png`~~ **under the stage, 21 September
+  2026:** the entry page has never shown `strip.png` on its own — it is the poster on the
+  play button, and only for a sketch too heavy to start itself (`gallery._frame`) — so the
+  ghost frames go under the stage, where a person is already looking, with the caption
+  *with the ghost pointer*. The template's `$ghost` sits at the end of the line above it,
+  so an entry without one renders byte for byte as it does today. The operator's job page
+  shows it per attempt.
 - `paid try`'s verdict names the `ghost.png` path beside the strip's, so a paid agent
   checks its own script before importing.
 
