@@ -1368,11 +1368,15 @@ def _process(row: sqlite3.Row) -> dict[str, Any] | None:
     return {key: found.get(key) for key in paid_mod.PROCESS_KEYS if key in found}
 
 
-#: The keys ``attempts.given_source_json`` carries (migration 016), in the
-#: order the record reads. A paid attempt's object has no ``path``: a node
-#: path is not something an off-node agent was ever shown, so it is absent
-#: rather than null, and this list passes through whatever is there.
-GIVEN_KEYS = ("kind", "path", "sha256", "lines", "shown")
+#: The keys of ``attempts.given_source_json`` (migration 016) that the
+#: published record carries, in the order the record reads. ``path`` is left
+#: out on purpose: it is an absolute path on the node
+#: (``/home/ubuntu/sketchgen/jobs/…``), and nothing else in ``meta.json``
+#: names the node's filesystem — ``strip_path`` and ``source_dir`` never
+#: leave the database either. The ``sha256`` says which bytes were shown and
+#: ``kind`` says whose; the path is in the row for the operator (2026-09-22,
+#: raised while building packet 18).
+GIVEN_KEYS = ("kind", "sha256", "lines", "shown")
 
 
 def _given(attempt: sqlite3.Row) -> dict[str, Any] | None:
