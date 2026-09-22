@@ -212,12 +212,40 @@ $SG executor-source --db ~/sketchgen/sketchgen.db --set both
 $SG executor-source --db ~/sketchgen/sketchgen.db --max-chars 12000
 ```
 
-The worker reads both rows at the top of every attempt, so a change lands on
-the next attempt claimed: no restart, no deploy, and nothing in flight moves.
+A job can answer for itself, over the node's row: `jobs.executor_source`
+(migration 017), NULL on every job that has no opinion, which is all of them
+unless somebody said otherwise. The New job page writes it — with a parent
+picked, the tick box *give the executor the parent's sketch* is on, and
+unticking it queues that one job with `none`. That is how the two arms of
+`MEASURE[source-follow]` go into the same queue: the alternative is flipping
+the node-wide row between two `paid start`s and sweeping every job the worker
+claimed in between into whichever arm was current. `lineage.spawn` sets
+nothing, so the idle loop's children follow `meta`. The job page prints the
+override under **executor** when there is one.
+
+The worker reads the job's column first and both rows at the top of every
+attempt, so a change lands on the next attempt claimed: no restart, no deploy,
+and nothing in flight moves.
 Over the cap the heading carries one line — *N lines, longer than the M
 characters this prompt has room for; not shown* — and the evidence stands alone
 as it did before; whole or not at all, because a model handed half a sketch
 rewrites the half it cannot see.
+
+Where the record shows, once an attempt has run:
+
+- **The job page** (`/job/<id>`), one line under each attempt: *given: parent
+  entry 1103 · 180 lines · ctx 16384*, or *given: attempt 1 · 143 lines · ctx
+  16384*, or *given: nothing*. A sketch found and over the cap says *not shown
+  (over the cap)*; an attempt written off the node says *ctx —*, because no
+  local context window applied to it.
+- **The entry page's provenance table**, under Lineage and only where it
+  belongs: **Revised from** — *entry 1103's sketch, 180 lines, then 2 attempts
+  on its own*. Absent, never dashed, on an entry whose kept attempt was shown
+  no parent code, which is every entry published before 2026-09-21.
+- **`meta.json`**: each `gate[]` entry gains `given` (the record, or null) and
+  `num_ctx`, and `lineage.inherits_source` is true exactly where that
+  **Revised from** row appears — the field the ledger reads to tell a
+  generation that revised code from one that revised a sentence.
 
 A paid attempt gets the same words: `paid export --step execute` renders the
 prompt through the same helper, and the item's `inputs.source` names the kind,

@@ -217,6 +217,13 @@ class Job:
     # work before the job existed, invisible to every column above.
     since_utc: str | None = None
     note: str | None = None
+    # Migration 017: this job's own answer to `meta.executor_source`, or NULL
+    # for "whatever the node says when the attempt runs" — which is what every
+    # job before 2026-09-22 meant. One of worker.SOURCE_SWITCH_VALUES; the New
+    # job page writes `none` when the operator unticks the parent's sketch, so
+    # a person can queue one line with the source and one without without
+    # flipping the node for every job in the queue (MEASURE[source-follow]).
+    executor_source: str | None = None
 
     @property
     def assertions(self) -> list[str]:
@@ -433,6 +440,7 @@ _JOB_FIELDS = (
     "critique_by",
     "since_utc",
     "note",
+    "executor_source",
 )
 
 

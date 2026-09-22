@@ -748,6 +748,153 @@ class MetaTests(GalleryTestCase):
         self.assertEqual(len(meta["gate"]), 2)
 
 
+class RevisedFromTests(GalleryTestCase):
+    """Which entries were revisions of code, and which of a sentence.
+
+    Entry 1103, 2026-09-20, is why the mechanism exists: five attempts at a
+    jigsaw, each written from a blank page, because the only thing carried
+    from a sketch to its revision was prose. Since 2026-09-21 the executor is
+    shown the sketch it is revising (child-source.md packet 17) and the
+    attempt row records it; this is where a reader of the gallery finds out,
+    and the field the ledger reads is `lineage.inherits_source`.
+
+    Entry 2 in the fixture is the child of entry 1, so it is the one with a
+    parent to have been shown. The column is set here with an UPDATE rather
+    than through `add_attempt` because `build_db` is shared with every other
+    test in this file and this is a fixture building a past, not the worker
+    writing a present.
+    """
+
+    def given(self, entry_id, record, *, num_ctx=16384):
+        job_id = self.conn.execute(
+            "SELECT job_id FROM entries WHERE id = ?", (entry_id,)
+        ).fetchone()["job_id"]
+        self.conn.execute(
+            "UPDATE attempts SET given_source_json = ?, num_ctx = ? "
+            "WHERE job_id = ? AND n = 1",
+            (json.dumps(record) if record else None, num_ctx, job_id),
+        )
+
+    def meta_for(self, entry_id):
+        return json.loads(
+            (self.dest / "e" / str(entry_id) / "meta.json").read_text(encoding="utf-8")
+        )
+
+    def page_for(self, entry_id):
+        return (self.dest / "e" / str(entry_id) / "index.html").read_text(
+            encoding="utf-8")
+
+    PARENT = {"kind": "parent", "path": "/home/x/jobs/1/attempt-1/sketch.js",
+              "sha256": "a" * 64, "lines": 180, "shown": True}
+
+    def test_the_gate_log_carries_the_record_and_the_context(self):
+        self.given(self.ids[1], self.PARENT)
+        self.render()
+        gate = self.meta_for(self.ids[1])["gate"]
+        self.assertEqual(self.PARENT, gate[0]["given"])
+        self.assertEqual(16384, gate[0]["num_ctx"])
+        # and the entry whose attempts were never given anything says null,
+        # which is every entry this gallery published before 2026-09-21
+        first = self.meta_for(self.ids[0])["gate"]
+        self.assertIsNone(first[0]["given"])
+        self.assertIsNone(first[0]["num_ctx"])
+
+    def test_inherits_source_is_true_only_where_code_was_shown(self):
+        self.given(self.ids[1], self.PARENT)
+        self.render()
+        self.assertIs(True, self.meta_for(self.ids[1])["lineage"]["inherits_source"])
+        self.assertIs(False, self.meta_for(self.ids[0])["lineage"]["inherits_source"])
+        # The whole of the lineage object, written out the way SPEC_7_KEYS
+        # writes out the top level: META_KEYS itself does not move, because
+        # both of this packet's fields are nested, and a key added inside here
+        # without a reason in this list should fail a test.
+        self.assertEqual(
+            {"parent_entry_id", "children", "generation", "root_entry_id",
+             "critique_by", "critique",
+             # child-source.md packet 18: was this sketch a revision of code,
+             # or of a sentence? False on every entry before 2026-09-21.
+             "inherits_source"},
+            set(self.meta_for(self.ids[1])["lineage"]),
+        )
+
+    def test_a_sketch_over_the_cap_revised_nothing(self):
+        """Found, named in one line, and not shown: the entry is a revision of
+        the prompt like any other, and `false` is the honest answer. That the
+        sketch was offered is still in the gate log and on the job page."""
+        self.given(self.ids[1], {**self.PARENT, "shown": False, "lines": 412})
+        self.render()
+        meta = self.meta_for(self.ids[1])
+        self.assertIs(False, meta["lineage"]["inherits_source"])
+        self.assertEqual(412, meta["gate"][0]["given"]["lines"])
+        self.assertNotIn("Revised from", self.page_for(self.ids[1]))
+
+    def test_the_revised_from_row_names_the_parent_and_the_lines(self):
+        self.given(self.ids[1], self.PARENT)
+        self.render()
+        page = self.page_for(self.ids[1])
+        self.assertIn('<th scope="row">Revised from</th>', page)
+        self.assertIn(f"entry {self.ids[0]}&#x27;s sketch, 180 lines", page)
+        # one attempt, so there is nothing to say about tries of its own
+        self.assertNotIn("on its own", page)
+        # and it lands directly under Lineage, which says which parent
+        self.assertLess(page.index("Lineage"), page.index("Revised from"))
+
+    def test_the_tail_counts_the_attempts_it_made_on_its_own(self):
+        self.conn.execute("UPDATE entries SET attempts = 3 WHERE id = ?",
+                          (self.ids[1],))
+        self.given(self.ids[1], self.PARENT)
+        self.render()
+        self.assertIn(
+            f"entry {self.ids[0]}&#x27;s sketch, 180 lines, then 2 attempts on its own",
+            self.page_for(self.ids[1]),
+        )
+
+    def test_the_line_itself_reads_as_the_packet_wrote_it(self):
+        self.assertEqual(
+            "entry 1103's sketch, 180 lines, then 2 attempts on its own",
+            gallery._revised_from_line({
+                "attempts": 3,
+                "lineage": {"parent_entry_id": 1103, "inherits_source": True},
+                "gate": [{"given": self.PARENT}],
+            }),
+        )
+        self.assertEqual(
+            "entry 1103's sketch, 180 lines, then 1 attempt on its own",
+            gallery._revised_from_line({
+                "attempts": 2,
+                "lineage": {"parent_entry_id": 1103, "inherits_source": True},
+                "gate": [{"given": self.PARENT}],
+            }),
+        )
+        self.assertIsNone(gallery._revised_from_line({
+            "attempts": 1,
+            "lineage": {"parent_entry_id": 1103, "inherits_source": False},
+            "gate": [{"given": None}],
+        }))
+
+    def test_an_entry_given_nothing_renders_as_it_did_before_the_packet(self):
+        """The promise the packet makes to 910 published pages.
+
+        A row of dashes would have been a change to every one of them; absent
+        means the render of an entry whose attempts carry NULLs is the render
+        it was, byte for byte. Checked against the same render with the row
+        generation forced off, which is the state of this file before packet
+        18 — no fixture of the old HTML to go stale beside it.
+        """
+        self.render()
+        before = {entry_id: self.page_for(entry_id) for entry_id in self.ids[:2]}
+        shutil.rmtree(self.dest)
+        self.dest.mkdir()
+        original = gallery._revised_from_line
+        gallery._revised_from_line = lambda meta: None
+        self.addCleanup(setattr, gallery, "_revised_from_line", original)
+        self.render()
+        for entry_id, page in before.items():
+            with self.subTest(entry=entry_id):
+                self.assertEqual(page, self.page_for(entry_id))
+                self.assertNotIn("Revised from", page)
+
+
 class GhostScriptTests(GalleryTestCase):
     """The executor's own pointer script, from the attempt dir onto the page.
 
