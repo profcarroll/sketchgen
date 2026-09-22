@@ -130,6 +130,12 @@ META_KEYS = (
     # auto-mouse.md §4.2: the pointer script this entry's page carries, and
     # who wrote it — the executor, or the built-in its assertions chose.
     "ghost",
+    # media-assertion.md §4: the pictures the kept attempt fetched from the
+    # web, host and content type and size, so a reader of the record can see
+    # that this sketch is partly somebody else's photograph. `[]` on every
+    # entry gated before `loads(image)` existed, which is all of them until a
+    # run under HARNESS_VERSION 3 writes one.
+    "loads",
     "gate",
     "attempts",
     "prompt_tokens",
@@ -163,6 +169,15 @@ EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 #: Oracle's instance hostnames start ``instance-``; the spec forbids them and
 #: every `sslip.io` name the course has used carries one.
 HOSTNAME_MARK = "instance-"
+
+# The guard is a scan over the bytes this generator writes, and it exists
+# because a public checkout is a thing you cannot take back. The URL of a
+# picture a sketch fetched is not scanned for here — it is not written at all
+# (:data:`LOADS_KEYS`, media-assertion.md §4). A URL can carry a query string
+# nobody chose to publish: a signed link, a key, a name. Host, content type
+# and size answer what a reader and a publisher need to know — where the
+# picture came from — and carry none of that. The whole URL stays in the
+# gate's own ``report.json`` on the node, where the operator can read it.
 
 #: Suffixes read as text by the guard. Everything else (PNG) is left alone.
 TEXT_SUFFIXES = frozenset(
@@ -1343,6 +1358,43 @@ def _timing(report: dict[str, Any], key: str) -> float | None:
     return float(value)
 
 
+#: The keys of a ``report.resources_loaded`` item that the published record
+#: carries, in the order the record reads. ``url`` is left out on purpose, and
+#: it is the whole point of this list: the gate records the full URL and a
+#: URL can carry a query string a person did not choose to publish, so the
+#: gallery publishes where the picture came from and nothing that could
+#: identify who asked for it (media-assertion.md §4, and the comment beside
+#: :data:`HOSTNAME_MARK`). ``ms`` is left out too — how long the node's
+#: network took to fetch a photograph says nothing about the sketch, and it is
+#: in the gate's report for whoever is measuring the node.
+LOADS_KEYS = ("host", "type", "bytes")
+
+
+def _loads(report: dict[str, Any]) -> list[dict[str, Any]]:
+    """The pictures one attempt fetched from the web, less their URLs.
+
+    ``[]`` for a report with no ``resources_loaded`` at all, which is every
+    report this gallery has published: the gate began recording arrivals with
+    `loads(image)` (media-assertion.md §3.1), and before that it recorded only
+    what a sketch asked for and did not get. Entry 1103, the jigsaw of
+    2026-09-20, loaded a photograph from picsum.photos in ``preload()`` and
+    nothing on its page said so; entry 429 loaded one eight times and drew
+    nothing. Both are the reason this field exists.
+
+    A malformed item is dropped rather than half-published, and a missing key
+    inside a kept one is ``None``: the shape is fixed so that a reader of
+    ``meta.json`` does not have to ask whether a key is absent or empty.
+    """
+    found = report.get("resources_loaded")
+    if not isinstance(found, list):
+        return []
+    return [
+        {key: item.get(key) for key in LOADS_KEYS}
+        for item in found
+        if isinstance(item, dict)
+    ]
+
+
 def _process(row: sqlite3.Row) -> dict[str, Any] | None:
     """The entry's process cost as an object, or None (migration 015).
 
@@ -1467,6 +1519,16 @@ def _gate_log(attempts: list[sqlite3.Row]) -> list[dict[str, Any]]:
                 # populations of MEASURE[source-follow] are read apart on.
                 "given": _given(attempt),
                 "num_ctx": attempt["num_ctx"],
+                # media-assertion.md §4: what arrived over the network while
+                # this attempt ran, and how long the canvas waited for it.
+                # Host, type and size only — never the URL (LOADS_KEYS).
+                # Empty and null on every attempt gated before `loads(image)`
+                # existed, which is every attempt this gallery has published:
+                # entry 1103 fetched a photograph and its page could not say
+                # so. Inside "gate" beside the other per-attempt facts, so
+                # META_KEYS moves once, for the kept attempt's own list.
+                "resources_loaded": _loads(report),
+                "preload_s": _timing(report, "preload_s"),
             }
         )
     return log
@@ -1498,6 +1560,20 @@ def _meta(
     kept = _kept_attempt(row, attempts)
     given = _given(kept) if kept is not None else None
     inherits = bool(given and given.get("kind") == "parent" and given.get("shown"))
+    # Built once and read twice: the whole log goes into "gate", and the kept
+    # attempt's row of it is where the top-level "loads" comes from. One
+    # producer, because a page saying this sketch loads a photograph while
+    # its own gate array says the attempt loaded none would be a lie nobody
+    # could see, and `_gate_report` reads the file off disk per attempt.
+    gate_log = _gate_log(attempts)
+    kept_log = next(
+        (
+            item
+            for item in gate_log
+            if kept is not None and item["attempt"] == int(kept["n"])
+        ),
+        None,
+    )
     meta: dict[str, Any] = {
         "entry_id": entry_id,
         "job_id": int(row["job_id"]),
@@ -1513,7 +1589,13 @@ def _meta(
         "rules_file": row["rules_file"],
         "assertions": _assertions(row),
         "ghost": _ghost_meta(row, source, _assertions(row)),
-        "gate": _gate_log(attempts),
+        # The kept attempt's own list, lifted out of "gate" to the top level:
+        # this entry *is* one attempt, and a reader asking what picture this
+        # sketch loads should not have to work out which of five attempts the
+        # gallery kept. `[]` when it loaded nothing, which is every entry
+        # published before `loads(image)` existed (media-assertion.md §4).
+        "loads": list(kept_log["resources_loaded"]) if kept_log is not None else [],
+        "gate": gate_log,
         "attempts": int(row["attempts"] or len(attempts)),
         "prompt_tokens": row["prompt_tokens"],
         "completion_tokens": row["completion_tokens"],
@@ -2350,6 +2432,94 @@ def _revised_from_line(meta: dict[str, Any]) -> str | None:
     return line
 
 
+def _size_word(size: Any) -> str:
+    """``61.4 kB``, ``1.2 MB``, or empty when the gate recorded no number.
+
+    Decimal thousands, because the unit is written kB and not KiB, and one
+    decimal because the size of a photograph is a sense of scale rather than a
+    measurement: the difference between 61 kB and 1.2 MB is what a reader is
+    being told, and rounding it to a whole kB loses the small ones.
+    """
+    if isinstance(size, bool) or not isinstance(size, (int, float)) or size < 0:
+        return ""
+    if size >= 1_000_000:
+        return f"{size / 1_000_000:.1f} MB"
+    return f"{size / 1000:.1f} kB"
+
+
+def _join_and(parts: list[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c`` — an Oxford-less list, in words."""
+    if len(parts) < 3:
+        return " and ".join(parts)
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def _loads_hosts(meta: dict[str, Any]) -> list[str]:
+    """The hosts the kept attempt fetched a picture from, once each, in order."""
+    hosts: list[str] = []
+    for item in meta.get("loads") or []:
+        host = str(item.get("host") or "").strip()
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def _loads_line(meta: dict[str, Any]) -> str | None:
+    """The Loads row's one line, or None when the row does not belong.
+
+    `a picture from picsum.photos (image/jpeg, 61.4 kB)`, two or more joined
+    with *and*. Absent rather than dashed, for the reason
+    :func:`_revised_from_line` is absent: a sketch that draws only what it
+    draws itself has nothing to put in this row, and a row of dashes would
+    invite a reader to wonder what it lost. That is every entry this gallery
+    published before `loads(image)` existed.
+
+    The host is named and the URL is not (:data:`LOADS_KEYS`). An item the
+    gate recorded without a host is still said — something arrived — because
+    dropping it would understate what the viewer's browser is about to do.
+    """
+    items = meta.get("loads") or []
+    if not items:
+        return None
+    said = []
+    for item in items:
+        host = str(item.get("host") or "").strip() or "a host the gate did not record"
+        facts = [
+            fact
+            for fact in (
+                str(item.get("type") or "").strip(),
+                _size_word(item.get("bytes")),
+            )
+            if fact
+        ]
+        said.append(f"a picture from {host}" + (f" ({', '.join(facts)})" if facts else ""))
+    return _join_and(said)
+
+
+def _loads_note(meta: dict[str, Any]) -> str:
+    """One line under the stage, or nothing at all.
+
+    *this sketch fetches an image from picsum.photos when it runs* — said
+    where a person is about to press play, because opening this page makes
+    their own browser call a host that is not this gallery, and nobody should
+    find that out from a network tab. The Provenance row says what arrived;
+    this says whose machine goes to get it.
+
+    Empty for an entry that loads nothing, and the template's ``$loads`` sits
+    at the end of the line above it for the reason :func:`_ghost_figure`'s
+    does: an entry with no list renders byte for byte the page it rendered
+    before this existed.
+    """
+    hosts = _loads_hosts(meta)
+    if not hosts:
+        return ""
+    what = "an image" if len(hosts) == 1 else "images"
+    return (
+        '\n    <p class="stage-loads">This sketch fetches '
+        f"{what} from {_esc(_join_and(hosts))} when it runs.</p>"
+    )
+
+
 def _provenance_rows(meta: dict[str, Any]) -> str:
     lineage = meta["lineage"]
     away = {item["step"] for item in meta.get("off_node") or []}
@@ -2450,6 +2620,14 @@ def _provenance_rows(meta: dict[str, Any]) -> str:
     revised = _revised_from_line(meta)
     if revised:
         pairs.insert(_row_after(pairs, "Lineage"), ("Revised from", _esc(revised)))
+    # Directly under Gate, which says what each attempt's run found, because
+    # this says what came in over the network while it was running. Only on an
+    # entry whose kept attempt fetched something (media-assertion.md §4);
+    # absent everywhere else, which keeps every page published before
+    # `loads(image)` byte for byte what it was.
+    loads = _loads_line(meta)
+    if loads:
+        pairs.insert(_row_after(pairs, "Gate"), ("Loads", _esc(loads)))
     if meta["last_error"]:
         pairs.append(("Last error", _esc(meta["last_error"])))
     return _rows(pairs)
@@ -2619,6 +2797,9 @@ def _write_entry(
         failed_note=failed_note,
         frame=_frame(has_sketch, title, heavy=_heavy(meta), has_strip=has_strip,
                      mic=has_sketch and _needs_mic(source)),
+        # Under the frame and above the seed line: what this page is about to
+        # ask the reader's own browser to fetch (media-assertion.md §4).
+        loads=_loads_note(meta),
         seed=_dash(meta["seed"]),
         state_chip=_state_chip(row["state"]),
         ghost=_ghost_figure(has_ghost, title),
