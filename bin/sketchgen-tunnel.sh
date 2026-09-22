@@ -123,14 +123,36 @@ reap() {
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BILLING_TIMEOUT="${SKETCHGEN_BILLING_TIMEOUT:-30}"
 
+# The sketchgen CLI on THIS laptop. Not a sibling of this script: sgt runs a
+# copy deployed to ~/.local/bin, away from bin/sketchgen, so guessing $SCRIPT_DIR
+# looked for a CLI that was not there. Try, in order: an explicit override, the
+# PATH, the usual laptop checkout, then a sibling for when it IS run from bin/.
+find_sketchgen() {
+  [[ -n "${SKETCHGEN_CLI:-}" ]] && { printf '%s\n' "$SKETCHGEN_CLI"; return 0; }
+  local c
+  for c in \
+    "$(command -v sketchgen 2>/dev/null)" \
+    "$HOME/sketchgen/bin/sketchgen" \
+    "$SCRIPT_DIR/sketchgen"; do
+    [[ -n $c && -f $c ]] && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
 refresh_billing() {
   [[ "${SKETCHGEN_NO_BILLING:-}" == 1 ]] && return 0
   # Bare python3 on the laptop: there is no venv here (AGENTS.md), and ~/.oci is.
   command -v python3 >/dev/null 2>&1 || { warn "no python3 for billing refresh"; return 0; }
+  local cli
+  cli=$(find_sketchgen) || {
+    warn "billing refresh skipped: no sketchgen CLI found"
+    dim  "set SKETCHGEN_CLI, or check ~/sketchgen/bin/sketchgen"
+    return 0
+  }
   dim "refreshing billing from OCI (this laptop's ~/.oci) → ${REMOTE_HOST} ..."
-  timeout "$BILLING_TIMEOUT" python3 "$SCRIPT_DIR/sketchgen" billing --sync "$REMOTE_HOST" \
+  timeout "$BILLING_TIMEOUT" python3 "$cli" billing --sync "$REMOTE_HOST" \
     || { warn "billing refresh skipped/failed (tunnel is up regardless)"
-         dim  "retry: python3 $SCRIPT_DIR/sketchgen billing --sync $REMOTE_HOST"; }
+         dim  "retry: python3 $cli billing --sync $REMOTE_HOST"; }
   return 0
 }
 
@@ -242,7 +264,8 @@ card. It is non-fatal — the tunnel is what 'up' guarantees, not the reading.
 Env overrides: SKETCHGEN_LOCAL_PORT, SKETCHGEN_REMOTE_HOST,
                SKETCHGEN_REMOTE_BIND, SKETCHGEN_REMOTE_PORT, SKETCHGEN_HEALTH_PATH,
                SKETCHGEN_NO_BILLING=1 (skip the refresh),
-               SKETCHGEN_BILLING_TIMEOUT (seconds, default 30)
+               SKETCHGEN_BILLING_TIMEOUT (seconds, default 30),
+               SKETCHGEN_CLI (path to the sketchgen CLI, if not auto-found)
 USAGE
 }
 
