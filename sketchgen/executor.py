@@ -78,7 +78,13 @@ DEFAULT_HOST = "http://127.0.0.1:11434"
 DEFAULT_MODEL = os.environ.get(
     "SKETCHGEN_EXECUTOR_MODEL", "qwen3-coder:30b-a3b-q4_K_M"
 )
-DEFAULT_NUM_CTX = 8192
+#: Kept equal to :data:`sketchgen.worker.SOURCE_NUM_CTX` (2026-09-22). Ollama keys a
+#: loaded runner on its context size, so an attempt at a different num_ctx tears the
+#: runner down and reloads — and on this CPU-only box a load is a full ARM CPU_REPACK
+#: of the weights (19 GB / 140-275 s of pinned cores for laguna-xs-2.1, all 16 threads,
+#: zero tokens out). Measured 2026-09-22: 7 of 7 ctx flips forced a cold load, avg 65 s.
+#: Splitting these two values again reintroduces that stall.
+DEFAULT_NUM_CTX = 16384
 DEFAULT_SEED = 1
 
 #: The page written when the model emits no ``html`` block: the gate's

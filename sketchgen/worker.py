@@ -339,8 +339,10 @@ SOURCE_SWITCH_DEFAULT = "both"
 SOURCE_MAX_CHARS_KEY = "source_max_chars"
 SOURCE_MAX_CHARS_DEFAULT = 16000
 
-#: The executor's context window when it is holding a sketch, against
-#: executor.DEFAULT_NUM_CTX (8192) when it is not. The budget without a source
+#: The executor's context window when it is holding a sketch. Since 2026-09-22
+#: executor.DEFAULT_NUM_CTX matches this value, so every executor call goes out at
+#: 16384 and the loaded runner is never torn down over a context change; the two
+#: names are kept apart only to document the two budgets. The budget without a source
 #: is about 2k tokens in and 3k out; a 3k-token parent sketch under the brief
 #: leaves attempt 3's accumulated evidence nowhere to go, and a prompt that
 #: overflows num_ctx loses its head — which here is the rules file and the
