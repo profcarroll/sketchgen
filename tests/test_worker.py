@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -92,11 +93,13 @@ class StubExecutor:
         # sketch. tests/test_preflight.py hands it one that shadows a p5 name.
         self.sketch_js = sketch_js
 
-    def __call__(self, *, brief, assertions, rules_file, out_dir, model, host):
+    def __call__(self, *, brief, assertions, rules_file, out_dir, model, host,
+                 num_ctx=None):
         n = len(self.calls) + 1
         self.calls.append(
             {"brief": brief, "assertions": list(assertions),
-             "rules_file": rules_file, "out_dir": out_dir, "model": model}
+             "rules_file": rules_file, "out_dir": out_dir, "model": model,
+             "num_ctx": num_ctx}
         )
         if self.on_call is not None:
             self.on_call(n)
@@ -2237,3 +2240,336 @@ class TestMadeOn(WorkerTestCase):
         self.assertEqual(here, worker.made_on(self.conn, "qwen3-coder:30b-a3b-q4_K_M"))
         self.assertEqual(f"off-node (claude-sonnet-5) · gated on {here}",
                          worker.made_on(self.conn, "claude-sonnet-5"))
+
+
+# ---------------------------------------------------------------------------
+# The sketch the executor is revising (docs/plans/child-source.md packet 17)
+# ---------------------------------------------------------------------------
+
+
+PARENT_JS = "function setup(){ createCanvas(800, 600); }\nfunction draw(){}\n"
+REPLY = """Here it is.
+
+```js
+function setup(){ createCanvas(800, 600); }
+function draw(){ background(9); }
+```
+
+## Statement
+
+A grey field.
+"""
+
+
+class TestBriefWithSource(unittest.TestCase):
+    """The words themselves. No database, no worker: just the assembly."""
+
+    def given(self, kind="parent", text=PARENT_JS, shown=True):
+        return worker.GivenSource(
+            kind=kind, path="/jobs/7/attempt-1/sketch.js",
+            sha256="a" * 64, lines=len(text.splitlines()),
+            text=text if shown else "", shown=shown,
+        )
+
+    def test_a_parent_is_filed_under_its_own_heading_with_its_lead(self):
+        out = worker.brief_with_source("A brief.", self.given("parent"))
+        self.assertIn(worker.PARENT_HEADING, out)
+        self.assertNotIn(worker.PREVIOUS_HEADING, out)
+        self.assertIn(worker.PARENT_LEAD, out)
+        self.assertIn("```js\n" + PARENT_JS.rstrip() + "\n```", out)
+        self.assertTrue(out.startswith("A brief.\n\n"))
+
+    def test_a_previous_attempt_is_filed_under_the_other_one(self):
+        out = worker.brief_with_source("A brief.", self.given("previous"))
+        self.assertIn(worker.PREVIOUS_HEADING, out)
+        self.assertNotIn(worker.PARENT_HEADING, out)
+        self.assertIn(worker.PREVIOUS_LEAD, out)
+
+    def test_nothing_given_is_the_brief_unchanged(self):
+        self.assertEqual("A brief.", worker.brief_with_source("A brief.", None))
+
+    def test_over_the_cap_the_heading_carries_one_line_and_no_code(self):
+        out = worker.brief_with_source("A brief.", self.given(shown=False), 120)
+        self.assertIn(worker.PARENT_HEADING, out)
+        self.assertIn("2 lines, longer than the 120 characters this prompt has "
+                      "room for; not shown.", out)
+        self.assertNotIn("```js", out)
+        # DECIDE[source-cap]: whole or not at all. Half a sketch is worse than
+        # none, because the model rewrites the half it cannot see.
+        self.assertNotIn("createCanvas", out)
+
+    def test_the_source_goes_above_the_evidence(self):
+        """brief -> source -> what the gate found, in that order."""
+        out = worker.brief_with_evidence(
+            worker.brief_with_source("A brief.", self.given("previous")),
+            "gate exit 1: motion(idle) failed",
+        )
+        self.assertLess(out.index("A brief."), out.index(worker.PREVIOUS_HEADING))
+        self.assertLess(out.index(worker.PREVIOUS_HEADING),
+                        out.index(worker.EVIDENCE_HEADING))
+
+
+class SourceTestCase(WorkerTestCase):
+    """A published parent entry with a sketch on disk, and children of it."""
+
+    def parent(self, js=PARENT_JS, *, on_disk=True, source_dir=True,
+               with_attempt=False):
+        job_id = self.enqueue("the parent prompt")
+        where = self.jobs / str(job_id) / "attempt-1"
+        if on_disk:
+            where.mkdir(parents=True, exist_ok=True)
+            (where / "sketch.js").write_text(js, encoding="utf-8")
+        if with_attempt:
+            db.add_attempt(self.conn, job_id, 1, model="qwen3-coder:30b",
+                           source_dir=str(where), gate_exit=0)
+        entry_id = db.create_entry(
+            self.conn, job_id, prompt="the parent prompt", attempts=1,
+            source_dir=str(where) if source_dir else None,
+        )
+        # The parent is finished; only the child is for the worker to claim.
+        # Set by hand rather than walked through the machine because this is
+        # a fixture building a past, not the worker writing a present.
+        self.conn.execute("UPDATE jobs SET state = 'published' WHERE id = ?",
+                          (job_id,))
+        return job_id, entry_id, where / "sketch.js"
+
+    def child(self, entry_id, **opts):
+        return self.enqueue("the parent prompt\n\nRevise: slower",
+                            parent_entry_id=entry_id, **opts)
+
+
+class TestSourceFor(SourceTestCase):
+
+    def test_a_childs_first_attempt_is_given_the_parents_kept_sketch(self):
+        _job, entry_id, sketch = self.parent()
+        job = db.get_job(self.conn, self.child(entry_id))
+        given = worker.source_for(self.conn, job, 1, self.jobs)
+        self.assertEqual(given.kind, "parent")
+        self.assertEqual(given.path, str(sketch))
+        self.assertEqual(given.text, PARENT_JS)
+        self.assertEqual(given.lines, 2)
+        self.assertTrue(given.shown)
+        self.assertEqual(
+            given.sha256, hashlib.sha256(PARENT_JS.encode("utf-8")).hexdigest()
+        )
+
+    def test_a_first_attempt_with_no_parent_is_given_nothing(self):
+        job = db.get_job(self.conn, self.enqueue())
+        self.assertIsNone(worker.source_for(self.conn, job, 1, self.jobs))
+
+    def test_the_reconstructed_path_is_the_fallback_when_source_dir_is_wrong(self):
+        """console._sketch_lines's chain: the row first, then where the worker
+        would have written it. A database restored beside a jobs directory that
+        moved has only the second."""
+        _job, entry_id, sketch = self.parent(with_attempt=True)
+        self.conn.execute("UPDATE entries SET source_dir = ? WHERE id = ?",
+                          ("/nonexistent/attempt-1", entry_id))
+        job = db.get_job(self.conn, self.child(entry_id))
+        given = worker.source_for(self.conn, job, 1, self.jobs)
+        self.assertEqual(given.path, str(sketch))
+
+    def test_none_when_neither_path_holds_a_sketch(self):
+        _job, entry_id, _sketch = self.parent(on_disk=False)
+        job = db.get_job(self.conn, self.child(entry_id))
+        self.assertIsNone(worker.source_for(self.conn, job, 1, self.jobs))
+
+    def test_attempt_two_is_given_attempt_one_and_not_the_parent(self):
+        _job, entry_id, _sketch = self.parent()
+        child = self.child(entry_id)
+        where = self.jobs / str(child) / "attempt-1"
+        where.mkdir(parents=True, exist_ok=True)
+        (where / "sketch.js").write_text("// the child's own try\n", encoding="utf-8")
+        db.add_attempt(self.conn, child, 1, model="qwen3-coder:30b",
+                       source_dir=str(where), gate_exit=1, evidence="gate exit 1")
+        given = worker.source_for(self.conn, db.get_job(self.conn, child), 2, self.jobs)
+        self.assertEqual(given.kind, "previous")
+        self.assertEqual(given.text, "// the child's own try\n")
+        self.assertNotIn("createCanvas", given.text)
+
+    def test_over_the_cap_is_recorded_but_not_carried(self):
+        _job, entry_id, _sketch = self.parent(js="// x\n" * 400)
+        db.set_meta(self.conn, worker.SOURCE_MAX_CHARS_KEY, "100")
+        job = db.get_job(self.conn, self.child(entry_id))
+        given = worker.source_for(self.conn, job, 1, self.jobs)
+        self.assertFalse(given.shown)
+        self.assertEqual(given.text, "")
+        self.assertEqual(given.lines, 400)
+        # the hash is still of the whole file: MEASURE[source-shown-rate]
+        # counts these, and "too long" is a fact about a known sketch.
+        self.assertEqual(given.sha256,
+                         hashlib.sha256(("// x\n" * 400).encode("utf-8")).hexdigest())
+
+    def test_the_switch_chooses_which_kinds_are_given(self):
+        _job, entry_id, _sketch = self.parent()
+        job = db.get_job(self.conn, self.child(entry_id))
+        for value, expected in (("both", "parent"), ("parent", "parent"),
+                                ("previous", None), ("none", None),
+                                ("nonsense", "parent")):
+            with self.subTest(switch=value):
+                db.set_meta(self.conn, worker.SOURCE_SWITCH_KEY, value)
+                given = worker.source_for(self.conn, job, 1, self.jobs)
+                self.assertEqual(given.kind if given else None, expected)
+
+
+class TestSourceInTheAttempt(SourceTestCase):
+
+    def test_the_attempt_row_records_the_sketch_and_the_bigger_context(self):
+        _job, entry_id, sketch = self.parent()
+        child = self.child(entry_id)
+        executor_fn = StubExecutor()
+        self.assertEqual(0, self.make_worker(executor_fn=executor_fn).run_once())
+
+        brief = executor_fn.calls[0]["brief"]
+        self.assertIn(worker.PARENT_HEADING, brief)
+        self.assertIn("createCanvas(800, 600)", brief)
+        self.assertEqual(worker.SOURCE_NUM_CTX, executor_fn.calls[0]["num_ctx"])
+
+        row = self.attempts(child)[0]
+        self.assertEqual(worker.SOURCE_NUM_CTX, row.num_ctx)
+        record = json.loads(row.given_source_json)
+        self.assertEqual(record["kind"], "parent")
+        self.assertEqual(record["path"], str(sketch))
+        self.assertEqual(record["lines"], 2)
+        self.assertTrue(record["shown"])
+        self.assertEqual(record["sha256"],
+                         hashlib.sha256(PARENT_JS.encode("utf-8")).hexdigest())
+
+    def test_an_ordinary_job_records_nothing_and_keeps_the_small_context(self):
+        job_id = self.enqueue()
+        executor_fn = StubExecutor()
+        self.make_worker(executor_fn=executor_fn).run_once()
+        self.assertEqual(executor.DEFAULT_NUM_CTX, executor_fn.calls[0]["num_ctx"])
+        row = self.attempts(job_id)[0]
+        self.assertIsNone(row.given_source_json)
+        self.assertEqual(executor.DEFAULT_NUM_CTX, row.num_ctx)
+
+    def test_a_sketch_over_the_cap_is_recorded_and_the_context_stays_small(self):
+        _job, entry_id, _sketch = self.parent(js="// x\n" * 400)
+        db.set_meta(self.conn, worker.SOURCE_MAX_CHARS_KEY, "100")
+        child = self.child(entry_id)
+        executor_fn = StubExecutor()
+        self.make_worker(executor_fn=executor_fn).run_once()
+        self.assertEqual(executor.DEFAULT_NUM_CTX, executor_fn.calls[0]["num_ctx"])
+        row = self.attempts(child)[0]
+        self.assertEqual(executor.DEFAULT_NUM_CTX, row.num_ctx)
+        self.assertFalse(json.loads(row.given_source_json)["shown"])
+
+    def test_a_repair_of_a_child_reads_brief_then_source_then_evidence(self):
+        _job, entry_id, _sketch = self.parent()
+        child = self.child(entry_id)
+        executor_fn = StubExecutor()
+        run = self.make_worker(executor_fn=executor_fn, gate_fn=StubGate([1, 0]))
+        self.assertEqual(0, run.run_once())
+
+        second = executor_fn.calls[1]["brief"]
+        self.assertIn(worker.PREVIOUS_HEADING, second)
+        self.assertNotIn(worker.PARENT_HEADING, second)   # two steps back by now
+        self.assertLess(second.index(worker.PREVIOUS_HEADING),
+                        second.index(worker.EVIDENCE_HEADING))
+        rows = self.attempts(child)
+        self.assertEqual(["parent", "previous"],
+                         [json.loads(r.given_source_json)["kind"] for r in rows])
+        # attempt 2's source is attempt 1's sketch.js, which the stub wrote
+        self.assertEqual(
+            json.loads(rows[1].given_source_json)["path"],
+            str(self.jobs / str(child) / "attempt-1" / "sketch.js"),
+        )
+
+
+class TestSourceSwitchedOff(SourceTestCase):
+    """`executor_source = none` is the control batch for MEASURE[source-follow].
+
+    Not "close to" today's prompt: the same bytes. The test renders the prompt
+    through the real executor, because prompt.txt is what the node keeps and
+    what a person compares two batches with.
+    """
+
+    def replay(self):
+        reply = Path(self._tmp.name) / "reply.txt"
+        reply.write_text(REPLY, encoding="utf-8")
+
+        def executor_fn(*, brief, assertions, rules_file, out_dir, model, host,
+                        num_ctx=None):
+            return worker.Execution.from_result(executor.run(
+                brief=brief, assertions=assertions, rules_file=rules_file,
+                model=model, host=host, out_dir=out_dir, num_ctx=num_ctx,
+                stub=reply))
+
+        return executor_fn
+
+    def test_the_prompt_is_byte_identical_to_the_one_without_the_mechanism(self):
+        _job, entry_id, _sketch = self.parent()
+        db.set_meta(self.conn, worker.SOURCE_SWITCH_KEY, "none")
+        child = self.child(entry_id)
+        self.make_worker(executor_fn=self.replay()).run_once()
+
+        job = db.get_job(self.conn, child)
+        rules = executor.resolve_rules(
+            worker.resolve_rules(job.rules_file, job.id)
+        ).read_text(encoding="utf-8")
+        today = executor.render_prompt(
+            job.brief, executor.normalise_assertions(job.assertions), rules,
+            executor.DEFAULT_SEED,
+        )
+        written = (self.jobs / str(child) / "attempt-1" / "prompt.txt").read_text(
+            encoding="utf-8")
+        self.assertEqual(today, written)
+        self.assertNotIn(worker.PARENT_HEADING, written)
+        row = self.attempts(child)[0]
+        self.assertIsNone(row.given_source_json)
+        self.assertEqual(executor.DEFAULT_NUM_CTX, row.num_ctx)
+
+    def test_with_the_switch_on_the_same_job_gets_the_parent(self):
+        """The other half of the control: the only difference is the meta row."""
+        _job, entry_id, _sketch = self.parent()
+        child = self.child(entry_id)
+        self.make_worker(executor_fn=self.replay()).run_once()
+        written = (self.jobs / str(child) / "attempt-1" / "prompt.txt").read_text(
+            encoding="utf-8")
+        self.assertIn(worker.PARENT_HEADING, written)
+        self.assertIn(PARENT_JS.rstrip(), written)
+
+
+class TestExecutorSourceVerb(SourceTestCase):
+    """`sketchgen executor-source`: the switch has a verb, not a sqlite edit.
+
+    AGENTS.md rule 4. MEASURE[source-follow] is two batches of the same ten
+    parents with this row at `both` and at `none`, and an operator opening
+    sqlite3 to run that comparison is what the rule is about.
+    """
+
+    def run_cli(self, *args):
+        return subprocess.run(
+            [sys.executable, str(REPO_ROOT / "bin" / "sketchgen"),
+             "executor-source", "--db", self.path, *args],
+            capture_output=True, text=True, check=False,
+        )
+
+    def payload(self, *args):
+        result = self.run_cli("--json", *args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_an_untouched_database_reads_as_the_default(self):
+        state = self.payload()
+        self.assertEqual(state["executor_source"], worker.SOURCE_SWITCH_DEFAULT)
+        self.assertIsNone(state["executor_source_set"])
+        self.assertEqual(state["source_max_chars"],
+                         worker.SOURCE_MAX_CHARS_DEFAULT)
+
+    def test_setting_it_is_what_the_worker_then_reads(self):
+        self.assertEqual(self.payload("--set", "none")["executor_source"], "none")
+        _job, entry_id, _sketch = self.parent()
+        job = db.get_job(self.conn, self.child(entry_id))
+        self.assertIsNone(worker.source_for(self.conn, job, 1, self.jobs))
+        self.assertEqual(self.payload("--set", "both")["executor_source"], "both")
+        self.assertIsNotNone(worker.source_for(self.conn, job, 1, self.jobs))
+
+    def test_the_cap_travels_the_same_way(self):
+        self.assertEqual(self.payload("--max-chars", "120")["source_max_chars"], 120)
+        self.assertEqual(worker.source_max_chars(self.conn), 120)
+
+    def test_a_value_outside_the_closed_set_is_refused(self):
+        self.assertEqual(self.run_cli("--set", "sometimes").returncode, 2)
+        self.assertEqual(self.run_cli("--max-chars", "0").returncode, 3)
+        self.assertIsNone(db.get_meta(self.conn, worker.SOURCE_MAX_CHARS_KEY))

@@ -12,11 +12,14 @@ import shutil
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sketchgen import executor, ghostshim, soundshim  # noqa: E402
+from sketchgen import worker  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "executor"
@@ -502,6 +505,57 @@ class TestPrompt(unittest.TestCase):
     def test_template_is_under_eighty_lines(self):
         lines = executor.TEMPLATE_PATH.read_text(encoding="utf-8").splitlines()
         self.assertLess(len(lines), 80)
+
+
+class TestNumCtxReachesTheRequest(ExecutorTestCase):
+    """The window the caller asks for is the window the model is given.
+
+    `num_ctx` has been a parameter of `run` since the first packet and was
+    never threaded from the worker (child-source.md §3.2), so nothing said out
+    loud that it reaches ollama. An attempt holding a parent sketch depends on
+    it: at 8192 the prompt overflows and the head of it — the rules file and
+    the brief — is what falls off.
+    """
+
+    def call(self, **kwargs):
+        seen = {}
+
+        def fake_urlopen(request, timeout=None):
+            seen["payload"] = json.loads(request.data.decode("utf-8"))
+            raise urllib.error.URLError("that is all we needed")
+
+        with mock.patch.object(executor.urllib.request, "urlopen", fake_urlopen):
+            executor.run(brief="a test brief", assertions=["motion(idle)"],
+                         rules_file="treatment", out_dir=self.out, **kwargs)
+        return seen["payload"]
+
+    def test_the_default_is_the_modules_own(self):
+        self.assertEqual(self.call()["options"]["num_ctx"],
+                         executor.DEFAULT_NUM_CTX)
+
+    def test_a_bigger_window_travels(self):
+        self.assertEqual(self.call(num_ctx=16384)["options"]["num_ctx"], 16384)
+
+    def test_the_worker_default_executor_passes_it_through(self):
+        seen = {}
+        real_run = executor.run
+
+        def fake_run(**kwargs):
+            seen.update(kwargs)
+            return real_run(brief=kwargs["brief"],
+                            assertions=kwargs["assertions"],
+                            rules_file=kwargs["rules_file"],
+                            out_dir=kwargs["out_dir"],
+                            stub=FIXTURES / "clean.txt")
+
+        with mock.patch.object(worker.executor, "run", fake_run):
+            worker.default_executor(
+                brief="a test brief", assertions=["motion(idle)"],
+                rules_file="treatment", out_dir=str(self.out),
+                model="qwen3-coder:30b", host="http://127.0.0.1:11434",
+                num_ctx=16384,
+            )
+        self.assertEqual(seen["num_ctx"], 16384)
 
 
 if __name__ == "__main__":

@@ -499,10 +499,11 @@ class ExecuteAdapter(Adapter):
     node. A failed gate parks the job again for attempt *n*+1, with the new
     evidence in the next export: one round trip per attempt.
 
-    The guard is a digest of the attempt number and the previous attempt's
-    evidence (plan §3.3): attempt *n* is a reply to attempt *n*−1's gate
-    output, and an answer written against evidence the job no longer holds is
-    an answer to a different question.
+    The guard is a digest of the attempt number, the previous attempt's
+    evidence and the sha256 of the sketch the item carried (plan §3.3,
+    child-source.md §3.1): attempt *n* is a reply to attempt *n*−1's gate
+    output over attempt *n*−1's code, and an answer written against either one
+    the job no longer holds is an answer to a different question.
     """
 
     step = "execute"
@@ -529,8 +530,16 @@ class ExecuteAdapter(Adapter):
         ]
 
     @staticmethod
-    def guard(n: int, evidence: str | None) -> str:
-        return sha256_text(f"attempt {int(n)}\n{evidence or ''}")
+    def guard(n: int, evidence: str | None, source_sha: str | None = None) -> str:
+        """Attempt number, evidence, and the sketch shown with them.
+
+        ``source_sha`` is :attr:`worker.GivenSource.sha256`, or the literal
+        ``none`` when nothing was shown — so *no source* and *a source whose
+        hash happens to be empty* cannot collide, and so a packet cut while
+        the job was on attempt 1 cannot land after attempt 1 rewrote the file
+        attempt 2 would be shown.
+        """
+        return sha256_text(f"attempt {int(n)}\n{evidence or ''}\n{source_sha or 'none'}")
 
     def offer(self, conn, *, model, limit, ctx):
         version = self.prompt_version()
@@ -540,7 +549,15 @@ class ExecuteAdapter(Adapter):
             n = len(done) + 1
             evidence = done[-1].evidence if done else None
             rules = worker.resolve_rules(job.rules_file, job.id)
-            brief = worker.brief_with_evidence(job.brief or job.prompt, evidence)
+            # The same helper the worker's own attempt calls, in the same
+            # order, so a paid agent and a local model read the same words
+            # (child-source.md §2).
+            given = worker.source_for(conn, job, n, ctx.jobs_dir)
+            brief = worker.brief_with_evidence(
+                worker.brief_with_source(job.brief or job.prompt, given,
+                                         worker.source_max_chars(conn)),
+                evidence,
+            )
             try:
                 rules_text = executor.resolve_rules(rules).read_text(encoding="utf-8")
                 prompt = executor.render_prompt(
@@ -549,16 +566,22 @@ class ExecuteAdapter(Adapter):
                 )
             except (executor.ExecutorRefused, OSError) as exc:
                 raise PaidRefused(f"job {job.id}: {exc}") from exc
-            previous = (
-                str(Path(done[-1].source_dir) / "sketch.js")
-                if done and done[-1].source_dir else None
-            )
+            # What the item says about the sketch in its own prompt. Until
+            # 2026-09-21 this was `previous_sketch`, an absolute path on the
+            # node that no off-node agent could open and that named a file the
+            # prompt did not contain. The code is in the prompt now, so what
+            # is left to say is which sketch it is and whether it was shown.
+            source = given.record() if given is not None else None
+            if source is not None:
+                source.pop("path", None)
             items.append(
                 {
                     "key": f"job {job.id} attempt {n}",
                     "prompt": prompt,
                     "images": [],
-                    "guard": self.guard(n, evidence),
+                    "guard": self.guard(
+                        n, evidence, given.sha256 if given is not None else None
+                    ),
                     "prompt_version": version,
                     "inputs": {
                         "job": job.id,
@@ -566,7 +589,7 @@ class ExecuteAdapter(Adapter):
                         "max_attempts": job.max_attempts,
                         "rules_file": rules,
                         "assertions": job.assertions,
-                        "previous_sketch": previous,
+                        "source": source,
                     },
                     "answer": "",
                 }
@@ -599,8 +622,13 @@ class ExecuteAdapter(Adapter):
         if len(done) + 1 != n:
             raise Rejected(f"job {job_id} is on attempt {len(done) + 1}, not {n}")
         evidence = done[-1].evidence if done else None
-        if str(item.get("guard") or "") != self.guard(n, evidence):
-            raise Rejected("the previous attempt's evidence no longer matches")
+        given = worker.source_for(conn, job, n, ctx.jobs_dir)
+        if str(item.get("guard") or "") != self.guard(
+            n, evidence, given.sha256 if given is not None else None
+        ):
+            raise Rejected(
+                "the previous attempt's evidence or the source no longer matches"
+            )
         version = str(item.get("prompt_version") or "")
         if version != self.prompt_version():
             raise Rejected(
@@ -659,6 +687,11 @@ class ExecuteAdapter(Adapter):
             (attempt_dir / worker.PAID_META).write_text(
                 json.dumps({"model": model, "prompt_version": version,
                             "guard": item.get("guard"),
+                            # Migration 016: the sketch this reply was written
+                            # over, as the item said it. The worker copies it
+                            # onto the attempt rather than resolving it again,
+                            # because provenance is what the agent read.
+                            "source": inputs.get("source"),
                             "exported_utc": item.get("_exported_utc"),
                             "imported_utc": landed,
                             # The node's own clock: export to import. The
