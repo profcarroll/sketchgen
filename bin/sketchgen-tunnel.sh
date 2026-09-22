@@ -108,6 +108,32 @@ reap() {
   return 0
 }
 
+# --- billing refresh --------------------------------------------------------
+# Opening the tunnel is the operator sitting down to look at the console — the
+# one moment the OCI key (on THIS laptop, never the node — see cli/billing.py)
+# is both present and wanted. So we take a fresh usage reading and ship it to
+# the node, where the console's billing card reads it. Before this the card
+# only moved when someone remembered to run `billing --sync` by hand, so it sat
+# stale for days.
+#
+# Deliberately non-fatal and independent of the -L forward: `billing --sync`
+# opens its own ssh (cli/billing.py), so a billing hiccup — OCI slow, key
+# missing, network down — must never cost you the tunnel you actually came for.
+# Runs only after cmd_up succeeds; skip it entirely with SKETCHGEN_NO_BILLING=1.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BILLING_TIMEOUT="${SKETCHGEN_BILLING_TIMEOUT:-30}"
+
+refresh_billing() {
+  [[ "${SKETCHGEN_NO_BILLING:-}" == 1 ]] && return 0
+  # Bare python3 on the laptop: there is no venv here (AGENTS.md), and ~/.oci is.
+  command -v python3 >/dev/null 2>&1 || { warn "no python3 for billing refresh"; return 0; }
+  dim "refreshing billing from OCI (this laptop's ~/.oci) → ${REMOTE_HOST} ..."
+  timeout "$BILLING_TIMEOUT" python3 "$SCRIPT_DIR/sketchgen" billing --sync "$REMOTE_HOST" \
+    || { warn "billing refresh skipped/failed (tunnel is up regardless)"
+         dim  "retry: python3 $SCRIPT_DIR/sketchgen billing --sync $REMOTE_HOST"; }
+  return 0
+}
+
 # --- commands ---------------------------------------------------------------
 
 cmd_status() {
@@ -202,19 +228,26 @@ usage() {
   cat <<USAGE
 sketchgen-tunnel.sh — SSH forward to the sketchgen console on ${REMOTE_HOST}
 
-  up       (default) start if not already responding; reaps dead stubs first
+  up       (default) start if not already responding; reaps dead stubs first,
+                    then refreshes the console's billing card from OCI
   status            show processes, listeners and a real HTTP health check
   heal              force full teardown + restart
   down              stop the tunnel
   url               print the URL
 
+On a successful 'up' a fresh OCI usage reading is taken here (this laptop holds
+~/.oci; the node never does) and shipped to the node for the console's billing
+card. It is non-fatal — the tunnel is what 'up' guarantees, not the reading.
+
 Env overrides: SKETCHGEN_LOCAL_PORT, SKETCHGEN_REMOTE_HOST,
-               SKETCHGEN_REMOTE_BIND, SKETCHGEN_REMOTE_PORT, SKETCHGEN_HEALTH_PATH
+               SKETCHGEN_REMOTE_BIND, SKETCHGEN_REMOTE_PORT, SKETCHGEN_HEALTH_PATH,
+               SKETCHGEN_NO_BILLING=1 (skip the refresh),
+               SKETCHGEN_BILLING_TIMEOUT (seconds, default 30)
 USAGE
 }
 
 case "${1:-up}" in
-  up|start)        cmd_up ;;
+  up|start)        cmd_up && refresh_billing ;;
   status|st)       cmd_status ;;
   heal|restart|fix) cmd_heal ;;
   down|stop)       cmd_down ;;
