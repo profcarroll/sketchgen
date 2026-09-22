@@ -249,6 +249,13 @@ class Attempt:
     # columns above are the reply's cost, measured or reported; this is the
     # process cost, and the two are never added together.
     process_json: str | None = None
+    # Migration 016: the sketch this attempt was shown — the parent entry's
+    # kept sketch.js on a child's first attempt, its own previous attempt's on
+    # a repair — as {"kind","path","sha256","lines","shown"}, and the context
+    # window it was run under. NULL means nothing was given, which is true of
+    # every attempt before 2026-09-21.
+    given_source_json: str | None = None
+    num_ctx: int | None = None
 
 
 @dataclass

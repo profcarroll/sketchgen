@@ -7,7 +7,7 @@ Grounded in the code as it stands at `main` 1c39d24 (#139). Written for Opus bui
 packet per branch, one PR each, numbering continues from `docs/plans/auto-mouse.md`
 (packets 13–16).
 
-*Status: draft for the operator's review. Nothing here is built.*
+*Status: Packet 17 built on `feat/executor-source` (2026-09-21); Packet 18 not built.*
 
 ## 0. What happens today, in one paragraph
 

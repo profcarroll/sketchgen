@@ -301,6 +301,53 @@ TRY_POLL_S = 5.0
 #: which is where a person would put it too.
 EVIDENCE_HEADING = "## What the gate found on the previous attempt"
 
+#: The two headings the sketch being revised is filed under, in the same place
+#: and for the same reason as the evidence above: inside the brief, so the
+#: template needs no slot and `executor-v3` stays the arm label the rules-file
+#: A/B measures (docs/plans/child-source.md DECIDE[source-in-brief]).
+#:
+#: Entry 1103, 2026-09-20, is why they exist: five attempts at a jigsaw puzzle,
+#: attempt 1 passing `responds(drag)` and fetching a photograph, attempts 4 and
+#: 5 running in 1.4 s with neither. Each was written from a blank page, because
+#: the only bridge between a sketch and its revision was one sentence of prose.
+PARENT_HEADING = "## The sketch this revises"
+PREVIOUS_HEADING = "## Your previous attempt, which the gate sent back"
+
+#: The lead sentence under each heading — what the model is to DO with the code
+#: that follows. Verbatim from docs/plans/child-source.md §3.1; the template
+#: itself says nothing about revising (DECIDE[template-wording]), so these two
+#: sentences are the whole instruction.
+PARENT_LEAD = (
+    "This is the published sketch the brief revises, as its author wrote it. "
+    "Keep what the brief keeps and change what the `Revise:` line asks for; "
+    "emit the complete revised sketch, not a diff."
+)
+PREVIOUS_LEAD = (
+    "This is your previous attempt, complete. The gate's findings on it "
+    "follow. Fix what they name and keep the rest; emit the complete sketch."
+)
+
+#: The `meta` rows that govern the whole mechanism. `executor_source` is the
+#: switch — `none` is byte-for-byte the prompt this node sent before 2026-09-21,
+#: which is the control batch MEASURE[source-follow] needs, and no deploy is
+#: involved in setting it. `source_max_chars` is DECIDE[source-cap]: include a
+#: sketch whole or not at all, because a model handed half a sketch rewrites
+#: the half it cannot see. 16,000 characters is about 4,000 tokens, ~250 lines.
+SOURCE_SWITCH_KEY = "executor_source"
+SOURCE_SWITCH_VALUES = ("both", "parent", "previous", "none")
+SOURCE_SWITCH_DEFAULT = "both"
+SOURCE_MAX_CHARS_KEY = "source_max_chars"
+SOURCE_MAX_CHARS_DEFAULT = 16000
+
+#: The executor's context window when it is holding a sketch, against
+#: executor.DEFAULT_NUM_CTX (8192) when it is not. The budget without a source
+#: is about 2k tokens in and 3k out; a 3k-token parent sketch under the brief
+#: leaves attempt 3's accumulated evidence nowhere to go, and a prompt that
+#: overflows num_ctx loses its head — which here is the rules file and the
+#: brief. Doubling it costs a KV cache twice the size for the decode, and
+#: MEASURE[source-ctx-cost] reads that back off the attempt rows.
+SOURCE_NUM_CTX = 16384
+
 #: The heading the pre-flight scan's findings are filed under, above everything
 #: the gate itself said. The gate remains the authority on the verdict; this is
 #: the sentence that explains the console error it reported (sketchgen/preflight.py).
@@ -613,6 +660,13 @@ class Execution:
     #: as JSON, for the attempt's `process_json`. A local run leaves it None —
     #: there is no agent to ask, and a zero would be a claim.
     process_json: str | None = None
+    #: Migration 016, and only ever set on a paid attempt: the source the
+    #: *packet* said, which is what the agent actually read. The node may have
+    #: found a different one by the time the reply lands — a repair whose
+    #: previous attempt changed under it — and provenance is what was given,
+    #: not what would be given now. A local run leaves it None and _attempt
+    #: records what it resolved itself.
+    given_source_json: str | None = None
 
     @classmethod
     def from_result(cls, result: executor.Result) -> "Execution":
@@ -1114,6 +1168,189 @@ def brief_with_evidence(brief: str, evidence: str | None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The sketch the executor is revising (docs/plans/child-source.md packet 17)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GivenSource:
+    """One sketch handed to the executor, and the record of having handed it.
+
+    ``kind`` is ``parent`` (the published sketch a child job revises) or
+    ``previous`` (this job's own last attempt, which the gate sent back);
+    never both, and never both at once — a child's attempt 2 gets its own
+    attempt 1, because the parent is two steps back by then and the context
+    budget has room for one sketch (DECIDE[which-source]).
+
+    ``shown`` false means the file was found and read and is over
+    ``source_max_chars``: the heading says so in one line and ``text`` is not
+    carried into the prompt. It is still recorded on the attempt, because
+    *offered and too long* and *there was nothing to offer* are different
+    facts about a job and MEASURE[source-shown-rate] counts the first.
+    """
+
+    kind: str
+    path: str
+    sha256: str
+    lines: int
+    text: str
+    shown: bool
+
+    def record(self) -> dict[str, Any]:
+        """What goes in ``attempts.given_source_json`` (migration 016).
+
+        The text is deliberately not in it: the file is on disk at ``path``
+        and the hash says which version of it this was, which is what a later
+        read needs and what a 16,000-character column would not add to.
+        """
+        return {"kind": self.kind, "path": self.path, "sha256": self.sha256,
+                "lines": self.lines, "shown": self.shown}
+
+
+def _read_sketch(candidates: list[Path]) -> tuple[Path, str] | None:
+    """The first readable ``sketch.js`` among *candidates*, with its path.
+
+    The fallback chain console._sketch_lines uses (console.py:1028): the row's
+    recorded ``source_dir`` first, then the directory the worker would have
+    written the attempt into. A database restored beside a jobs directory that
+    moved has the second and not the first, and a sketch that is there under
+    the name the worker chose is the sketch.
+    """
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            continue
+        return path, text
+    return None
+
+
+def source_max_chars(conn: "sqlite3.Connection") -> int:
+    """``source_max_chars`` from ``meta``, or the default. Never raises."""
+    try:
+        value = int(str(db.get_meta(conn, SOURCE_MAX_CHARS_KEY, "") or "").strip())
+    except (ValueError, sqlite3.Error):
+        return SOURCE_MAX_CHARS_DEFAULT
+    return value if value > 0 else SOURCE_MAX_CHARS_DEFAULT
+
+
+def source_for(
+    conn: "sqlite3.Connection",
+    job: db.Job,
+    n: int,
+    jobs_dir: str | os.PathLike[str],
+) -> GivenSource | None:
+    """The sketch attempt *n* of *job* is being asked to revise, or None.
+
+    Attempt 1 of a job spawned from a critique gets the parent entry's kept
+    ``sketch.js`` — the one ``_create_entry`` chose from ``best_attempt`` and
+    recorded as ``entries.source_dir`` (DECIDE[which-parent-attempt]); every
+    attempt after the first gets attempt *n*−1's, whatever the job's ancestry.
+    Everything else — a first attempt on a job with no parent, a parent entry
+    whose sketch has been deleted, the switch set to exclude this kind — is
+    None, and the prompt is the one this node sent before 2026-09-21.
+
+    Never raises: a database or a disk that cannot answer is a prompt without
+    a source, not a failed job.
+    """
+    switch = (db.get_meta(conn, SOURCE_SWITCH_KEY) or SOURCE_SWITCH_DEFAULT).strip()
+    if switch not in SOURCE_SWITCH_VALUES:
+        switch = SOURCE_SWITCH_DEFAULT
+    if switch == "none":
+        return None
+
+    root = Path(jobs_dir).expanduser()
+    kind = "previous" if int(n) > 1 else "parent"
+    if switch != "both" and switch != kind:
+        return None
+
+    candidates: list[Path] = []
+    if kind == "previous":
+        try:
+            done = db.list_attempts(conn, job.id)
+        except sqlite3.Error:  # pragma: no cover - the table is unreadable
+            return None
+        previous = [a for a in done if a.n == int(n) - 1]
+        if not previous:
+            return None
+        if previous[-1].source_dir:
+            candidates.append(Path(previous[-1].source_dir) / "sketch.js")
+        candidates.append(root / str(job.id) / f"attempt-{int(n) - 1}" / "sketch.js")
+    else:
+        if not job.parent_entry_id:
+            return None
+        try:
+            entry = db.get_entry(conn, int(job.parent_entry_id))
+        except sqlite3.Error:  # pragma: no cover - the table is unreadable
+            return None
+        if entry is None:
+            return None
+        if entry["source_dir"]:
+            candidates.append(Path(entry["source_dir"]) / "sketch.js")
+        if entry["job_id"] is not None:
+            # The reconstructed path needs an attempt number, and the entry
+            # does not record which attempt it kept. The last one on the
+            # parent's job is what console._sketch_lines falls back to, and it
+            # is the attempt _create_entry chose unless an earlier one ran
+            # clean and a later one did not — in which case source_dir, which
+            # is tried first, is right and this line is never reached.
+            try:
+                rows = conn.execute(
+                    "SELECT n FROM attempts WHERE job_id = ? ORDER BY n",
+                    (int(entry["job_id"]),),
+                ).fetchall()
+            except sqlite3.Error:  # pragma: no cover - the table is unreadable
+                rows = []
+            if rows:
+                candidates.append(
+                    root / str(entry["job_id"])
+                    / f"attempt-{int(rows[-1]['n'])}" / "sketch.js"
+                )
+
+    found = _read_sketch(candidates)
+    if found is None:
+        return None
+    path, text = found
+    shown = len(text) <= source_max_chars(conn)
+    return GivenSource(
+        kind=kind,
+        path=str(path),
+        sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        lines=len(text.splitlines()),
+        # Not carried when it is not shown: the only reader of this field is
+        # the prompt, and half a sketch is worse than none (DECIDE[source-cap]).
+        text=text if shown else "",
+        shown=shown,
+    )
+
+
+def source_too_long_line(given: GivenSource, cap: int) -> str:
+    """The one line a heading carries in place of a sketch over the cap."""
+    return (f"{given.lines} lines, longer than the {cap} characters this "
+            "prompt has room for; not shown.")
+
+
+def brief_with_source(brief: str, given: GivenSource | None,
+                      cap: int = SOURCE_MAX_CHARS_DEFAULT) -> str:
+    """The brief with the sketch being revised under its own heading.
+
+    The twin of :func:`brief_with_evidence`, and applied *inside* it at both
+    call sites, so the prompt reads brief → source → what the gate found: the
+    code first, then the findings about it, which is the order a person would
+    put them in and the order the evidence's own line numbers make sense in.
+    """
+    if given is None:
+        return brief
+    heading = PARENT_HEADING if given.kind == "parent" else PREVIOUS_HEADING
+    if not given.shown:
+        body = source_too_long_line(given, cap)
+    else:
+        lead = PARENT_LEAD if given.kind == "parent" else PREVIOUS_LEAD
+        body = f"{lead}\n\n```js\n{given.text.rstrip()}\n```"
+    return f"{brief.rstrip()}\n\n{heading}\n\n{body}\n"
+
+
+# ---------------------------------------------------------------------------
 # The default injectables
 # ---------------------------------------------------------------------------
 
@@ -1146,8 +1383,16 @@ def default_executor(
     out_dir: str,
     model: str,
     host: str,
+    num_ctx: int = executor.DEFAULT_NUM_CTX,
 ) -> Execution:
-    """The single-shot executor (packet 2.2). Calls the model."""
+    """The single-shot executor (packet 2.2). Calls the model.
+
+    ``num_ctx`` was never threaded here until 2026-09-21: executor.run's
+    default was the only value this path could ever send, which was fine while
+    the prompt was rules + brief + assertions and nothing else. An attempt
+    that is holding a sketch needs the bigger window, and only the caller
+    knows whether it is (:data:`SOURCE_NUM_CTX`).
+    """
     result = executor.run(
         brief=brief,
         assertions=assertions,
@@ -1155,6 +1400,7 @@ def default_executor(
         model=model,
         host=host,
         out_dir=out_dir,
+        num_ctx=num_ctx,
     )
     return Execution.from_result(result)
 
@@ -2597,6 +2843,14 @@ class Worker:
                 if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                     setattr(execution, key, value)
             execution.process_json = self._process_json(job_id, meta.get("process"))
+            # Migration 016: the source the packet named, which is the sketch
+            # the agent had in front of it. `paid.ExecuteAdapter.land` copies
+            # `inputs.source` here verbatim for exactly this line; the guard
+            # has already refused a reply written against a source the job no
+            # longer holds, so what is here is what was read.
+            source = meta.get("source")
+            if isinstance(source, dict):
+                execution.given_source_json = json.dumps(source, sort_keys=True)
         return execution
 
     def _process_json(self, job_id: int, reported: Any) -> str | None:
@@ -2819,7 +3073,18 @@ class Worker:
         attempt_dir.mkdir(parents=True, exist_ok=True)
         started = db.utc_now()
         last = n >= job.max_attempts
-        brief = brief_with_evidence(job.brief or job.prompt, evidence)
+        # brief → source → evidence: the code, then the findings about it.
+        # Packet 17; source_for answers None for everything that was true
+        # before it, so an ordinary first attempt on a job with no parent gets
+        # exactly the brief it got yesterday.
+        given = source_for(self.conn, job, n, self.jobs_dir)
+        brief = brief_with_evidence(
+            brief_with_source(job.brief or job.prompt, given,
+                              source_max_chars(self.conn)),
+            evidence,
+        )
+        num_ctx = SOURCE_NUM_CTX if (given and given.shown) else executor.DEFAULT_NUM_CTX
+        given_json = json.dumps(given.record(), sort_keys=True) if given else None
 
         model = self.executor_model_for(job)
         paid_reply = attempt_dir / PAID_REPLY
@@ -2845,8 +3110,9 @@ class Worker:
             job_id=job.id,
             model=model,
         )
+        written_off_node = models.is_paid(model, self.conn)
         try:
-            if models.is_paid(model, self.conn):
+            if written_off_node:
                 execution = self._paid_execution(
                     job_id=job.id, brief=brief, assertions=assertions,
                     rules_file=rules, attempt_dir=attempt_dir, asked=model,
@@ -2859,6 +3125,7 @@ class Worker:
                     out_dir=str(attempt_dir),
                     model=model,
                     host=self.host,
+                    num_ctx=num_ctx,
                 )
         except StopNow:
             raise
@@ -2874,6 +3141,13 @@ class Worker:
                 model=model,
             )
         self._check_stop()
+
+        # Migration 016, on every attempt below. For a paid one the record is
+        # the packet's, because that is what the agent read, and `num_ctx` is
+        # NULL: no local context window applied to a reply written elsewhere.
+        if written_off_node:
+            given_json = execution.given_source_json
+            num_ctx = None
 
         if not execution.ok:
             failure = f"executor: {execution.error or 'malformed response'}"
@@ -2897,6 +3171,8 @@ class Worker:
                 evidence=failure,
                 statement=execution.statement,
                 process_json=execution.process_json,
+                given_source_json=given_json,
+                num_ctx=num_ctx,
             )
             self.log(f"job {job.id}: attempt {n} — {failure} (no gate run)")
             if last:
@@ -2985,6 +3261,8 @@ class Worker:
             evidence=new_evidence,
             statement=execution.statement,
             process_json=execution.process_json,
+            given_source_json=given_json,
+            num_ctx=num_ctx,
         )
         self.log(f"job {job.id}: attempt {n} gate exit {outcome.exit_code}")
 
