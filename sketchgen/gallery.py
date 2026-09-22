@@ -753,12 +753,25 @@ def _gate_report(attempt: sqlite3.Row) -> dict[str, Any]:
     return {}
 
 
+#: The three pictures the gate leaves behind, and the entry column each one has
+#: — ``ghost.png`` has none. It arrived with the gate's ghost window on
+#: 2026-09-21 (auto-mouse.md §5.3) and nothing re-gates an entry, so a column
+#: would be NULL on all 910 published entries and a migration would buy a
+#: lookup the attempt directory already answers. The gate's own directory is
+#: where it comes from, which is the fallback ``strip.png`` has always had.
+_ARTEFACTS = {
+    "strip": ("strip_path", "strip.png"),
+    "png": ("png_path", "gate.png"),
+    "ghost": (None, "ghost.png"),
+}
+
+
 def _artefact(row: sqlite3.Row, attempts: list[sqlite3.Row], which: str) -> Path | None:
-    """The strip or the gate frame, from the entry row or the gate's own dir."""
-    column = "strip_path" if which == "strip" else "png_path"
-    filename = "strip.png" if which == "strip" else "gate.png"
+    """The strip, the gate frame or the ghost frames, from the row or the
+    gate's own dir."""
+    column, filename = _ARTEFACTS[which]
     candidates: list[Path] = []
-    if row[column]:
+    if column and row[column]:
         candidates.append(Path(row[column]))
     source = _source_dir(row, attempts)
     if source is not None:
@@ -1379,6 +1392,12 @@ def _gate_log(attempts: list[sqlite3.Row]) -> list[dict[str, Any]]:
                 # Inside "gate" on purpose, so META_KEYS does not change.
                 "total_s": _timing(report, "total_s"),
                 "ms_per_frame": _timing(report, "ms_per_frame"),
+                # What the ghost pointer did to this attempt, from the gate's
+                # own report: whose script it was, how much of it played.
+                # None on every attempt gated before 2026-09-21, which is
+                # every attempt this gallery has published so far, and that
+                # is what MEASURE[ghost-coverage] counts from.
+                "ghost": report.get("ghost"),
             }
         )
     return log
@@ -1783,6 +1802,32 @@ def _frame(
     return (
         f'<iframe class="sketch" src="sketch/" title="{_esc(title)}" '
         'loading="lazy" sandbox="allow-scripts"></iframe>'
+    )
+
+
+def _ghost_figure(has_ghost: bool, title: str) -> str:
+    """The ghost window's four frames, under the stage, or nothing at all.
+
+    Under the stage and not beside ``strip.png``, because this page has never
+    shown the strip on its own: it is the poster on the play button, and only
+    for a sketch too heavy to start itself (:func:`_frame`). So the ghost
+    frames go where a person is already looking, with the one caption that
+    says what they are — nobody was at the keyboard (auto-mouse.md §5.3,
+    2026-09-21).
+
+    An entry gated before the ghost window existed has no ``ghost.png``, which
+    is all 910 of them until something re-gates one, and nothing does. The
+    empty string here is why their pages render byte for byte as they did: the
+    template's ``$ghost`` sits at the end of the line above it.
+    """
+    if not has_ghost:
+        return ""
+    return (
+        '\n    <figure class="ghost">\n'
+        f'      <img src="ghost.png" alt="four frames from {_esc(title)} under a '
+        'synthetic pointer" loading="lazy">\n'
+        "      <figcaption>with the ghost pointer</figcaption>\n"
+        "    </figure>"
     )
 
 
@@ -2383,11 +2428,13 @@ def _write_entry(
                 written.write_text(out / "sketch" / "index.html", shimmed)
             has_sketch = True
     has_strip = False
-    for which, name in (("strip", "strip.png"), ("png", "gate.png")):
+    has_ghost = False
+    for which, (_column, name) in _ARTEFACTS.items():
         artefact = _artefact(row, attempts, which)
         if artefact is not None:
             written.copy(artefact, out / name)
             has_strip = has_strip or which == "strip"
+            has_ghost = has_ghost or which == "ghost"
 
     statement = meta["statement"] or ""
     written.write_text(
@@ -2446,6 +2493,7 @@ def _write_entry(
                      mic=has_sketch and _needs_mic(source)),
         seed=_dash(meta["seed"]),
         state_chip=_state_chip(row["state"]),
+        ghost=_ghost_figure(has_ghost, title),
         brief=_paragraphs(str(row["brief"] or ""), "No brief was recorded for this job."),
         statement_model=_esc(row["executor"] or "an unrecorded model"),
         statement=_paragraphs(statement, "The executor wrote no statement."),

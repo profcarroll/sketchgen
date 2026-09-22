@@ -1711,6 +1711,30 @@ class TryTests(AgentLoopTests):
             {"events": 2},
             json.loads((written / "execution.json").read_text())["ghost"])
 
+    def test_the_verdict_names_the_ghost_frames_beside_the_strip(self):
+        """auto-mouse.md §5.3: an agent can look at what its own script did.
+
+        The whole point of a `try` is that the node's gate runs and the agent
+        reads the result; since 2026-09-21 that result includes four frames of
+        the sketch under the pointer script, at a node path to `scp`. The
+        ghost window fails nothing, so a verdict that did not name it would be
+        an agent writing a `ghost` block and never seeing it played.
+        """
+        job = self.leased()
+        summary = {"source": "executor", "script": None, "events": 2,
+                   "played": 2, "ms": 800}
+        run = self.worker(gate_fn=self.gate(ghost=summary))
+        result = self.drive(run, job, answer=GHOST_SKETCH)
+        self.assertEqual("verdict", result["do"], result)
+        self.assertTrue(result["artefacts"]["ghost"].endswith("ghost.png"))
+        self.assertTrue(result["artefacts"]["strip"].endswith("strip.png"))
+
+    def test_a_verdict_from_a_gate_with_no_ghost_window_names_none(self):
+        job = self.leased()
+        run = self.worker(gate_fn=self.gate())
+        result = self.drive(run, job)
+        self.assertNotIn("ghost", result["artefacts"])
+
     def test_a_second_try_is_its_own_directory_and_counts_up(self):
         job = self.leased()
         run = self.worker(gate_fn=test_worker.StubGate([1, 0]))

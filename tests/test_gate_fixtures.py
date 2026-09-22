@@ -23,7 +23,9 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -34,6 +36,9 @@ GATE_DIR = REPO_ROOT / "gate"
 GATE = GATE_DIR / "sketch_gate.py"
 ACCEPT = GATE_DIR / "accept.sh"
 FIXTURES = GATE_DIR / "fixtures"
+
+sys.path.insert(0, str(REPO_ROOT))
+from sketchgen import executor, ghostshim  # noqa: E402
 
 #: sha256 of the gate in this repo. Three copies — here, the node, the
 #: operator's course repo — one hash: that is the whole claim spec §3.2 makes,
@@ -53,10 +58,19 @@ FIXTURES = GATE_DIR / "fixtures"
 #: Changed 2026-09-15 by the frame budget (job 166, job 270): the gate now times
 #: its own idle window and fails `frame_budget` above --frame-budget-ms, or
 #: above the --budget-s wall ceiling.
-GATE_SHA256 = "88bedeb8b32eadb5522984e3ef481375e904b94a9affdd2f0a76e38ccf436d99"
+#:
+#: Changed 2026-09-21 by the ghost window (entry 1103, auto-mouse.md §5): after
+#: every check and every assertion has been decided, the gate plays a pointer
+#: script through page.mouse and writes ghost.png beside strip.png. It adds no
+#: check and fails no run — strip.png and gate.png are byte-for-byte what they
+#: were, the assertions are evaluated before it opens, and console_clean is
+#: read at the moment it opens. The previous value, which is the one the node
+#: and the course repo carry until this is deployed, was
+#: 88bedeb8b32eadb5522984e3ef481375e904b94a9affdd2f0a76e38ccf436d99.
+GATE_SHA256 = "f64ac446bac40ebce61bfc2811684087b23c824f70220de1dd373b56928bfcbc"
 
-#: How long the seven fixtures are allowed to take together. On the node a
-#: single gate run is about four seconds and the harness does thirteen of them —
+#: How long the eight fixtures are allowed to take together. On the node a
+#: single gate run is about four seconds and the harness does fifteen of them —
 #: except bad-frame-budget, which is a third of a second a frame by design and
 #: costs tens of seconds before the budget stops it. That fixture is why this
 #: number is 900 and not 600.
@@ -251,3 +265,167 @@ class FrameBudgetTests(unittest.TestCase):
                 want["checks"].get("frame_budget"), True,
                 f"{name} should clear the frame budget",
             )
+
+
+#: Scripts both validators are run over, and what each one is. The gate's copy
+#: of the rules and `executor.validate_ghost` have to agree on every one of
+#: them: the executor is what lets a script onto disk and the gate is what
+#: plays it, so a gate that refused what the executor accepted would hand the
+#: entry the built-in instead — which looks exactly like a working entry.
+GHOST_SAMPLES = [
+    ("one move", '[{"t": 0, "type": "move", "x": 0, "y": 0}]'),
+    ("a click and a drag",
+     (FIXTURES / "ghost-echo" / "ghost.json").read_text(encoding="utf-8")),
+    ("out of order",
+     '[{"t": 9, "type": "up", "x": 1, "y": 1},'
+     ' {"t": 1, "type": "down", "x": 0, "y": 0}]'),
+    ("not JSON", "the pointer goes left a bit"),
+    ("not a list", '{"t": 0, "type": "move", "x": 0, "y": 0}'),
+    ("empty", "[]"),
+    ("too many", json.dumps([{"t": 1, "type": "move", "x": 0.5, "y": 0.5}] * 65)),
+    ("not an object", '["move"]'),
+    ("a fifth key",
+     '[{"t": 1, "type": "move", "x": 0.5, "y": 0.5, "button": 0}]'),
+    ("a missing key", '[{"t": 1, "type": "move", "x": 0.5}]'),
+    ("t as a word", '[{"t": "soon", "type": "move", "x": 0.5, "y": 0.5}]'),
+    ("t past the cap", '[{"t": 8001, "type": "move", "x": 0.5, "y": 0.5}]'),
+    ("t negative", '[{"t": -1, "type": "move", "x": 0.5, "y": 0.5}]'),
+    ("a type nobody plays",
+     '[{"t": 1, "type": "wheel", "x": 0.5, "y": 0.5}]'),
+    ("x off the canvas", '[{"t": 1, "type": "move", "x": 4, "y": 0.5}]'),
+    ("y as true", '[{"t": 1, "type": "move", "x": 0.5, "y": true}]'),
+]
+
+
+class GhostWindowTests(unittest.TestCase):
+    """The ghost window's pure-Python half (auto-mouse.md §5, 2026-09-21).
+
+    Everything here is a thing two copies could disagree about. The gate is a
+    standalone script that imports nothing from the package — it has its own
+    copy on the node and a third in the course repo — so the caps, the four
+    event types, the built-in scripts and the rule for what a script may be are
+    written twice on purpose, and this is the file that says they are the same
+    twice. `tests/test_executor.py`'s SOUND_RE parity test is the pattern.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gate = _gate_module()
+
+    def test_the_built_in_scripts_are_the_shim_s(self):
+        self.assertEqual(ghostshim.BUILTINS, self.gate.GHOST_BUILTINS)
+
+    def test_the_caps_and_the_types_are_the_shim_s(self):
+        self.assertEqual(ghostshim.MAX_EVENTS, self.gate.GHOST_MAX_EVENTS)
+        self.assertEqual(ghostshim.MAX_MS, self.gate.GHOST_MAX_MS)
+        self.assertEqual(ghostshim.TYPES, self.gate.GHOST_TYPES)
+        self.assertEqual(executor.GHOST_KEYS, self.gate.GHOST_KEYS)
+
+    def test_the_gap_between_two_built_ins_is_the_shim_s(self):
+        # The one number that lives only in the shim's JavaScript: the shim
+        # offsets a second built-in by this much, and a gate that used another
+        # would play the same two scripts at different times.
+        found = re.search(r"\bvar GAP_MS = (\d+);", ghostshim.script_js())
+        self.assertIsNotNone(found, "the shim declares no GAP_MS")
+        self.assertEqual(int(found.group(1)), self.gate.GHOST_GAP_MS)
+
+    def test_the_two_validators_agree_on_every_sample(self):
+        for what, text in GHOST_SAMPLES:
+            with self.subTest(what):
+                mine, why_mine = self.gate.validate_ghost(text)
+                theirs, why_theirs = executor.validate_ghost(text)
+                self.assertEqual(theirs, mine)
+                self.assertEqual(why_theirs, why_mine)
+
+    def test_a_list_out_of_order_is_played_in_order_not_refused(self):
+        events, why = self.gate.validate_ghost(
+            '[{"t": 9, "type": "up", "x": 1, "y": 1},'
+            ' {"t": 1, "type": "down", "x": 0, "y": 0}]')
+        self.assertIsNone(why)
+        self.assertEqual([1, 9], [event["t"] for event in events])
+
+    def wanted(self, *words):
+        return [(word, word, None) for word in words]
+
+    def test_the_default_script_follows_the_assertions(self):
+        self.assertEqual("click",
+                         self.gate.ghost_default_name(self.wanted("responds(click)")))
+        self.assertEqual("drag",
+                         self.gate.ghost_default_name(self.wanted("responds(drag)")))
+        # Both, in that order: a sketch is clicked before it is dragged.
+        self.assertEqual(
+            "click,drag",
+            self.gate.ghost_default_name(
+                self.wanted("responds(drag)", "responds(click)")))
+        # Every run gets a window, so a sketch that asked for no interaction
+        # at all is crossed rather than left alone (DECIDE[ghost-who]).
+        self.assertEqual("wander", self.gate.ghost_default_name([]))
+        self.assertEqual("wander",
+                         self.gate.ghost_default_name(self.wanted("motion(idle)")))
+
+    def test_two_built_ins_are_joined_the_way_the_shim_joins_them(self):
+        both = self.gate.ghost_builtin("click,drag")
+        click = ghostshim.BUILTINS["click"]
+        drag = ghostshim.BUILTINS["drag"]
+        self.assertEqual(len(click) + len(drag), len(both))
+        shift = max(event["t"] for event in click) + self.gate.GHOST_GAP_MS
+        self.assertEqual([event["t"] + shift for event in drag],
+                         [event["t"] for event in both[len(click):]])
+        self.assertLessEqual(max(event["t"] for event in both),
+                             self.gate.GHOST_MAX_MS)
+
+    def test_a_joined_script_is_still_held_to_the_caps(self):
+        # Nothing the gate plays may be longer than what the shim would play,
+        # or the two players show the sketch different things.
+        long = self.gate.ghost_builtin("wander,wander,wander")
+        self.assertLessEqual(len(long), self.gate.GHOST_MAX_EVENTS)
+        self.assertLessEqual(max(event["t"] for event in long),
+                             self.gate.GHOST_MAX_MS)
+
+    def test_a_sketch_with_no_script_of_its_own_gets_the_default(self):
+        with tempfile.TemporaryDirectory() as empty:
+            notes = []
+            events, source, name = self.gate.ghost_script(
+                empty, self.wanted("responds(click)"), notes)
+            self.assertEqual(("default", "click"), (source, name))
+            self.assertEqual(ghostshim.BUILTINS["click"], events)
+            self.assertEqual([], notes)
+
+    def test_an_invalid_script_is_a_note_and_the_default_not_a_refusal(self):
+        with tempfile.TemporaryDirectory() as home:
+            (Path(home) / "ghost.json").write_text("[]", encoding="utf-8")
+            notes = []
+            events, source, name = self.gate.ghost_script(home, [], notes)
+            self.assertEqual(("default", "wander"), (source, name))
+            self.assertEqual(ghostshim.BUILTINS["wander"], events)
+            self.assertEqual(1, len(notes))
+            self.assertIn("nothing to play", notes[0])
+
+    def test_the_echo_fixture_carries_the_script_the_expectation_counts(self):
+        fixture = FIXTURES / "ghost-echo"
+        events, why = self.gate.validate_ghost(
+            (fixture / "ghost.json").read_text(encoding="utf-8"))
+        self.assertIsNone(why)
+        expected = json.loads((FIXTURES / "expected.json").read_text(encoding="utf-8"))
+        want = expected["ghost-echo"]["ghost"]
+        self.assertEqual({"source": "executor", "events": len(events),
+                          "played": len(events)}, want)
+        # And the gate reads it from the directory rather than being told.
+        notes = []
+        read, source, name = self.gate.ghost_script(fixture, [], notes)
+        self.assertEqual((events, "executor", None, []), (read, source, name, notes))
+
+    def test_the_console_is_read_up_to_the_window_and_not_through_it(self):
+        # The promise HARNESS_VERSION 3 makes: nothing the gate fails changed.
+        # A pointer clicking where the probe did not may not turn a sketch that
+        # passed into a console_clean failure.
+        rec = self.gate.Recorder()
+        rec.entries = [{"t": "x", "type": "log", "text": "hello"},
+                       {"t": "x", "type": "pageerror", "text": "boom"}]
+        self.assertTrue(rec.clean_through(1))
+        self.assertFalse(rec.clean_through())
+        self.assertFalse(rec.clean)
+
+    def test_the_ghost_window_can_be_turned_off(self):
+        self.assertTrue(self.gate.parse_args(["dir"]).ghost)
+        self.assertFalse(self.gate.parse_args(["dir", "--no-ghost"]).ghost)

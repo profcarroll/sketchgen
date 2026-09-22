@@ -886,6 +886,79 @@ class GhostScriptTests(GalleryTestCase):
         self.assertEqual("wander", meta["ghost"]["script"])
 
 
+class GhostFramesTests(GalleryTestCase):
+    """``ghost.png``, from the gate's own directory onto the entry page.
+
+    auto-mouse.md §5.3. No migration and no column: nothing re-gates a
+    published entry, so a column would be NULL on all 910 of them and the
+    attempt directory the entry already names is where the file is.
+    """
+
+    def gate_dir(self, entry_id):
+        row = gallery._entry(self.conn, int(entry_id))
+        source = gallery._source_dir(row, gallery._attempt_rows(self.conn,
+                                                                row["job_id"]))
+        return source / ".gate"
+
+    def give(self, entry_id, summary=None):
+        """The two halves the gate writes: the picture, and the summary."""
+        gate = self.gate_dir(entry_id)
+        (gate / "ghost.png").write_bytes(PNG_BYTES)
+        report = json.loads((gate / "report.json").read_text(encoding="utf-8"))
+        report["artefacts"]["ghost"] = str(gate / "ghost.png")
+        report["ghost"] = summary or {"source": "default", "script": "click",
+                                      "events": 16, "played": 16, "ms": 3320}
+        (gate / "report.json").write_text(json.dumps(report, indent=2),
+                                          encoding="utf-8")
+
+    def rendered(self, entry_id):
+        gallery.render_entry(self.conn, entry_id, self.dest, self.config)
+        base = self.dest / "e" / str(entry_id)
+        return ((base / "index.html").read_text(encoding="utf-8"),
+                json.loads((base / "meta.json").read_text(encoding="utf-8")),
+                base)
+
+    def test_the_frames_are_copied_and_captioned(self):
+        one = self.ids[0]
+        self.give(one)
+        page, meta, base = self.rendered(one)
+        self.assertEqual(PNG_BYTES, (base / "ghost.png").read_bytes())
+        self.assertIn('<img src="ghost.png"', page)
+        self.assertIn("with the ghost pointer", page)
+        # Under the stage the sketch is in, not somewhere else on the page.
+        self.assertLess(page.index("stage-meta"), page.index('src="ghost.png"'))
+        self.assertEqual({"source": "default", "script": "click", "events": 16,
+                          "played": 16, "ms": 3320}, meta["gate"][0]["ghost"])
+        self.assertEqual(set(gallery.META_KEYS), set(meta))
+
+    def test_an_entry_with_no_ghost_renders_exactly_as_it_did(self):
+        # The 910 published entries have no ghost.png and nothing re-gates
+        # them. Their pages must not move by one byte, or the next render-all
+        # is a diff of the whole gallery for a file none of them has.
+        one = self.ids[0]
+        before, meta_before, base = self.rendered(one)
+        self.assertFalse((base / "ghost.png").exists())
+        self.assertNotIn("ghost.png", before)
+        self.assertIsNone(meta_before["gate"][0]["ghost"])
+        after, _meta, _base = self.rendered(one)
+        self.assertEqual(before, after)
+
+    def test_the_summary_travels_even_when_the_picture_did_not_arrive(self):
+        # A window the budget stopped writes the summary and no file: the page
+        # shows nothing, and meta.json still says what was attempted, which is
+        # what MEASURE[ghost-coverage] counts.
+        one = self.ids[0]
+        gate = self.gate_dir(one)
+        report = json.loads((gate / "report.json").read_text(encoding="utf-8"))
+        report["ghost"] = {"source": "default", "script": "wander",
+                           "events": 40, "played": 11, "ms": 1100}
+        (gate / "report.json").write_text(json.dumps(report), encoding="utf-8")
+        page, meta, base = self.rendered(one)
+        self.assertFalse((base / "ghost.png").exists())
+        self.assertNotIn("ghost.png", page)
+        self.assertEqual(11, meta["gate"][0]["ghost"]["played"])
+
+
 class PublishTimeLineageTests(GalleryTestCase):
     """The entry being published is in its own forest (packet 1, spec §4.1).
 
