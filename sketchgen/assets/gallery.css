@@ -689,6 +689,11 @@ details.fold[open] > summary.fold-label::before { content: "\25be\a0"; }
 .stage-run .play.running img { display: none; }
 .stage-run iframe.sketch { aspect-ratio: 64 / 45; height: auto; width: 100%; }
 .stage-heavy { color: var(--ink-soft); font-size: 0.85rem; margin: 0.6rem 0 0; }
+/* A sketch that fetches a photograph makes the reader's own browser call a
+ * host that is not this gallery, so the page says which one before they press
+ * play (media-assertion.md §4). Only entries gated under `loads(image)` have
+ * the line, so this selector is unused on most pages and costs them nothing. */
+.stage-loads { color: var(--ink-soft); font-size: 0.85rem; margin: 0.6rem 0 0; }
 /* A microphone sketch opens in its own tab — the sandboxed frame cannot reach
  * the mic — so its stage is a link, with the label as an accent tag under it. */
 .stage-mic .play { text-decoration: none; }

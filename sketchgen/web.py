@@ -3565,6 +3565,75 @@ def given_line(job: db.Job, attempt: db.Attempt) -> str:
     return "given: " + " · ".join(parts)
 
 
+def human_bytes(size: Any) -> str:
+    """``61.4 kB``, ``1.2 MB``, or empty when the gate recorded no number.
+
+    Decimal thousands, because the unit is written kB and not KiB. The
+    gallery's ``_size_word`` spells a size the same way and this is a second
+    copy on purpose: the operator UI does not import the static generator, and
+    a size on an operator's screen is not worth making it start to.
+    """
+    if isinstance(size, bool) or not isinstance(size, (int, float)) or size < 0:
+        return ""
+    if size >= 1_000_000:
+        return f"{size / 1_000_000:.1f} MB"
+    return f"{size / 1000:.1f} kB"
+
+
+def loads_items(report: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """``report.resources_loaded``, or an empty list. Never raises.
+
+    The gate began recording what arrived over the network with
+    `loads(image)` (media-assertion.md §3.1); every report written before
+    that has no such key, which is every attempt on this node until the
+    harness that has it is deployed.
+    """
+    found = (report or {}).get("resources_loaded")
+    if not isinstance(found, list):
+        return []
+    return [item for item in found if isinstance(item, dict)]
+
+
+def loads_hosts(report: dict[str, Any] | None) -> list[str]:
+    """The hosts one attempt fetched a picture from, once each, in order."""
+    hosts: list[str] = []
+    for item in loads_items(report):
+        host = str(item.get("host") or "").strip()
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def loads_line(report: dict[str, Any] | None) -> str:
+    """What this attempt fetched from the web, in one line, or nothing.
+
+    `loads: picsum.photos (image/jpeg, 61.4 kB)`, several joined with the
+    page's own middle dot. Nothing at all when the attempt fetched nothing,
+    unlike :func:`given_line`, which always says something: `given: nothing`
+    is a fact about how an attempt was written, and every attempt has one,
+    whereas a `loads: nothing` under all 900 jobs on this node would be a line
+    saying that a sketch drew what sketches draw.
+
+    Host, type and size, which is what the published record carries too
+    (``gallery.LOADS_KEYS``, DECIDE[image-hosts]). The whole URL is in the
+    attempt's own ``report.json``, which this page serves under
+    ``/jobs/…/.gate/``, for the operator who needs to open the picture.
+    """
+    said = []
+    for item in loads_items(report):
+        host = str(item.get("host") or "").strip() or "an unrecorded host"
+        facts = [
+            fact
+            for fact in (str(item.get("type") or "").strip(),
+                         human_bytes(item.get("bytes")))
+            if fact
+        ]
+        said.append(host + (f" ({', '.join(facts)})" if facts else ""))
+    if not said:
+        return ""
+    return "loads: " + " · ".join(said)
+
+
 def _given_source(attempt: db.Attempt) -> dict[str, Any] | None:
     """``attempts.given_source_json``, parsed, or None. Never raises."""
     try:
@@ -3613,6 +3682,7 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
             if attempt.evidence
             else ""
         )
+        loads = loads_line(report)
         blocks.append(
             '<section class="panel">'
             f"<h2>Attempt {attempt.n} — <span style='text-transform:none'>"
@@ -3633,6 +3703,11 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
             f"{esc(human_seconds(attempt.wall_s))} wall"
             + process_line(attempt)
             + f"<br>{esc(given_line(job, attempt))}"
+            # And, on the attempts that fetched something, what arrived:
+            # entry 1103's five attempts each pulled a photograph off
+            # picsum.photos and no screen on this node said so
+            # (media-assertion.md §4).
+            + (f"<br>{esc(loads)}" if loads else "")
             + "</p></section>"
         )
     if not blocks:
@@ -4074,6 +4149,51 @@ def _lineage_note(
     return "a root prompt, no lineage"
 
 
+def _kept_attempt_n(conn: sqlite3.Connection, row: sqlite3.Row) -> int | None:
+    """Which attempt an entry is, by number: the one copied onto the row.
+
+    ``entries.source_dir`` is the attempt ``_create_entry`` chose, which is
+    not always the last (``best_attempt``), and the gallery resolves the same
+    thing the same way (``gallery._kept_attempt``). The last attempt stands in
+    when the column names nothing, which is what the gallery falls back to
+    as well — one answer to "which sketch is this entry", on both screens.
+    """
+    name = Path(str(row["source_dir"] or "")).name
+    if name.startswith("attempt-") and name[8:].isdigit():
+        return int(name[8:])
+    found = conn.execute(
+        "SELECT MAX(n) AS n FROM attempts WHERE job_id = ?", (int(row["job_id"]),)
+    ).fetchone()
+    return int(found["n"]) if found is not None and found["n"] is not None else None
+
+
+def _card_loads(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
+    """Where this entry's picture comes from, for the card's meta line.
+
+    The host and nothing else, because the decision this card is for is
+    whether to publish, and publishing a sketch that fetches a photograph
+    publishes a page that sends every viewer to a third party under that
+    party's terms (DECIDE[image-hosts], DECIDE[image-licence]: the picture is
+    recorded, not resolved, and the entry's own CC BY covers the code). Seeing
+    that took opening the attempt until now.
+
+    The kept attempt's report, not the runnable one's: the entry *is* that
+    attempt, and the gallery page this decision produces reads the same file.
+
+    Two hosts are joined with "and" rather than the line's own middle dot,
+    which separates the facts on it: *image from a · b · job 5* reads as
+    three things and is two.
+    """
+    attempt_n = _kept_attempt_n(conn, row)
+    if attempt_n is None:
+        return ""
+    hosts = loads_hosts(_report_for_n(app, int(row["job_id"]), attempt_n))
+    if not hosts:
+        return ""
+    what = "image" if len(hosts) == 1 else "images"
+    return f" · {what} from {esc(' and '.join(hosts))}"
+
+
 def _card_face(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
     """Everything above the buttons: the number, the sketch, the prompt, the line.
 
@@ -4136,6 +4256,7 @@ def _card_face(app: App, conn: sqlite3.Connection, row: sqlite3.Row) -> str:
         f"{revision}"
         f'<p class="meta">{esc(_held_summary(conn, row))}'
         f" · {esc(row['rules_file'] or '—')} · {esc(row['executor'] or '—')}"
+        f"{_card_loads(app, conn, row)}"
         f' · job <a href="/job/{job_id}">{job_id}</a>'
         f" · {esc(_lineage_note(conn, row, with_generation=False))}"
         f"{tab}</p>"
