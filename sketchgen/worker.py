@@ -1250,10 +1250,20 @@ def source_for(
     whose sketch has been deleted, the switch set to exclude this kind — is
     None, and the prompt is the one this node sent before 2026-09-21.
 
+    The job's own ``executor_source`` (migration 017) answers first and the
+    ``meta`` row answers for every job that left it NULL, which is all of them
+    until the New job page's tick box was built. A person comparing one line
+    with the source against one without needs the two arms side by side in the
+    same queue, and flipping the node-wide row between the two `paid start`s
+    would sweep every job the worker happened to claim in between into
+    whichever arm was current (MEASURE[source-follow]).
+
     Never raises: a database or a disk that cannot answer is a prompt without
     a source, not a failed job.
     """
-    switch = (db.get_meta(conn, SOURCE_SWITCH_KEY) or SOURCE_SWITCH_DEFAULT).strip()
+    switch = (job.executor_source
+              or db.get_meta(conn, SOURCE_SWITCH_KEY)
+              or SOURCE_SWITCH_DEFAULT).strip()
     if switch not in SOURCE_SWITCH_VALUES:
         switch = SOURCE_SWITCH_DEFAULT
     if switch == "none":

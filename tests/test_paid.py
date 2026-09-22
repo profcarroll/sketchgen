@@ -2302,6 +2302,53 @@ class Migration016Tests(unittest.TestCase):
         self.assertGreaterEqual(db.schema_version(conn), 16)
 
 
+class Migration017Tests(unittest.TestCase):
+    """One nullable column on `jobs`, and nothing already queued moves.
+
+    The same promise 015 and 016 made: a node mid-deploy, with rows written
+    under 016, reads them all back afterwards, and the new column is NULL on
+    every one of them — which is the true thing to say about a job queued
+    before there was a tick box to say anything else. NULL is not `both`: it
+    means *whatever `meta.executor_source` says when the attempt runs*, which
+    is what every job meant on 2026-09-21.
+    """
+
+    def test_a_database_at_016_keeps_every_row_and_gains_the_column(self):
+        tmp = Path(tempfile.mkdtemp(prefix="sketchgen-017-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        conn = db.connect(tmp / "old.db")
+        self.addCleanup(conn.close)
+        db.migrate(conn, migrations_upto(16, tmp / "migrations"))
+        self.assertEqual(db.schema_version(conn), 16)
+
+        job_id = db.enqueue(conn, "a tide of slow lines", "octocat",
+                            brief="a brief", parent_entry_id=None,
+                            since_utc="2026-09-21T13:20:00Z", note="a note")
+        before = dict(conn.execute("SELECT * FROM jobs WHERE id = ?",
+                                   (job_id,)).fetchone())
+
+        self.assertEqual(db.migrate(conn, migrations_upto(17, tmp / "migrations")),
+                         [17])
+        self.assertEqual(db.schema_version(conn), 17)
+
+        after = dict(conn.execute("SELECT * FROM jobs WHERE id = ?",
+                                  (job_id,)).fetchone())
+        self.assertEqual(before, {k: v for k, v in after.items() if k in before})
+        self.assertIsNone(db.get_job(conn, job_id).executor_source)
+        # and it is written through the verb, not by hand (AGENTS.md rule 4)
+        other = db.enqueue(conn, "the control arm", "octocat",
+                           executor_source="none")
+        self.assertEqual("none", db.get_job(conn, other).executor_source)
+
+    def test_db_init_applies_it(self):
+        tmp = Path(tempfile.mkdtemp(prefix="sketchgen-017-init-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.assertIn(17, db.init(tmp / "fresh.db"))
+        conn = db.connect(tmp / "fresh.db")
+        self.addCleanup(conn.close)
+        self.assertGreaterEqual(db.schema_version(conn), 17)
+
+
 class ProcessCostTests(AgentLoopTests):
     """What the work around the reply cost, recorded beside it and kept apart.
 

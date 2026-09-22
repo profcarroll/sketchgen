@@ -1,0 +1,40 @@
+-- 017_executor_source.sql — one job's answer to "is the executor shown the
+-- sketch it is revising", beside the node's.
+--
+-- Packet 17 (migration 016, 2026-09-21) gave the whole node one switch: the
+-- `meta` row `executor_source`, read at the top of every attempt, values both
+-- / parent / previous / none. That is the right shape for a batch and the
+-- wrong shape for the comparison the batch is for. MEASURE[source-follow] is
+-- two lines from the same parent — one whose executor held the parent's
+-- sketch, one whose executor did not — and a person queueing the second of
+-- those two from the New job page would otherwise have to set the node-wide
+-- row to `none`, queue, and set it back, with every other job the worker
+-- claimed in between silently landing in the control arm. The row is not a
+-- per-job setting and pretending it is one is how a measurement gets a
+-- population it did not ask for.
+--
+-- So: a column on the job, written once when the job is made and never again.
+--
+--   jobs.executor_source  NULL — whatever `meta.executor_source` says when
+--                         the attempt runs, which is what every job before
+--                         this migration meant and still means. Otherwise one
+--                         of worker.SOURCE_SWITCH_VALUES (both, parent,
+--                         previous, none), and `source_for` reads it in place
+--                         of the meta row for this job alone. The New job
+--                         page writes `none` when the operator unticks *give
+--                         the executor the parent's sketch*; `sketchgen
+--                         executor-source` still owns the node-wide row, and
+--                         the two never disagree about a job because the
+--                         column wins where it is set.
+--
+-- `lineage.spawn` deliberately sets nothing: a child queued by the idle critic
+-- hours later has no operator standing over it, and the arm such a child
+-- belongs in is the node's current answer, not one inherited from a parent
+-- whose operator was running a comparison that finished.
+--
+-- One nullable column, additive, no CHECK to rebuild (AGENTS.md, "Working on
+-- the code"). The closed set is enforced in web.create_job, where the bad
+-- value can be refused to the person who typed it; the column takes text so
+-- that a value added to SOURCE_SWITCH_VALUES later needs no second migration.
+
+ALTER TABLE jobs ADD COLUMN executor_source TEXT;

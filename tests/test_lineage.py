@@ -361,6 +361,25 @@ class TestSpawn(LineageTestCase):
         self.assertEqual("gemma4:e4b", job.planner)
         self.assertEqual("qwen3-coder:30b-a3b-q4_K_M", job.executor)
 
+    def test_a_spawned_child_has_no_opinion_about_the_executors_source(self):
+        """Migration 017 is the operator's hand, not an inherited setting.
+
+        The per-job override exists for a person standing over two lines at
+        once; a child the idle critic queues hours later has nobody standing
+        over it, and a parent queued as the control arm of a comparison that
+        has since finished should not go on enrolling its descendants in it.
+        NULL means *whatever `meta.executor_source` says when the attempt
+        runs*, which is what every job meant before the column existed.
+        """
+        job_id = lineage.spawn(
+            self.conn,
+            parent_entry_id=self.root_entry,
+            critique="slower still",
+            critique_by="gemma4:e4b",
+            submitted_by="profcarroll",
+        )
+        self.assertIsNone(db.get_job(self.conn, job_id).executor_source)
+
     def test_either_model_can_be_overridden_on_purpose(self):
         job_id = lineage.spawn(
             self.conn,

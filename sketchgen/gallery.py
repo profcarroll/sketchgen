@@ -1368,6 +1368,60 @@ def _process(row: sqlite3.Row) -> dict[str, Any] | None:
     return {key: found.get(key) for key in paid_mod.PROCESS_KEYS if key in found}
 
 
+#: The keys of ``attempts.given_source_json`` (migration 016) that the
+#: published record carries, in the order the record reads. ``path`` is left
+#: out on purpose: it is an absolute path on the node
+#: (``/home/ubuntu/sketchgen/jobs/…``), and nothing else in ``meta.json``
+#: names the node's filesystem — ``strip_path`` and ``source_dir`` never
+#: leave the database either. The ``sha256`` says which bytes were shown and
+#: ``kind`` says whose; the path is in the row for the operator (2026-09-22,
+#: raised while building packet 18).
+GIVEN_KEYS = ("kind", "sha256", "lines", "shown")
+
+
+def _given(attempt: sqlite3.Row) -> dict[str, Any] | None:
+    """The sketch this attempt was shown, from ``given_source_json``, or None.
+
+    None means nothing was given, which is the true thing to say about every
+    attempt written before 2026-09-21 (migration 016) and about a first
+    attempt on a job with no parent. Unreadable JSON is None too, not a half
+    object: this is a line on a page and a record of an input, and there is
+    nothing here worth guessing at — the same bargain :func:`_process` makes.
+    """
+    try:
+        raw = attempt["given_source_json"]
+    except (IndexError, KeyError):  # pragma: no cover - a row from an old SELECT
+        return None
+    try:
+        found = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    if not isinstance(found, dict):
+        return None
+    return {key: found[key] for key in GIVEN_KEYS if key in found}
+
+
+def _kept_attempt(
+    row: sqlite3.Row, attempts: list[sqlite3.Row]
+) -> sqlite3.Row | None:
+    """The attempt this entry is, out of the attempts its job ran.
+
+    ``_create_entry`` copies one attempt's statement, gate report and source
+    directory onto the entry, and ``entries.source_dir`` is the name of the
+    one it chose (``best_attempt``, which is not always the last). Matching on
+    that column is how the entry page can say what *this* sketch was revised
+    from rather than what the job's last try was, and :func:`_source_dir`
+    resolves the same two candidates in the same order.
+    """
+    if not attempts:
+        return None
+    if row["source_dir"]:
+        for attempt in attempts:
+            if attempt["source_dir"] == row["source_dir"]:
+                return attempt
+    return attempts[-1]
+
+
 def _gate_log(attempts: list[sqlite3.Row]) -> list[dict[str, Any]]:
     """What each attempt's gate run said — §7's "and what each attempt's gate
     run said", from report.json where there is one."""
@@ -1404,6 +1458,15 @@ def _gate_log(attempts: list[sqlite3.Row]) -> list[dict[str, Any]]:
                 # every attempt this gallery has published so far, and that
                 # is what MEASURE[ghost-coverage] counts from.
                 "ghost": report.get("ghost"),
+                # child-source.md packet 17: the sketch this attempt was
+                # holding while it wrote — the parent entry's kept sketch on a
+                # child's first try, its own previous attempt on a repair — and
+                # the context window it ran under. Both null on every attempt
+                # before 2026-09-21, which is every attempt this gallery had
+                # published until then, and that is the line the two
+                # populations of MEASURE[source-follow] are read apart on.
+                "given": _given(attempt),
+                "num_ctx": attempt["num_ctx"],
             }
         )
     return log
@@ -1423,6 +1486,18 @@ def _meta(
     line = _lineage_row(conn, entry_id)
     kids = children.get(entry_id, [])
     generation = int(line["generation"]) if line is not None else 1
+    # Was this sketch a revision of code, or of a sentence? Until 2026-09-21
+    # every entry in the gallery was the second: a child inherited its
+    # parent's prompt and the critic's one line, and the executor wrote from a
+    # blank page (entry 1103). `true` means the attempt this entry kept had
+    # the parent's own sketch in front of it and could see what it was
+    # changing; `false` is every other entry, including one whose parent's
+    # sketch was found and was over the cap, because a sketch named in one
+    # line and not shown revised nothing. The ledger reads generations apart
+    # on this field, so it is a plain boolean and never null.
+    kept = _kept_attempt(row, attempts)
+    given = _given(kept) if kept is not None else None
+    inherits = bool(given and given.get("kind") == "parent" and given.get("shown"))
     meta: dict[str, Any] = {
         "entry_id": entry_id,
         "job_id": int(row["job_id"]),
@@ -1454,6 +1529,7 @@ def _meta(
             "root_entry_id": _root_of(parent, entry_id),
             "critique_by": line["critique_by"] if line is not None else None,
             "critique": line["critique"] if line is not None else None,
+            "inherits_source": inherits,
         },
         "off_node": [
             {"step": step, "model": model} for step, model in _off_node(conn, row)
@@ -2235,6 +2311,45 @@ def _process_line(process: dict[str, Any] | None) -> str | None:
     return " · ".join(parts)
 
 
+def _revised_from_line(meta: dict[str, Any]) -> str | None:
+    """The Revised from row's one line, or None when the row does not belong.
+
+    `entry 1103's sketch, 180 lines, then 2 attempts on its own`. It belongs
+    only where ``lineage.inherits_source`` is true — the attempt this entry
+    kept had the parent's own code in front of it — and there is exactly one
+    such attempt when there is any, because only a first attempt is ever shown
+    a parent (DECIDE[which-source]); so the line count comes from whichever
+    ``gate`` entry names a ``parent``. Absent, not dashed: an entry revised
+    from a prompt and a sentence, which is every entry this gallery published
+    before 2026-09-21, has nothing to put in this row, and a row of dashes
+    would invite the reader to wonder what it lost.
+
+    The tail counts the attempts after the first — the tries this sketch made
+    on its own, with its own previous attempt in front of it instead of the
+    parent — and is left off a job that needed only one.
+    """
+    lineage = meta["lineage"]
+    if not lineage.get("inherits_source"):
+        return None
+    given: dict[str, Any] = {}
+    for item in meta["gate"]:
+        found = item.get("given") or {}
+        if found.get("kind") == "parent":
+            given = found
+            break
+    parent = lineage.get("parent_entry_id")
+    whose = f"entry {parent}'s sketch" if parent else "its parent's sketch"
+    lines = given.get("lines")
+    line = whose + (f", {lines} lines" if isinstance(lines, int) else "")
+    try:
+        after = max(int(meta["attempts"]) - 1, 0)
+    except (TypeError, ValueError):  # pragma: no cover - the column is an int
+        after = 0
+    if after:
+        line += f", then {after} attempt{'' if after == 1 else 's'} on its own"
+    return line
+
+
 def _provenance_rows(meta: dict[str, Any]) -> str:
     lineage = meta["lineage"]
     away = {item["step"] for item in meta.get("off_node") or []}
@@ -2328,6 +2443,13 @@ def _provenance_rows(meta: dict[str, Any]) -> str:
     if meta.get("note"):
         pairs.insert(_row_after(pairs, "Process" if process else "Wall seconds"),
                      ("Note", _esc(meta["note"])))
+    # Directly under Lineage, which says which parent, because this says what
+    # came with it. Only on an entry whose kept attempt held the parent's own
+    # code (child-source.md packet 18); absent everywhere else, which keeps
+    # every page published before 2026-09-21 byte for byte what it was.
+    revised = _revised_from_line(meta)
+    if revised:
+        pairs.insert(_row_after(pairs, "Lineage"), ("Revised from", _esc(revised)))
     if meta["last_error"]:
         pairs.append(("Last error", _esc(meta["last_error"])))
     return _rows(pairs)
