@@ -700,6 +700,59 @@ class CritiqueTests(PaidTestCase):
         self.assertEqual(item["guard"], paid.sha256_file(row["strip_path"]))
         self.assertEqual(item["prompt_version"], "critic-v3")
 
+    def give_every_entry_a_ghost(self):
+        """The gate's second picture in each entry's attempt directory.
+
+        No column holds it (auto-mouse.md §5.3), so the fixture is a file and a
+        ``source_dir`` to find it from.
+        """
+        for entry_id in self.conn.execute("SELECT id FROM entries").fetchall():
+            source = self.tmp / "art" / f"entry-{entry_id['id']}"
+            (source / ".gate").mkdir(parents=True, exist_ok=True)
+            (source / ".gate" / "ghost.png").write_bytes(b"ghost frames\n")
+            self.conn.execute(
+                "UPDATE entries SET source_dir = ? WHERE id = ?",
+                (str(source), entry_id["id"]),
+            )
+
+    def two_image_prompt(self):
+        """A critic prompt whose header asks for the ghost frames as well."""
+        body = lineage.PROMPT_PATH.read_text(encoding="utf-8").split("\n\n", 1)[1]
+        path = self.tmp / "critic-v4.md"
+        path.write_text(
+            "prompt_version: critic-v4\nimages: strip ghost\n\n" + body,
+            encoding="utf-8",
+        )
+        return mock.patch.object(lineage, "PROMPT_PATH", path)
+
+    def test_an_item_names_the_ghost_frames_when_the_prompt_asks_for_them(self):
+        """Packet 16: the second picture, by path, for the entries that have one."""
+        self.give_every_entry_a_ghost()
+        with self.two_image_prompt():
+            item = self.export()["items"][0]
+        row = db.get_entry(self.conn, item["inputs"]["entry"])
+        ghost = str(Path(row["source_dir"]) / ".gate" / "ghost.png")
+        self.assertEqual(item["images"], [row["strip_path"], ghost])
+        self.assertEqual(item["inputs"]["ghost_path"], ghost)
+        # the guard is the strip's and only the strip's: it is what the
+        # critique is refused without
+        self.assertEqual(item["guard"], paid.sha256_file(row["strip_path"]))
+
+    def test_an_entry_with_no_ghost_frames_names_none(self):
+        with self.two_image_prompt():
+            item = self.export()["items"][0]
+        row = db.get_entry(self.conn, item["inputs"]["entry"])
+        self.assertEqual(item["images"], [row["strip_path"]])
+        self.assertNotIn("ghost_path", item["inputs"])
+
+    def test_the_file_alone_does_not_put_it_in_the_packet(self):
+        """critic-v3 on disk: the prompt version is the switch, not the file."""
+        self.give_every_entry_a_ghost()
+        item = self.export()["items"][0]
+        row = db.get_entry(self.conn, item["inputs"]["entry"])
+        self.assertEqual(item["images"], [row["strip_path"]])
+        self.assertNotIn("ghost_path", item["inputs"])
+
     def test_a_reply_lands_the_rows_the_idle_critic_lands(self):
         """Plan §5.1 for the critic: the critique row and the child job."""
         packet = self.export()

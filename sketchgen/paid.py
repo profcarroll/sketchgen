@@ -685,12 +685,21 @@ class CritiqueAdapter(Adapter):
     The guard is the sha256 of the strip (plan §3.3). The strip is the evidence
     and :func:`lineage.critique` refuses to critique without it; a strip that
     changed since export means the sentence is about a picture that is gone.
+
+    A critic prompt that asks for the gate's ghost frames as well
+    (:func:`lineage.critic_images`, auto-mouse.md §6) names them second in
+    ``images`` and again as ``inputs.ghost_path``, for the entries that have
+    one. The guard stays the strip's alone: it is what the critique is refused
+    without, and a second hash would refuse a sentence about a picture that is
+    still there over a second picture that was never required.
     """
 
     step = "critique"
     how_to_answer = (
-        "Show the model the item's prompt with the one image in 'images' (the "
-        "sketch's frame strip: the only evidence of what it shows). Put its "
+        "Show the model the item's prompt with the image(s) in 'images', named "
+        "by their path on the node — the sketch's frame strip first (the only "
+        "evidence of what it shows) and, where the prompt asks for it and the "
+        "entry has one, the same sketch under the ghost pointer second. Put its "
         "reply, verbatim, in 'answer': one sentence, under 40 words, no code."
     )
 
@@ -709,6 +718,9 @@ class CritiqueAdapter(Adapter):
 
     def offer(self, conn, *, model, limit, ctx):
         version = self.prompt_version()
+        # Once per packet, not once per entry: it is the prompt file that
+        # decides, and it cannot change between two items of one export.
+        wants_ghost = "ghost" in lineage.critic_images()
         wanted = db.entries_to_critique(
             conn, version, limit, exclude=self._others(conn, model)
         )
@@ -720,17 +732,26 @@ class CritiqueAdapter(Adapter):
                 guard = sha256_file(strip)
             except Rejected:
                 continue  # an unreadable strip: the local critic refuses it too
+            images = [strip]
+            inputs: dict[str, Any] = {
+                "entry": entry_id,
+                "generation": lineage.generation_of(conn, entry_id),
+            }
+            ghost = lineage.ghost_image(conn, row) if wants_ghost else None
+            if ghost is not None:
+                # Second, as the local critic sends it, and named in `inputs`
+                # too so the agent can tell which path is which without
+                # counting. AGENTS.md tells it to scp both and look.
+                images.append(str(ghost))
+                inputs["ghost_path"] = str(ghost)
             items.append(
                 {
                     "key": f"entry {entry_id}",
                     "prompt": lineage.critique_prompt(row, row["statement"], row["brief"]),
-                    "images": [strip],
+                    "images": images,
                     "guard": guard,
                     "prompt_version": version,
-                    "inputs": {
-                        "entry": entry_id,
-                        "generation": lineage.generation_of(conn, entry_id),
-                    },
+                    "inputs": inputs,
                     "answer": "",
                 }
             )

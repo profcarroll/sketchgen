@@ -48,6 +48,30 @@ rather than critiquing blind when there is no strip to send. Every
 :class:`Critique` carries the path and the sha256 of exactly the bytes that went
 out, so a sentence is tied to the pixels that produced it.
 
+**A second picture, when the prompt asks for one.** Since 21 September 2026 the
+gate plays a ghost pointer after its probes and writes ``ghost.png`` beside the
+strip: the same sketch with something clicking and dragging it
+(auto-mouse.md §5). Entry 1103, the jigsaw, is the case that made it — a
+photograph cut into pieces that never move, four identical frames, and a critic
+that can only ask for a different photograph. :func:`critique` sends that second
+image when, and only when, the critic prompt asks for it, which it does with a
+second header line under ``prompt_version:``::
+
+    prompt_version: critic-v4
+    images: strip ghost
+
+The switch is deliberately the prompt file and not the file on disk. Critiques
+are comparable only within one prompt version (`critiques` is UNIQUE on
+``(entry_id, prompt_version)``), so if the presence of ``ghost.png`` decided it,
+one version would hold sighted and half-sighted critiques mixed together and
+MEASURE[critic-quality] would have nothing to compare. With the line absent —
+critic-v3 as it stands — the payload is the strip alone, byte for byte what it
+has always been. With the line present, an entry that has no ghost window still
+gets the strip alone and is still critiqued: nothing re-gates a published entry,
+so waiting for one would be waiting forever. Cutting critic-v4 is the operator's
+call, and what it costs is in docs/OPERATIONS.md, *A new critic prompt version is
+a burst of work*.
+
 Python 3.12, stdlib only. Every timestamp is UTC, ISO 8601, with a Z.
 """
 
@@ -65,9 +89,11 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from sketchgen import db
+from sketchgen import ghostshim
 from sketchgen import models
 
 __all__ = [
+    "CRITIC_IMAGES",
     "CRITIQUE_BY_RE",
     "DEFAULT_HOST",
     "DEFAULT_MAX_DEPTH",
@@ -79,9 +105,11 @@ __all__ = [
     "CritiqueFailed",
     "CritiqueRefused",
     "compose_prompt",
+    "critic_images",
     "critique",
     "critique_prompt",
     "generation_of",
+    "ghost_image",
     "line",
     "prompt_version",
     "record_child",
@@ -115,6 +143,14 @@ USERNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 #: A critique longer than this is a review, not a revision line.
 MAX_CRITIQUE_WORDS = 40
 
+#: The pictures a critic prompt may ask for, in the order they go to the model.
+#: ``strip`` is first and is not optional — :func:`_strip_bytes` refuses without
+#: it — so this is really the list of what may follow it. A name the prompt asks
+#: for that is not here is dropped rather than refused: the same rule the
+#: planner's assertion vocabulary follows, because a prompt file is prose and a
+#: typo in it should not stop the critic working.
+CRITIC_IMAGES = ("strip", "ghost")
+
 DEFAULT_HOST = "http://127.0.0.1:11434"
 DEFAULT_MODEL = "gemma4:e4b"
 PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "critic.md"
@@ -125,6 +161,10 @@ PROMPT_PATH = Path(__file__).resolve().parent.parent / "prompts" / "critic.md"
 _REVISE_SPLIT_RE = re.compile(rf"^{re.escape(REVISE_HEADING)}[ \t]*", re.MULTILINE)
 
 _PROMPT_VERSION_RE = re.compile(r"^prompt_version:\s*(\S+)\s*$", re.MULTILINE)
+#: ``images: strip ghost``, the second header line. Read from the header block
+#: only (see :func:`_settings`), unlike ``prompt_version:``, which has been read
+#: from the whole file since critic-v1 and is left alone here.
+_IMAGES_RE = re.compile(r"^images:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
 #: Where one sentence ends and the next begins: a terminator, then whitespace,
 #: then something that is not the rest of an abbreviation.
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
@@ -167,6 +207,15 @@ class Critique:
     :func:`sketchgen.pairs.artefact_hash` is for a verdict: re-run the sketch,
     regenerate the strip, and the hash no longer matches, so an old critique is
     visibly about a picture that no longer exists.
+
+    ``ghost_path`` and ``ghost_sha256`` are the same two facts about the second
+    image, filled in only when the prompt asked for it and the entry had one,
+    and ``ghost_note`` says why there was none when there was not. They have no
+    columns in `critiques` — migration 009 gave the strip two, and a second pair
+    would be a migration for a picture that most entries will never have — so
+    the worker writes them into its log line instead (auto-mouse.md §6). If a
+    ghost window ever has to be audited the way a strip can be, a
+    ``ghost_sha256`` column is the honest way to do it.
     """
 
     text: str
@@ -176,6 +225,9 @@ class Critique:
     strip_sha256: str
     tokens: dict[str, int] = field(default_factory=dict)
     raw: str = ""
+    ghost_path: str = ""
+    ghost_sha256: str = ""
+    ghost_note: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +281,65 @@ def _strip_bytes(row: Any) -> tuple[bytes, str]:
     if not data:
         raise CritiqueRefused(f"the strip for entry {label} at {path} is empty")
     return data, path
+
+
+def ghost_image(conn: sqlite3.Connection, entry_row: Any) -> Path | None:
+    """The gate's ghost frames for one entry, or None when it has none.
+
+    No column and no migration: ``ghost.png`` arrived on 2026-09-21 with the
+    gate's ghost window, nothing re-gates a published entry, and a column would
+    be NULL on all 910 of them (auto-mouse.md §5.3). It is resolved from the
+    attempt directory by :func:`sketchgen.ghostshim.ghost_png`, which is also
+    what ``gallery._artefact`` calls, so the picture the entry page shows and
+    the picture the critic is given are the same file by construction.
+
+    The entry's own ``source_dir`` first and the last attempt's second, the
+    order ``gallery._source_dir`` has always tried: the two disagree on an entry
+    whose kept attempt was not its last.
+    """
+    dirs: list[Any] = [_get(entry_row, "source_dir")]
+    job_id = _get(entry_row, "job_id")
+    if job_id is not None:
+        rows = conn.execute(
+            "SELECT source_dir FROM attempts WHERE job_id = ? ORDER BY n",
+            (int(job_id),),
+        ).fetchall()
+        if rows:
+            dirs.append(rows[-1]["source_dir"])
+    return ghostshim.ghost_png(*dirs)
+
+
+def _ghost_bytes(conn: sqlite3.Connection, row: Any) -> tuple[bytes, str, str]:
+    """The second image, or empty bytes and one line saying why there is none.
+
+    Never a refusal, and that is the difference between this and
+    :func:`_strip_bytes`. The strip is the evidence and a critique without it is
+    critic-v2 again; the ghost frames are extra evidence that exists for the
+    entries the gate has seen since 2026-09-21 and for no others. A critic
+    prompt that asked for them and then refused every older entry would stop the
+    idle loop dead on the first published entry it reached.
+    """
+    found = ghost_image(conn, row)
+    label = _get(row, "id", "?")
+    if found is None:
+        return b"", "", (
+            f"entry {label} has no {ghostshim.GHOST_PNG}: gated before the "
+            "ghost window existed, or the window ran out of budget; the critic "
+            "saw the strip alone"
+        )
+    try:
+        data = found.read_bytes()
+    except OSError as exc:
+        return b"", "", (
+            f"cannot read the ghost frames for entry {label} at {found}: {exc}; "
+            "the critic saw the strip alone"
+        )
+    if not data:
+        return b"", "", (
+            f"the ghost frames for entry {label} at {found} are empty; the "
+            "critic saw the strip alone"
+        )
+    return data, str(found), ""
 
 
 def _lineage_row(conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row | None:
@@ -586,6 +697,44 @@ def prompt_version(path: str | Path | None = None) -> str:
     return match.group(1)
 
 
+def _settings(text: str) -> str:
+    """The prompt file's header: the lines before the first blank one.
+
+    ``images:`` is read from here and nowhere else. The body is prose an
+    operator writes and a paragraph that begins a line with the word would
+    otherwise change what the critic is shown, silently, under a version number
+    that says nothing happened.
+    """
+    head, _, _ = text.partition("\n\n")
+    return head
+
+
+def critic_images(path: str | Path | None = None) -> tuple[str, ...]:
+    """What ``prompts/critic.md`` asks to be shown, strip first.
+
+    ``("strip",)`` when there is no ``images:`` line, which is critic-v3 and
+    every version before it: no line, no change. ``images: strip ghost`` under
+    the ``prompt_version:`` line adds the gate's ghost frames
+    (:func:`ghost_image`), and that line is the whole switch — see this module's
+    docstring for why it is the prompt file and not the file on disk.
+
+    The strip is always first and always present, whatever the line says. It is
+    the evidence :func:`_strip_bytes` refuses to work without, and a version
+    that forgot to name it would otherwise quietly become a blind critic, which
+    is exactly what critic-v3 was written to end.
+    """
+    match = _IMAGES_RE.search(_settings(_read_prompt_file(path)))
+    if match is None:
+        return ("strip",)
+    asked = match.group(1).replace(",", " ").split()
+    out = ["strip"]
+    for name in asked:
+        name = name.lower()
+        if name in CRITIC_IMAGES and name not in out:
+            out.append(name)
+    return tuple(out)
+
+
 def critique_prompt(
     entry_row: Any,
     statement: str | None,
@@ -602,10 +751,15 @@ def critique_prompt(
     The picture is not in here. :func:`critique` attaches the frame strip as an
     image beside this text, and critic-v3's first section tells the model that
     the image is the only evidence of what the sketch shows and that it beats
-    the statement wherever the two disagree.
+    the statement wherever the two disagree. A prompt that also asks for the
+    ghost frames (:func:`critic_images`) says so in its own words, in the body;
+    the ``images:`` line is a setting and goes out of the rendered prompt with
+    the version line, because neither is anything to say to a model.
     """
     text = _read_prompt_file(path)
-    text = _PROMPT_VERSION_RE.sub("", text, count=1).lstrip("\n")
+    text = _PROMPT_VERSION_RE.sub("", text, count=1)
+    head, sep, body = text.partition("\n\n")
+    text = (_IMAGES_RE.sub("", head, count=1) + sep + body).lstrip("\n")
     raw_assertions = _get(entry_row, "assertions_json")
     try:
         words = json.loads(raw_assertions) if raw_assertions else []
@@ -690,8 +844,16 @@ def critique(
     multi-turn conversation. An entry with no readable strip is
     :class:`CritiqueRefused` and never a blind critique (see :func:`_strip_bytes`).
 
-    The strip is read before the ``stub`` branch, so a replayed run refuses on
-    the same evidence a real one would: the stub replaces the model, not the
+    A prompt that says ``images: strip ghost`` in its header
+    (:func:`critic_images`) gets the gate's ghost frames as a second image,
+    after the strip and never instead of it — the prompt tells the model which
+    is which by their order, so the order is the contract. An entry with no
+    ghost window is critiqued over the strip alone and the reason is on the
+    :class:`Critique` as ``ghost_note``; it is never a refusal, because nothing
+    re-gates the 910 entries published before the ghost window existed.
+
+    Both images are read before the ``stub`` branch, so a replayed run refuses
+    on the same evidence a real one would: the stub replaces the model, not the
     requirement to have looked.
 
     ``"think": false`` goes only to the qwen tags, as in planner.py: ollama
@@ -707,6 +869,14 @@ def critique(
     rendered = critique_prompt(row, row["statement"], row["brief"], prompt_path)
     tokens: dict[str, int] = {}
 
+    images = [strip]
+    ghost_path = ghost_sha256 = ghost_note = ""
+    if "ghost" in critic_images(prompt_path):
+        ghost, ghost_path, ghost_note = _ghost_bytes(conn, row)
+        if ghost:
+            images.append(ghost)
+            ghost_sha256 = hashlib.sha256(ghost).hexdigest()
+
     if stub is not None:
         path = Path(stub)
         try:
@@ -717,7 +887,10 @@ def critique(
         payload: dict = {
             "model": model,
             "prompt": rendered,
-            "images": [base64.b64encode(strip).decode("ascii")],
+            # Strip first, always: critic-v3 says "the image", critic-v4 says
+            # "the second image is the same sketch under a pointer", and both
+            # sentences are about a position in this list.
+            "images": [base64.b64encode(image).decode("ascii") for image in images],
             "stream": False,
             "options": {"num_ctx": num_ctx, "seed": seed},
         }
@@ -755,4 +928,7 @@ def critique(
         strip_sha256=strip_sha256,
         tokens=tokens,
         raw=raw,
+        ghost_path=ghost_path,
+        ghost_sha256=ghost_sha256,
+        ghost_note=ghost_note,
     )

@@ -270,9 +270,11 @@ If you find yourself guessing, that is a missing verb — say so.
 
 - **Judge / critique** items name images by their path on the node:
   `scp sld-cloud:<path> .` and look before answering — the local critic refuses
-  to work blind, and so should you. `bin/sg paid export --step judge --as $ME
-  --out -` (no `--job`); a critique packet claims its entries until imported
-  (`bin/sg paid release --step critique --all` to give them back).
+  to work blind, and so should you. A critique item may also name `ghost.png`,
+  the same sketch under the ghost pointer; look at both. `bin/sg paid export
+  --step judge --as $ME --out -` (no `--job`); a critique packet claims its
+  entries until imported (`bin/sg paid release --step critique --all` to give
+  them back).
 - `paid assign` sets a *local* model for `plan`/`execute` defaults and may set
   a paid one for `judge`/`critique`, which makes the idle loop leave that step
   for `paid export`. Never needed for your own job.
