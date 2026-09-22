@@ -1,0 +1,42 @@
+-- 016_given_source.sql — what sketch the executor was holding when it wrote
+-- this attempt, and how much room it had to hold it.
+--
+-- Entry 1103, 2026-09-20, is the incident. Five attempts at a jigsaw puzzle:
+-- attempt 1 passed `responds(drag)` and took 11 s to run because it fetched a
+-- photograph; attempts 4 and 5 ran in 1.4 s and passed nothing, the photograph
+-- and the drag both gone. Every one of them was written from a blank page,
+-- because the only thing carried forward was prose — the gate's evidence on a
+-- repair, the critic's one sentence on a child — and never the code either was
+-- about. From 2026-09-21 the executor is shown the sketch it is revising
+-- (docs/plans/child-source.md packet 17), and these two columns are the record
+-- of it.
+--
+--   attempts.given_source_json  {"kind","path","sha256","lines","shown"} —
+--                        `kind` parent (the published sketch a child job
+--                        revises) or previous (this job's own last attempt);
+--                        `sha256` of the file as it was read, so a later read
+--                        can tell whether it is looking at the same bytes;
+--                        `shown` false when the sketch was over
+--                        `meta.source_max_chars` and the heading carried one
+--                        line instead of the code (DECIDE[source-cap]: whole
+--                        or not at all). Written for a paid attempt too, from
+--                        what the packet's `inputs.source` said, because that
+--                        is what the agent actually read — and that object has
+--                        no `path`, because a node path is not something an
+--                        off-node agent was ever shown.
+--   attempts.num_ctx     the context window the local executor ran under —
+--                        16384 with a sketch in the prompt, 8192 without — so
+--                        a decode time can be read against it
+--                        (MEASURE[source-ctx-cost]). NULL for an attempt
+--                        written off the node: no local window applied to it.
+--
+-- NULL on every row written before this migration, deliberately and not as
+-- missing data: nothing was given to any of them, and nothing here infers what
+-- they were shown. Two nullable columns, additive, no CHECK to rebuild.
+--
+-- The text of the sketch is not stored. It is on disk at `path` and the hash
+-- says which version it was; a copy in the row would be 16,000 characters per
+-- attempt saying what the jobs directory already says.
+
+ALTER TABLE attempts ADD COLUMN given_source_json TEXT;
+ALTER TABLE attempts ADD COLUMN num_ctx INTEGER;
