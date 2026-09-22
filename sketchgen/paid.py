@@ -137,6 +137,11 @@ class Context:
     #: job started with `--since` whose `process` is all nulls is rejected —
     #: see :meth:`ExecuteAdapter.land` for the incident.
     process_unreported: bool = False
+    #: The same declaration for the reply's own counts (`paid import
+    #: --no-usage`): without it an attempt on a `--since` job whose `usage` is
+    #: all nulls is rejected too — job 1319, entry 1312 (2026-09-22), landed
+    #: with its process recorded and both counts still blank.
+    usage_unreported: bool = False
 
 
 def sha256_file(path: str | Path) -> str:
@@ -621,10 +626,30 @@ class ExecuteAdapter(Adapter):
             # to be recorded. A job without --since made no such promise.
             raise Rejected(
                 f"process is empty and job {job_id} was started with --since "
-                f"{job.since_utc}: run  python3 rig/cost.py --since {job.since_utc}  "
-                "and put its last line in items[0].process, then import again; "
-                "if your harness cannot report it, import with --no-process. "
-                "Nothing was written."
+                f"{job.since_utc}: run  python3 rig/cost.py --since {job.since_utc} "
+                "--reply <the file you wrote the answer to>  and merge its last "
+                "line into items[0], then import again; if your harness cannot "
+                "report it, import with --no-process. Nothing was written."
+            )
+        usage = usage_of(item)
+        if job.since_utc and not usage_reported(usage) and not ctx.usage_unreported:
+            # The same omission, one field over. #145 made an empty process a
+            # rejection, and job 1319 (entry 1312, 2026-09-22) then landed with
+            # its process filled and its usage still null: cost.py printed no
+            # usage and nothing asked for one, so every paid entry page went on
+            # saying "—" for the two counts a local attempt always has. The
+            # transcript carries them — the message that wrote the reply has
+            # the API's own count of what it read and what it generated, and
+            # `rig/cost.py --reply` finds that message by the reply's text —
+            # so a blank is an omission unless --no-usage says it is not (the
+            # reply edited in place across tool calls, which no one message
+            # wrote).
+            raise Rejected(
+                f"usage is empty and job {job_id} was started with --since "
+                f"{job.since_utc}: run  python3 rig/cost.py --since {job.since_utc} "
+                "--reply <the file you wrote the answer to>  and merge its last "
+                "line into items[0], then import again; if it cannot find the "
+                "reply in one message, import with --no-usage. Nothing was written."
             )
         attempt_dir = ctx.jobs_dir / str(job_id) / f"attempt-{n}"
         try:
@@ -640,7 +665,7 @@ class ExecuteAdapter(Adapter):
                             # worker writes it on the attempt as wall_s, where
                             # a local attempt's model time goes.
                             "round_trip_s": round_trip_s(item.get("_exported_utc"), landed),
-                            "usage": usage_of(item),
+                            "usage": usage,
                             # Beside the reply's cost, never added to it: what
                             # the agent says the work around this reply cost.
                             # The worker copies it onto the attempt and fills
@@ -650,7 +675,8 @@ class ExecuteAdapter(Adapter):
                             # --no-process: the difference between a cost
                             # nobody could count and one nobody counted, kept
                             # where the attempt's record is.
-                            "process_unreported": bool(ctx.process_unreported)},
+                            "process_unreported": bool(ctx.process_unreported),
+                            "usage_unreported": bool(ctx.usage_unreported)},
                            indent=2) + "\n",
                 encoding="utf-8",
             )
@@ -920,9 +946,10 @@ def export_packet(
             adapter.how_to_answer
             + " Leave an item's 'answer' empty to skip it. Set 'model' (here, or "
             "on one item) to the model that actually answered: that is what the "
-            "node records. If you know the token counts of your own reply, put "
-            "them in the item's 'usage' (prompt_tokens, completion_tokens); "
-            "leave what you do not know null, never an estimate. Change nothing "
+            "node records. Put the token counts of your own reply in the item's "
+            "'usage' (prompt_tokens, completion_tokens): a Claude Code session "
+            "reads them off its transcript with rig/cost.py --reply FILE; leave "
+            "what you do not know null, never an estimate. Change nothing "
             "else — 'guard' is how the node knows the answer is still about "
             "what it asked."
             + (
@@ -947,6 +974,10 @@ def export_packet(
 #: measures the round trip itself (`round_trip_s`, export to import); tokens
 #: it can only be told. Null means not known, and stays null: a page that says
 #: "—" is truer than one that says a guess (2026-09-21, entry 1246's blanks).
+#: The answering side does know them, though: a Claude Code transcript records
+#: the API's `usage` on every assistant message, and the message that wrote
+#: the reply has the reply's — `rig/cost.py --reply FILE` prints it. Until
+#: 2026-09-22 nothing read it, and every paid entry page showed two dashes.
 EMPTY_USAGE: dict[str, int | None] = {"prompt_tokens": None, "completion_tokens": None}
 
 
@@ -963,6 +994,11 @@ def usage_of(item: Mapping[str, Any]) -> dict[str, int | None]:
         if out[key] is not None and out[key] < 0:
             out[key] = None
     return out
+
+
+def usage_reported(usage: Mapping[str, Any] | None) -> bool:
+    """Whether either count is known: `process_reported`'s rule for the reply."""
+    return bool(usage) and any(value is not None for value in usage.values())
 
 
 #: What an item carries about the work *around* the reply, when the agent's

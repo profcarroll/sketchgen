@@ -37,10 +37,15 @@ console and run `await __probe.all()`, then paste `rig/bench.js` and run
 `git status` is clean.
 
 `rig/cost.py` is the other half, and has nothing to do with the browser:
-`python3 rig/cost.py --since ISO` totals what the session has cost from the
-transcript Claude Code already writes, and prints one JSON line to paste into
-an attempt item's `process`, which the node records beside the entry as
-reported by you (migration 015).
+`python3 rig/cost.py --since ISO --reply FILE` reads the transcript Claude
+Code already writes and prints one JSON line to merge into an attempt item:
+`process`, what the session has cost since ISO, which the node records beside
+the entry as reported by you (migration 015), and `usage`, the API's own
+counts for the message that wrote the reply in FILE — what it read and what
+it generated — which land where a local attempt's prompt and completion
+tokens do. Without `--reply` the usage is null and the line says so; a reply
+no single message wrote (edited in place) is reported as not found, and
+`paid import --no-usage` is how that is declared.
 
 ## The six traps
 
