@@ -46,10 +46,12 @@ Read the first two rows: `qwen3-coder` and `laguna-xs-2.1` are **5% apart on tok
 on cold load**. A page that ranks by tok/s calls them equivalent. They are not. That contrast is
 the whole of the argument and it does not need the other rows.
 
-† The `qwen3.5:9b` row is shown for completeness but **carries no weight here**. Its 30 attempts
-all ran on 2026-09-19/20, which the day table below shows was the node's cheapest stretch — 7%
-cold — so a model holding a slot across jobs is unremarkable. One row in it still is not
-(§7), and nothing in this document is argued from it.
+† The `qwen3.5:9b` row **is not evidence that the model is cheap to load**, and it was nearly
+quoted as if it were. All 30 attempts ran on 2026-09-19/20, the node's cheapest stretch (7% cold
+in the day table below), with the model holding a slot across consecutive jobs. Measured directly
+on 2026-09-22, a cold `qwen3.5:9b` cost **89.5 s** — about what 6.6 GB comes to at the repack rate
+in §1. The zeros were a warm runner, not a cheap model, which is the mundane answer and the one
+that should have been assumed. Nothing in this document is argued from that row.
 
 And the rate is not a fixed property of the node. It is a property of its *configuration*, and it
 has swung by an order of magnitude in eight days:
@@ -172,7 +174,28 @@ Two smaller notes, neither blocking:
   "sixteen-core box" framing is the part the measurements complicate; the conclusion may well
   survive it.
 
-## 6. What does not change
+## 6. Packet 7: an audition is where this cost distorts most
+
+`audition` queues N jobs on a candidate model, and it is the one place on the page where load
+cost does not merely go unreported but actively **biases the result against the candidate**.
+
+Measured on job 1366, an audition of `qwen3.5:9b` against the resident `qwen3-coder:30b-a3b`:
+
+- The challenger paid **89.5 s** to load on its first attempt. The incumbent had been paying
+  **0.1 s** on the jobs either side of it, because it was resident.
+- Compared on wall time the challenger therefore looks about 90 s a job worse than it is. Some of
+  the gap is real — 12.6 against 20.6 tok/s — but the load is not part of what an audition is
+  trying to measure, and on a first attempt it is the larger term.
+- The audition also **evicted both executor arms**, so the next job needing either paid 30–276 s
+  to bring it back. An audition bills the queue, not only itself.
+
+So Packet 7 should report a candidate's attempts with load **separated**, not folded into wall,
+and the detail page should say plainly how many of the audition's attempts paid a cold load. A
+fair trial of a model is a trial of the sketches it writes, not of whether it happened to be
+resident. The same column §1 asks for answers this; what Packet 7 adds is that here it is not a
+diagnostic nicety but a correctness question about the comparison.
+
+## 7. What does not change
 
 1. **The key decision, and Packets 1–3.** Nothing here touches what syncs, where the answerer
    runs, or §1.7's fence. This amendment does not reach the paid path at all.
@@ -183,17 +206,16 @@ Two smaller notes, neither blocking:
 4. **The page's shape.** Assignments, catalogue, off-node, housekeeping. These are columns and a
    corrected denominator, not a redesign.
 
-## 7. Open
+## 8. Open
 
 - **Why `/api/ps` under-reports `gemma4:26b` by 14×.** Worth ten minutes before Packet 4 reads
   that field for anything load-bearing. The workaround (read RSS) does not depend on the answer.
-- **Why `qwen3.5:9b`'s 30 attempts all report a near-zero load.** Partly explained: they ran
-  2026-09-19/20, and 09-19 was the node's best day at 7% cold overall, with two slots and a
-  rotation small enough that a model could hold one across jobs. That is mundane. What is not yet
-  explained is a 0.08 s load at 06:02 on 09-20 after a six-hour gap in that model's own attempts
-  against a 30 m `KEEP_ALIVE` — either other jobs kept the runner resident in its slot, or `wall_s`
-  on that path did not enclose the load. The day table above is the safer evidence either way, and
-  §1 now rests on it rather than on that row.
+- ~~Why `qwen3.5:9b`'s 30 attempts all report a near-zero load.~~ **Answered 2026-09-22**: a cold
+  `qwen3.5:9b` costs **89.5 s** (job 1366, attempt 1), so the model is not cheap to load and the
+  zeros were a warm runner holding a slot across consecutive jobs on the node's 7%-cold day. One
+  detail is still unaccounted for and is not worth chasing: a 0.08 s load at 06:02 on 09-20 after a
+  six-hour gap in that model's own attempts, against a 30 m `KEEP_ALIVE` — most likely other jobs
+  kept the runner in its slot. It changes nothing above.
 - **Whether a per-model mean is meaningful at all across a configuration change.** The day table
   says a model's load cost moved by 10× without the model changing. Packet 5 plans to key stats on
   (model, step, prompt version, node shape) — none of which captures slot count or keep-alive. A
