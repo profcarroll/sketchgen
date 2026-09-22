@@ -2689,7 +2689,48 @@ def _spawnable_rows(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
     ).fetchall()
 
 
-def _parent_card(app: App, conn: sqlite3.Connection, parent_id: int | None) -> str:
+#: The tick box under the parent card, and the hidden field that tells
+#: :func:`create_job` the box was on the page at all. A checkbox posts nothing
+#: when it is clear, so without the marker a form that never carried one and a
+#: form whose box was unticked arrive identical — and the difference between
+#: them is the difference between *the node decides* and *this job is the
+#: control arm*. The block is always in the DOM and hidden until a parent is
+#: picked, so that the script that fills the card in place (op_layout.html,
+#: ``pickParent``) has something to unhide instead of something to rebuild.
+_SOURCE_TICK = (
+    '<div class="opts" id="source-tick"{hidden}>'
+    '<input type="hidden" name="source_form" value="1">'
+    '<label><input type="checkbox" id="give_source" name="give_source" '
+    'value="1"{checked}> give the executor the parent\'s sketch</label>'
+    '</div>'
+    '<p class="help" id="source-tick-help"{hidden}>Ticked, the first attempt is '
+    "shown the parent's kept <code>sketch.js</code> under a heading in its "
+    "brief, and a repair is shown its own previous attempt. Untick it and this "
+    "job alone is written the way every job was before 2026-09-21 — from the "
+    "prompt and the critique and nothing else. That is the control arm: one "
+    "line with the source and one without, without moving "
+    "<code>executor_source</code> for the whole node and sweeping up every "
+    "job the worker claims in between.</p>"
+)
+
+
+def _source_tick(parent_id: int | None, ticked: bool = True) -> str:
+    """The *give the executor the parent's sketch* box, hidden with no parent.
+
+    ``ticked`` is False only when a refused POST is being drawn again and the
+    operator had cleared it: a form that comes back with a choice silently
+    undone is a form that queues the job the person did not ask for.
+    """
+    hidden = "" if parent_id else " hidden"
+    return _SOURCE_TICK.format(hidden=hidden, checked=" checked" if ticked else "")
+
+
+def _parent_card(
+    app: App,
+    conn: sqlite3.Connection,
+    parent_id: int | None,
+    ticked: bool = True,
+) -> str:
     """The entry the new job descends from, drawn so the operator can see it.
 
     A bare id was the whole of this field until 2026-09-18, and a number is
@@ -2697,17 +2738,25 @@ def _parent_card(app: App, conn: sqlite3.Connection, parent_id: int | None) -> s
     generation, the root prompt and the newest revision — enough to know
     whether it is the entry you meant — and a refusal in red when the line
     cannot grow from it.
+
+    Under it since 2026-09-22, and only with a parent picked, the one thing
+    about a child the operator now has a say in: whether its executor is shown
+    the parent's code (packet 18). The box is outside ``#parent-card`` on
+    purpose — the page's script replaces that element's innerHTML when a
+    parent is picked without a reload, and a field inside it would be thrown
+    away mid-form.
     """
     if not parent_id:
         return (
             '<p class="help" id="parent-card">none — a fresh root. Pick one below '
             "and the job is a child of it: the queue and the job page say so, and "
             "its models and rules are preset from it so the line stays a fair "
-            "comparison with itself.</p>"
+            "comparison with itself.</p>" + _source_tick(None, ticked)
         )
     row = db.get_entry(conn, parent_id)
     if row is None:
-        return f'<p class="err" id="parent-card">there is no entry {parent_id}</p>'
+        return (f'<p class="err" id="parent-card">there is no entry {parent_id}</p>'
+                + _source_tick(None, ticked))
     state = str(row["state"])
     root, revisions = lineage.split_prompt(row["prompt"] or "")
     generation = lineage.generation_of(conn, parent_id)
@@ -2733,7 +2782,7 @@ def _parent_card(app: App, conn: sqlite3.Connection, parent_id: int | None) -> s
         f'<p class="prompt">{esc(root or "—")}</p>{revision}'
         '<p class="help"><button type="button" class="link" id="use-parent-prompt">'
         "use its prompt</button> as the starting point, or write a fresh one.</p>"
-        f"</div></div>{refusal}"
+        f"</div></div>{refusal}{_source_tick(parent_id, ticked)}"
     )
 
 
@@ -2888,6 +2937,11 @@ def new_page(
     parent_raw = one("parent_entry_id").strip()
     parent_id = int(parent_raw) if parent_raw.isdigit() else None
     picked = set(form.get("assert") or [])
+    # The tick box is per job and is never a saved default (`defaults_from`
+    # keeps only BUILTIN_DEFAULTS), so it opens ticked every time — except on
+    # a POST this page refused, where the operator's own choice is still in
+    # the form and has to survive the redraw.
+    ticked = not (one("source_form") and not one("give_source"))
     return render(
         "op_new",
         error=f'<p class="err">{esc(error)}</p>' if error else "",
@@ -2896,7 +2950,7 @@ def new_page(
         recent=_recent_prompts(conn),
         submitter=_submitter_block(one("submitted_by").strip()),
         parent_entry_id=esc(parent_raw),
-        parent_card=_parent_card(app, conn, parent_id),
+        parent_card=_parent_card(app, conn, parent_id, ticked),
         parent_picker=_parent_picker(app, conn, parent_id),
         planner_options=_grouped_options(
             planner_groups(), planner_selected(one("planner", LOCAL))
@@ -3053,6 +3107,21 @@ def create_job(conn: sqlite3.Connection, form: dict[str, list[str]]) -> tuple[in
                 "rejected or archived one"
             )
 
+    # Migration 017. `executor_source` is what a caller that means it names
+    # outright; the New job page's tick box says the same thing in the form a
+    # person reads, and `source_form` is how an unticked box is told from a
+    # form that never had one. Ticked, or absent, is NULL: the job follows
+    # `meta.executor_source` at the moment each attempt runs, as every job did
+    # before 2026-09-22.
+    executor_source = one("executor_source")
+    if not executor_source and one("source_form") and not one("give_source"):
+        executor_source = "none"
+    if executor_source and executor_source not in worker.SOURCE_SWITCH_VALUES:
+        raise ValueError(
+            "executor source must be one of "
+            + ", ".join(worker.SOURCE_SWITCH_VALUES)
+        )
+
     words, problem = _assertions_from(form)
     if problem:
         raise ValueError(problem)
@@ -3064,6 +3133,7 @@ def create_job(conn: sqlite3.Connection, form: dict[str, list[str]]) -> tuple[in
         "publication": publication,
         "max_attempts": int(raw_attempts),
         "parent_entry_id": parent,
+        "executor_source": executor_source or None,
     }
     if words:
         options["assertions_json"] = json.dumps(words)
@@ -3453,6 +3523,57 @@ def process_line(attempt: db.Attempt) -> str:
     return " · process: " + " · ".join(parts) + " (as reported by the agent)"
 
 
+def given_line(job: db.Job, attempt: db.Attempt) -> str:
+    """What this attempt was shown before it wrote, in one line.
+
+    `given: parent entry 1103 · 180 lines · ctx 16384` on a child's first
+    attempt, `given: attempt 1 · 143 lines · ctx 16384` on a repair,
+    `given: nothing` on everything else — which is every attempt this node ran
+    before 2026-09-21 and every first attempt on a job with no parent
+    (migration 016). Job 1327 on 2026-09-22 is the one this is drawn for: the
+    first attempt this node wrote with a previous sketch under the heading,
+    134 lines of it, at ctx 16384, and nothing on the page said so.
+
+    ``kind`` parent carries no entry id of its own, because for a parent
+    source there is only ever one candidate — the job's own
+    ``parent_entry_id`` — and repeating it in the record would be a second
+    place for it to be wrong. ``ctx —`` is an attempt written off the node: no
+    local context window applied to it, and an em dash is true where a number
+    would be invented.
+    """
+    given = _given_source(attempt)
+    if given is None:
+        return "given: nothing"
+    kind = str(given.get("kind") or "")
+    if kind == "parent":
+        what = f"parent entry {job.parent_entry_id}" if job.parent_entry_id else "the parent"
+    elif kind == "previous":
+        what = f"attempt {attempt.n - 1}"
+    else:  # pragma: no cover - the record's kind is one of the two
+        what = kind or "something"
+    parts = [what]
+    lines = given.get("lines")
+    if isinstance(lines, int) and not isinstance(lines, bool):
+        parts.append(f"{lines} lines")
+    if not given.get("shown"):
+        # Found, read, and over `meta.source_max_chars`: the heading carried
+        # one line naming it instead of the code, and that is a different fact
+        # about this attempt from having been given nothing at all
+        # (MEASURE[source-shown-rate] counts these).
+        parts.append("not shown (over the cap)")
+    parts.append(f"ctx {attempt.num_ctx}" if attempt.num_ctx else "ctx —")
+    return "given: " + " · ".join(parts)
+
+
+def _given_source(attempt: db.Attempt) -> dict[str, Any] | None:
+    """``attempts.given_source_json``, parsed, or None. Never raises."""
+    try:
+        found = json.loads(attempt.given_source_json) if attempt.given_source_json else None
+    except ValueError:
+        return None
+    return found if isinstance(found, dict) else None
+
+
 def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
     attempts = db.list_attempts(conn, job.id)
     attempt_n = attempts[-1].n if attempts else 0
@@ -3511,6 +3632,7 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
             f"{esc(attempt.prompt_tokens or 0)} in / {esc(attempt.completion_tokens or 0)} out · "
             f"{esc(human_seconds(attempt.wall_s))} wall"
             + process_line(attempt)
+            + f"<br>{esc(given_line(job, attempt))}"
             + "</p></section>"
         )
     if not blocks:
@@ -3544,6 +3666,18 @@ def job_page(app: App, conn: sqlite3.Connection, job: db.Job) -> str:
         ("updated (UTC)", job.updated_utc),
         ("last error", job.last_error or "—"),
     ]
+    # Migration 017, and only when it is set: a job that left the column NULL
+    # follows `meta.executor_source` like every job before 2026-09-22, and a
+    # row saying so on all of them would bury the handful that do not. The
+    # value is named as the override it is, because a reader comparing two
+    # lines needs to know which of them was told something different from the
+    # node (MEASURE[source-follow]).
+    if job.executor_source:
+        rows.insert(
+            [key for key, _ in rows].index("executor") + 1,
+            ("executor source",
+             f"{job.executor_source} — set on this job, over the node's setting"),
+        )
     provenance = "".join(
         f'<tr><th style="width:10em">{esc(key)}</th><td>{esc(value)}</td></tr>'
         for key, value in rows
@@ -5801,8 +5935,24 @@ NEW_JOB_SCRIPT = r"""<script>
 
   // Picking a parent fills the id, the card and — as spawn() would — planner and rules.
   var card = document.getElementById("parent-card");
+  // The source tick box only means something with a parent, so it is hidden
+  // until there is one. It is unhidden rather than built: it carries the
+  // hidden marker create_job reads, and a box rebuilt by this script would be
+  // a box whose clear state the server could not tell from no box at all.
+  function showSourceTick(on) {
+    ["source-tick", "source-tick-help"].forEach(function (id) {
+      var el = document.getElementById(id);
+      if (el) { el.hidden = !on; }
+    });
+  }
+  if (parentBox) {
+    parentBox.addEventListener("input", function () {
+      showSourceTick(!!parentBox.value.trim());
+    });
+  }
   function pickParent(row) {
     parentBox.value = row.dataset.parent;
+    showSourceTick(true);
     document.querySelectorAll(".pick.on").forEach(function (el) { el.classList.remove("on"); });
     row.classList.add("on");
     var rules = form.querySelector("[name=rules]");

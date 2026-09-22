@@ -2399,6 +2399,37 @@ class TestSourceFor(SourceTestCase):
         self.assertEqual(given.sha256,
                          hashlib.sha256(("// x\n" * 400).encode("utf-8")).hexdigest())
 
+    def test_the_jobs_own_column_answers_before_the_meta_row(self):
+        """Migration 017: one line as the control arm, the node left alone.
+
+        MEASURE[source-follow] is two lines from the same parent, and the
+        alternative to a per-job column is setting `meta.executor_source` to
+        `none`, queueing, and setting it back — with every job the worker
+        happened to claim in between landing in whichever arm was current.
+        """
+        _job, entry_id, _sketch = self.parent()
+        db.set_meta(self.conn, worker.SOURCE_SWITCH_KEY, "both")
+        child = self.child(entry_id, executor_source="none")
+        job = db.get_job(self.conn, child)
+        self.assertEqual("none", job.executor_source)
+        self.assertIsNone(worker.source_for(self.conn, job, 1, self.jobs))
+        # ...and the other way round: the node off, this one job on
+        db.set_meta(self.conn, worker.SOURCE_SWITCH_KEY, "none")
+        other = db.get_job(self.conn, self.child(entry_id, executor_source="parent"))
+        given = worker.source_for(self.conn, other, 1, self.jobs)
+        self.assertEqual("parent", given.kind)
+
+    def test_a_null_column_falls_back_to_the_meta_row(self):
+        """NULL is not `both`: it is whatever the node says when it runs, which
+        is what every job meant before the column existed."""
+        _job, entry_id, _sketch = self.parent()
+        job = db.get_job(self.conn, self.child(entry_id))
+        self.assertIsNone(job.executor_source)
+        self.assertEqual("parent",
+                         worker.source_for(self.conn, job, 1, self.jobs).kind)
+        db.set_meta(self.conn, worker.SOURCE_SWITCH_KEY, "none")
+        self.assertIsNone(worker.source_for(self.conn, job, 1, self.jobs))
+
     def test_the_switch_chooses_which_kinds_are_given(self):
         _job, entry_id, _sketch = self.parent()
         job = db.get_job(self.conn, self.child(entry_id))

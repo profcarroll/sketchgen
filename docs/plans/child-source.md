@@ -7,7 +7,9 @@ Grounded in the code as it stands at `main` 1c39d24 (#139). Written for Opus bui
 packet per branch, one PR each, numbering continues from `docs/plans/auto-mouse.md`
 (packets 13–16).
 
-*Status: Packet 17 built on `feat/executor-source` (2026-09-21); Packet 18 not built.*
+*Status: Packet 17 built on `feat/executor-source` (2026-09-21); Packet 18 built
+on `feat/executor-source-shown` (2026-09-22), with migration 017 for
+`jobs.executor_source` and one correction to §4.1, struck through below.*
 
 ## 0. What happens today, in one paragraph
 
@@ -154,18 +156,34 @@ writes what the packet's `inputs.source` said, which is what the agent saw).
 
 - The operator's job page (`web.py`, the attempt list): a line per attempt, *given: parent
   entry 1103 · 180 lines · ctx 16384* or *given: attempt 1 · 143 lines*, or *given: nothing*.
+  **Built 2026-09-22** with `ctx` on every line and `ctx —` where the attempt was written off
+  the node, and one more segment — *not shown (over the cap)* — for a sketch that was found
+  and was too long; ` · ` throughout, matching the dim line it joins.
 - The entry page provenance table (`gallery._provenance_rows`, `gallery.py:2084`): one row,
   **Revised from**, on entries whose kept attempt was given a source: *entry 1103's sketch,
-  180 lines, then 2 attempts on its own* — dashes when NULL. `meta.json`'s `gate` array
+  180 lines, then 2 attempts on its own* — ~~dashes when NULL~~ **absent when NULL, corrected
+  2026-09-22: a row of dashes on all 910 published entries invites the reader to wonder what
+  it lost, and the promise the packet makes instead is that every page already published
+  renders byte for byte what it did. The row appears exactly where
+  `lineage.inherits_source` is true — the kept attempt held the parent's code *and* it was
+  shown — so a parent sketch found and over the cap gets no row either: it revised nothing,
+  and the fact that it was offered is on the job page and in `meta.json`.** `meta.json`'s
+  `gate` array
   entries gain `given` from the attempt row, and the entry-level `lineage` object gains
   `inherits_source: true|false`, so the ledger can say which generations were revisions of
   code and which of prompts.
 - The New job page's parent card (`web._parent_card`, `web.py:2692`) says what the child will
   be given, in one sentence, and a checkbox *give the executor the parent's sketch* that is
   on by default and, unchecked, sets the job's `executor_source` override — a job column,
-  `jobs.executor_source TEXT`, NULL meaning *whatever `meta` says*, added in the same
-  migration as §3.3 if the packets are built together, else `017`. `lineage.spawn` sets
-  nothing; the idle loop's children follow `meta`.
+  `jobs.executor_source TEXT`, NULL meaning *whatever `meta` says*, ~~added in the same
+  migration as §3.3 if the packets are built together, else~~ `017`. `lineage.spawn` sets
+  nothing; the idle loop's children follow `meta`. **Built 2026-09-22 just outside
+  `#parent-card` rather than inside it: the page's own script replaces that element's
+  innerHTML when a parent is picked without a reload (`pickParent`), and a form field inside
+  it would be thrown away mid-form. The block is always in the DOM and `hidden` until there
+  is a parent, and it carries a hidden `source_form` marker — a clear checkbox posts nothing,
+  so without the marker "unticked" and "this form never had a box" arrive identical, and
+  those are the two different answers *this job is the control arm* and *the node decides*.**
 
 ### 4.2 The ledger
 
