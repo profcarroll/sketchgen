@@ -2256,9 +2256,10 @@ class ProcessCostTests(AgentLoopTests):
         attempt_dir = self.jobs_dir / str(job) / "attempt-1"
         self.assertFalse((attempt_dir / worker.PAID_REPLY).exists())
         self.assertFalse((attempt_dir / worker.PAID_META).exists())
-        # and the same packet lands once the cost is in it: a rejection is a
+        # and the same packet lands once the costs are in it: a rejection is a
         # re-import, not a lost attempt
         packet["items"][0]["process"] = self.PROCESS
+        packet["items"][0]["usage"] = self.USAGE
         again = paid.import_packet(self.conn, packet, ctx=self.ctx)
         self.assertEqual(len(again.recorded), 1, again.rejected)
         self.worker().run_once()
@@ -2268,11 +2269,13 @@ class ProcessCostTests(AgentLoopTests):
     def test_a_half_reported_process_is_reported_enough(self):
         job, packet = self.attempt_packet(since=self.SINCE)
         packet["items"][0]["process"] = {"output_tokens": 12000}
+        packet["items"][0]["usage"] = self.USAGE
         report = paid.import_packet(self.conn, packet, ctx=self.ctx)
         self.assertEqual(len(report.recorded), 1, report.rejected)
 
     def test_no_process_declares_the_empty_cost_instead(self):
         job, packet = self.attempt_packet(since=self.SINCE)
+        packet["items"][0]["usage"] = self.USAGE
         declared = dataclasses.replace(self.ctx, process_unreported=True)
         report = paid.import_packet(self.conn, packet, ctx=declared)
         self.assertEqual(len(report.recorded), 1, report.rejected)
@@ -2292,14 +2295,90 @@ class ProcessCostTests(AgentLoopTests):
                           .read_text(encoding="utf-8"))
         self.assertFalse(meta["process_unreported"])
 
+    # -- and the reply's own counts, for the same reason ------------------------
+
+    USAGE = {"prompt_tokens": 68935, "completion_tokens": 2493}
+
+    def test_an_empty_usage_on_a_since_job_is_rejected_and_nothing_is_written(self):
+        # Job 1319 (entry 1312, 2026-09-22): #145 got its process recorded and
+        # its usage stayed null, so the page said "—" for both counts while the
+        # transcript held them all along.
+        job, packet = self.attempt_packet(since=self.SINCE)
+        packet["items"][0]["process"] = self.PROCESS
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(report.recorded, [])
+        self.assertEqual(len(report.rejected), 1)
+        reason = report.rejected[0]["reason"]
+        self.assertIn("usage is empty", reason)
+        self.assertIn(f"python3 rig/cost.py --since {self.SINCE} --reply", reason)
+        self.assertIn("--no-usage", reason)
+        self.assertIn("Nothing was written", reason)
+        self.assertEqual(report.rejected[0]["answer"], GOOD_SKETCH)
+        self.assertEqual(db.get_job(self.conn, job).state, "needs-laptop")
+        self.assertEqual(db.list_attempts(self.conn, job), [])
+        attempt_dir = self.jobs_dir / str(job) / "attempt-1"
+        self.assertFalse((attempt_dir / worker.PAID_META).exists())
+        # the same packet lands once the counts are in it, and they reach the
+        # rows the entry page reads
+        packet["items"][0]["usage"] = self.USAGE
+        again = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(len(again.recorded), 1, again.rejected)
+        self.worker().run_once()
+        attempt = db.list_attempts(self.conn, job)[0]
+        self.assertEqual((attempt.prompt_tokens, attempt.completion_tokens), (68935, 2493))
+        entry = self.entry_of(job)
+        self.assertEqual((entry["prompt_tokens"], entry["completion_tokens"]), (68935, 2493))
+
+    def test_the_process_is_asked_for_before_the_usage(self):
+        # One command fills both; the reason names the first thing missing.
+        job, packet = self.attempt_packet(since=self.SINCE)
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertIn("process is empty", report.rejected[0]["reason"])
+        self.assertIn("--reply", report.rejected[0]["reason"])
+
+    def test_a_half_reported_usage_is_reported_enough(self):
+        job, packet = self.attempt_packet(since=self.SINCE)
+        packet["items"][0]["process"] = self.PROCESS
+        packet["items"][0]["usage"] = {"completion_tokens": 2493}
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(len(report.recorded), 1, report.rejected)
+
+    def test_no_usage_declares_the_blank_counts_instead(self):
+        job, packet = self.attempt_packet(since=self.SINCE)
+        packet["items"][0]["process"] = self.PROCESS
+        declared = dataclasses.replace(self.ctx, usage_unreported=True)
+        report = paid.import_packet(self.conn, packet, ctx=declared)
+        self.assertEqual(len(report.recorded), 1, report.rejected)
+        meta = json.loads((self.jobs_dir / str(job) / "attempt-1" / worker.PAID_META)
+                          .read_text(encoding="utf-8"))
+        self.assertTrue(meta["usage_unreported"])
+        self.assertFalse(meta["process_unreported"])
+        self.assertEqual(meta["usage"], paid.EMPTY_USAGE)
+        # declared is still not reported: the rows stay null, never zero
+        self.worker().run_once()
+        attempt = db.list_attempts(self.conn, job)[0]
+        self.assertEqual((attempt.prompt_tokens, attempt.completion_tokens), (None, None))
+
+    def test_a_job_without_since_made_no_promise_about_usage_either(self):
+        job, packet = self.attempt_packet(since=None)
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(len(report.recorded), 1, report.rejected)
+        meta = json.loads((self.jobs_dir / str(job) / "attempt-1" / worker.PAID_META)
+                          .read_text(encoding="utf-8"))
+        self.assertFalse(meta["usage_unreported"])
+
     def test_the_import_flag_reaches_the_context(self):
         from sketchgen.cli import paid as cli
         parser = argparse.ArgumentParser()
         cli.register(parser.add_subparsers(dest="command"))
         args = parser.parse_args(["paid", "import", "--no-process", "-"])
         self.assertTrue(cli._ctx(args).process_unreported)
+        self.assertFalse(cli._ctx(args).usage_unreported)
+        args = parser.parse_args(["paid", "import", "--no-usage", "-"])
+        self.assertTrue(cli._ctx(args).usage_unreported)
         args = parser.parse_args(["paid", "import", "-"])
         self.assertFalse(cli._ctx(args).process_unreported)
+        self.assertFalse(cli._ctx(args).usage_unreported)
 
     def test_the_tries_alone_are_recorded_when_the_agent_reports_nothing(self):
         job, _report = self.drive(tries=2)

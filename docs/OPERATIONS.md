@@ -1599,8 +1599,15 @@ model it did not run, so it measures what it can and records what it is told:
 `round_trip_s`, export to import, goes on the attempt as `wall_s` (and into
 `plan.json` for the plan), and the token counts an agent puts in an item's
 `usage` land as `prompt_tokens` / `completion_tokens`; unreported counts stay
-null, never zero. The entry page says "as reported by the model" and "round
-trip, export to import" beside those numbers, and an off-node entry's shape
+null, never zero. A Claude Code session can report them: its transcript
+carries the API's `usage` on every assistant message, and the message that
+wrote the reply has the reply's own — what it read (`input_tokens` and both
+cache counts) and what it generated, thinking included. `rig/cost.py --reply
+FILE` finds that message by the reply's text and prints both counts beside
+`process`. Until 2026-09-22 nothing read them: job 1319 (entry 1312) landed
+with its process recorded under #145 and both counts still blank, and so did
+every paid entry before it. The entry page says "as reported by the model" and
+"round trip, export to import" beside those numbers, and an off-node entry's shape
 reads `off-node (MODEL) · gated on SHAPE` — the node only gated it. A local
 entry's shape is the IMDS-identified one (`meta.node_shape`, e.g.
 `VM.Standard.A1.Flex 16/96`) when the node has identified itself.
@@ -1632,7 +1639,13 @@ apart (dossier 01 §6.4):
   declaration is kept in the attempt's `paid.json` as `process_unreported`.
   Job 1308 (entry 1300, 2026-09-21) is why: a `--since` job whose agent never
   ran `cost.py`, landed in silence, and a page of dashes that could not say
-  whether the cost was uncountable or uncounted.
+  whether the cost was uncountable or uncounted. An all-null `usage` on the
+  same kind of job is rejected the same way, with the same command
+  (`rig/cost.py --since … --reply FILE` fills both), unless `paid import
+  --no-usage` says cost.py could not find the reply in one message of the
+  transcript — a reply edited in place across several tool calls — and that
+  is kept as `usage_unreported`. The process check comes first, so a packet
+  missing both is told once.
 
 Two more columns carry what only the agent knows: `jobs.since_utc` from `paid
 start --since ISO` (what its first `date -u +%FT%TZ` printed; a stamp in the

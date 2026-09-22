@@ -213,13 +213,32 @@ class FetchP5Tests(unittest.TestCase):
 
 
 class CostTests(unittest.TestCase):
-    """Acceptance 4: the meter reads a transcript the same way every time."""
+    """Acceptance 4: the meter reads a transcript the same way every time.
+
+    The last line is one object to merge into a packet item: `process`, the
+    window's total, and `usage`, the reply's own counts. The fixture's msg_d
+    wrote a reply (a heredoc into answer.txt) and msg_e copied it into an
+    import; job 1319 (entry 1312, 2026-09-22) is why the reply's usage is here
+    at all: #145 got the process recorded and the two counts a local attempt
+    always has stayed blank, because nothing read them off the transcript.
+    """
+
+    REPLY = ("```js\nfunction setup() { createCanvas(800, 600); }\n"
+             "function draw() { background(frameCount % 255); }\n```\n"
+             "A statement about it.\n")
 
     def cost(self, *args):
         return subprocess.run(
             [sys.executable, str(RIG / "cost.py"), "--transcript", str(FIXTURE), *args],
             capture_output=True, text=True, check=False,
         )
+
+    def reply_file(self, text):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = Path(d) / "answer.txt"
+        path.write_text(text, encoding="utf-8")
+        return str(path)
 
     def test_a_window_reproduces_its_line(self):
         result = self.cost("--since", "2026-09-21T17:00:00Z",
@@ -232,9 +251,12 @@ class CostTests(unittest.TestCase):
         # both of them; three images in the tool results.
         self.assertEqual(lines[1], "2 assistant messages, 3 tool calls, 3 screenshots")
         self.assertEqual(lines[2], "2,300 tokens generated, 1,300 of them thinking (56%)")
-        self.assertEqual(json.loads(lines[3]), {
-            "session_s": 1800, "output_tokens": 2300, "thinking_tokens": 1300,
-            "tool_calls": 3, "screenshots": 3,
+        self.assertEqual(lines[3], "reply: not looked for; --reply FILE names the file "
+                                   "it was written to")
+        self.assertEqual(json.loads(lines[4]), {
+            "usage": {"prompt_tokens": None, "completion_tokens": None},
+            "process": {"session_s": 1800, "output_tokens": 2300, "thinking_tokens": 1300,
+                        "tool_calls": 3, "screenshots": 3},
         })
 
     def test_the_whole_transcript_spans_its_own_stamps(self):
@@ -242,12 +264,56 @@ class CostTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         lines = result.stdout.splitlines()
         self.assertEqual(lines[0], "17:02:11Z -> 18:00:00Z  57 min 49 s")
-        self.assertEqual(json.loads(lines[3])["output_tokens"], 7300)
+        self.assertEqual(json.loads(lines[4])["process"]["output_tokens"], 10226)
 
     def test_an_empty_window_exits_1(self):
         result = self.cost("--since", "2026-09-22T00:00:00Z")
         self.assertEqual(result.returncode, 1)
         self.assertIn("nothing in that window", result.stderr)
+
+    # -- the reply's own counts ------------------------------------------------
+
+    def test_the_reply_s_usage_is_the_message_that_wrote_it(self):
+        # msg_d wrote it at 17:40 and msg_e copied it into an import at 17:50:
+        # the earliest is the one that generated it, and the copy is counted
+        # as a copy. prompt_tokens is everything that message read (input and
+        # both caches), completion_tokens everything it generated.
+        result = self.cost("--since", "2026-09-21T17:00:00Z", "--until", "2026-09-21T18:00:00Z",
+                           "--reply", self.reply_file(self.REPLY))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[3], "reply: written at 17:40:00Z, 68,935 tokens read, "
+                                   "2,493 generated, and 1 later copy")
+        found = json.loads(lines[4])
+        self.assertEqual(found["usage"], {"prompt_tokens": 68935, "completion_tokens": 2493})
+        # and the window's total is still the window's total
+        self.assertEqual(found["process"]["output_tokens"], 10226)
+
+    def test_a_reply_without_a_js_block_is_matched_whole(self):
+        # A plan is Brief and Assertions with no fence: the whole text is the key.
+        result = self.cost("--reply", self.reply_file("A statement about it.\n"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout.splitlines()[4])["usage"],
+                         {"prompt_tokens": 68935, "completion_tokens": 2493})
+
+    def test_a_reply_no_single_message_wrote_leaves_usage_null(self):
+        # Edited in place across several tool calls, or written outside the
+        # window: not found is the truth, and null is what the node records.
+        result = self.cost("--reply", self.reply_file("```js\nfunction draw() {}\n```\n"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[3], "reply: not found in one message of this window; "
+                                   "usage left null")
+        self.assertEqual(json.loads(lines[4])["usage"],
+                         {"prompt_tokens": None, "completion_tokens": None})
+        outside = self.cost("--since", "2026-09-21T17:00:00Z", "--until", "2026-09-21T17:30:00Z",
+                            "--reply", self.reply_file(self.REPLY))
+        self.assertIn("not found in one message", outside.stdout)
+
+    def test_an_empty_reply_file_exits_1(self):
+        result = self.cost("--reply", self.reply_file("  \n"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("the reply is empty", result.stderr)
 
 
 @unittest.skipUnless(shutil.which("git"), "needs git")
