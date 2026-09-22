@@ -12,7 +12,7 @@ the kiosk's `?ghost=` and `responds` in `kiosk.json`. Packet 14 is built — bra
 `meta.json`'s `ghost`, and the bullet in AGENTS.md. Packet 15 is built — branch
 `feat/ghost-gate`: the gate's ghost window and `ghost.png`, `HARNESS_VERSION` 3, the
 `ghost-echo` fixture, and the file on the entry page, the attempt page and a `try`
-verdict. Packet 16 is built — branch `feat/ghost-critic`: `lineage.critic_images`
+verdict. Packet 16 is built — branch `feat/ghost-critic`, PR #147: `lineage.critic_images`
 and the `images: strip ghost` header line, the two-image payload, `ghost_path` on a
 paid critique item, and the operator's recipe for cutting `critic-v4`; option 1, and
 `prompts/critic.md` is not touched. Two things are corrected
