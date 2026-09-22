@@ -791,7 +791,12 @@ class RevisedFromTests(GalleryTestCase):
         self.given(self.ids[1], self.PARENT)
         self.render()
         gate = self.meta_for(self.ids[1])["gate"]
-        self.assertEqual(self.PARENT, gate[0]["given"])
+        # the record less its node path: the public gallery names nothing on
+        # the node's filesystem (gallery.GIVEN_KEYS)
+        published = {k: v for k, v in self.PARENT.items() if k != "path"}
+        self.assertEqual(published, gate[0]["given"])
+        self.assertNotIn("path", gate[0]["given"])
+        self.assertNotIn("/home/", json.dumps(gate))
         self.assertEqual(16384, gate[0]["num_ctx"])
         # and the entry whose attempts were never given anything says null,
         # which is every entry this gallery published before 2026-09-21
