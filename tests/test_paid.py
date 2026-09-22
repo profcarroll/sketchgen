@@ -11,6 +11,7 @@ path would have got, lands the same rows the local path lands (plan §5.1).
 
 import argparse
 import dataclasses
+import hashlib
 import json
 import os
 import shutil
@@ -511,7 +512,8 @@ class ExecuteTests(PaidTestCase):
         reply = self.tmp / "reply.txt"
         reply.write_text(GOOD_SKETCH, encoding="utf-8")
 
-        def replay(*, brief, assertions, rules_file, out_dir, model, host):
+        def replay(*, brief, assertions, rules_file, out_dir, model, host,
+                   num_ctx=None):
             return worker.Execution.from_result(executor.run(
                 brief=brief, assertions=assertions, rules_file=rules_file,
                 model="claude-opus-5", host=host, out_dir=out_dir, stub=reply))
@@ -621,12 +623,134 @@ class ExecuteTests(PaidTestCase):
         self.assertEqual(again.recorded, [])
         self.assertIn("not waiting", again.rejected[0]["reason"])
 
+    def test_the_item_no_longer_points_at_a_file_the_agent_cannot_open(self):
+        """`inputs.previous_sketch` was a node path; the code is in the prompt
+        now (child-source.md §3.1)."""
+        self.gate = test_worker.StubGate([1, 0])
+        self.park()
+        self.answer()
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.worker().run_once()
+        item = self.export()["items"][0]
+        self.assertNotIn("previous_sketch", item["inputs"])
+        self.assertIn("source", item["inputs"])
+
     def test_the_executor_menu_offers_no_paid_model(self):
         with mock.patch.dict(os.environ, PAID_ENV), \
                 mock.patch.object(web.models, "catalogue", return_value=[]):
             offered = [v for v, _ in dict(web.executor_groups())["off this node"]]
             self.assertEqual(offered, [])
             self.assertNotIn("paid", web.executor_values())
+
+
+class ExecuteSourceTests(ExecuteTests):
+    """The sketch being revised travels in the packet, not as a path.
+
+    An off-node agent cannot open `/home/ubuntu/sketchgen/jobs/…`, which is
+    what `inputs.previous_sketch` used to hand it. Packet 17 puts the code in
+    the prompt through the worker's own helper, so the agent and a local model
+    read the same words, and records in `inputs.source` which sketch that was.
+    """
+
+    PARENT_JS = "function setup(){ createCanvas(800, 600); }\nfunction draw(){}\n"
+
+    def parent(self, js=None):
+        """Give a published entry a sketch on disk, and return its id."""
+        entry_id = self.ids[0]
+        row = db.get_entry(self.conn, entry_id)
+        where = self.jobs_dir / str(row["job_id"]) / "attempt-1"
+        where.mkdir(parents=True, exist_ok=True)
+        (where / "sketch.js").write_text(js or self.PARENT_JS, encoding="utf-8")
+        self.conn.execute("UPDATE entries SET source_dir = ? WHERE id = ?",
+                          (str(where), entry_id))
+        return entry_id
+
+    def queue(self, executor_model="claude-opus-5", max_attempts=3,
+              rules="random"):
+        """ExecuteTests.queue's job, spawned from a parent that has a sketch."""
+        return db.enqueue(self.conn, "a breathing field", "octocat",
+                          brief="A grey field that brightens and dims, forever.",
+                          assertions=["motion(idle)"], executor=executor_model,
+                          rules_file=rules, max_attempts=max_attempts,
+                          parent_entry_id=self.parent())
+
+    def test_the_packet_carries_the_parent_fenced_and_names_it_in_inputs(self):
+        self.park()
+        item = self.export()["items"][0]
+        self.assertIn(worker.PARENT_HEADING, item["prompt"])
+        self.assertIn("```js\n" + self.PARENT_JS.rstrip() + "\n```", item["prompt"])
+        source = item["inputs"]["source"]
+        self.assertEqual(source["kind"], "parent")
+        self.assertEqual(source["lines"], 2)
+        self.assertTrue(source["shown"])
+        self.assertEqual(
+            source["sha256"],
+            hashlib.sha256(self.PARENT_JS.encode("utf-8")).hexdigest(),
+        )
+        # a node path is not something the agent was shown, so it is not here
+        self.assertNotIn("path", source)
+
+    def test_the_attempt_records_what_the_packet_said_it_showed(self):
+        job_id = self.park()
+        self.answer()
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.worker().run_once()
+        attempt = db.list_attempts(self.conn, job_id)[0]
+        record = json.loads(attempt.given_source_json)
+        self.assertEqual(record["kind"], "parent")
+        self.assertEqual(
+            record["sha256"],
+            hashlib.sha256(self.PARENT_JS.encode("utf-8")).hexdigest(),
+        )
+        # NULL, and not 8192: no local context window applied to a reply
+        # written somewhere else.
+        self.assertIsNone(attempt.num_ctx)
+
+    def test_a_packet_cut_before_the_source_changed_is_refused(self):
+        """The guard covers the code as well as the evidence now.
+
+        Attempt 2's packet is an answer to attempt 1's sketch. If that sketch
+        is not the one the job holds any more, the reply is an answer to a
+        different question, and it is refused with nothing written — the same
+        bargain a moved evidence already had.
+        """
+        self.gate = test_worker.StubGate([1, 0])
+        job_id = self.park()
+        self.answer()
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.worker().run_once()
+
+        packet = self.export()
+        item = packet["items"][0]
+        self.assertEqual(item["inputs"]["attempt"], 2)
+        self.assertEqual(item["inputs"]["source"]["kind"], "previous")
+        self.assertIn(worker.PREVIOUS_HEADING, item["prompt"])
+        item["answer"] = GOOD_SKETCH
+
+        sketch = self.jobs_dir / str(job_id) / "attempt-1" / "sketch.js"
+        sketch.write_text("function setup(){ /* not what you read */ }\n",
+                          encoding="utf-8")
+        report = paid.import_packet(self.conn, packet, ctx=self.ctx)
+        self.assertEqual(report.recorded, [])
+        self.assertIn("source no longer matches", report.rejected[0]["reason"])
+        self.assertEqual(db.get_job(self.conn, job_id).state, "needs-laptop")
+        self.assertEqual(len(db.list_attempts(self.conn, job_id)), 1)
+
+    def test_the_same_packet_lands_when_nothing_moved(self):
+        """The other half: the guard refuses a change, not the mechanism."""
+        self.gate = test_worker.StubGate([1, 0])
+        job_id = self.park()
+        self.answer()
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.worker().run_once()
+        _packet, report = self.answer()
+        self.assertEqual(report.rejected, [])
+        with mock.patch.dict(os.environ, PAID_ENV):
+            self.worker().run_once()
+        self.assertEqual(db.get_job(self.conn, job_id).state, "held")
+        kinds = [json.loads(a.given_source_json)["kind"]
+                 for a in db.list_attempts(self.conn, job_id)]
+        self.assertEqual(["parent", "previous"], kinds)
 
 
 class Migration014Tests(unittest.TestCase):
@@ -2086,7 +2210,10 @@ class Migration015Tests(unittest.TestCase):
         entries = dict(conn.execute("SELECT * FROM entries WHERE id = ?",
                                     (entry_id,)).fetchone())
 
-        self.assertEqual(db.migrate(conn), [15])
+        # 015 and only 015: the directory is capped so this stays a test of
+        # one migration as later ones are written (016 is the next).
+        self.assertEqual(db.migrate(conn, migrations_upto(15, tmp / "migrations")),
+                         [15])
         self.assertEqual(db.schema_version(conn), 15)
 
         job = db.get_job(conn, job_id)
@@ -2113,7 +2240,7 @@ class Migration015Tests(unittest.TestCase):
         self.assertIn(15, db.init(tmp / "fresh.db"))
         conn = db.connect(tmp / "fresh.db")
         self.addCleanup(conn.close)
-        self.assertEqual(db.schema_version(conn), 15)
+        self.assertGreaterEqual(db.schema_version(conn), 15)
         self.assertGreaterEqual(db.schema_version(self.fixture()), 15)
 
     def fixture(self):
@@ -2122,6 +2249,57 @@ class Migration015Tests(unittest.TestCase):
         conn, _ids = test_judge.build_entries(tmp)
         self.addCleanup(conn.close)
         return conn
+
+
+class Migration016Tests(unittest.TestCase):
+    """Two nullable columns on `attempts`, and nothing already written moves.
+
+    The promise attached to 016 is the one attached to 015: a node mid-deploy,
+    with rows written under 015, reads them all back afterwards, and the new
+    columns are NULL on every one of them — which is the true thing to say
+    about an attempt that was shown no sketch, as every attempt before
+    2026-09-21 was.
+    """
+
+    def test_a_database_at_015_keeps_every_row_and_gains_the_columns(self):
+        tmp = Path(tempfile.mkdtemp(prefix="sketchgen-016-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        conn = db.connect(tmp / "old.db")
+        self.addCleanup(conn.close)
+        db.migrate(conn, migrations_upto(15, tmp / "migrations"))
+        self.assertEqual(db.schema_version(conn), 15)
+
+        job_id = db.enqueue(conn, "a tide of slow lines", "octocat", brief="a brief")
+        db.add_attempt(conn, job_id, 1, model="qwen3-coder:30b", wall_s=120.0,
+                       prompt_tokens=2100, completion_tokens=3300, gate_exit=0,
+                       process_json='{"tries": 2}')
+        before = dict(conn.execute("SELECT * FROM attempts WHERE job_id = ?",
+                                   (job_id,)).fetchone())
+
+        self.assertEqual(db.migrate(conn, migrations_upto(16, tmp / "migrations")),
+                         [16])
+        self.assertEqual(db.schema_version(conn), 16)
+
+        after = dict(conn.execute("SELECT * FROM attempts WHERE job_id = ?",
+                                  (job_id,)).fetchone())
+        self.assertEqual(before, {k: v for k, v in after.items() if k in before})
+        row = db.list_attempts(conn, job_id)[0]
+        self.assertIsNone(row.given_source_json)
+        self.assertIsNone(row.num_ctx)
+        # and they are written through the verb, not by hand
+        db.add_attempt(conn, job_id, 2, model="qwen3-coder:30b",
+                       given_source_json='{"kind": "previous"}', num_ctx=16384)
+        second = db.list_attempts(conn, job_id)[1]
+        self.assertEqual(second.num_ctx, 16384)
+        self.assertEqual(json.loads(second.given_source_json)["kind"], "previous")
+
+    def test_db_init_applies_it(self):
+        tmp = Path(tempfile.mkdtemp(prefix="sketchgen-016-init-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.assertIn(16, db.init(tmp / "fresh.db"))
+        conn = db.connect(tmp / "fresh.db")
+        self.addCleanup(conn.close)
+        self.assertGreaterEqual(db.schema_version(conn), 16)
 
 
 class ProcessCostTests(AgentLoopTests):

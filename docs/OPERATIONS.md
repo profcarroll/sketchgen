@@ -173,6 +173,58 @@ Each job has a directory under `$SKETCHGEN_JOBS` (default `~/sketchgen/jobs`):
 the sketch, and the gate's own output under `attempt-N/.gate/`. That is the
 canonical record of what happened; the database rows point at it.
 
+## What the executor is shown
+
+Since 2026-09-21 an attempt is given the sketch it is revising, under a heading
+inside the brief, in the prompt the node writes to `attempt-N/prompt.txt`:
+
+- **`## The sketch this revises`** — on attempt 1 of a job spawned from a
+  critique, the parent entry's kept `sketch.js`, the one `entries.source_dir`
+  points at.
+- **`## Your previous attempt, which the gate sent back`** — on every attempt
+  after the first, that job's own attempt *n*−1, above the gate's evidence
+  about it. A child's attempt 2 gets its own attempt 1 and not the parent: the
+  parent is two steps back by then.
+
+Before this, the only thing carried from one sketch to its revision was prose —
+the critic's one sentence, or the gate's findings — and entry 1103 is what that
+cost: five attempts, the photograph and the `responds(drag)` that passed in
+attempt 1 both gone by attempt 4, each attempt written from a blank page. The
+executor template did not change and `executor-v3` is still the arm label the
+rules-file A/B measures; what each attempt was given is recorded per attempt in
+`attempts.given_source_json`, with the context window it ran under in
+`attempts.num_ctx` (16384 with a sketch in the prompt, 8192 without).
+
+Two `meta` rows govern it, and `sketchgen executor-source` is the verb:
+
+```
+# on the node: read both
+$SG executor-source --db ~/sketchgen/sketchgen.db
+
+# the control batch for MEASURE[source-follow]: byte for byte the prompt this
+# node sent before 2026-09-21
+$SG executor-source --db ~/sketchgen/sketchgen.db --set none
+
+# back on; `parent` and `previous` give one kind and not the other
+$SG executor-source --db ~/sketchgen/sketchgen.db --set both
+
+# the length over which a sketch is named in one line instead of shown
+$SG executor-source --db ~/sketchgen/sketchgen.db --max-chars 12000
+```
+
+The worker reads both rows at the top of every attempt, so a change lands on
+the next attempt claimed: no restart, no deploy, and nothing in flight moves.
+Over the cap the heading carries one line — *N lines, longer than the M
+characters this prompt has room for; not shown* — and the evidence stands alone
+as it did before; whole or not at all, because a model handed half a sketch
+rewrites the half it cannot see.
+
+A paid attempt gets the same words: `paid export --step execute` renders the
+prompt through the same helper, and the item's `inputs.source` names the kind,
+the sha256, the line count and whether it was shown. The guard covers that hash
+as well as the evidence, so a packet cut before the sketch changed under it is
+refused at import with nothing written — export again.
+
 ## What the worker does when the queue is empty
 
 Nothing stays idle for long. With an empty queue and `control: running`, the
