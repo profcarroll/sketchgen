@@ -261,6 +261,57 @@ Raise the limit back (or resume) when you want it, and the pass picks up where
 it left off: the rows already in `critiques` under the new version are what it
 counts as done.
 
+### Showing the critic the ghost window (cutting critic-v4)
+
+Since 2026-09-21 the gate plays a ghost pointer after its probes and writes
+`ghost.png` beside `strip.png`: the same sketch with something clicking and
+dragging it. The critic can be shown both, and the code for it is in (Packet 16,
+`docs/plans/auto-mouse.md` §6) — but it is off until you say so, because turning
+it on means cutting a new critic prompt version, which is the burst of work
+above. Entry 1103, the jigsaw, is what it is for: four identical frames of a
+photograph cut into pieces that never move, and a critic that can only ask for a
+different photograph.
+
+The switch is `prompts/critic.md` and nothing else. Two lines at the top, in
+this order:
+
+```
+prompt_version: critic-v4
+images: strip ghost
+```
+
+and one sentence in the body, in the WHAT THE SKETCH ACTUALLY SHOWS section,
+saying what the second picture is:
+
+> The second image is the same sketch under a pointer that clicked and dragged
+> it; nobody was at the keyboard.
+
+`images:` is read from the header only, `strip` is always first and never
+optional, and a name the reader does not know is ignored. With the line absent —
+critic-v3 as it stands — the payload is the strip alone, byte for byte what it
+has always been. **The presence of `ghost.png` never switches it on by itself**,
+and that is deliberate: critiques are comparable only within one prompt version,
+so a version that was sighted for some entries and half-sighted for others would
+have nothing to measure. An entry with no ghost window is still critiqued, over
+the strip alone, with the reason in the worker's log — nothing re-gates a
+published entry, so most of the gallery will never have one.
+
+Run it as a deliberate batch, not as a surprise on a Sunday:
+
+1. `SKETCHGEN_IDLE_CRITIQUE=0` in the worker unit's environment, restart, and
+   confirm the worker is quiet — this is the burst-of-work section's first
+   switch, and every published entry becomes critiquable again the moment the
+   version changes.
+2. Edit `prompts/critic.md`, deploy (`update.sh --no-render`; the prompt file is
+   read from disk on every critique, so nothing else has to change).
+3. Raise `SKETCHGEN_IDLE_CRITIQUE` back and watch the first few rounds. The log
+   line `entry N was critiqued over two images` names both sha256s; `entry N has
+   no ghost.png` is the other half of the population and is not an error.
+4. Keep the batch as its own batch. MEASURE[critic-quality] is the same parents
+   critiqued blind and then over two images, and MEASURE[ghost-coverage] — how
+   many entries even have a ghost window whose frames differ from their strip —
+   is what says whether the second image was worth a version at all.
+
 ## When a job goes wrong
 
 Two things the worker does for itself, both written after job 5 spent a night
