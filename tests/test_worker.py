@@ -290,7 +290,7 @@ class WorkerTestCase(unittest.TestCase):
     def make_worker(self, *, executor_fn=None, gate_fn=None, planner_fn=None,
                     probe=None, judge_fn=None, critic_fn=None, spawn_fn=None,
                     idle_judge=0, idle_critique=0, lineage_depth=3,
-                    log_stream=None):
+                    log_stream=None, warm_fn=None, resident_fn=None):
         """A worker with everything external stubbed.
 
         Idle work is off by default, so a test that does not ask for it cannot
@@ -311,6 +311,8 @@ class WorkerTestCase(unittest.TestCase):
             lineage_depth=lineage_depth,
             probe=probe or (lambda: dict(FREE_SLOT)),
             log_stream=log_stream or self.log,
+            warm_fn=warm_fn,
+            resident_fn=resident_fn,
         )
 
     def attempts(self, job_id):
@@ -2687,3 +2689,100 @@ class TestExecutorSourceVerb(SourceTestCase):
         self.assertEqual(self.run_cli("--set", "sometimes").returncode, 2)
         self.assertEqual(self.run_cli("--max-chars", "0").returncode, 3)
         self.assertIsNone(db.get_meta(self.conn, worker.SOURCE_MAX_CHARS_KEY))
+
+
+class TestTheCardSaysLoadingBeforeWriting(WorkerTestCase):
+    """The process card stops calling a model load "Writing the sketch".
+
+    Until 2026-09-22 one activity row spanned the load, the prefill and the
+    decode, so a cold model showed *Writing the sketch* for minutes before a
+    token existed — job 1357 for 377 s, 47% of it before the first one; job 1364
+    for 276.1 s. See Worker._warm_for and docs/plans/model-load-cost.md.
+    """
+
+    def resident(self, mapping, error=None):
+        """A stub /api/ps: what is loaded, and at which context."""
+        return lambda host, **kwargs: (dict(mapping), error)
+
+    def recorder(self, took=1.5, raises=None):
+        calls = []
+
+        def warm(host, model, num_ctx, **kwargs):
+            calls.append({"host": host, "model": model, "num_ctx": num_ctx})
+            if raises is not None:
+                raise raises
+            return took
+
+        warm.calls = calls
+        return warm
+
+    def test_a_cold_model_gets_its_own_step_before_writing(self):
+        self.enqueue("cold start", executor="qwen3.5:9b")
+        warm = self.recorder()
+        self.make_worker(
+            warm_fn=warm, resident_fn=self.resident({})
+        ).run_once()
+        steps = self.steps()
+        self.assertIn("loading", steps)
+        self.assertLess(steps.index("loading"), steps.index("writing"))
+        row = next(r for r in self.activity_rows() if r["step"] == "loading")
+        self.assertEqual("Loading a new model", row["headline"])
+        self.assertEqual("qwen3.5:9b", row["model"])
+        self.assertEqual(
+            [{"host": worker.DEFAULT_HOST, "model": "qwen3.5:9b",
+              "num_ctx": executor.DEFAULT_NUM_CTX}],
+            warm.calls,
+        )
+
+    def test_the_loading_step_closes_when_writing_opens(self):
+        self.enqueue("cold start", executor="qwen3.5:9b")
+        self.make_worker(
+            warm_fn=self.recorder(), resident_fn=self.resident({})
+        ).run_once()
+        row = next(r for r in self.activity_rows() if r["step"] == "loading")
+        self.assertIsNotNone(row["ended_utc"])
+
+    def test_a_resident_model_at_the_same_context_says_nothing(self):
+        self.enqueue("already up", executor="qwen3.5:9b")
+        warm = self.recorder()
+        self.make_worker(
+            warm_fn=warm,
+            resident_fn=self.resident({"qwen3.5:9b": executor.DEFAULT_NUM_CTX}),
+        ).run_once()
+        self.assertNotIn("loading", self.steps())
+        self.assertEqual([], warm.calls)
+
+    def test_resident_at_a_different_context_still_loads(self):
+        """Ollama keys a runner on its context size; 8192 does not serve 16384."""
+        self.enqueue("wrong window", executor="qwen3.5:9b")
+        warm = self.recorder()
+        self.make_worker(
+            warm_fn=warm, resident_fn=self.resident({"qwen3.5:9b": 4096})
+        ).run_once()
+        self.assertIn("loading", self.steps())
+        self.assertEqual(executor.DEFAULT_NUM_CTX, warm.calls[0]["num_ctx"])
+
+    def test_an_unreachable_ollama_leaves_the_card_as_it_was(self):
+        self.enqueue("no ps", executor="qwen3.5:9b")
+        warm = self.recorder()
+        self.make_worker(
+            warm_fn=warm, resident_fn=self.resident({}, error="did not answer"),
+        ).run_once()
+        self.assertNotIn("loading", self.steps())
+        self.assertEqual([], warm.calls)
+
+    def test_a_failed_load_does_not_cost_the_attempt(self):
+        """The attempt runs and the job still lands; only the card is poorer."""
+        job_id = self.enqueue("load blows up", executor="qwen3.5:9b")
+        self.make_worker(
+            warm_fn=self.recorder(raises=OSError("connection reset")),
+            resident_fn=self.resident({}),
+        ).run_once()
+        self.assertIn("writing", self.steps())
+        self.assertEqual("held", db.get_job(self.conn, job_id).state)
+
+    def test_warming_is_off_whenever_the_executor_is_stubbed(self):
+        """A stubbed run calls no model, so it must open no socket."""
+        w = self.make_worker(executor_fn=StubExecutor())
+        self.assertIsNone(w.warm_fn)
+        self.assertIsNone(w.resident_fn)
