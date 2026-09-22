@@ -2106,6 +2106,19 @@ class Worker:
             strip_path=getattr(critique, "strip_path", "") or None,
             strip_sha256=getattr(critique, "strip_sha256", "") or None,
         )
+        # What the critic was actually shown, when a critic prompt asks for the
+        # gate's ghost frames as well (auto-mouse.md §6, 2026-09-21). Migration
+        # 009 gave the strip two columns and the second image has none, so this
+        # line is where the record of it lives; a `ghost_sha256` column is the
+        # honest place for it if it ever has to be audited rather than read.
+        if getattr(critique, "ghost_sha256", ""):
+            self.log(
+                f"idle: entry {entry_id} was critiqued over two images: strip "
+                f"{str(getattr(critique, 'strip_sha256', ''))[:12]} and ghost "
+                f"{critique.ghost_sha256[:12]} at {critique.ghost_path}"
+            )
+        elif getattr(critique, "ghost_note", ""):
+            self.log(f"idle: {critique.ghost_note}")
         if job_id is None:
             self.log(f"idle: critiqued entry {entry_id}, spawned nothing: {reason}")
         else:

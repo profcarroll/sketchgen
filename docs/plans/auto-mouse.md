@@ -12,7 +12,10 @@ the kiosk's `?ghost=` and `responds` in `kiosk.json`. Packet 14 is built — bra
 `meta.json`'s `ghost`, and the bullet in AGENTS.md. Packet 15 is built — branch
 `feat/ghost-gate`: the gate's ghost window and `ghost.png`, `HARNESS_VERSION` 3, the
 `ghost-echo` fixture, and the file on the entry page, the attempt page and a `try`
-verdict. Packet 16 is still a draft for the operator's review. Two things are corrected
+verdict. Packet 16 is built — branch `feat/ghost-critic`, PR #147: `lineage.critic_images`
+and the `images: strip ghost` header line, the two-image payload, `ghost_path` on a
+paid critique item, and the operator's recipe for cutting `critic-v4`; option 1, and
+`prompts/critic.md` is not touched. Two things are corrected
 where they stand: `DECIDE[ghost-off]` says the key is `G`, and `G` is the generation
 overlay — the key built is `M`; and §5.1 does not say what `console_clean` is read over,
 which turned out to matter (see the dated note there).*
@@ -327,6 +330,21 @@ person on the compare page. Three ways to give them the ghost window, and one re
 differs from their strip. The packet builds the two-image path behind the prompt version, so
 turning it on is editing `prompts/critic.md`; it does not edit that file itself. The judge is
 left as it is and recorded in §7.
+
+**How the prompt asks, and what it does when there is nothing to show — added 21
+September 2026, in the build.** The recommendation says *behind the prompt version* and
+does not say how a prompt file says so. It is a second header line, `images: strip
+ghost`, under `prompt_version:`, read by `lineage.critic_images` from the header block
+only and dropped out of the rendered prompt with the version line; absent means `strip`
+alone, which is critic-v3 byte for byte. Two things fell out of building it. An entry
+the prompt asks about that has no `ghost.png` is critiqued over the strip alone and
+**never refused** — nothing re-gates a published entry, so refusing would stop the idle
+loop on the first entry it reached — and the reason goes in the worker's log line.
+And the second image gets no column: migration 009 gave the strip `strip_path` and
+`strip_sha256`, and a matching pair for a picture most entries will never have is a
+migration to record an absence, so what was shown is in the log (`entry N was critiqued
+over two images: strip … and ghost …`). A `ghost_sha256` column is the honest follow-up
+if a critique's second picture ever has to be audited rather than read.
 
 Tests: `tests/test_lineage.py`: two images in the payload when `ghost.png` exists and the
 prompt asks for it, one otherwise; the prompt-version bump is what switches it, not the

@@ -8,6 +8,7 @@ sketch_gate.py's real schema, so the evidence builder is tested against the shap
 the gate actually produces rather than against a convenient fiction.
 """
 
+import hashlib
 import io
 import json
 import os
@@ -1203,6 +1204,91 @@ class TestIdlePause(IdleTestCase):
         self.assertEqual(0, run.run_once())
         self.assertEqual("queued", db.get_job(self.conn, job_id).state)
         self.assertEqual([], self.attempts(job_id))
+
+
+class TestIdleCritiqueOverTwoImages(IdleTestCase):
+    """Packet 16: the idle round with a critic prompt that asks for the ghost.
+
+    The real :func:`lineage.critique` rather than the stub, because what is
+    under test is the round it runs in: a two-image prompt must record the
+    critique and spawn the child exactly as a one-image prompt does, and the
+    second picture — which has no column to live in — must reach the log.
+    """
+
+    def publish_with_files(self, prompt="a jigsaw nobody touches", ghost=True):
+        """A published entry whose strip, and maybe ghost frames, are real."""
+        job_id = db.enqueue(self.conn, prompt, "octocat", rules_file="random",
+                            brief="a brief", assertions=["responds(click)"])
+        for state in ("executing", "gating", "held", "published"):
+            db.transition(self.conn, job_id, state)
+        source = self.jobs / str(job_id) / "attempt-1"
+        (source / ".gate").mkdir(parents=True, exist_ok=True)
+        strip = source / ".gate" / "strip.png"
+        strip.write_bytes(b"four frames of a jigsaw\n")
+        if ghost:
+            (source / ".gate" / "ghost.png").write_bytes(b"four frames, dragged\n")
+        entry_id = db.create_entry(
+            self.conn, job_id, state="published", prompt=prompt, brief="a brief",
+            statement="the model's own words", submitted_by="octocat",
+            rules_file="treatment", assertions_json=json.dumps(["responds(click)"]),
+            source_dir=str(source), strip_path=str(strip),
+        )
+        self.states.clear()
+        return job_id, entry_id
+
+    def two_image_prompt(self):
+        body = lineage.PROMPT_PATH.read_text(encoding="utf-8").split("\n\n", 1)[1]
+        path = Path(self._tmp.name) / "critic-v4.md"
+        path.write_text("prompt_version: critic-v4\nimages: strip ghost\n\n" + body,
+                        encoding="utf-8")
+        return mock.patch.object(lineage, "PROMPT_PATH", path)
+
+    def run_idle(self, ghost=True):
+        reply = Path(self._tmp.name) / "critique.txt"
+        reply.write_text("the same jigsaw, and this time let a finished piece "
+                         "glow for a moment.\n", encoding="utf-8")
+        _, entry_id = self.publish_with_files(ghost=ghost)
+        log = io.StringIO()
+        with self.two_image_prompt():
+            run = self.make_worker(
+                critic_fn=lambda conn, eid, **kw: lineage.critique(
+                    conn, eid, model=kw.get("model") or "gemma4:e4b", stub=reply),
+                idle_critique=1, log_stream=log,
+            )
+            self.assertEqual(0, run.run_once())
+        return entry_id, log.getvalue()
+
+    def test_the_round_records_the_critique_and_spawns_the_child_as_before(self):
+        entry_id, log = self.run_idle()
+        rows = self.critiques()
+        self.assertEqual(1, len(rows))
+        self.assertEqual(entry_id, rows[0]["entry_id"])
+        self.assertEqual("critic-v4", rows[0]["prompt_version"])
+        self.assertIsNone(rows[0]["rejected_reason"])
+        self.assertTrue(rows[0]["strip_path"].endswith("/.gate/strip.png"))
+        self.assertEqual(hashlib.sha256(b"four frames of a jigsaw\n").hexdigest(),
+                         rows[0]["strip_sha256"])
+        children = self.child_jobs()
+        self.assertEqual(1, len(children))
+        self.assertEqual(rows[0]["spawned_job_id"], children[0]["id"])
+        self.assertTrue(children[0]["prompt"].endswith("glow for a moment."),
+                        children[0]["prompt"])
+
+    def test_the_log_says_which_two_pictures_went_out(self):
+        """No column holds the second one, so the line is the whole record."""
+        entry_id, log = self.run_idle()
+        ghost = hashlib.sha256(b"four frames, dragged\n").hexdigest()
+        self.assertIn(f"entry {entry_id} was critiqued over two images", log)
+        self.assertIn(ghost[:12], log)
+        self.assertIn("/.gate/ghost.png", log)
+
+    def test_an_entry_gated_before_the_ghost_window_is_still_critiqued(self):
+        """Nothing re-gates a published entry; refusing would stop the loop."""
+        entry_id, log = self.run_idle(ghost=False)
+        self.assertEqual(1, len(self.critiques()))
+        self.assertEqual(1, len(self.child_jobs()))
+        self.assertIn(f"entry {entry_id} has no ghost.png", log)
+        self.assertIn("the critic saw the strip alone", log)
 
 
 class TestIdleCritiqueRejected(IdleTestCase):

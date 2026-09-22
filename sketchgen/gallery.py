@@ -762,13 +762,19 @@ def _gate_report(attempt: sqlite3.Row) -> dict[str, Any]:
 _ARTEFACTS = {
     "strip": ("strip_path", "strip.png"),
     "png": ("png_path", "gate.png"),
-    "ghost": (None, "ghost.png"),
+    "ghost": (None, ghostshim.GHOST_PNG),
 }
 
 
 def _artefact(row: sqlite3.Row, attempts: list[sqlite3.Row], which: str) -> Path | None:
     """The strip, the gate frame or the ghost frames, from the row or the
     gate's own dir."""
+    if which == "ghost":
+        # One resolver, because the critic reads the same file through
+        # lineage.ghost_image when a critic prompt asks for it (Packet 16,
+        # auto-mouse.md §6), and a page showing one picture while the critique
+        # is about another would be a lie nobody could see.
+        return ghostshim.ghost_png(_source_dir(row, attempts))
     column, filename = _ARTEFACTS[which]
     candidates: list[Path] = []
     if column and row[column]:

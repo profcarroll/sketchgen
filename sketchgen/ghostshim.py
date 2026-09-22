@@ -66,9 +66,12 @@ from __future__ import annotations
 import json
 import math
 import re
+from pathlib import Path
 
 __all__ = [
     "BUILTINS",
+    "GATE_DIR",
+    "GHOST_PNG",
     "GLOBAL",
     "MARKER",
     "MAX_EVENTS",
@@ -76,6 +79,7 @@ __all__ = [
     "SCRIPT_MARKER",
     "SHIM",
     "TYPES",
+    "ghost_png",
     "script_js",
     "with_script",
     "with_shim",
@@ -87,6 +91,16 @@ __all__ = [
 #: entry sixty seconds in total.
 MAX_EVENTS = 64
 MAX_MS = 8000
+
+#: Where the gate leaves the four ghost frames, and what it calls them
+#: (auto-mouse.md §5.1). Named here rather than in either reader because there
+#: are two of them and no column between them: :func:`sketchgen.gallery._artefact`
+#: copies the file onto the entry page and :func:`sketchgen.lineage.ghost_image`
+#: shows it to the critic, and a picture the page shows and the critic does not
+#: — or the other way round — would be the kind of drift nobody notices until a
+#: critique is about a frame nobody can find.
+GATE_DIR = ".gate"
+GHOST_PNG = "ghost.png"
 
 #: The four event types the players know. ``click`` is the other three in
 #: order, because p5 sets ``mouseIsPressed`` from ``mousedown`` and calls
@@ -186,6 +200,28 @@ BUILTINS: dict[str, list[dict]] = {
     + _drag_script_leg((0.5, 0.2), (0.5, 0.8), 1800),
     "wander": _wander_script(),
 }
+
+
+def ghost_png(*source_dirs: str | Path | None) -> Path | None:
+    """The gate's ghost frames for the first of these attempt directories.
+
+    ``None`` when none of them has the file, which is the normal answer: the
+    ghost window arrived with ``HARNESS_VERSION`` 3 on 21 September 2026 and
+    nothing re-gates a published entry, so every one of the 910 entries in the
+    gallery today has a ``strip.png`` and no ``ghost.png``. Callers treat that
+    as a fact about the entry, never as an error (auto-mouse.md §6).
+
+    Several directories because an entry's ``source_dir`` and its last
+    attempt's can disagree — ``gallery._source_dir`` has always tried both —
+    and the entry page and the critic have to land on the same file.
+    """
+    for source in source_dirs:
+        if not source:
+            continue
+        candidate = Path(source) / GATE_DIR / GHOST_PNG
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _render_builtins() -> str:
