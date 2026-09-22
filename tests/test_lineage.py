@@ -26,6 +26,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sketchgen import db  # noqa: E402
+from sketchgen import ghostshim  # noqa: E402
 from sketchgen import lineage  # noqa: E402
 from sketchgen import worker  # noqa: E402
 
@@ -114,7 +115,8 @@ class LineageTestCase(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------
 
-    def publish(self, prompt, by="astudent", state="published", strip="png", **opts):
+    def publish(self, prompt, by="astudent", state="published", strip="png",
+                ghost=None, **opts):
         """A job walked to a terminal state with its entry row, as the worker
         leaves it. Returns the entry id.
 
@@ -123,6 +125,12 @@ class LineageTestCase(unittest.TestCase):
         nothing, and ``None`` for no ``strip_path`` column at all. Since
         critic-v3 the critic refuses everything but the first, so the three
         broken shapes each have a test.
+
+        ``ghost`` is the gate's second picture, which has no column at all and
+        is found in the attempt directory (auto-mouse.md §5.3): ``"png"`` for a
+        real one, ``"empty"`` for a zero-byte one, ``"dir"`` for an attempt
+        directory with no ghost window in it — the shape every entry published
+        before 2026-09-21 has — and ``None`` for no ``source_dir`` either.
         """
         job_id = db.enqueue(self.conn, prompt, by, rules_file="treatment", **opts)
         db.transition(self.conn, job_id, "executing")
@@ -140,9 +148,19 @@ class LineageTestCase(unittest.TestCase):
             elif strip == "empty":
                 path.write_bytes(b"")
             strip_path = str(path)
+        source_dir = None
+        if ghost is not None:
+            attempt = self.jobs / str(job_id) / "attempt-1"
+            (attempt / ".gate").mkdir(parents=True, exist_ok=True)
+            if ghost != "dir":
+                (attempt / ".gate" / "ghost.png").write_bytes(
+                    b"" if ghost == "empty" else png_bytes(bytes([9, job_id % 251, 3]))
+                )
+            source_dir = str(attempt)
         entry_id = db.create_entry(
             self.conn,
             job_id,
+            source_dir=source_dir,
             state="held" if state == "held" else state,
             prompt=prompt,
             brief="a brief that arrived with the job",
@@ -164,6 +182,28 @@ class LineageTestCase(unittest.TestCase):
             "SELECT strip_path FROM entries WHERE id = ?", (entry_id,)
         ).fetchone()
         return Path(row["strip_path"]).read_bytes()
+
+    def ghost_of(self, entry_id):
+        """The bytes on disk for one entry's ghost frames."""
+        row = self.conn.execute(
+            "SELECT source_dir FROM entries WHERE id = ?", (entry_id,)
+        ).fetchone()
+        return (Path(row["source_dir"]) / ".gate" / "ghost.png").read_bytes()
+
+    def critic_file(self, images="strip ghost", version="critic-v4"):
+        """The real prompt file with a header of this test's choosing.
+
+        The body is copied rather than invented so that what these tests switch
+        is one header line and nothing else — which is the claim the switch is
+        making (auto-mouse.md §6).
+        """
+        body = lineage.PROMPT_PATH.read_text(encoding="utf-8").split("\n\n", 1)[1]
+        head = f"prompt_version: {version}\n"
+        if images is not None:
+            head += f"images: {images}\n"
+        path = self.root_dir / f"critic-{version}-{images!r}.md".replace("/", "-")
+        path.write_text(head + "\n" + body, encoding="utf-8")
+        return path
 
     def counts(self):
         """(critiques, jobs) — what a refusal must leave untouched."""
@@ -680,6 +720,169 @@ class TestCritique(LineageTestCase):
             lineage.critique(
                 self.conn, self.root_entry, stub=self.root_dir / "nothing.txt"
             )
+
+
+class TestTheGhostImage(LineageTestCase):
+    """Packet 16: the second picture, and the header line that asks for it.
+
+    The gate has played a ghost pointer and written ``ghost.png`` since
+    2026-09-21, and the critic may be shown it beside the strip. What is under
+    test here is mostly the *switch*: it is the prompt file that decides, never
+    the presence of the file on disk, because critiques are comparable only
+    inside one prompt version (auto-mouse.md §6).
+    """
+
+    def fake_ollama(self, reply="the same field, and this time let one circle "
+                                "fall out of phase with the rest."):
+        """A stand-in for ``/api/generate`` that keeps the payload it was sent.
+
+        The stub file replays a *reply*; this replaces the call, which is the
+        only way to see what went out on the wire.
+        """
+        seen = {}
+
+        def post(host, payload, timeout):
+            seen["host"] = host
+            seen["payload"] = payload
+            return {"response": reply, "prompt_eval_count": 11, "eval_count": 7}
+
+        return seen, mock.patch.object(lineage, "_post", post)
+
+    def images_sent(self, entry_id, prompt_path=None):
+        """The decoded images one critique sent, in order."""
+        seen, patched = self.fake_ollama()
+        with patched:
+            result = lineage.critique(
+                self.conn, entry_id, model="gemma4:e4b", prompt_path=prompt_path
+            )
+        sent = [base64.b64decode(one) for one in seen["payload"]["images"]]
+        return sent, result, seen["payload"]
+
+    # -- the reader ------------------------------------------------------
+
+    def test_a_prompt_with_no_images_line_asks_for_the_strip_alone(self):
+        self.assertEqual(
+            ("strip",), lineage.critic_images(self.critic_file(images=None))
+        )
+
+    def test_the_line_is_what_adds_the_ghost(self):
+        self.assertEqual(
+            ("strip", "ghost"), lineage.critic_images(self.critic_file())
+        )
+        self.assertEqual(
+            ("strip", "ghost"),
+            lineage.critic_images(self.critic_file(images="strip, ghost")),
+        )
+
+    def test_the_strip_is_first_whatever_the_line_says(self):
+        """A version that forgot to name it would be a blind critic again."""
+        self.assertEqual(
+            ("strip", "ghost"), lineage.critic_images(self.critic_file(images="ghost"))
+        )
+
+    def test_a_word_the_reader_does_not_know_is_dropped_not_refused(self):
+        self.assertEqual(
+            ("strip", "ghost"),
+            lineage.critic_images(self.critic_file(images="ghost sonogram")),
+        )
+        self.assertEqual(
+            ("strip",), lineage.critic_images(self.critic_file(images="sonogram"))
+        )
+
+    def test_critic_v3_on_disk_asks_for_the_strip_alone(self):
+        self.assertEqual(("strip",), lineage.critic_images())
+
+    def test_the_setting_is_not_sent_to_the_model(self):
+        path = self.critic_file()
+        row = self.conn.execute(
+            "SELECT * FROM entries WHERE id = ?", (self.root_entry,)
+        ).fetchone()
+        rendered = lineage.critique_prompt(row, row["statement"], row["brief"], path)
+        self.assertNotIn("images:", rendered)
+        self.assertNotIn("prompt_version:", rendered)
+        self.assertTrue(rendered.startswith("You are looking"), rendered[:40])
+        # and it is the same prompt the version on disk renders, because the
+        # body was copied: one header line is the whole difference
+        self.assertEqual(
+            lineage.critique_prompt(row, row["statement"], row["brief"]), rendered
+        )
+
+    # -- the payload -----------------------------------------------------
+
+    def test_the_two_image_prompt_sends_the_strip_then_the_ghost(self):
+        entry = self.publish("a jigsaw nobody touches", ghost="png")
+        sent, result, payload = self.images_sent(entry, self.critic_file())
+        self.assertEqual([self.strip_of(entry), self.ghost_of(entry)], sent)
+        self.assertEqual(
+            hashlib.sha256(self.ghost_of(entry)).hexdigest(), result.ghost_sha256
+        )
+        self.assertTrue(result.ghost_path.endswith("/.gate/ghost.png"), result.ghost_path)
+        self.assertEqual("", result.ghost_note)
+        # the first image and its provenance are untouched
+        self.assertEqual(
+            hashlib.sha256(self.strip_of(entry)).hexdigest(), result.strip_sha256
+        )
+        self.assertEqual("critic-v4", result.prompt_version)
+
+    def test_the_file_on_disk_never_switches_it_on_by_itself(self):
+        """The whole of DECIDE-by-prompt-version: comparability, not coverage.
+
+        An entry with a ghost window, critiqued under critic-v3, sends exactly
+        what critic-v3 has always sent — or the version would hold sighted and
+        half-sighted critiques mixed together.
+        """
+        entry = self.publish("a jigsaw with a ghost", ghost="png")
+        sent, result, payload = self.images_sent(entry)
+        self.assertEqual([self.strip_of(entry)], sent)
+        self.assertEqual("critic-v3", result.prompt_version)
+        self.assertEqual("", result.ghost_path)
+        self.assertEqual("", result.ghost_sha256)
+        self.assertEqual("", result.ghost_note)
+        self.assertEqual(
+            [base64.b64encode(self.strip_of(entry)).decode("ascii")],
+            payload["images"],
+        )
+
+    def test_an_entry_with_no_ghost_window_is_critiqued_over_the_strip_alone(self):
+        """910 entries were published before the gate had a ghost window."""
+        for shape in (None, "dir", "empty"):
+            with self.subTest(shape=shape):
+                entry = self.publish(f"an entry gated in {shape} times", ghost=shape)
+                sent, result, _ = self.images_sent(entry, self.critic_file())
+                self.assertEqual([self.strip_of(entry)], sent)
+                self.assertEqual("", result.ghost_sha256)
+                self.assertIn("the strip alone", result.ghost_note)
+
+    def test_an_unreadable_strip_is_still_a_refusal_under_the_new_prompt(self):
+        entry = self.publish("a sketch with no strip", strip=None, ghost="png")
+        with self.assertRaises(lineage.CritiqueRefused):
+            lineage.critique(
+                self.conn, entry, stub=FIXTURES / "one-sentence.txt",
+                prompt_path=self.critic_file(),
+            )
+
+    def test_a_replayed_run_still_records_what_it_was_shown(self):
+        """The stub replaces the model, not the requirement to have looked."""
+        entry = self.publish("a jigsaw replayed", ghost="png")
+        result = lineage.critique(
+            self.conn, entry, model="gemma4:e4b",
+            stub=FIXTURES / "one-sentence.txt", prompt_path=self.critic_file(),
+        )
+        self.assertEqual(
+            hashlib.sha256(self.ghost_of(entry)).hexdigest(), result.ghost_sha256
+        )
+
+    def test_the_ghost_is_the_file_the_entry_page_shows(self):
+        """One resolver, so a critique cannot be about a frame nobody can find."""
+        entry = self.publish("a jigsaw on the page", ghost="png")
+        row = self.conn.execute(
+            "SELECT * FROM entries WHERE id = ?", (entry,)
+        ).fetchone()
+        found = lineage.ghost_image(self.conn, row)
+        self.assertIsNotNone(found)
+        self.assertEqual(
+            found, ghostshim.ghost_png(row["source_dir"])
+        )
 
 
 class TestCli(LineageTestCase):
