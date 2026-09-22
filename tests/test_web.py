@@ -1271,6 +1271,125 @@ class TestNewJob(WebTestCase):
         self.assertRegex(page, r"behind \d+ queued jobs?|the queue is empty")
 
 
+class TestExecutorSourceChoice(WebTestCase):
+    """The operator's hand on what the executor is shown (packet 18).
+
+    Its own database, and not TestNewJob's, because every job these tests
+    queue lands in that page's *recent prompts, to run again* list — eight
+    entries long — and a test that pushed the seeded prompt off the end would
+    be a test breaking another one from the far side of the file.
+    """
+
+    def post_page(self, path, fields):
+        """(status, body text) for a POST that answers with a page."""
+        data = urllib.parse.urlencode(fields, doseq=True).encode("utf-8")
+        request = urllib.request.Request(self.url(path), data=data, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            with exc:
+                return exc.code, exc.read().decode("utf-8")
+
+    def newest_job(self):
+        conn = self.db()
+        try:
+            return db.get_job(conn, max(job.id for job in db.list_jobs(conn)))
+        finally:
+            conn.close()
+
+    def queued_ids(self):
+        conn = self.db()
+        try:
+            return {job.id for job in db.list_jobs(conn, "queued")}
+        finally:
+            conn.close()
+
+    def test_the_tick_is_shown_only_with_a_parent_and_is_on(self):
+        """`give the executor the parent's sketch`: on, and out of the way.
+
+        Hidden rather than absent without a parent, because the block carries
+        the `source_form` marker create_job reads and the page's own script
+        unhides it when a parent is picked without a reload. A box the script
+        had to build instead would be a box whose clear state the server could
+        not tell from no box at all.
+        """
+        fresh = self.text("/new")
+        self.assertIn('<div class="opts" id="source-tick" hidden>', fresh)
+        self.assertIn('<p class="help" id="source-tick-help" hidden>', fresh)
+        page = self.text(f"/new?parent={self.entry_id}")
+        self.assertIn('<div class="opts" id="source-tick">', page)
+        self.assertIn('<p class="help" id="source-tick-help">', page)
+        self.assertIn('name="give_source" value="1" checked>', page)
+        self.assertIn("give the executor the parent's sketch</label>", page)
+        self.assertIn('<input type="hidden" name="source_form" value="1">', page)
+
+    def test_unticking_it_queues_that_one_job_as_the_control_arm(self):
+        status, _ = self.post(
+            "/new",
+            {"prompt": "a child written blind", "submitted_by": "student-two",
+             "parent_entry_id": str(self.entry_id), "source_form": "1"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual("none", self.newest_job().executor_source)
+
+    def test_leaving_it_ticked_leaves_the_column_null(self):
+        """NULL is not `both`: it is whatever the node says when it runs."""
+        status, _ = self.post(
+            "/new",
+            {"prompt": "a child shown the parent", "submitted_by": "student-two",
+             "parent_entry_id": str(self.entry_id), "source_form": "1",
+             "give_source": "1"},
+        )
+        self.assertEqual(status, 303)
+        self.assertIsNone(self.newest_job().executor_source)
+        # and a POST that never carried the box at all means the same thing
+        status, _ = self.post(
+            "/new", {"prompt": "a job from elsewhere", "submitted_by": "student-two"}
+        )
+        self.assertEqual(status, 303)
+        self.assertIsNone(self.newest_job().executor_source)
+
+    def test_a_caller_may_name_the_value_and_a_wrong_one_is_refused(self):
+        status, _ = self.post(
+            "/new", {"prompt": "previous only", "submitted_by": "student-two",
+                     "executor_source": "previous"},
+        )
+        self.assertEqual(status, 303)
+        self.assertEqual("previous", self.newest_job().executor_source)
+        before = self.queued_ids()
+        status, body = self.post_page(
+            "/new", {"prompt": "sideways", "submitted_by": "student-two",
+                     "executor_source": "sideways"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("executor source must be one of", body)
+        self.assertEqual(before, self.queued_ids())
+
+    def test_an_unticked_choice_survives_a_refused_post(self):
+        status, body = self.post_page(
+            "/new", {"prompt": "", "submitted_by": "student-two",
+                     "parent_entry_id": str(self.entry_id), "source_form": "1"},
+        )
+        self.assertEqual(status, 400)
+        self.assertIn('name="give_source" value="1">', body)
+        self.assertNotIn('name="give_source" value="1" checked>', body)
+
+    def test_the_job_page_says_when_a_job_was_told_something_else(self):
+        status, _ = self.post(
+            "/new",
+            {"prompt": "the control arm", "submitted_by": "student-two",
+             "parent_entry_id": str(self.entry_id), "source_form": "1"},
+        )
+        self.assertEqual(status, 303)
+        job = self.newest_job()
+        page = self.text(f"/job/{job.id}")
+        self.assertIn("executor source", page)
+        self.assertIn("none — set on this job, over the node&#x27;s setting", page)
+        # and a job with no opinion says nothing at all
+        self.assertNotIn("executor source", self.text(f"/job/{self.held_id}"))
+
+
 class TestControl(WebTestCase):
     def tearDown(self):
         conn = self.db()
@@ -4243,3 +4362,100 @@ class ProcessCostTests(unittest.TestCase):
         self.assertEqual(web.process_line(db.Attempt(id=1, job_id=1, n=1)), "")
         self.assertEqual(
             web.process_line(db.Attempt(id=1, job_id=1, n=1, process_json="{oops")), "")
+
+
+class GivenSourceTests(unittest.TestCase):
+    """The job page says what each attempt was holding while it wrote.
+
+    Job 1327, 2026-09-22, is the case: the first attempt this node wrote with
+    a previous sketch under the heading — 134 lines of it, at ctx 16384 — and
+    nothing anywhere on the page said so, so an operator reading a repair
+    could not tell it apart from every repair before 2026-09-21, which had
+    only the gate's prose (migration 016, child-source.md packet 18).
+
+    Its own database, as ProcessCostTests has: the page is read here rather
+    than over the server, and nothing else in this file should see these rows.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="sketchgen-given-")
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.db_path = root / "sketchgen.db"
+        self.jobs_dir = root / "jobs"
+        self.jobs_dir.mkdir()
+        db.init(self.db_path)
+        self.conn = db.connect(self.db_path)
+        self.addCleanup(self.conn.close)
+        self.app = web.App(db_path=str(self.db_path), jobs_dir=str(self.jobs_dir))
+
+    def page(self, given=None, num_ctx=16384, *, parent_entry_id=None, n=1,
+             model="qwen3-coder:30b"):
+        job_id = db.enqueue(self.conn, "a tide of slow lines", "profcarroll",
+                            parent_entry_id=parent_entry_id)
+        db.transition(self.conn, job_id, "executing")
+        db.transition(self.conn, job_id, "gating")
+        for k in range(1, n + 1):
+            db.add_attempt(
+                self.conn, job_id, k, model=model, gate_exit=0,
+                given_source_json=json.dumps(given) if given and k == n else None,
+                num_ctx=num_ctx if k == n else None,
+            )
+        db.transition(self.conn, job_id, "held")
+        return web.job_page(self.app, self.conn, db.get_job(self.conn, job_id))
+
+    def test_a_childs_first_attempt_names_the_parent_entry(self):
+        page = self.page(
+            {"kind": "parent", "path": "/jobs/9/attempt-1/sketch.js",
+             "sha256": "a" * 64, "lines": 180, "shown": True},
+            parent_entry_id=None,
+        )
+        # No parent row to point at, so the line says the parent in words
+        self.assertIn("given: the parent · 180 lines · ctx 16384", page)
+
+    def test_the_parent_entry_id_comes_off_the_job(self):
+        job_id = db.enqueue(self.conn, "the parent prompt", "profcarroll")
+        parent = db.create_entry(self.conn, job_id, prompt="the parent prompt")
+        page = self.page(
+            {"kind": "parent", "path": "/jobs/9/attempt-1/sketch.js",
+             "sha256": "a" * 64, "lines": 180, "shown": True},
+            parent_entry_id=parent,
+        )
+        self.assertIn(f"given: parent entry {parent} · 180 lines · ctx 16384", page)
+
+    def test_a_repair_names_the_attempt_before_it(self):
+        page = self.page(
+            {"kind": "previous", "path": "/jobs/1327/attempt-1/sketch.js",
+             "sha256": "b" * 64, "lines": 134, "shown": True},
+            n=2,
+        )
+        self.assertIn("given: attempt 1 · 134 lines · ctx 16384", page)
+
+    def test_an_attempt_given_nothing_says_so(self):
+        """Which is every attempt this node ran before 2026-09-21."""
+        page = self.page(None, num_ctx=None)
+        self.assertIn("given: nothing", page)
+        self.assertNotIn("ctx", page.split("given: nothing")[1].split("</p>")[0])
+
+    def test_a_sketch_over_the_cap_is_named_and_marked_unshown(self):
+        page = self.page(
+            {"kind": "parent", "path": "/jobs/9/attempt-1/sketch.js",
+             "sha256": "c" * 64, "lines": 412, "shown": False},
+            num_ctx=8192,
+        )
+        self.assertIn("given: the parent · 412 lines · not shown (over the cap) "
+                      "· ctx 8192", page)
+
+    def test_an_attempt_written_off_the_node_has_no_context_window(self):
+        """A paid packet's record has no `path` and no local window: `ctx —`,
+        because an em dash is true where a number would be invented."""
+        page = self.page(
+            {"kind": "parent", "sha256": "d" * 64, "lines": 180, "shown": True},
+            num_ctx=None, model="claude-opus-4-6",
+        )
+        self.assertIn("given: the parent · 180 lines · ctx —", page)
+
+    def test_an_unreadable_record_is_read_as_nothing(self):
+        attempt = db.Attempt(id=1, job_id=1, n=1, given_source_json="{oops")
+        job = db.Job(id=1, state="held", prompt="x")
+        self.assertEqual("given: nothing", web.given_line(job, attempt))

@@ -459,6 +459,14 @@ def spawn(
     The child of a paid entry is written by this node's models (blank column:
     the assignment, else the worker's default), and its entry says so. A
     caller that names a paid model on purpose still gets it.
+
+    **``executor_source`` is not inherited and not set** (migration 017). The
+    per-job override exists for a person standing over two lines at once, and
+    a child the idle critic queues hours later has nobody standing over it:
+    it follows ``meta.executor_source`` as the node reads it when the attempt
+    runs, which is what every job did before the column existed. A parent
+    queued as the control arm of a finished comparison should not go on
+    quietly enrolling its descendants in it.
     """
     text = " ".join((critique or "").split())
     if not text:
