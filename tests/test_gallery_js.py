@@ -42,6 +42,7 @@ HARNESS = Path(__file__).resolve().parent / "js" / "run_in_place.js"
 KIOSK_HARNESS = Path(__file__).resolve().parent / "js" / "kiosk.js"
 SWIPE_HARNESS = Path(__file__).resolve().parent / "js" / "swipe.js"
 GHOST_HARNESS = Path(__file__).resolve().parent / "js" / "ghostshim.js"
+PAGES_HARNESS = Path(__file__).resolve().parent / "js" / "grid_pages.js"
 DOM = Path(__file__).resolve().parent / "js" / "dom.js"
 SCRIPT = Path(__file__).resolve().parent.parent / "sketchgen" / "assets" / "gallery.js"
 KIOSK_SCRIPT = Path(__file__).resolve().parent.parent / "sketchgen" / "assets" / "kiosk.js"
@@ -59,6 +60,20 @@ class RunInPlaceTests(unittest.TestCase):
         self.assertEqual(
             0, done.returncode, done.stdout + done.stderr
         )
+        self.assertIn("ok ", done.stdout)
+
+
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+class GridPagesTests(unittest.TestCase):
+    """The paged index (2026-09-23): browsing fetches nothing, and a sort, a
+    search or a failed fetch each do what tests/js/grid_pages.js says."""
+
+    def test_sort_and_search_reach_every_card(self):
+        done = subprocess.run(
+            [shutil.which("node"), str(PAGES_HARNESS)],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(0, done.returncode, done.stdout + done.stderr)
         self.assertIn("ok ", done.stdout)
 
 

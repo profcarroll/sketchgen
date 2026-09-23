@@ -347,6 +347,9 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 .preview .revise em { color: var(--ink); font-style: italic; }
 
 .grid { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); }
+/* The index's pages (2026-09-23): plain links, so browsing needs no script. */
+.pager { margin: 1.5rem 0 0; text-align: center; }
+.pager .off { opacity: 0.4; }
 
 .card {
   background: var(--panel);

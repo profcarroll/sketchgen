@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -198,6 +199,13 @@ def card_search(text: str) -> dict[str, str]:
         for tag, attrs in elements(text)
         if tag == "div" and "card" in attrs.get("class", "").split()
     }
+
+
+def search_finds(haystack: str, query: str) -> bool:
+    """gallery.js's searchMatches, restated: every whitespace-separated term of
+    the lowercased query is a substring of the card's data-search."""
+    text = html.unescape(haystack)
+    return all(term in text for term in query.lower().split())
 
 
 # ---------------------------------------------------------------------------
@@ -1117,6 +1125,88 @@ class GhostFramesTests(GalleryTestCase):
         self.assertEqual(11, meta["gate"][0]["ghost"]["played"])
 
 
+class PagedIndexTests(GalleryTestCase):
+    """The index as pages, and every card in cards.json (2026-09-23).
+
+    The index was 1,049 cards and 3.2 MB. It is now PAGE_SIZE cards a page,
+    linked by a pager that needs no script; the script fetches cards.json to
+    sort or search the whole gallery. Three published entries at a page size of
+    one is three pages.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.third = add_child(self.conn, self.tmp, self.ids[1], state="published")
+        patcher = mock.patch.object(gallery, "PAGE_SIZE", 1)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def read(self, name):
+        return (self.dest / name).read_text(encoding="utf-8")
+
+    def test_each_page_holds_its_share_newest_first(self):
+        self.render()
+        newest = gallery._newest_first(gallery._entries(self.conn, "published"))
+        order = [str(row["id"]) for row in newest]
+        for number, name in enumerate(["index.html", "page-2.html", "page-3.html"]):
+            with self.subTest(page=name):
+                self.assertEqual([order[number]], list(card_search(self.read(name))))
+        self.assertFalse((self.dest / "page-4.html").exists())
+
+    def test_the_pager_is_plain_links(self):
+        self.render()
+        first, middle, last = (self.read(n) for n in ("index.html", "page-2.html", "page-3.html"))
+        self.assertIn("page 1 of 3", first)
+        self.assertIn('<a href="page-2.html" rel="next">', first)
+        self.assertIn('<span class="off">← newer</span>', first)
+        self.assertIn('<a href="index.html" rel="prev">', middle)
+        self.assertIn('<a href="page-3.html" rel="next">', middle)
+        self.assertIn('<span class="off">older →</span>', last)
+        for page in (first, middle, last):
+            self.assertIn('class="grid" data-paged="1"', page)
+            self.assertIn('href="index.html?all=1"', page)
+
+    def test_cards_json_is_every_card_the_pages_hold(self):
+        self.render()
+        data = json.loads(self.read("cards.json"))
+        in_pages = []
+        for name in ("index.html", "page-2.html", "page-3.html"):
+            in_pages += list(card_search(self.read(name)))
+        in_json = list(card_search("\n".join(data["cards"])))
+        self.assertEqual(in_pages, in_json)
+        # the same card, byte for byte, wherever it is read from
+        self.assertIn(data["cards"][0], self.read("index.html"))
+
+    def test_only_the_first_page_carries_the_composer(self):
+        self.render()
+        self.assertIn("data-compose", self.read("index.html"))
+        self.assertNotIn("data-compose", self.read("page-2.html"))
+
+    def test_a_gallery_that_fits_on_one_page_has_no_pager(self):
+        with mock.patch.object(gallery, "PAGE_SIZE", 60):
+            self.render()
+        index = self.read("index.html")
+        self.assertNotIn("data-pager", index)
+        self.assertNotIn("data-paged", index)
+        self.assertFalse((self.dest / "page-2.html").exists())
+        self.assertEqual(3, len(json.loads(self.read("cards.json"))["cards"]))
+
+    def test_pages_past_the_end_are_removed(self):
+        self.render()
+        self.assertTrue((self.dest / "page-3.html").exists())
+        with mock.patch.object(gallery, "PAGE_SIZE", 2):
+            self.render()
+        self.assertTrue((self.dest / "page-2.html").exists())
+        self.assertFalse((self.dest / "page-3.html").exists())
+        self.assertIn("page 2 of 2", self.read("page-2.html"))
+
+    def test_a_second_render_is_byte_identical(self):
+        self.render()
+        before = {n: self.read(n) for n in ("index.html", "page-2.html", "cards.json")}
+        self.render()
+        self.assertEqual(before, {n: self.read(n) for n in before})
+
+
 class WebFramesTests(GalleryTestCase):
     """The WebP beside a gate PNG is what the gallery publishes, when it exists.
 
@@ -1572,7 +1662,30 @@ class TitleTests(GalleryTestCase):
         haystack = card_search(index)[str(self.chain[-1])]
         for revision in self.REVISIONS:
             with self.subTest(revision=revision):
-                self.assertIn(revision, html.unescape(haystack))
+                # Found the way the page finds it, term by term; the attribute
+                # keeps each word once (2026-09-23), so the phrase itself is
+                # not in it verbatim and never needed to be.
+                self.assertTrue(search_finds(haystack, revision), revision)
+
+    def test_each_word_once_answers_every_search_the_same(self):
+        # The attribute used to be the whole accumulated prompt; it is now each
+        # word once. A term holds no space, so it can only ever match inside
+        # one word, and the two strings must agree on every query.
+        row = gallery._entry(self.conn, self.chain[-1])
+        deduped = html.unescape(gallery._search_text(int(row["id"]), row))
+        words = deduped.split()
+        self.assertEqual(len(words), len(set(words)))
+        full = " ".join(" ".join(str(part) for part in (
+            f"entry {row['id']}", f"#{row['id']}", row["prompt"] or "", row["brief"] or "",
+            row["rules_file"] or "", row["executor"] or "", row["submitted_by"] or "",
+        )).split()).lower()
+        self.assertLess(len(deduped), len(full))
+        queries = self.REVISIONS + ["circle", "irc", "hue, half", "#13", "entry",
+                                    "stillness motion", "nothing-like-this", "e r"]
+        for query in queries:
+            with self.subTest(query=query):
+                self.assertEqual(all(t in full for t in query.lower().split()),
+                                 search_finds(deduped, query))
 
     def test_only_the_root_card_on_a_line_page_carries_the_prompt(self):
         line = (self.dest / "lines" / f"{self.root_id}.html").read_text(
