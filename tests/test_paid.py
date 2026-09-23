@@ -2448,7 +2448,11 @@ class ProcessCostTests(AgentLoopTests):
 
     # -- an empty process on a --since job is declared or it is rejected --------
 
-    SINCE = "2026-09-21T20:00:00Z"
+    # Relative to now, because `paid start` refuses a stamp more than a day
+    # old: the literal this was (2026-09-21T20:00:00Z) aged out on 2026-09-22
+    # and took seven tests with it. Read once at import, which a run outlives
+    # by seconds against a day's slack.
+    SINCE = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime(db.UTC_FORMAT)
 
     def attempt_packet(self, *, since):
         """A job driven to its attempt packet, the sketch written in."""
