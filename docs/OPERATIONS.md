@@ -1367,8 +1367,9 @@ allowance — **before 1 November**, so November bills nothing for compute.
 The resize is a reboot into the new shape from the console (Instance → Edit →
 Shape), with the generator paused first so no attempt is cut off. Afterwards
 `billing --identify` on the node, so the Node card and new entries say 4/24.
-The two models (19 GB + 9 GB) still fit in 24 GB, only just, and not with room
-for a third.
+The two models (19 GB + 9 GB) do not fit in 24 GB together, as they did not
+before 2026-09-13: planner and executor take turns, and every job pays a load
+between them. Read `attempts.load_s` after the resize to see what that costs.
 
 Nothing else to do. The unit encodes no core count, no memory figure and no
 concurrency: one job at a time, fenced against other clients. The node gets
