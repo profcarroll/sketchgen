@@ -1355,11 +1355,149 @@ bin/pull-backup.sh sld-cloud-new --no-jobs
 unit in this document works unchanged, and write the date and elapsed time on
 the `Last rehearsed:` line above.
 
-## The 10/1 shrink
+## The shrink to 4/24, before 1 November
 
-Nothing to do. The unit encodes no core count, no memory figure and no
+This was the 10/1 shrink until 2026-09-23, when the tenancy was confirmed
+pay-as-you-go: the trial credit ends on 30 September, but the account keeps
+running and bills the card after it, so nothing is reclaimed on 1 October. The
+decision that day was to keep 16/96 through October (about $166 on the card)
+while the D12 lab comes up, and to resize to 4 OCPU / 24 GB — the Always Free
+allowance — **before 1 November**, so November bills nothing for compute.
+
+The resize is a reboot into the new shape from the console (Instance → Edit →
+Shape), with the generator paused first so no attempt is cut off. Afterwards
+`billing --identify` on the node, so the Node card and new entries say 4/24.
+The two models (19 GB + 9 GB) do not fit in 24 GB together, as they did not
+before 2026-09-13: planner and executor take turns, and every job pays a load
+between them. Read `attempts.load_s` after the resize to see what that costs.
+
+Nothing else to do. The unit encodes no core count, no memory figure and no
 concurrency: one job at a time, fenced against other clients. The node gets
 smaller, jobs get slower, the drip drips further apart.
+
+## A rented GPU node: OCI VM.GPU.A10.1
+
+Written 2026-09-23 for the trial's last week: one NVIDIA A10 (24 GB), 15 Intel
+OCPUs, 240 GB RAM, **$2.00 an hour** list, in the same tenancy as sld-cloud.
+Why and what to run on it is `docs/plans/a10-benchmark.md`; this is how to
+stand it up and take it down. Call it `sld-gpu` in `~/.ssh/config`.
+
+**It is x86 with an NVIDIA card, like d12 — not like sld-cloud.** OCI's A1
+(Ampere ARM) shapes take no GPU; this is a separate instance. So copy d12's
+setup where the two differ, and match d12's versions exactly: arm C of the
+hardware A/B is only a comparison if Ollama, the driver major and the model
+digests are the same on both.
+
+**0. Read d12's versions first**, and write them down; step 5 pins to them.
+On 2026-09-23 they were Ollama 0.34.3, driver 595.91.07, Ubuntu 26.04.1
+(Python 3.14.4), app a72f076 — read them again, they move. d12's Ollama
+listens on its Tailscale address only (`OLLAMA_HOST=100.107.156.77:11434`),
+so a bare `ollama` there says it cannot connect; that is not an outage.
+The A10 keeps the default loopback address and needs no such line.
+
+```bash
+ssh dave@d12-node-profcarroll 'ollama -v; nvidia-smi --query-gpu=driver_version --format=csv,noheader; systemctl cat ollama | grep -i environment; systemctl --user show sketchgen-worker -p Environment --value; cd ~/sketchgen/app && git log --oneline -1'
+```
+
+**1. Launch.** Console → Compute → Create instance, in the availability domain
+the limit was raised for. Shape `VM.GPU.A10.1`; image the newest Canonical
+Ubuntu (26.04 if listed, to match d12); boot volume 200 GB (two models are
+30 GB, the rest is attempts); same VCN and subnet as sld-cloud, public IPv4,
+your usual SSH key. Ingress stays at the default: port 22 only. **Launch
+as soon as it can be used and do not stop it until you are done** — stopping a
+GPU VM gives its host back, and the restart can fail with *out of host
+capacity*, which is days, not minutes.
+
+```bash
+ssh sld-gpu 'lsb_release -d && nproc && free -g && df -h / && lspci | grep -i nvidia'
+```
+
+**2. The driver.** The platform image has none. Pick the same major as d12's.
+
+```bash
+ssh sld-gpu 'sudo apt-get update && sudo ubuntu-drivers list --gpgpu'
+ssh sld-gpu 'sudo ubuntu-drivers install --gpgpu nvidia:<d12 major>-server && sudo reboot'
+ssh sld-gpu 'nvidia-smi'        # must say A10, 23028 MiB or so, and the driver you chose
+```
+
+**3–4. Packages, linger, the app, the venv, Chromium** — as steps 2–4 of
+*Recovery* with `sld-gpu` for `sld-cloud-new`, plus the browser's system
+libraries, which a fresh x86 image does not have:
+
+```bash
+ssh sld-gpu 'sudo ~/sketchgen/.venv/bin/playwright install-deps chromium'
+ssh sld-gpu 'cd ~/sketchgen/app && git checkout <d12 commit>'   # the A/B's build, not main
+```
+
+**5. Ollama, pinned, and the models by digest.** The install script takes a
+version. d12 runs Ollama on its defaults — its one drop-in (`tailnet.conf`)
+only binds it to the Tailscale address and waits for `tailscale0` — so the
+A10 gets **no** `OLLAMA_*` drop-in at all, and the A/B arm runs under the
+same defaults; the variants in the plan change one at a time from there.
+(sld-cloud is the odd one out: `KEEP_ALIVE=30m` and `MAX_LOADED_MODELS=2`.
+The bench asks for 30 minutes per request, so its numbers are unaffected.)
+
+```bash
+ssh sld-gpu 'curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=<d12 version> sh'
+ssh sld-gpu 'systemctl show ollama -p Environment --value'   # PATH only, no OLLAMA_*
+ssh sld-gpu 'ollama pull qwen3-coder:30b && ollama pull gemma4:e4b'   # d12's tags
+ssh sld-gpu 'ollama list'      # must show 06c1097efce0 and c6eb396dbd59, as d12 does
+```
+
+**6. A fresh database, not a restore.** This is a new arm, like d12: its entry
+ids start at 1 and mean nothing outside it.
+
+```bash
+ssh sld-gpu '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen db init'
+```
+
+**7. A private gallery, as d12 has one.** A local bare repo as the checkout's
+origin, so `publish` works and nothing leaves the box. No deploy keys, no
+write-path token, and **do not enable `sketchgen-sync.timer`**: there is no
+Worker for this node, and its votes table stays empty.
+
+```bash
+ssh sld-gpu 'cd ~/sketchgen && git init --bare gallery.git && git clone gallery.git gallery && cd gallery && git config user.name profcarroll && git config user.email profcarroll@users.noreply.github.com'
+```
+
+**8. Units and their settings.** `install-unit`, then one drop-in for the
+worker and web units. `SKETCHGEN_RATE_PER_HOUR` is what the per-sketch cost is
+figured at on a cloud node, and its default is the A1 rate; left alone, every
+A10 sketch would be priced at a ninth of what it cost.
+
+```bash
+ssh sld-gpu '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen install-unit'
+ssh sld-gpu 'for u in sketchgen-worker sketchgen-web; do mkdir -p ~/.config/systemd/user/$u.service.d; printf "[Service]\nEnvironment=SKETCHGEN_EXECUTOR_MODEL=qwen3-coder:30b\nEnvironment=SKETCHGEN_RATE_PER_HOUR=2.00\nEnvironment=SKETCHGEN_SHAPE=VM.GPU.A10.1 15/240 + A10 24G\n" > ~/.config/systemd/user/$u.service.d/node.conf; done; systemctl --user daemon-reload'
+ssh sld-gpu '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen control pause --reason "bench first"'
+ssh sld-gpu 'systemctl --user enable --now sketchgen-worker.service sketchgen-web.service sketchgen-backup.timer'
+```
+
+The worker comes up paused. `billing --identify` on the node records the OCI
+shape; the tunnel's `billing --sync sld-gpu` reads the same tenancy bill
+sld-cloud's card shows, because it is the same bill.
+
+**9. Bench before anything else**, while the box is quiet — then the A/B arm:
+
+```bash
+ssh sld-gpu '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen bench --out ~/sketchgen/bench-sld-gpu.json'
+scp sld-gpu:sketchgen/bench-sld-gpu.json . && python3 bin/sketchgen bench --compare bench-*.json
+```
+
+The executor should load **100% on the GPU** here (`gpu%` in the table), where
+d12 shows about 75: that difference is most of what the rental is for.
+
+**10. Take it down.** Snapshot, pull, verify, and only then terminate —
+ticking *permanently delete the attached boot volume*, or it bills on.
+
+```bash
+ssh sld-gpu '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen control pause --reason teardown'
+ssh sld-gpu '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen backup snapshot'
+bin/pull-backup.sh sld-gpu            # verifies the snapshot it pulled
+scp 'sld-gpu:sketchgen/bench-*.json' 'sld-gpu:sketchgen/*.json' ~/sketchgen-backups/sld-gpu/
+```
+
+Remove the `sld-gpu` block from `~/.ssh/config` afterwards so nothing tries to
+reach an address Oracle has given to somebody else.
 
 ## The operator UI as a service
 
