@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import db
+from . import webimg
 
 __all__ = [
     "DEFAULT_GALLERY_DIR",
@@ -409,6 +410,12 @@ def _render_with_generator(
     render = getattr(gallery, "render_entry", None)
     if render is None:
         raise PublishRefused("generator not present; pass --from")
+    # The web copies of the frames, before the render that looks for them
+    # (gallery-hub.md, Step 0). Never a refusal: with no encoder, or a frame
+    # it cannot read, the page publishes the PNG as every entry used to.
+    frame_pngs = getattr(gallery, "frame_pngs", None)
+    if frame_pngs is not None:
+        webimg.ensure(frame_pngs(conn, entry_id))
     try:
         # The generator takes the gallery ROOT and writes dest/e/<id>/, which it
         # returns; that returned directory is the entry, and it is what we copy.
