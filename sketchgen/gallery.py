@@ -9,7 +9,9 @@ One entry row plus its attempt directory in, a directory of plain files out:
     <gallery>/e/<id>/ghost.webp          the same under the ghost pointer, when there is one
     <gallery>/e/<id>/statement.md        the executor's own words, verbatim
     <gallery>/e/<id>/meta.json           every spec §7 field
-    <gallery>/index.html                 the grid (published entries)
+    <gallery>/index.html                 the grid's first page (published entries, newest first)
+    <gallery>/page-<n>.html              the grid's later pages, PAGE_SIZE cards each
+    <gallery>/cards.json                 every published card, for a sort or search of all of them
     <gallery>/rejections.html            the gate's rejections, kept
     <gallery>/compare.html               the paired-judgment shell
     <gallery>/kiosk.html                  the projector shell (spec kiosk.md)
@@ -2935,7 +2937,14 @@ def _search_text(entry_id: int, row: sqlite3.Row) -> str:
         row["executor"] or "",
         row["submitted_by"] or "",
     ]
-    return _esc(" ".join(" ".join(str(part) for part in parts).split()).lower())
+    # Each word once, in the order it first appears. A child's prompt carries
+    # every revision above it, so on 2026-09-23 this attribute was 1.45 MB of a
+    # 3.2 MB index, most of it the same chain again one card down. The script
+    # asks whether every query term is a substring of this string, and a term
+    # holds no space, so it can only ever match inside one word: dropping a
+    # word's second copy changes no answer.
+    words = " ".join(str(part) for part in parts).lower().split()
+    return _esc(" ".join(dict.fromkeys(words)))
 
 
 def _rejection_reason(conn: sqlite3.Connection, row: sqlite3.Row) -> str:
@@ -3109,14 +3118,18 @@ def _grid_page(
     page: str,
     failed: bool,
     composer: str = "",
+    cards: list[str] | None = None,
+    pager: str = "",
+    paged: bool = False,
 ) -> str:
-    card = _template("card.html")
-    scores = _all_scores(conn)
-    rows = _newest_first(rows)
-    if rows:
-        cards = "\n      ".join(_card(conn, row, failed, card, scores) for row in rows)
-    else:
-        cards = '<p class="none">Nothing here yet.</p>'
+    """One grid page. ``cards`` is the page's share of an already-rendered,
+    newest-first list (:func:`_index_pages`); without it every row is rendered
+    here, which is what the rejections page still wants."""
+    if cards is None:
+        card = _template("card.html")
+        scores = _all_scores(conn)
+        cards = [_card(conn, row, failed, card, scores) for row in _newest_first(rows)]
+    cards_html = "\n      ".join(cards) if cards else '<p class="none">Nothing here yet.</p>'
     return _template("grid.html").substitute(
         root="./",
         page_title=_esc(heading),
@@ -3130,8 +3143,72 @@ def _grid_page(
         # the same so that putting it back is a change to one file.
         filters=_filters(rows, page),
         composer=composer,
-        cards=cards,
+        cards=cards_html,
+        # The script reads this to know the grid holds one page of the
+        # gallery, and fetches cards.json before it sorts or searches.
+        grid_attrs=' data-paged="1"' if paged else "",
+        pager=pager,
     )
+
+
+#: Cards on one page of the gallery grid. On 2026-09-23 the index was every
+#: published entry, 1,049 cards and 3.2 MB for a phone to parse before the
+#: first strip; sixty is a few screens on a laptop and never a wait.
+PAGE_SIZE = 60
+
+
+def _page_name(number: int) -> str:
+    """``index.html`` for the first page, ``page-<n>.html`` after it: flat at
+    the root, so every card's relative link works unchanged on every page."""
+    return "index.html" if number == 1 else f"page-{number}.html"
+
+
+def _pager(number: int, total: int) -> str:
+    if total <= 1:
+        return ""
+    newer = (f'<a href="{_page_name(number - 1)}" rel="prev">← newer</a>'
+             if number > 1 else '<span class="off">← newer</span>')
+    older = (f'<a href="{_page_name(number + 1)}" rel="next">older →</a>'
+             if number < total else '<span class="off">older →</span>')
+    return (
+        '<nav class="pager" data-pager aria-label="pages of the gallery">'
+        f"{newer} · page {number} of {total} · {older} · "
+        '<a href="index.html?all=1" data-show-all>every entry</a></nav>'
+    )
+
+
+def _index_pages(
+    conn: sqlite3.Connection, rows: list[sqlite3.Row], composer: str
+) -> dict[str, str]:
+    """The published grid as pages, and every card again in ``cards.json``.
+
+    Browsing is by page and needs no script. Sorting, searching and filtering
+    are over the whole gallery or they are wrong, so the script fetches
+    ``cards.json`` — the same card HTML, rendered once here, newest first —
+    puts every card in the grid, and then runs the sort and search code that
+    has always worked on a grid of all of them.
+    """
+    card = _template("card.html")
+    scores = _all_scores(conn)
+    cards = [_card(conn, row, False, card, scores) for row in _newest_first(rows)]
+    total = max(1, -(-len(cards) // PAGE_SIZE))
+    pages: dict[str, str] = {}
+    for number in range(1, total + 1):
+        name = _page_name(number)
+        pages[name] = _grid_page(
+            conn,
+            rows,
+            heading="",   # the header bar names the site; the grid needs no title
+            intro="",
+            page=name,
+            failed=False,
+            composer=composer if number == 1 else "",
+            cards=cards[(number - 1) * PAGE_SIZE:number * PAGE_SIZE],
+            pager=_pager(number, total),
+            paged=total > 1,
+        )
+    pages["cards.json"] = json.dumps({"cards": cards}, ensure_ascii=False) + "\n"
+    return pages
 
 
 def _compare_page(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> str:
@@ -3638,18 +3715,14 @@ def render_index(
         for asset in sorted(ASSET_DIR.iterdir()):
             if asset.is_file():
                 written.copy(asset, dest / "assets" / asset.name)
-        written.write_text(
-            dest / "index.html",
-            _grid_page(
-                conn,
-                published,
-                heading="",   # the header bar names the site; the grid needs no title
-                intro="",
-                page="index.html",
-                failed=False,
-                composer=_composer(config, "index.html"),
-            ),
-        )
+        pages = _index_pages(conn, published, _composer(config, "index.html"))
+        for name, text in pages.items():
+            written.write_text(dest / name, text)
+        # A gallery that shrank (a batch of rejections, a reset) leaves the
+        # old last pages behind, linking to a page that says it is page 19 of 18.
+        for stale in sorted(dest.glob("page-*.html")):
+            if stale.name not in pages:
+                written.remove(stale)
         written.write_text(
             dest / "rejections.html",
             _grid_page(
