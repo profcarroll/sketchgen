@@ -1401,7 +1401,11 @@ ssh dave@d12-node-profcarroll 'ollama -v; nvidia-smi --query-gpu=driver_version 
 ```
 
 **1. Launch.** Console → Compute → Create instance, in the availability domain
-the limit was raised for. Shape `VM.GPU.A10.1`; image the newest Canonical
+the limit was raised for (AD-1 in 2026-09: the limit was 1 there and 0 in AD-2
+and AD-3). There is no `oci` CLI on the operator machine; the launch on
+2026-09-23 was one signed `POST /20160918/instances` through a copy of
+`~/.oci/ocirest.sh`, with the subnet, AD and SSH key read from sld-cloud's own
+instance. Shape `VM.GPU.A10.1`; image the newest Canonical
 Ubuntu (26.04 if listed, to match d12); boot volume 200 GB (two models are
 30 GB, the rest is attempts); same VCN and subnet as sld-cloud, public IPv4,
 your usual SSH key. Ingress stays at the default: port 22 only. **Launch
@@ -1413,12 +1417,18 @@ capacity*, which is days, not minutes.
 ssh sld-gpu 'lsb_release -d && nproc && free -g && df -h / && lspci | grep -i nvidia'
 ```
 
-**2. The driver.** The platform image has none. Pick the same major as d12's.
+**2. The driver.** The platform image has none. d12 runs
+`nvidia-driver-595-open` (595.91.07), and the A10 takes the open modules too,
+so install the same flavour. cloud-init holds the apt lock for the first few
+minutes; wait it out. `--gpgpu` installs a headless driver **without
+`nvidia-smi`**, which the bench and the Node card both read, so add the
+utilities. The modules are built for the newest Oracle kernel, which the
+reboot boots into.
 
 ```bash
-ssh sld-gpu 'sudo apt-get update && sudo ubuntu-drivers list --gpgpu'
-ssh sld-gpu 'sudo ubuntu-drivers install --gpgpu nvidia:<d12 major>-server && sudo reboot'
-ssh sld-gpu 'nvidia-smi'        # must say A10, 23028 MiB or so, and the driver you chose
+ssh sld-gpu 'cloud-init status --wait; sudo ubuntu-drivers install --gpgpu nvidia:595-open'
+ssh sld-gpu 'sudo reboot'
+ssh sld-gpu 'sudo apt-get install -y nvidia-utils-595 && nvidia-smi'   # NVIDIA A10, 23028 MiB, 595.91.07
 ```
 
 **3–4. Packages, linger, the app, the venv, Chromium** — as steps 2–4 of
@@ -1458,8 +1468,12 @@ write-path token, and **do not enable `sketchgen-sync.timer`**: there is no
 Worker for this node, and its votes table stays empty.
 
 ```bash
-ssh sld-gpu 'cd ~/sketchgen && git init --bare gallery.git && git clone gallery.git gallery && cd gallery && git config user.name profcarroll && git config user.email profcarroll@users.noreply.github.com'
+ssh sld-gpu 'cd ~/sketchgen && git init -q --bare -b main gallery.git && git clone -q gallery.git gallery && cd gallery && git config user.name profcarroll && git config user.email 323383783+profcarroll@users.noreply.github.com'
+ssh sld-gpu 'cd ~/sketchgen/gallery && echo "# sketchgen gallery (private)" > README.md && git add README.md && git commit -qm "A private gallery for sld-gpu" && git push -q -u origin main'
 ```
+
+The first commit is what d12's gallery started from too: a README and
+nothing else; the first render fills in the rest.
 
 **8. Units and their settings.** `install-unit`, then one drop-in for the
 worker and web units. `SKETCHGEN_RATE_PER_HOUR` is what the per-sketch cost is
@@ -1468,7 +1482,7 @@ A10 sketch would be priced at a ninth of what it cost.
 
 ```bash
 ssh sld-gpu '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen install-unit'
-ssh sld-gpu 'for u in sketchgen-worker sketchgen-web; do mkdir -p ~/.config/systemd/user/$u.service.d; printf "[Service]\nEnvironment=SKETCHGEN_EXECUTOR_MODEL=qwen3-coder:30b\nEnvironment=SKETCHGEN_RATE_PER_HOUR=2.00\nEnvironment=SKETCHGEN_SHAPE=VM.GPU.A10.1 15/240 + A10 24G\n" > ~/.config/systemd/user/$u.service.d/node.conf; done; systemctl --user daemon-reload'
+ssh sld-gpu 'for u in sketchgen-worker sketchgen-web; do mkdir -p ~/.config/systemd/user/$u.service.d; printf "[Service]\nEnvironment=SKETCHGEN_EXECUTOR_MODEL=qwen3-coder:30b\nEnvironment=SKETCHGEN_RATE_PER_HOUR=2.00\nEnvironment=\"SKETCHGEN_SHAPE=VM.GPU.A10.1 15/240 + A10 24G\"\nEnvironment=OLLAMA_MODELS=/usr/share/ollama/.ollama/models\nEnvironment=SKETCHGEN_OPERATOR=profcarroll\n" > ~/.config/systemd/user/$u.service.d/node.conf; done; systemctl --user daemon-reload'
 ssh sld-gpu '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen control pause --reason "bench first"'
 ssh sld-gpu 'systemctl --user enable --now sketchgen-worker.service sketchgen-web.service sketchgen-backup.timer'
 ```
@@ -1477,7 +1491,13 @@ The worker comes up paused. `billing --identify` on the node records the OCI
 shape; the tunnel's `billing --sync sld-gpu` reads the same tenancy bill
 sld-cloud's card shows, because it is the same bill.
 
-**9. Bench before anything else**, while the box is quiet — then the A/B arm:
+(`OLLAMA_MODELS` is for the Node card's model-volume meter and
+`SKETCHGEN_OPERATOR` for the Held page; d12's drop-ins carry both.)
+
+**9. Bench before anything else**, while the box is quiet — then the A/B arm.
+Until `bench` is on the checked-out build, run it from a copy
+(`rsync` the repo to `~/sketchgen/bench-src` and run its `bin/sketchgen`),
+which leaves the A/B's checkout where it is:
 
 ```bash
 ssh sld-gpu '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen bench --out ~/sketchgen/bench-sld-gpu.json'
