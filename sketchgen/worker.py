@@ -1125,8 +1125,9 @@ def node_shape(conn: "sqlite3.Connection | None" = None) -> str:
     figures — ``VM.Standard.A1.Flex 16/96``) when ``conn`` is given and the
     node has identified itself; otherwise the core count and
     MemTotal are read and reported against the machine architecture. The
-    tenancy's trial ends about 10/1 and 16/96 becomes 4/24 (spec §9) — the
-    entry has to say which one made it, or the timings in it mean nothing.
+    node was 16/96 from 2026-09-13 and goes back to 4/24 before 1 November
+    (OPERATIONS.md, *The shrink to 4/24*) — the entry has to say which one
+    made it, or the timings in it mean nothing.
 
     That last sentence is why this no longer hard-codes ``VM.Standard.A1.Flex``.
     Only the node itself can say it is an OCI shape, and it says so through
