@@ -1276,7 +1276,9 @@
     button.setAttribute("data-play", "");
     button.setAttribute("aria-label", "run entry " + id);
     var img = document.createElement("img");
-    img.src = "../" + id + "/strip.png";
+    // lineage.json names the file the entry directory has — strip.webp once
+    // the entry has a web copy — the same one gallery._ledger_tile uses.
+    img.src = "../" + id + "/" + String((item && item.strip) || "strip.png").split("/").pop();
     img.loading = "lazy";
     img.alt = "the first frame of entry " + id;
     button.appendChild(img);

@@ -493,7 +493,6 @@ class TreeTests(GalleryTestCase):
             "assets/gallery.js",
             "compare.html",
             "config.json",
-            f"e/{one}/gate.png",
             f"e/{one}/index.html",
             f"e/{one}/meta.json",
             f"e/{one}/sketch/index.html",
@@ -514,6 +513,9 @@ class TreeTests(GalleryTestCase):
         for relative in expected:
             with self.subTest(path=relative):
                 self.assertTrue((self.dest / relative).is_file(), relative)
+        # The gate's single frame stays on the node: no page shows it
+        # (gallery-hub.md, Step 0).
+        self.assertFalse((self.dest / f"e/{one}/gate.png").exists())
 
     def test_the_sketch_is_copied_verbatim_but_for_the_two_shims(self):
         # sketch.js is byte for byte the bytes the gate ran, always. The page
@@ -1113,6 +1115,100 @@ class GhostFramesTests(GalleryTestCase):
         self.assertFalse((base / "ghost.png").exists())
         self.assertNotIn("ghost.png", page)
         self.assertEqual(11, meta["gate"][0]["ghost"]["played"])
+
+
+class WebFramesTests(GalleryTestCase):
+    """The WebP beside a gate PNG is what the gallery publishes, when it exists.
+
+    gallery-hub.md, Step 0: on 2026-09-22 the PNGs were 1,166 MB of a 1.2 GB
+    tree against Pages' 1 GB cap. The copy is made on the node beside the PNG
+    (webimg.py); the render only looks for it, so these tests write one by hand.
+    """
+
+    WEBP = b"RIFF\x10\x00\x00\x00WEBPVP8 fake"
+
+    def gate_dir(self, entry_id):
+        row = gallery._entry(self.conn, int(entry_id))
+        return Path(row["strip_path"]).parent
+
+    def rendered(self, entry_id):
+        gallery.render_entry(self.conn, entry_id, self.dest, self.config)
+        base = self.dest / "e" / str(entry_id)
+        return (base / "index.html").read_text(encoding="utf-8"), base
+
+    def give_webp(self, entry_id, name="strip.webp"):
+        (self.gate_dir(entry_id) / name).write_bytes(self.WEBP)
+
+    def test_an_entry_with_a_web_copy_publishes_it_and_not_the_png(self):
+        one = self.ids[0]
+        self.give_webp(one)
+        _page, base = self.rendered(one)
+        self.assertEqual(self.WEBP, (base / "strip.webp").read_bytes())
+        self.assertFalse((base / "strip.png").exists())
+        self.assertFalse((base / "gate.png").exists())
+
+    def test_a_render_after_the_copy_is_made_removes_what_the_last_one_left(self):
+        # The backfill: every entry directory already holds strip.png and
+        # gate.png from renders before this, and publish-index stages removals.
+        one = self.ids[0]
+        _page, base = self.rendered(one)
+        (base / "gate.png").write_bytes(PNG_BYTES)  # as a pre-2026-09-22 render left it
+        self.assertTrue((base / "strip.png").exists())
+        self.give_webp(one)
+        self.rendered(one)
+        self.assertFalse((base / "strip.png").exists())
+        self.assertFalse((base / "gate.png").exists())
+        self.assertTrue((base / "strip.webp").exists())
+
+    def test_every_page_names_the_file_the_entry_has(self):
+        one = self.ids[0]
+        self.give_webp(one)
+        self.render()
+        index = (self.dest / "index.html").read_text(encoding="utf-8")
+        self.assertIn(f'src="e/{one}/strip.webp"', index)
+        self.assertNotIn(f'src="e/{one}/strip.png"', index)
+        ledger = json.loads((self.dest / "lineage.json").read_text(encoding="utf-8"))
+        self.assertEqual(f"e/{one}/strip.webp", ledger["entries"][str(one)]["strip"])
+        compare = (self.dest / "compare.html").read_text(encoding="utf-8")
+        self.assertIn(f"e/{one}/strip.webp", compare)
+
+    def test_a_copy_older_than_its_png_is_not_used(self):
+        # The PNG was rewritten after the copy: a smaller picture of a
+        # different frame is worse than the large right one.
+        one = self.ids[0]
+        self.give_webp(one)
+        webp = self.gate_dir(one) / "strip.webp"
+        png = self.gate_dir(one) / "strip.png"
+        os.utime(webp, (1, 1))
+        _page, base = self.rendered(one)
+        self.assertTrue((base / "strip.png").exists())
+        self.assertFalse((base / "strip.webp").exists())
+        self.assertTrue(png.exists())
+
+    def test_the_ghost_frames_have_a_web_copy_too(self):
+        one = self.ids[0]
+        gate = self.gate_dir(one)
+        (gate / "ghost.png").write_bytes(PNG_BYTES)
+        self.give_webp(one, "ghost.webp")
+        page, base = self.rendered(one)
+        self.assertIn('<img src="ghost.webp"', page)
+        self.assertFalse((base / "ghost.png").exists())
+
+    def test_a_refused_render_puts_back_what_it_removed(self):
+        base = self.dest / "e" / "99"
+        base.mkdir(parents=True)
+        (base / "gate.png").write_bytes(PNG_BYTES)
+        written = gallery._Written(self.dest)
+        written.remove(base / "gate.png")
+        self.assertFalse((base / "gate.png").exists())
+        written.undo()
+        self.assertEqual(PNG_BYTES, (base / "gate.png").read_bytes())
+
+    def test_frame_pngs_names_the_strip_and_not_the_gate_frame(self):
+        one = self.ids[0]
+        found = gallery.frame_pngs(self.conn, one)
+        self.assertEqual(["strip.png"], [p.name for p in found])
+        self.assertEqual([], gallery.frame_pngs(self.conn, 10_000))
 
 
 class PublishTimeLineageTests(GalleryTestCase):

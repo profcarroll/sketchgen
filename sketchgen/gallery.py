@@ -5,8 +5,8 @@ One entry row plus its attempt directory in, a directory of plain files out:
     <gallery>/e/<id>/index.html          the ENTRY page (not the sketch)
     <gallery>/e/<id>/sketch/index.html   the sketch's own page, verbatim but for the two shims
     <gallery>/e/<id>/sketch/sketch.js    the file the entry's frame loads
-    <gallery>/e/<id>/strip.png           four frames, from the gate
-    <gallery>/e/<id>/gate.png            the gate's single frame
+    <gallery>/e/<id>/strip.webp          four frames, from the gate (strip.png if no web copy)
+    <gallery>/e/<id>/ghost.webp          the same under the ghost pointer, when there is one
     <gallery>/e/<id>/statement.md        the executor's own words, verbatim
     <gallery>/e/<id>/meta.json           every spec §7 field
     <gallery>/index.html                 the grid (published entries)
@@ -68,6 +68,7 @@ from . import models
 from . import qr
 from . import ghostshim
 from . import soundshim
+from . import webimg
 
 __all__ = [
     "DEFAULT_GALLERY_URL",
@@ -240,10 +241,19 @@ class _Written:
         self.files.append(dst)
         return dst
 
+    def remove(self, path: Path) -> None:
+        """Delete a file a previous render left, restorable like any other."""
+        if not path.is_file():
+            return
+        self._remember(path)
+        path.unlink()
+        self.files.append(path)
+
     def undo(self) -> None:
         for path in self.files:
             try:
                 if path in self.previous:
+                    path.parent.mkdir(parents=True, exist_ok=True)
                     path.write_bytes(self.previous[path])
                 else:
                     path.unlink()
@@ -694,7 +704,7 @@ def _lineage_index(conn: sqlite3.Connection) -> dict[str, Any]:
                 if cap is not None:
                     root_prompt = root_prompt[:cap]
                 item["submitted_by"] = row["submitted_by"]
-                item["strip"] = f"e/{entry_id}/strip.png"
+                item["strip"] = _strip_href(row)
                 item["root_prompt"] = root_prompt
                 # So a ledger tile the script paints routes a listening sketch to
                 # its own tab, the same as the server-rendered tiles do.
@@ -779,6 +789,64 @@ _ARTEFACTS = {
     "png": ("png_path", "gate.png"),
     "ghost": (None, ghostshim.GHOST_PNG),
 }
+
+#: The frames the gallery publishes, in the order the page uses them. Not
+#: ``png``: no page has ever shown the gate's single frame, and at about
+#: 1.2 MB an entry it was 264 MB of a tree over Pages' 1 GB cap on 2026-09-22
+#: (docs/plans/gallery-hub.md, Step 0). It stays on the node, where the
+#: console shows it.
+_PUBLISHED_FRAMES = ("strip", "ghost")
+
+#: Names an entry directory may hold from an earlier render and must not keep:
+#: the PNG once a web copy replaces it, and the gate frame, which is no longer
+#: published at all.
+_RETIRED = ("gate.png",)
+
+
+def _strip_png(row: Any) -> Path | None:
+    """The strip on the node, from the row alone — no attempts query.
+
+    Every index-level page names every public entry's strip, and the lineage
+    index is built once per entry page, so this runs n² times in a render-all;
+    ``strip_path`` is set on every published entry, and the gate's own
+    directory is the same fallback :func:`_artefact` uses.
+    """
+    candidates: list[Path] = []
+    if row["strip_path"]:
+        candidates.append(Path(row["strip_path"]))
+    if row["source_dir"]:
+        candidates.append(Path(row["source_dir"]) / ".gate" / "strip.png")
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def frame_pngs(conn: sqlite3.Connection, entry_id: int) -> list[Path]:
+    """The gate PNGs on the node whose web copies this entry's page publishes.
+
+    What ``sketchgen web-frames`` and the publisher hand to
+    :func:`sketchgen.webimg.ensure`. Any state: the publisher asks before the
+    entry is public.
+    """
+    row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
+    if row is None:
+        return []
+    attempts = _attempt_rows(conn, int(row["job_id"])) if row["job_id"] else []
+    found = [_artefact(row, attempts, which) for which in _PUBLISHED_FRAMES]
+    return [path for path in found if path is not None]
+
+
+def _strip_href(row: Any) -> str:
+    """``e/<id>/strip.webp`` when the entry has a web copy, else ``strip.png``.
+
+    The same decision :func:`render_entry` makes when it copies the file, from
+    the same place, so a card never points at the name the entry directory
+    does not have.
+    """
+    frame = webimg.web_or_png(_strip_png(row))
+    name = frame.name if frame is not None and frame.suffix == webimg.SUFFIX else "strip.png"
+    return f"e/{int(row['id'])}/{name}"
 
 
 def _artefact(row: sqlite3.Row, attempts: list[sqlite3.Row], which: str) -> Path | None:
@@ -1914,7 +1982,7 @@ def _frame(
     title: str,
     *,
     heavy: dict[str, float | None] | None = None,
-    has_strip: bool = False,
+    strip: str | None = None,
     mic: bool = False,
 ) -> str:
     """The stage: an iframe that starts itself, or a frame that waits.
@@ -1935,8 +2003,8 @@ def _frame(
         )
     if mic:
         poster = (
-            f'<img src="strip.png" alt="four frames from {_esc(title)}">'
-            if has_strip else "<span data-play-label></span>"
+            f'<img src="{_esc(strip)}" alt="four frames from {_esc(title)}">'
+            if strip else "<span data-play-label></span>"
         )
         return (
             '<div class="stage-run stage-mic">\n'
@@ -1948,12 +2016,12 @@ def _frame(
             "in this embedded frame.</p>\n"
             "    </div>"
         )
-    if heavy is not None and has_strip:
+    if heavy is not None and strip:
         return (
             '<div class="stage-run" data-stage-run>\n'
             '      <button type="button" class="play" data-play data-run-href="sketch/"'
             ' data-run-name="this sketch" aria-label="run this sketch">'
-            f'<img src="strip.png" alt="four frames from {_esc(title)}">'
+            f'<img src="{_esc(strip)}" alt="four frames from {_esc(title)}">'
             '<span data-play-label></span></button>\n'
             # The note lives inside the box the frame appears in, because that
             # is where runInPlace looks for it.
@@ -1969,7 +2037,7 @@ def _frame(
     )
 
 
-def _ghost_figure(has_ghost: bool, title: str) -> str:
+def _ghost_figure(ghost: str | None, title: str) -> str:
     """The ghost window's four frames, under the stage, or nothing at all.
 
     Under the stage and not beside ``strip.png``, because this page has never
@@ -1984,11 +2052,11 @@ def _ghost_figure(has_ghost: bool, title: str) -> str:
     empty string here is why their pages render byte for byte as they did: the
     template's ``$ghost`` sits at the end of the line above it.
     """
-    if not has_ghost:
+    if not ghost:
         return ""
     return (
         '\n    <figure class="ghost">\n'
-        f'      <img src="ghost.png" alt="four frames from {_esc(title)} under a '
+        f'      <img src="{_esc(ghost)}" alt="four frames from {_esc(title)} under a '
         'synthetic pointer" loading="lazy">\n'
         "      <figcaption>with the ghost pointer</figcaption>\n"
         "    </figure>"
@@ -2087,12 +2155,15 @@ def _ledger_tile(entry_id: int, item: dict[str, Any] | None, width: str) -> str:
     if not (item or {}).get("public"):
         return f'<div class="ledger-tile {width} blank" aria-hidden="true"></div>'
     mic = ' data-run-mic="1"' if (item or {}).get("mic") else ""
+    # The name the lineage index recorded, which is the one render_entry
+    # wrote: strip.webp for an entry with a web copy, strip.png otherwise.
+    strip = Path(str((item or {}).get("strip") or "strip.png")).name
     return (
         f'<div class="ledger-tile {width}">'
         f'<button type="button" class="play" data-play '
         f'data-run-href="../{entry_id}/sketch/"{mic} '
                 f'aria-label="run entry {entry_id}" data-run-name="entry {entry_id}">'
-        f'<img src="../{entry_id}/strip.png" loading="lazy" '
+        f'<img src="../{entry_id}/{_esc(strip)}" loading="lazy" '
         f'alt="the first frame of entry {entry_id}">'
         f"<span data-play-label></span></button></div>"
     )
@@ -2733,14 +2804,21 @@ def _write_entry(
             else:
                 written.write_text(out / "sketch" / "index.html", shimmed)
             has_sketch = True
-    has_strip = False
-    has_ghost = False
-    for which, (_column, name) in _ARTEFACTS.items():
-        artefact = _artefact(row, attempts, which)
-        if artefact is not None:
-            written.copy(artefact, out / name)
-            has_strip = has_strip or which == "strip"
-            has_ghost = has_ghost or which == "ghost"
+    published: dict[str, str] = {}
+    for which in _PUBLISHED_FRAMES:
+        png_name = _ARTEFACTS[which][1]
+        frame = webimg.web_or_png(_artefact(row, attempts, which))
+        if frame is None:
+            continue
+        name = Path(png_name).stem + frame.suffix
+        written.copy(frame, out / name)
+        published[which] = name
+        # The other spelling, if an earlier render left it: a PNG this web
+        # copy replaces, or (should a copy ever go missing) the reverse.
+        other = png_name if name != png_name else Path(png_name).stem + webimg.SUFFIX
+        written.remove(out / other)
+    for name in _RETIRED:
+        written.remove(out / name)
 
     statement = meta["statement"] or ""
     written.write_text(
@@ -2795,14 +2873,14 @@ def _write_entry(
         subtitle=_subtitle(revisions, meta),
         byline=_byline(row, [(o["step"], o["model"]) for o in meta["off_node"]]),
         failed_note=failed_note,
-        frame=_frame(has_sketch, title, heavy=_heavy(meta), has_strip=has_strip,
+        frame=_frame(has_sketch, title, heavy=_heavy(meta), strip=published.get("strip"),
                      mic=has_sketch and _needs_mic(source)),
         # Under the frame and above the seed line: what this page is about to
         # ask the reader's own browser to fetch (media-assertion.md §4).
         loads=_loads_note(meta),
         seed=_dash(meta["seed"]),
         state_chip=_state_chip(row["state"]),
-        ghost=_ghost_figure(has_ghost, title),
+        ghost=_ghost_figure(published.get("ghost"), title),
         brief=_paragraphs(str(row["brief"] or ""), "No brief was recorded for this job."),
         statement_model=_esc(row["executor"] or "an unrecorded model"),
         statement=_paragraphs(statement, "The executor wrote no statement."),
@@ -2914,7 +2992,7 @@ def _card(
     return template.substitute(
         entry_id=entry_id,
         href=f"e/{entry_id}/",
-        strip=f"e/{entry_id}/strip.png",
+        strip=_strip_href(row),
         prompt=_esc(prompt),
         revision=revision,
         chip=chip,
@@ -3076,7 +3154,7 @@ def _compare_page(conn: sqlite3.Connection, rows: list[sqlite3.Row]) -> str:
             "brief": row["brief"] or "",
             "seed": row["seed"],
             "state": str(row["state"]),
-            "strip": f"e/{int(row['id'])}/strip.png",
+            "strip": _strip_href(row),
             "href": f"e/{int(row['id'])}/",
         }
         for row in rows

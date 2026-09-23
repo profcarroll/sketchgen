@@ -216,6 +216,15 @@ green "gallery checkout up to date"
 # never reaches the hundreds of pages that ARE the gallery. That is how 36
 # entries went up with no critique form. Same database, same config, so a page
 # already current comes out byte-identical and there is nothing to commit for it.
+# First the web copies of the gate's frames, which the render publishes in
+# place of the PNGs (gallery-hub.md, Step 0). A no-op once every entry has
+# them; the first run after 2026-09-22 made ~1,200. Not fatal: an entry with
+# no copy publishes its PNG, as all of them used to.
+step "Making web copies of the gate's frames"
+cd "$APP"
+"$VENV" bin/sketchgen web-frames --all --db "$DB" \
+    || dim "web-frames did not finish; entries without a copy publish their PNG"
+
 step "Re-rendering and pushing the gallery (index and every entry)"
 cd "$APP"
 # --progress: one line redrawn per page, with the count and an estimate. Five
