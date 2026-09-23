@@ -1430,14 +1430,18 @@ ssh sld-gpu 'cd ~/sketchgen/app && git checkout <d12 commit>'   # the A/B's buil
 ```
 
 **5. Ollama, pinned, and the models by digest.** The install script takes a
-version. Then the same `OLLAMA_*` drop-in d12 has — the A/B arm is run under
-d12's settings; the variants in the plan change one at a time from there.
+version. d12 runs Ollama on its defaults — its one drop-in (`tailnet.conf`)
+only binds it to the Tailscale address and waits for `tailscale0` — so the
+A10 gets **no** `OLLAMA_*` drop-in at all, and the A/B arm runs under the
+same defaults; the variants in the plan change one at a time from there.
+(sld-cloud is the odd one out: `KEEP_ALIVE=30m` and `MAX_LOADED_MODELS=2`.
+The bench asks for 30 minutes per request, so its numbers are unaffected.)
 
 ```bash
 ssh sld-gpu 'curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=<d12 version> sh'
-ssh sld-gpu 'sudo systemctl edit ollama'      # paste d12's Environment= lines
-ssh sld-gpu 'ollama pull <d12 executor tag> && ollama pull gemma4:e4b'
-ssh sld-gpu 'ollama list'      # executor digest 06c1097efce0; gemma4:e4b's must equal d12's
+ssh sld-gpu 'systemctl show ollama -p Environment --value'   # PATH only, no OLLAMA_*
+ssh sld-gpu 'ollama pull qwen3-coder:30b && ollama pull gemma4:e4b'   # d12's tags
+ssh sld-gpu 'ollama list'      # must show 06c1097efce0 and c6eb396dbd59, as d12 does
 ```
 
 **6. A fresh database, not a restore.** This is a new arm, like d12: its entry
@@ -1463,7 +1467,7 @@ A10 sketch would be priced at a ninth of what it cost.
 
 ```bash
 ssh sld-gpu '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen install-unit'
-ssh sld-gpu 'for u in sketchgen-worker sketchgen-web; do mkdir -p ~/.config/systemd/user/$u.service.d; printf "[Service]\nEnvironment=SKETCHGEN_EXECUTOR_MODEL=<d12 executor tag>\nEnvironment=SKETCHGEN_RATE_PER_HOUR=2.00\nEnvironment=SKETCHGEN_SHAPE=VM.GPU.A10.1 15/240 + A10 24G\n" > ~/.config/systemd/user/$u.service.d/node.conf; done; systemctl --user daemon-reload'
+ssh sld-gpu 'for u in sketchgen-worker sketchgen-web; do mkdir -p ~/.config/systemd/user/$u.service.d; printf "[Service]\nEnvironment=SKETCHGEN_EXECUTOR_MODEL=qwen3-coder:30b\nEnvironment=SKETCHGEN_RATE_PER_HOUR=2.00\nEnvironment=SKETCHGEN_SHAPE=VM.GPU.A10.1 15/240 + A10 24G\n" > ~/.config/systemd/user/$u.service.d/node.conf; done; systemctl --user daemon-reload'
 ssh sld-gpu '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen control pause --reason "bench first"'
 ssh sld-gpu 'systemctl --user enable --now sketchgen-worker.service sketchgen-web.service sketchgen-backup.timer'
 ```
