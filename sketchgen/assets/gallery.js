@@ -732,8 +732,10 @@
    * entry's number, its prompt, its brief, its rules file, its executor and
    * whoever submitted it — already lowercased and collapsed, so the matching
    * here is: lowercase the query, split it on spaces, and keep a card whose
-   * attribute contains every one of those terms. Nothing is fetched and no
-   * index is built; the whole grid is on the page already.
+   * attribute contains every one of those terms. No index is built. On a
+   * paged index the first term fetches cards.json once, so the terms are
+   * matched against every card and not only this page's sixty (see "the
+   * grid's pages" below).
    *
    * With this script absent the box is a form that submits to the page it is
    * already on, which reloads it showing everything. Nothing is broken. */
@@ -782,6 +784,7 @@
       remember("q", query);
       carryOnLinks("q", query);
       applyVisibility();
+      if (query) { withWholeGrid(); }
     }
 
     // Small grids, one attribute each: there is nothing here to debounce.
@@ -800,6 +803,61 @@
       });
     }
     if (box.value) { carryOnLinks("q", box.value); }
+  }
+
+  /* ---- the grid's pages ------------------------------------------------ */
+
+  /* Since 2026-09-23 the index is pages of sixty (gallery._index_pages): 1,049
+   * cards and 3.2 MB was too much page for a phone. A page marks its grid
+   * data-paged. Browsing needs nothing from here — the pager is plain links —
+   * but a sort, a search, a rules or executor filter, or ?all has to be over
+   * the whole gallery or it is a wrong answer, so those first fetch
+   * cards.json, the same cards the generator rendered, and put every one of
+   * them in the grid. From then on the sort and search code below is the code
+   * it always was, over a grid that holds everything. */
+  var wholeGrid = null;
+
+  function wantsWholeGrid() {
+    var params = new URLSearchParams(window.location.search);
+    return currentSort() !== DEFAULT_SORT || queryTerms(currentQuery()).length > 0 ||
+      !!params.get("rules") || !!params.get("executor") || params.has("all");
+  }
+
+  function ensureWholeGrid() {
+    var grid = document.querySelector(".grid[data-paged]");
+    if (!grid) { return Promise.resolve(false); }
+    if (wholeGrid) { return wholeGrid; }
+    wholeGrid = fetch(ROOT + "cards.json")
+      .then(function (response) {
+        if (!response.ok) { throw new Error("cards.json " + response.status); }
+        return response.json();
+      })
+      .then(function (data) {
+        grid.innerHTML = ((data && data.cards) || []).join("");
+        grid.removeAttribute("data-paged");
+        var pager = document.querySelector("[data-pager]");
+        if (pager) { pager.hidden = true; }
+        return true;
+      })
+      .catch(function () {
+        // Leave the page as it was: a sort or search of this page is a
+        // smaller answer than asked for, and a retry on the next one is free.
+        wholeGrid = null;
+        return false;
+      });
+    return wholeGrid;
+  }
+
+  /* Whatever asked for the whole gallery gets the grid re-filtered, re-sorted
+   * and re-counted once it is there: the counts slots of the cards that just
+   * arrived still read an em dash. */
+  function withWholeGrid() {
+    return ensureWholeGrid().then(function (loaded) {
+      if (!loaded) { return; }
+      applyFilters();
+      applySort(currentSort());
+      loadCounts();
+    });
   }
 
   /* ---- the grid's order ------------------------------------------------ */
@@ -972,6 +1030,7 @@
         // applySort shuffles every time it is asked for "random", so pressing
         // random again is another shuffle rather than nothing at all.
         applySort(name);
+        if (name !== DEFAULT_SORT) { withWholeGrid(); }
       });
     });
   }
@@ -1658,6 +1717,7 @@
     applyFilters();
     applySort(sort);
     wireSort();
+    if (wantsWholeGrid()) { withWholeGrid(); }
     loadConfig().then(function () {
       sendView();
       loadCounts();

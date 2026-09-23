@@ -331,6 +331,12 @@ class Element {
   removeAttribute(name) { delete this.attributes[name]; }
 
   appendChild(node) {
+    // A fragment hands over its children and is itself never inserted, as in
+    // a browser; the grid's sort moves every card through one (gallery.js).
+    if (node.isFragment) {
+      node.childNodes.slice().forEach(function (child) { this.appendChild(child); }, this);
+      return node;
+    }
     if (node.parentNode) { node.parentNode.removeChild(node); }
     node.parentNode = this;
     this.childNodes.push(node);
@@ -479,6 +485,11 @@ class Document extends Element {
   }
   createElement(tag) { return new Element(tag); }
   createTextNode(value) { return new Text(value); }
+  createDocumentFragment() {
+    const fragment = new Element("#document-fragment");
+    fragment.isFragment = true;
+    return fragment;
+  }
   getElementById(id) { return this.querySelector('[id="' + id + '"]'); }
 }
 
