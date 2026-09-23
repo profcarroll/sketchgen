@@ -998,6 +998,11 @@ python3 bin/sketchgen billing --sync sld-cloud
 endpoint, which is what lets it run on the node at all. To look without
 recording, run `billing` with no flags; to see the raw reading, `--json`.
 
+`bin/sketchgen-tunnel.sh up` runs this `--sync` for you after the forward
+answers, but only when the node is an OCI instance: it asks the node's metadata
+service first, and a node where that does not answer (the DT lab PCs on
+Tailscale) keeps its card empty rather than showing this tenancy's bill.
+
 ### What is stored, and why it is not one number
 
 A reading is a *day at a time*, one row per service and SKU, in `billing_usage`

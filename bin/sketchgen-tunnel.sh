@@ -120,6 +120,13 @@ reap() {
 # opens its own ssh (cli/billing.py), so a billing hiccup — OCI slow, key
 # missing, network down — must never cost you the tunnel you actually came for.
 # Runs only after cmd_up succeeds; skip it entirely with SKETCHGEN_NO_BILLING=1.
+#
+# And only when the node is on OCI. The script is pointed at a DT lab PC on
+# Tailscale since 2026-09-22, where a refresh would put this laptop's OCI bill on
+# a console for a box that costs nothing. The node is asked, not named: the
+# metadata service (cli/billing.py's IMDS) answers on an OCI instance and
+# nowhere else, so a renamed or migrated OCI node keeps its refresh with no list
+# to update here.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BILLING_TIMEOUT="${SKETCHGEN_BILLING_TIMEOUT:-30}"
 
@@ -139,8 +146,24 @@ find_sketchgen() {
   return 1
 }
 
+# 0 on OCI, 1 not on OCI, 2 could not ask (ssh itself failed).
+node_on_oci() {
+  local rc
+  timeout 20 ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE_HOST" \
+    "curl -sf -m 3 -o /dev/null -H 'Authorization: Bearer Oracle' http://169.254.169.254/opc/v2/instance/id"
+  rc=$?
+  (( rc == 0 )) && return 0
+  (( rc == 255 || rc == 124 )) && return 2
+  return 1
+}
+
 refresh_billing() {
   [[ "${SKETCHGEN_NO_BILLING:-}" == 1 ]] && return 0
+  node_on_oci
+  case $? in
+    1) dim "billing refresh skipped: ${REMOTE_HOST} is not an OCI instance"; return 0 ;;
+    2) warn "billing refresh skipped: could not ask ${REMOTE_HOST} whether it is on OCI"; return 0 ;;
+  esac
   # Bare python3 on the laptop: there is no venv here (AGENTS.md), and ~/.oci is.
   command -v python3 >/dev/null 2>&1 || { warn "no python3 for billing refresh"; return 0; }
   local cli
@@ -252,6 +275,7 @@ sketchgen-tunnel.sh — SSH forward to the sketchgen console on ${REMOTE_HOST}
 
   up       (default) start if not already responding; reaps dead stubs first,
                     then refreshes the console's billing card from OCI
+                    (OCI nodes only)
   status            show processes, listeners and a real HTTP health check
   heal              force full teardown + restart
   down              stop the tunnel
@@ -259,7 +283,8 @@ sketchgen-tunnel.sh — SSH forward to the sketchgen console on ${REMOTE_HOST}
 
 On a successful 'up' a fresh OCI usage reading is taken here (this laptop holds
 ~/.oci; the node never does) and shipped to the node for the console's billing
-card. It is non-fatal — the tunnel is what 'up' guarantees, not the reading.
+card. It is non-fatal — the tunnel is what 'up' guarantees, not the reading —
+and it is skipped when the node is not an OCI instance.
 
 Env overrides: SKETCHGEN_LOCAL_PORT, SKETCHGEN_REMOTE_HOST,
                SKETCHGEN_REMOTE_BIND, SKETCHGEN_REMOTE_PORT, SKETCHGEN_HEALTH_PATH,
