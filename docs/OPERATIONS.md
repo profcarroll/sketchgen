@@ -1389,6 +1389,11 @@ hardware A/B is only a comparison if Ollama, the driver major and the model
 digests are the same on both.
 
 **0. Read d12's versions first**, and write them down; step 5 pins to them.
+On 2026-09-23 they were Ollama 0.34.3, driver 595.91.07, Ubuntu 26.04.1
+(Python 3.14.4), app a72f076 — read them again, they move. d12's Ollama
+listens on its Tailscale address only (`OLLAMA_HOST=100.107.156.77:11434`),
+so a bare `ollama` there says it cannot connect; that is not an outage.
+The A10 keeps the default loopback address and needs no such line.
 
 ```bash
 ssh dave@d12-node-profcarroll 'ollama -v; nvidia-smi --query-gpu=driver_version --format=csv,noheader; systemctl cat ollama | grep -i environment; systemctl --user show sketchgen-worker -p Environment --value; cd ~/sketchgen/app && git log --oneline -1'

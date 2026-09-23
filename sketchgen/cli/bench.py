@@ -64,7 +64,8 @@ EXIT_OK, EXIT_FAIL, EXIT_REFUSED = 0, 1, 3
 #: lines up two runs that asked different questions.
 BENCH_VERSION = 1
 
-DEFAULT_HOST = os.environ.get("OLLAMA_HOST_URL", "http://127.0.0.1:11434")
+#: None means "where this node's worker looks" — see :func:`default_host`.
+DEFAULT_HOST = os.environ.get("OLLAMA_HOST_URL")
 
 #: (name, target prompt tokens). ``short`` is a fresh prompt with the rules
 #: file, ``rules`` a first repair with its evidence, ``source`` a critique
@@ -243,6 +244,18 @@ def _unit_env(unit: str, user: bool = True) -> dict[str, str]:
         if sep:
             found[key] = value
     return found
+
+
+def default_host() -> str:
+    """Where the worker reaches Ollama: its unit's OLLAMA_HOST_URL, else loopback.
+
+    d12's Ollama listens on its Tailscale address only (OLLAMA_HOST in the
+    ollama unit, read 2026-09-23), and the worker is pointed there by a
+    drop-in a shell does not inherit; a bench defaulting to 127.0.0.1 there
+    reports no model host on a machine that has one.
+    """
+    return (_unit_env("sketchgen-worker").get("OLLAMA_HOST_URL")
+            or "http://127.0.0.1:11434")
 
 
 def default_models(conn=None) -> tuple[str, str]:
@@ -497,7 +510,7 @@ def cmd(args: argparse.Namespace, post: Post = http) -> int:
         )
         return EXIT_REFUSED
 
-    host = args.host
+    host = args.host or default_host()
     try:
         post(host, "/api/version", None, 5.0)
     except OSError as exc:
@@ -635,7 +648,8 @@ def register(top: argparse._SubParsersAction) -> None:
                    help=f"override the context size (default {PLANNER_NUM_CTX} for "
                         f"the planner, {EXECUTOR_NUM_CTX} for everything else)")
     p.add_argument("--host", default=DEFAULT_HOST, metavar="URL",
-                   help="Ollama (default $OLLAMA_HOST_URL, else 127.0.0.1:11434)")
+                   help="Ollama (default $OLLAMA_HOST_URL, else the worker unit's, "
+                        "else 127.0.0.1:11434)")
     p.add_argument("--out", metavar="FILE", help="also write the full result as JSON here")
     p.add_argument("--compare", nargs="+", metavar="FILE",
                    help="print saved results side by side instead of running")
