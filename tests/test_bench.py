@@ -214,6 +214,27 @@ class MeasurementTests(unittest.TestCase):
         self.assertAlmostEqual(sizes[-1] / 4, bench.CASES[-1][1], delta=10)
 
 
+class HostTests(unittest.TestCase):
+    def test_the_worker_units_host_is_the_default(self):
+        unit = "Environment=OLLAMA_HOST_URL=http://100.107.156.77:11434 SKETCHGEN_X=1"
+        with mock.patch.object(bench, "_run", return_value=unit.split("=", 1)[1]):
+            self.assertEqual(bench.default_host(), "http://100.107.156.77:11434")
+
+    def test_loopback_without_a_unit(self):
+        with mock.patch.object(bench, "_run", return_value=""):
+            self.assertEqual(bench.default_host(), "http://127.0.0.1:11434")
+
+    def test_host_none_resolves_before_the_first_request(self):
+        seen = []
+        fake = FakeOllama(MODELS)
+
+        def post(host, *rest):
+            seen.append(host)
+            return fake(host, *rest)
+        run(post, host=None, model=["exec:tag"])
+        self.assertEqual(set(seen), {"http://127.0.0.1:11434"})
+
+
 class CompareTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory(prefix="sketchgen-bench-")
