@@ -318,6 +318,15 @@ worker and web, resume. Traps:
 - Tests: `python3 -m unittest discover -s tests` from the repo root — stdlib,
   ~75 s, ~1330 tests, 3 skips that need the node. No network, no model, no
   browser: every model reply is a stub on disk. Keep it that way.
+- **The suite is a laptop thing.** It publishes for real wherever a gallery
+  checkout and a deploy key both exist, which on the node they do: on
+  2026-09-22 a run here pushed fixture entries 9281 and 9282 to the public
+  gallery, overwrote entry 1 with one, and re-rendered the index from its own
+  temporary database, leaving "Nothing here yet." over 1047 published entries
+  until a full `publish-index` put it back. `tests/__init__.py` now points
+  `SKETCHGEN_GALLERY`, `SKETCHGEN_GALLERY_KEY` and `SKETCHGEN_DB` at a
+  directory that does not exist, so the publisher refuses instead — do not
+  unpin them, and run the suite on the laptop anyway.
 - Exit codes everywhere: 0 ok, 1 failed, 3 refused (nothing written).
 - New CLI verbs go in `sketchgen/cli/<name>.py` with `register(top)`;
   `bin/sketchgen` picks them up. Give agent-facing verbs `--json`.
