@@ -24,8 +24,10 @@ On d12 RAM is not the constraint. Read from `/api/ps` during the A/B:
 | `qwen3-coder:30b` (executor) | 19.03 GiB | 14.18 GiB | **75%** |
 
 `nvidia-smi` at the same moment: 14,855 of 16,303 MiB used. So a quarter of the executor's
-weights run on the CPU, and the planner (`gemma4:e4b`, 8.9 GiB) cannot be resident beside it at
-all. The worker's log shows what that costs: **the executor was reloaded for 22 of the first 22
+weights run on the CPU, and the planner cannot be resident beside it at all. (This said the
+planner was 8.9 GiB; that is its size on disk. `sketchgen bench` read it back from `/api/ps` on
+2026-09-23 as 3.37 GB resident at 8k context, all of it on the GPU — still more than the
+card has left once the executor is loaded.) The worker's log shows what that costs: **the executor was reloaded for 22 of the first 22
 A/B jobs**, a mean of 4.31 s each, because every plan evicts it. On sld-cloud the same pair sits
 in 94 GB of RAM and neither is evicted by the other.
 

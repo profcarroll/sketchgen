@@ -1367,8 +1367,9 @@ allowance — **before 1 November**, so November bills nothing for compute.
 The resize is a reboot into the new shape from the console (Instance → Edit →
 Shape), with the generator paused first so no attempt is cut off. Afterwards
 `billing --identify` on the node, so the Node card and new entries say 4/24.
-The two models (19 GB + 9 GB) do not fit in 24 GB together, as they did not
-before 2026-09-13: planner and executor take turns, and every job pays a load
+The two models are 20.4 GB and 3.4 GB resident (`sketchgen bench` on d12,
+2026-09-23), which is 24 GB with nothing left for the system, the web server
+or the gate's Chromium: expect them to take turns, and every job to pay a load
 between them. Read `attempts.load_s` after the resize to see what that costs.
 
 Nothing else to do. The unit encodes no core count, no memory figure and no

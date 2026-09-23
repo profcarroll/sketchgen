@@ -173,8 +173,19 @@ def num_ctx_for(model: str, planner: str) -> int:
     return PLANNER_NUM_CTX if model == planner else EXECUTOR_NUM_CTX
 
 
+#: What the filler actually tokenises to, measured on d12 on 2026-09-23:
+#: qwen3-coder 3.19 characters a token and gemma4 3.09, not the four the
+#: prompts were sized by — the 12k case is 15,029 tokens. The prompts stay
+#: as they are (changing them would orphan that run); the fit check uses the
+#: measured ratio. At 3.0 it would skip the 12k case at 16k, which fits with
+#: 800 tokens to spare; gemma4's slightly denser count is inside CTX_MARGIN,
+#: and a run that overflows anyway is flagged from Ollama's own counts.
+CHARS_PER_TOKEN = 3.1
+
+
 def fits(target_tokens: int, num_ctx: int) -> bool:
-    return target_tokens + NUM_PREDICT + CTX_MARGIN <= num_ctx
+    estimated = target_tokens * 4 / CHARS_PER_TOKEN
+    return estimated + NUM_PREDICT + CTX_MARGIN <= num_ctx
 
 
 # ---------------------------------------------------------------------------
@@ -363,11 +374,19 @@ def load(host: str, post: Post, name: str, num_ctx: int) -> dict[str, Any]:
                  {"model": name, "options": {"num_ctx": num_ctx}, "keep_alive": "30m"},
                  REQUEST_TIMEOUT_S)
     wall = round(time.monotonic() - started, 2)
+    # Ollama 0.34.3 answers an empty-prompt load with no load_duration (d12,
+    # 2026-09-23: 0.0 for both models, 3.5 s and 2.1 s by the clock), so the
+    # wall clock is the load time when the counter is missing. "Cold" means
+    # not resident in Ollama; the weights may still be in the OS page cache,
+    # which only a root `drop_caches` would rule out, so a first load after
+    # boot reads slower than this.
+    counted = _s(reply.get("load_duration"))
     ps = resident(host, post, name) or {}
     size, size_vram = ps.get("size") or 0, ps.get("size_vram") or 0
     return {
         "num_ctx": num_ctx,
-        "load_s": _s(reply.get("load_duration")),
+        "load_s": counted if counted else wall,
+        "load_counted": bool(counted),
         "wall_s": wall,
         "resident_gb": round(size / 1e9, 2),
         "vram_gb": round(size_vram / 1e9, 2),
@@ -450,6 +469,8 @@ def bench_model(host: str, post: Post, info: dict, num_ctx: int, *, repeat: int,
             flags.append("prompt cached")
         if any((r.get("load_s") or 0) > 1.0 for r in runs):
             flags.append("reloaded during run")
+        if any((r.get("prompt_tokens") or 0) + (r.get("tokens") or 0) > num_ctx for r in runs):
+            flags.append("overflowed ctx")
         if flags:
             summary["flags"] = flags
         results[case] = summary
@@ -567,14 +588,15 @@ def cmd(args: argparse.Namespace, post: Post = http) -> int:
 
 def table(results: list[dict]) -> str:
     """One line per node x model x case, matched on the model's digest."""
-    lines = [f"{'node':<24} {'model':<30} {'digest':<12} {'load s':>7} {'gpu%':>5} "
+    lines = [f"{'node':<36} {'model':<30} {'digest':<12} {'load s':>7} {'gpu%':>5} "
              f"{'case':<7} {'prompt':>6} {'prefill':>8} {'decode':>7} {'agg':>7}"]
     rows = []
     for result in results:
         node = result["node"]
         label = node.get("hostname") or "?"
         if node["gpu"].get("name"):
-            label += f" ({node['gpu']['name'].replace('NVIDIA ', '')})"
+            card = node["gpu"]["name"].replace("NVIDIA ", "").replace("GeForce ", "")
+            label += f" ({card})"
         for entry in result["models"]:
             m, load_ = entry["model"], entry["load"]
             for case, row in entry["cases"].items():
@@ -583,12 +605,12 @@ def table(results: list[dict]) -> str:
     for digest, case, label, name, load_, row in sorted(
             rows, key=lambda r: (r[0], order.get(r[1], 99), r[2])):
         if "skipped" in row:
-            lines.append(f"{label[:24]:<24} {name[:30]:<30} {digest:<12} {'':>7} {'':>5} "
+            lines.append(f"{label[:36]:<36} {name[:30]:<30} {digest:<12} {'':>7} {'':>5} "
                          f"{case:<7} skipped")
             continue
         flags = f"  [{', '.join(row['flags'])}]" if row.get("flags") else ""
         lines.append(
-            f"{label[:24]:<24} {name[:30]:<30} {digest:<12} {load_['load_s']:>7.1f} "
+            f"{label[:36]:<36} {name[:30]:<30} {digest:<12} {load_['load_s']:>7.1f} "
             f"{_fmt(load_.get('on_gpu_pct')):>5} {case:<7} {_fmt(row['prompt_tokens']):>6} "
             f"{_fmt(row['prefill_tok_s']):>8} {_fmt(row['decode_tok_s']):>7} "
             f"{_fmt(row.get('aggregate_decode_tok_s')):>7}{flags}"

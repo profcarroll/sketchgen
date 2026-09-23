@@ -10,10 +10,14 @@ instance terminated and its data on the laptop. Setup and teardown are in
 ## 1. The question
 
 The lab will be built from desktop cards. d12's card is fast (896 GB/s) but
-16 GB, and the executor is 19 GB: about a quarter of it runs on the CPU, and
-planner plus executor (28 GB) cannot be resident together, so every job
-reloads (docs/plans/models-console-two-nodes.md §1). The A10 is the opposite:
-slower memory (600 GB/s), but 24 GB, so the executor is resident whole.
+16 GB, and the executor is 20.4 GB resident at 16k context: a quarter of it
+runs on the CPU, and the planner (3.4 GB resident at 8k — measured by
+`sketchgen bench`, 2026-09-23) evicts it, so every job reloads
+(docs/plans/models-console-two-nodes.md §1). The A10 is the opposite: slower
+memory (600 GB/s), but 24 GB, so the executor is resident whole. The pair
+together is 23.8 GB, which is the A10's whole card less CUDA's overhead — so
+expect the planner to evict the executor there too, until L2's first
+variant moves the planner to the CPU.
 
 **What does whole residency buy, against raw bandwidth?** That decides whether
 the next boxes want a bigger card or just more of the same one, and it is the
@@ -54,6 +58,12 @@ the model landed (`size_vram`, `nvidia-smi`). Matched on digest, so d12's
 sld-cloud benches after the B arm (jobs 1373–1472) is done — the bench
 refuses while the generator runs — and d12 between its own runs.
 `bench --compare` on the laptop makes the table.
+
+d12 is done (2026-09-23, 3 minutes; `~/sketchgen/bench-d12.json` there and in
+`~/sketchgen-backups/bench/` on the laptop): the executor decodes at 102 / 93 /
+87 tok/s with 1.2k / 5k / 15k prompt tokens, prefills at 1.4–1.75k tok/s, and
+sits 75% on the GPU; the planner decodes at 165 / 161 tok/s, wholly on the GPU.
+The A10's executor figures are the ones to put beside these.
 
 **L1 — arm C of the hardware A/B (about 6 h).** The same 100 harvest prompts
 as d12's jobs 102–201 and sld-cloud's 1373–1472, at the same build (a72f076)

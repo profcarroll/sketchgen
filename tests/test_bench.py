@@ -198,6 +198,26 @@ class MeasurementTests(unittest.TestCase):
                 self.assertEqual(body["options"]["num_predict"], bench.NUM_PREDICT)
                 self.assertFalse(body["stream"])
 
+    def test_a_load_without_a_counter_falls_back_to_the_clock(self):
+        fake = FakeOllama(MODELS)
+        real = fake.__call__
+
+        def no_counter(host, path, body, timeout):
+            reply = real(host, path, body, timeout)
+            if path == "/api/generate" and body and "prompt" not in body:
+                reply.pop("load_duration", None)
+            return reply
+        _code, out, _err = run(no_counter, model=["exec:tag"])
+        loaded = json.loads(out)["models"][0]["load"]
+        self.assertFalse(loaded["load_counted"])
+        self.assertEqual(loaded["load_s"], loaded["wall_s"])
+
+    def test_the_fit_check_uses_the_measured_ratio(self):
+        # 12k asked is ~16k real: it fits 16384 with 512 out, and not 8192.
+        self.assertTrue(bench.fits(12000, 16384))
+        self.assertFalse(bench.fits(12000, 8192))
+        self.assertFalse(bench.fits(4000, 5500))
+
     def test_a_cached_prompt_is_flagged(self):
         _code, out, _err = run(FakeOllama(MODELS, cached_prompt=True))
         self.assertIn("prompt cached", json.loads(out)["models"][0]["cases"]["short"]["flags"])
