@@ -131,14 +131,15 @@ outage. Step 2 puts `wrangler deploy` into a deploy script with a version endpoi
 - **Publish web copies of the frames.** The gate's PNGs stay on the node, byte-for-byte, as the
   judge's and critic's evidence and the pair hash's input. What the gallery gets is a WebP beside
   each (`strip.webp`, `ghost.webp`), encoded by the same Chromium the gate runs, cached next to
-  the PNG. A trial at quality 75 took two strips from 3.2 MB to about 230 KB.
+  the PNG. On four real frames the copy came to 38–340 KB against 1.2–3.2 MB, about 200 KB a
+  strip on average.
 - **Stop publishing `gate.png`.** Nothing shows it.
 - **A backfill verb** encodes the ~1,200 existing entries once, so the next `publish-index`
   replaces every PNG in the tree.
 - **Paginate the index**, so a visit is not 3.2 MB.
 - **Re-run the harvest on sld-cloud** under d12's settings (§0).
 
-Expected: the tree from ~1.2 GB to under 150 MB. The repository's history keeps the old PNGs;
+Expected: the tree from ~1.2 GB to about 300 MB, most of it the WebP strips. The repository's history keeps the old PNGs;
 squashing it is a separate, destructive choice (§4).
 
 ### Step 1 — the mutable half moves to D1
@@ -159,7 +160,7 @@ into the pool, and the A/B in §0 starts measuring.
 
 ## 3. Acceptance
 
-1. Step 0: the gallery tree under 150 MB; no `gate.png` in it; every entry page and the kiosk
+1. Step 0: the gallery tree under 400 MB; no `gate.png` in it; every entry page and the kiosk
    show their frames; the judge and critic still read PNGs on the node.
 2. Step 1: a judgment appears on its entry page with no render and no push.
 3. Step 2: an entry published on sld-cloud appears at `sketchgen.davidcarroll.org/e/<id>/`; its
