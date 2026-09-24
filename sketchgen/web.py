@@ -1238,15 +1238,17 @@ ACTIVITY_PILLS: dict[str, tuple[str, str]] = {
     "paused": ("paused", "bad"),
     "gone": ("not running", "bad"),
     "stalled": ("stalled", "warn"),
+    "fenced": ("fenced", "warn"),
     "unknown": ("unknown", "quiet"),
 }
 
-#: Steps that are not work. There is exactly one, and it is the nap: the worker
-#: opens an ``idle`` row when it goes to sleep so that an open row exists for as
-#: long as the process does. The bar reads this, not the state, because
+#: Steps that are not work: the nap, in both its shapes. The worker opens an
+#: ``idle`` row when it goes to sleep so that an open row exists for as long as
+#: the process does, and a ``fenced`` row when the sleep follows a pass the
+#: fence refused (2026-09-23). The bar reads this, not the state, because
 #: console.activity() puts judging and critiquing under the ``idle`` state too,
 #: and those two are work — long, model-shaped work, with medians of their own.
-ACTIVITY_RESTING_STEPS = frozenset({"idle"})
+ACTIVITY_RESTING_STEPS = frozenset({"idle", "fenced"})
 
 #: Card states where nothing is running whatever the newest row says: a paused
 #: worker, one whose pid is gone (its last step stays open on purpose), and a

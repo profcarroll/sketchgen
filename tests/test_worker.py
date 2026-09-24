@@ -1936,6 +1936,27 @@ class TestStatusCard(IdleTestCase):
         self.assertIn("judging is switched off", row["detail"])
         self.assertIn("next wake in 3 min 40 s", row["detail"])
 
+    def test_a_refused_pass_says_fenced_on_the_card_not_nothing_to_do(self):
+        # 2026-09-23, job 1524: an opencode process held the slot for two
+        # hours, the nap said "Nothing to do" every 30 s, and the preflight and
+        # `paid next` that read the card believed it.
+        job_id = self.enqueue()
+        run = self.make_worker(probe=lambda: dict(BUSY_SLOT))
+        self.assertEqual(3, run.run_once())
+        run._terminating = True  # the nap opens its step, then returns
+        run._nap(30.0)
+        row = db.current_activity(self.conn)
+        self.assertEqual(worker.FENCED_STEP, row["step"])
+        self.assertEqual(worker.FENCED_HEADLINE, row["headline"])
+        self.assertIn("another client holds the inference slot: 4242 node", row["detail"])
+        self.assertIn("next wake in 30 s", row["detail"])
+        self.assertEqual("queued", db.get_job(self.conn, job_id).state)
+        # the slot frees: the next pass claims, and the nap after it is idle
+        run.probe = lambda: dict(FREE_SLOT)
+        self.assertEqual(0, run.run_once())
+        run._nap(0.0)
+        self.assertEqual("idle", db.current_activity(self.conn)["step"])
+
     def test_a_sweep_that_re_queues_nothing_says_nothing(self):
         # The sweep runs on every pass. A step per pass would push whatever the
         # worker is really doing off the card.

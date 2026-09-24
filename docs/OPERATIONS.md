@@ -168,6 +168,16 @@ is why the refusal is worth reading rather than working around: `db status`
 showing jobs in flight while the fence refuses is the healthy shape of this,
 not a stuck queue.
 
+The status card tells the two apart. After a pass the fence refused, the nap
+is the `fenced` step, headline *Waiting for the inference slot*, with the
+fence's reason in its detail — the console shows it as an amber `fenced` pill,
+`paid preflight` fails its worker check on it, and `paid next` and `paid
+wait` return `stop` with the reason. Before 2026-09-23 that nap said *Nothing
+to do*, indistinguishable from an empty queue: an `opencode` process held the
+slot from about 21:30 to 00:30 UTC, every pass was refused, the preflight read
+the process count alone and said READY, and the agent driving job 1524 polled
+`next` for 13 minutes over a queue nothing was going to claim.
+
 Each job has a directory under `$SKETCHGEN_JOBS` (default `~/sketchgen/jobs`):
 `job.log`, then `attempt-1/`, `attempt-2/` … holding the prompt, the raw response,
 the sketch, and the gate's own output under `attempt-N/.gate/`. That is the
