@@ -63,6 +63,27 @@ CREATE TABLE IF NOT EXISTS views (
 
 CREATE INDEX IF NOT EXISTS views_updated_idx ON views (updated_utc);
 
+-- Kiosk views by room. `site` is the id programmed into a kiosk's launch URL
+-- (`?site=d12`): it names a place, not a person, so it keeps the kiosk's
+-- no-identity rule. One row per (entry, site), an absolute running count; each
+-- row's views are also in views.kiosk_count and views.count, written in the
+-- same batch. A kiosk that sends no site adds nothing here.
+--
+-- Nothing reads this table yet — not /counts, not /pull, not the node. It is
+-- for the write-up and for later. Decided 2026-09-23 to record it now: a
+-- per-site split that is not written when the view lands can never be
+-- recovered for views already counted.
+--
+-- New tables do come from a rerun of this file, but it has to run **before**
+-- the Worker that writes it deploys, or every kiosk view with a site fails.
+CREATE TABLE IF NOT EXISTS kiosk_views (
+    entry_id    INTEGER NOT NULL,
+    site        TEXT    NOT NULL,           -- a room id, [a-z0-9-]{1,32}
+    count       INTEGER NOT NULL DEFAULT 0,
+    updated_utc TEXT    NOT NULL,
+    PRIMARY KEY (entry_id, site)
+);
+
 -- The 60 s de-duplication window for /view. `session_hash` is SHA-256 of the
 -- session cookie, hex — never the cookie itself, so this table cannot be
 -- replayed into a session even if it leaks. Signed-out viewers have no session

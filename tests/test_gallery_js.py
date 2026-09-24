@@ -1232,6 +1232,145 @@ class KioskTests(unittest.TestCase):
     def test_a_gallery_with_no_write_path_posts_nothing(self):
         self.assertEqual(0, self.report["views"]["noWritePathPosts"])
 
+    # ---- unattended (docs/plans/kiosk-mac.md §1.1–1.2) --------------------
+
+    def test_an_unattended_kiosk_plays_with_nobody_pressing_start(self):
+        started = self.report["unattended"]["started"]
+        self.assertFalse(started["welcomeUp"])
+        self.assertEqual(1, started["frames"])
+        self.assertEqual(33, started["showing"])
+        # The menu that teaches the person who pressed Start stays shut:
+        # nobody did.
+        self.assertTrue(started["menuShut"])
+
+    def test_the_cursor_is_gone_from_the_first_frame(self):
+        started = self.report["unattended"]["started"]
+        # idle is cursor: none, and unattended takes the pointer off the frame
+        # so the whole stage is under that rule (gallery.css).
+        self.assertTrue(started["idle"])
+        self.assertTrue(started["unattendedClass"])
+
+    def test_it_outlasts_a_network_that_comes_up_after_it(self):
+        run = self.report["unattended"]
+        self.assertEqual(0, run["afterOne"]["frames"])
+        self.assertIn("waiting for the gallery (try 1)", run["afterOne"]["title"])
+        # Ten seconds, then twenty: not a moment before the first.
+        self.assertEqual(1, run["beforeTen"])
+        self.assertEqual(2, run["afterTwo"]["asks"])
+        self.assertIn("try 2", run["afterTwo"]["title"])
+        self.assertEqual(3, run["recovered"]["asks"])
+        self.assertEqual(1, run["recovered"]["frames"])
+        self.assertFalse(run["recovered"]["welcomeUp"])
+
+    def test_an_attended_kiosk_that_cannot_load_waits_for_a_person(self):
+        self.assertEqual(1, self.report["unattended"]["attendedAsks"])
+
+    def test_the_address_bar_keeps_the_machine_s_own_parameters(self):
+        self.assertIn("&unattended=1", self.report["unattended"]["bar"])
+
+    def test_new_entries_join_at_the_next_seat_without_a_reload(self):
+        run = self.report["refreshing"]
+        # Nothing moves under a sketch that is playing.
+        self.assertEqual(run["first"], run["midSketch"]["showing"])
+        self.assertTrue(run["midSketch"]["status"].startswith("1 of 3"))
+        # Then 44 is in, first in newest order, and the rotation carries on
+        # from 33 to 22 rather than going back to the top.
+        self.assertEqual(22, run["next"]["showing"])
+        self.assertTrue(run["next"]["status"].startswith("3 of 4"))
+        self.assertEqual(0, run["next"]["reloads"])
+
+    def test_a_refresh_revalidates_rather_than_downloading_again(self):
+        # The first read is the boot's; every later one may be a 304.
+        inits = self.report["refreshing"]["refreshInits"]
+        self.assertEqual({"cache": "no-store"}, inits[0])
+        self.assertTrue(inits[1:])
+        for one in inits[1:]:
+            self.assertEqual({"cache": "no-cache"}, one)
+
+    def test_a_new_build_reloads_once_and_only_between_two_sketches(self):
+        run = self.report["refreshing"]
+        self.assertEqual(0, run["beforeBoundary"]["reloads"])
+        self.assertEqual(1, run["atBoundary"]["reloads"])
+        # And it does not seat another sketch on the way out.
+        self.assertEqual(run["beforeBoundary"]["showing"], run["atBoundary"]["showing"])
+
+    def test_an_unchanged_gallery_changes_nothing(self):
+        run = self.report["refreshing"]["unchanged"]
+        self.assertEqual(0, run["reloads"])
+        self.assertTrue(run["status"].startswith("2 of 3"))
+
+    def test_an_attended_kiosk_never_refreshes(self):
+        self.assertEqual(1, self.report["refreshing"]["attendedAsks"])
+
+    def test_the_title_carries_the_seat_the_count_and_the_build(self):
+        self.assertEqual(
+            "sketchgen kiosk · #22 · counting · aaa", self.report["refreshing"]["title"]
+        )
+
+    # ---- a kiosk that knows where it lives (kiosk-mac.md §1.3) ------------
+
+    def posts(self, case):
+        return self.report["sites"]["cases"][case]["posts"]
+
+    def title(self, case):
+        return self.report["sites"]["cases"][case]["title"]
+
+    def test_it_counts_inside_the_building_s_hours_and_tags_the_site(self):
+        for case in ("mondayAtOpen", "mondayLastMinute", "sundayAtTen",
+                     "finalsThreeAm", "winterEvening"):
+            with self.subTest(case=case):
+                self.assertEqual(
+                    [{"entry_id": 33, "source": "kiosk", "site": "d12"}], self.posts(case)
+                )
+                self.assertTrue(self.title(case).endswith("· counting"), self.title(case))
+
+    def test_it_counts_nothing_outside_them_and_says_closed(self):
+        for case in ("mondayBeforeOpen", "tuesdayMidnight", "sundayBeforeTen",
+                     "thanksgiving", "winterLate"):
+            with self.subTest(case=case):
+                self.assertEqual([], self.posts(case))
+                self.assertIn("not counting: closed", self.title(case))
+
+    def test_a_date_past_the_posted_schedule_counts_nothing(self):
+        # Under-count, never over-count: a list nobody extended stops the wall
+        # counting and the title says why.
+        self.assertEqual([], self.posts("afterTheList"))
+        self.assertIn("not counting: no posted hours", self.title("afterTheList"))
+
+    def test_a_site_it_cannot_resolve_counts_nothing_and_names_itself(self):
+        self.assertEqual([], self.posts("unknownSite"))
+        self.assertIn("not counting: unknown site d13", self.title("unknownSite"))
+        # A typo anywhere in the building, even in a term that has not
+        # started, is found now rather than the morning that term begins.
+        self.assertEqual([], self.posts("badHours"))
+        self.assertIn("not counting: bad hours", self.title("badHours"))
+
+    def test_a_kiosk_with_no_site_keeps_the_attendance_rule(self):
+        # A default kiosk does not know where it lives, even in a gallery
+        # that knows about D12 — and it does not tag a site it was not given.
+        for case in ("noSite", "noSiteNoConfig"):
+            with self.subTest(case=case):
+                self.assertEqual([{"entry_id": 33, "source": "kiosk"}], self.posts(case))
+                self.assertNotIn("d12", self.title(case))
+
+    def test_a_building_open_all_night_counts_all_night_with_nobody_there(self):
+        # Ten hours with no key and no mouse: the 8-hour rule would have
+        # stopped at 48 seats. Under a site the building is the audience.
+        self.assertEqual(60, self.report["sites"]["allNightPosts"])
+
+    def test_the_menu_says_which_rule_the_room_is_on(self):
+        self.assertEqual(
+            "D12 lab · views and likes are live from the write path; a sketch counts "
+            "as a view once it has been on screen for ten seconds, during Vera List "
+            "Center hours.",
+            self.report["sites"]["note"],
+        )
+
+    def test_the_site_lives_in_the_url_and_never_in_storage(self):
+        self.assertIn("&site=d12", self.report["sites"]["bar"])
+        self.assertNotIn("site", self.report["sites"]["stored"])
+        self.assertNotIn("unattended", self.report["sites"]["stored"])
+
 
 def _without_comments(source: str) -> str:
     """kiosk.js with its comments taken out, so the bans below hold on code.

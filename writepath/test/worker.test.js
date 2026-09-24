@@ -41,12 +41,14 @@ function makeDB() {
     votes: new Map(), // `${username}|${a}|${b}|${question}`
     likes: new Map(), // `${entry_id}|${username}`
     views: new Map(), // entry_id
+    kioskViews: new Map(), // `${entry_id}|${site}`
     viewLog: new Map(), // `${session_hash}|${entry_id}`
     oauthState: new Map(), // state
     submissions: new Map(), // id, as SQLite's AUTOINCREMENT hands them out
   };
   let nextSubmissionId = 1;
   const statements = []; // every {sql, args} the worker issued, in order
+  const batches = []; // the sql of each statement in each env.DB.batch, per call
 
   const sorted = (rows, keys) =>
     rows.slice().sort((x, y) => {
@@ -117,6 +119,19 @@ function makeDB() {
         return { rows: [] };
       }
 
+      case SQL.bumpKioskSite: {
+        const [entryId, site, updated] = args;
+        const key = `${entryId}|${site}`;
+        const existing = store.kioskViews.get(key);
+        store.kioskViews.set(key, {
+          entry_id: entryId,
+          site,
+          count: existing ? existing.count + 1 : 1,
+          updated_utc: updated,
+        });
+        return { rows: [] };
+      }
+
       case SQL.lastSeen: {
         const row = store.viewLog.get(`${args[0]}|${args[1]}`);
         return { rows: row ? [row] : [] };
@@ -148,7 +163,11 @@ function makeDB() {
           rows: sorted(
             [...store.views.values()].filter((r) => r.updated_utc >= args[0]),
             ["updated_utc", "entry_id"],
-          ).slice(0, args[1]),
+          )
+            .slice(0, args[1])
+            // The columns SQL.pullViews selects, and no others: kiosk_count
+            // stays in D1, and a test of the /pull shape has to see that.
+            .map(({ entry_id, count, updated_utc }) => ({ entry_id, count, updated_utc })),
         };
 
       case SQL.insertSubmission: {
@@ -210,6 +229,8 @@ function makeDB() {
       return {
         bind(...args) {
           return {
+            sql,
+            args,
             async run() {
               const result = execute(sql, args);
               return { success: true, meta: { last_row_id: result.lastRowId ?? null } };
@@ -224,8 +245,18 @@ function makeDB() {
         },
       };
     },
+    // D1 runs a batch as one transaction. The fake runs it in order, which is
+    // all the worker's single-threaded tests can tell apart, and records it so
+    // a test can see the writes went together.
+    async batch(bound) {
+      batches.push(bound.map((b) => b.sql));
+      return bound.map((b) => {
+        const result = execute(b.sql, b.args);
+        return { success: true, results: result.rows, meta: { last_row_id: result.lastRowId ?? null } };
+      });
+    },
   };
-  return { DB, store, statements };
+  return { DB, store, statements, batches };
 }
 
 function makeEnv(extra = {}) {
@@ -459,6 +490,104 @@ test("a kiosk view is anonymous and is never de-duplicated", async () => {
   assert.equal(store.views.get(9).count, 4);
   assert.equal(store.views.get(9).kiosk_count, 4);
   assert.equal(store.viewLog.size, 0);
+});
+
+test("a kiosk view with a site is a view, a kiosk view, and that room's view, in one batch", async () => {
+  const { env, store, batches } = makeEnv();
+
+  const response = await worker.fetch(post("/view", { entry_id: 12, source: "kiosk", site: "d12" }), env);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, counted: true });
+  assert.equal(store.views.get(12).count, 1);
+  assert.equal(store.views.get(12).kiosk_count, 1);
+  assert.deepEqual(store.kioskViews.get("12|d12"), {
+    entry_id: 12,
+    site: "d12",
+    count: 1,
+    updated_utc: store.views.get(12).updated_utc,
+  });
+  // Both writes in one transaction, so the room can never outrun the total.
+  assert.deepEqual(batches, [[SQL.bumpView, SQL.bumpKioskSite]]);
+
+  // The same room again is the same row; another room is its own row.
+  await worker.fetch(post("/view", { entry_id: 12, source: "kiosk", site: "d12" }), env);
+  await worker.fetch(post("/view", { entry_id: 12, source: "kiosk", site: "lab-2" }), env);
+  assert.equal(store.kioskViews.get("12|d12").count, 2);
+  assert.equal(store.kioskViews.get("12|lab-2").count, 1);
+  assert.equal(store.kioskViews.size, 2);
+  assert.equal(store.views.get(12).count, 3);
+  assert.equal(store.views.get(12).kiosk_count, 3);
+});
+
+test("a kiosk view without a site is what it was before sites", async () => {
+  const { env, store, batches, statements } = makeEnv();
+  for (const body of [{ entry_id: 5, source: "kiosk" }, { entry_id: 5, source: "kiosk", site: null }]) {
+    const response = await worker.fetch(post("/view", body), env);
+    assert.deepEqual(await response.json(), { ok: true, counted: true });
+  }
+  assert.equal(store.views.get(5).count, 2);
+  assert.equal(store.views.get(5).kiosk_count, 2);
+  assert.equal(store.kioskViews.size, 0);
+  assert.deepEqual(batches, []);
+  assert.deepEqual(statements.map((s) => s.sql), [SQL.bumpView, SQL.bumpView]);
+});
+
+test("a site on anything but a kiosk view is refused, and counts nothing", async () => {
+  const { env, store, statements } = makeEnv();
+  for (const body of [
+    { entry_id: 3, source: "entry", site: "d12" },
+    { entry_id: 3, site: "d12" }, // absent source is the entry page
+  ]) {
+    const response = await worker.fetch(post("/view", body), env);
+    assert.equal(response.status, 400);
+    assert.deepEqual(await response.json(), { error: "site is only for a kiosk view" });
+  }
+  assert.equal(store.views.get(3), undefined);
+  assert.equal(store.kioskViews.size, 0);
+  assert.deepEqual(statements, []);
+});
+
+test("a site that is not a short lowercase room id is refused, and counts nothing", async () => {
+  const { env, store, statements } = makeEnv();
+  const cookie = await forgeSession("octocat");
+  for (const site of ["D12", "x".repeat(33), 12, "", "lab 2", "d12\n", true, ["d12"], { site: "d12" }]) {
+    // Signed in, too: a refusal must not leave a de-duplication row behind.
+    const response = await worker.fetch(post("/view", { entry_id: 3, source: "kiosk", site }, cookie), env);
+    assert.equal(response.status, 400, `site ${JSON.stringify(site)}`);
+    assert.deepEqual(await response.json(), { error: "site must be 1 to 32 of a-z, 0-9 and -" });
+  }
+  assert.equal(store.views.get(3), undefined);
+  assert.equal(store.kioskViews.size, 0);
+  assert.equal(store.viewLog.size, 0);
+  assert.deepEqual(statements, []);
+
+  // The longest that is allowed is allowed.
+  const edge = await worker.fetch(post("/view", { entry_id: 3, source: "kiosk", site: "x".repeat(32) }), env);
+  assert.equal(edge.status, 200);
+});
+
+test("per-site kiosk views reach neither /counts nor /pull", async () => {
+  const { env } = makeEnv();
+  await worker.fetch(post("/view", { entry_id: 1, source: "kiosk", site: "d12" }), env);
+  await worker.fetch(post("/view", { entry_id: 1, source: "kiosk", site: "d12" }), env);
+
+  const counts = await worker.fetch(get("/counts?entries=1"), env);
+  assert.deepEqual(await counts.json(), { 1: { views: 2, likes: 0 } });
+
+  const pulled = await (await worker.fetch(
+    get("/pull?since=1970-01-01T00:00:00Z", { bearer: PULL_TOKEN }),
+    env,
+  )).json();
+  assert.equal(pulled.views.length, 1);
+  assert.deepEqual(Object.keys(pulled.views[0]).sort(), ["count", "entry_id", "updated_utc"]);
+  assert.equal(pulled.views[0].count, 2);
+  assert.deepEqual(
+    Object.keys(pulled).sort(),
+    ["likes", "next_since", "since", "submissions", "views", "votes"],
+  );
+  // And by construction: no statement either route issues names the table.
+  assert.ok(!/kiosk/.test(SQL.pullViews));
+  assert.ok(!/kiosk/.test(sqlCountViews(1)));
 });
 
 // ---------------------------------------------------------------------------
