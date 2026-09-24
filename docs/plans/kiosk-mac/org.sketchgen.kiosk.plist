@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ~/Library/LaunchAgents/org.sketchgen.kiosk.plist — keeps the kiosk browser running.
+     USER is replaced at install. Load: launchctl bootstrap gui/$(id -u) <this file>
+     DRAFT: finalize in the on-device session (docs/plans/kiosk-mac.md §2.4). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>org.sketchgen.kiosk</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/USER/Library/sketchgen-kiosk/launch-kiosk.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>/Users/USER/Library/Caches/sketchgen-kiosk/chrome.log</string>
+  <key>StandardErrorPath</key><string>/Users/USER/Library/Caches/sketchgen-kiosk/chrome.log</string>
+</dict>
+</plist>
