@@ -108,12 +108,23 @@ the worker settles into `paused` there. Worst case is one step, not one round.
 
 ## Deploying a change
 
-The whole deploy is one script — pull, pause, re-install units, migrate,
-re-render the gallery, restart, resume:
+The whole deploy is one script — move to the node's build, pause, re-install
+units, migrate, re-render the gallery, restart, resume. With more than one node,
+drive it from the laptop with `bin/fleet` (*The fleet*, below):
 
 ```
-ssh sld-cloud 'bash ~/sketchgen/app/update.sh'
+bin/fleet update sld-cloud                      # or: ssh sld-cloud 'bash ~/sketchgen/app/update.sh'
 ```
+
+"The node's build" is main, unless the node is **pinned**: then `update.sh`
+moves the checkout to the pin and never past it (it still re-installs units and
+migrates). Before 2026-09-24 step 1 was `git pull origin main`, which
+fast-forwards a detached HEAD without a word — three nodes were held on a72f076
+for the hardware A/B by nothing else. It also refuses, before anything is paused
+or moved, a tree with changed tracked files, a branch other than `main`, or a
+local `main` with commits of its own; it holds `~/sketchgen/update.lock`, so two
+deploys cannot overlap; and before a pending migration it snapshots the database
+to `sketchgen.db.pre-NNN` (an existing one is kept, never overwritten).
 
 Its slowest step is the gallery re-render (every entry page, minutes), and it is
 there for a reason: entry pages are written once by the publisher, so a change to
@@ -129,15 +140,85 @@ ssh sld-cloud 'bash ~/sketchgen/app/update.sh --no-render'   # or SKETCHGEN_SKIP
 
 That still pulls, re-installs units, migrates, restarts and resumes — it only
 drops the gallery pull and render. When in doubt, leave it off: an unnecessary
-render costs minutes, a skipped necessary one ships stale pages. Restarting only
-the operator UI by hand, without pausing the worker, is smaller still:
+render costs minutes, a skipped necessary one ships stale pages.
 
+`--render=auto` (or `SKETCHGEN_RENDER=auto`) makes that call from the diff:
+`sketchgen build --needs-render OLD NEW` renders when anything changed that a
+page is made from — a module the render path imports (worked out from
+`gallery.py`'s and `publish.py`'s own imports, not a list), a template other
+than `op_*`, an asset, a migration — or anything it does not recognise, and
+skips for `gate/`, `prompts/`, `docs/`, `tests/`, `systemd/`, the operator UI and
+the like. It is what `bin/fleet update` passes. The render path imports
+`worker.py` (through `judge` and `paid`), so a worker change renders; that is
+the cost of computing it rather than trusting a list.
+
+Restarting only the operator UI by hand, without pausing the worker, used to be
+the smaller recipe here. It leaves the worker on the old code, which is exactly
+the gap the build chip now shows as **restart pending** — use `update.sh`.
+
+## The fleet: one build across the nodes
+
+`bin/fleet`, on the laptop, is the one place that sees every node
+(docs/plans/fleet.md). It reads `~/.config/sketchgen/fleet` — one node per line,
+`name ssh-host [port] [billing]`; copy `fleet.example` — and never needs the
+node to have the verb: it sends `sketchgen/build.py` over ssh and runs it
+there, so a node at a72f076 is read like one on main.
+
+```bash
+bin/fleet status                    # which build each node is on; exit 0 only if all on target
+bin/fleet status --same             # …and all on ONE build (assert it before an A/B)
+bin/fleet update sld-gpu d12-flux   # update.sh on each, as the sketchgen-update unit; returns at once
+bin/fleet watch sld-gpu d12-flux    # follow them; ends with a status
+bin/fleet pin d12 d12-flux --to a72f076 --reason "hardware A/B, through 09-28"
+bin/fleet pin d12 d12-flux --clear
 ```
-ssh sld-cloud
-cd ~/sketchgen/app && git pull origin main
-.venv/bin/python3 bin/sketchgen install-unit          # picks up unit-file changes
-systemctl --user restart sketchgen-web.service
+
+"Main" in the report is this checkout's `origin/main`, fetched once per run, not
+what each node last fetched: a node that never fetches thinks it is current
+(sld-cloud, four PRs behind, on 2026-09-24).
+
+`update` refuses a node, before starting anything there, when:
+
+- **it has work in hand** — queued, in flight, or parked for an agent. A deploy
+  in the middle of a batch splits it across two builds; wait for the queue to
+  drain (that is what "between batches" means), or `--mid-batch`.
+- **its update.sh predates pins.** That copy pulls main whatever the node is on,
+  and it runs first even when the new one would not. `--adopt` when moving it to
+  main is the point; leave it alone if it is an A/B arm.
+- **an update is already running there**, or the tree is dirty or off `main`.
+
+It starts `update.sh` as a transient user unit, `sketchgen-update`, with its
+output in `~/sketchgen/logs/update-<utc>.log` on the node. The unit outlives the
+ssh session — a dropped laptop no longer SIGHUPs a deploy between its migration
+and its restart — and systemd will not start a second one under that name. The
+render choice travels as the environment (`SKETCHGEN_RENDER`), never as a flag,
+because an old `update.sh` dies on a flag it does not know.
+
+On the node itself:
+
+```bash
+$SG build --fetch       # checkout, target, main, what the worker and web are running, the queue
+$SG pin a72f076 --reason "hardware A/B" --by profcarroll
+$SG pin --clear --by profcarroll
 ```
+
+The worker and the web process each stamp the build they started on (`meta`
+`run.worker`, `run.web`), and every attempt and plan since migration 018 carries
+the worker's (`attempts.build`, `jobs.plan_build`). "Was this batch one build"
+is then:
+
+```sql
+SELECT build, COUNT(*) FROM attempts WHERE job_id BETWEEN 1373 AND 1473 GROUP BY build;
+```
+
+The Console header has a chip for it, linking to `/build`: the sha, quiet, when
+the node is on target; **N behind** (amber) when main has moved; **pinned
+a72f076** (quiet — behind on purpose); red for **dirty**, a foreign branch,
+**off pin** or **restart pending**. The web process fetches main every 15
+minutes (`SKETCHGEN_BUILD_FETCH_S`), and `/build` has **Check now**, which is a
+`git fetch` and nothing else: nothing on the node moves. The deploy itself is
+`bin/fleet update` — the button that starts it from the Console is Packet 3 of
+the plan, for a node whose operator is not at the laptop.
 
 ## Watching one job
 
@@ -1577,6 +1658,9 @@ ssh d12-node-flux 'systemctl --user enable --now sketchgen-worker.service sketch
 - **`-t` is for sudo.** Missing packages, or Chromium's system libraries, need
   root. Without a terminal it stops (exit 2) and prints the line to rerun;
   with one, sudo asks once.
+- **`--ref` other than main is a pin.** Step 5b writes it (`sketchgen pin`'s
+  rows), so the next `update.sh` keeps the arm where it is instead of pulling it
+  to main. `bin/fleet pin NODE --clear` when the arm is done.
 - **Run it again freely.** An existing app, gallery or `node.conf` is left as
   it is; a flag that disagrees with `node.conf` is printed, not written. A
   database it did not create keeps its switch; one it did create comes up
