@@ -4351,6 +4351,36 @@ class CommandLineTests(GalleryTestCase):
         self.assertTrue((self.dest / "index.html").is_file())
         self.assertIn(str(self.dest / "index.html"), result.stdout)
 
+    def test_the_url_flags_change_their_field_and_keep_the_kiosk_s(self):
+        # Each flag used to rebuild the config from three fields, so a
+        # render-index with either one wrote back a config.json with no kiosk
+        # sites or buildings and its switches reset (docs/plans/kiosk-mac.md
+        # §1.3) — the bug publish-index had, 2026-09-24.
+        written = {
+            "write_path": "https://old-write.example.invalid/api",
+            "gallery_url": "https://old.example.invalid/gallery/",
+            "repository": "https://github.com/example/sketchgen-gallery",
+            "kiosk_views": False,
+            "kiosk_ghost": False,
+            "kiosk_ghost_loop_s": 20,
+            "kiosk_sites": {"d12": {"name": "D12 lab", "building": "vera-list"}},
+            "kiosk_buildings": {"vera-list": {"name": "Vera List Center"}},
+        }
+        (self.dest / "config.json").write_text(json.dumps(written), encoding="utf-8")
+        result = self.run_cli(
+            "render-index", "--gallery-dir", str(self.dest),
+            "--db", str(self.tmp / "sketchgen.db"),
+            "--write-path", "https://write.example.invalid/api",
+            "--gallery-url", "https://profcarroll.github.io/sketchgen-gallery/",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = json.loads((self.dest / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            dict(written, write_path="https://write.example.invalid/api",
+                 gallery_url="https://profcarroll.github.io/sketchgen-gallery/"),
+            after,
+        )
+
     def test_a_missing_checkout_is_a_refusal(self):
         result = self.run_cli(
             "render-all", "--gallery-dir", str(self.tmp / "nowhere"),
