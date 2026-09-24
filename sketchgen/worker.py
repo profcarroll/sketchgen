@@ -290,9 +290,10 @@ TRY_EXECUTION = "execution.json"
 #: The marker on a try's result.json, so a half-written or foreign file in the
 #: directory is not mistaken for a verdict.
 TRY_KIND = "sketchgen-try"
-#: How often the nap looks for a try while an agent holds a lease. The nap is
-#: thirty seconds and the agent is watching; five is the slice that makes a
-#: try cost the gate's own seconds and little else.
+#: How often the nap looks for a try, and for a leased job back on the queue,
+#: while an agent holds a lease. The nap is thirty seconds and the agent is
+#: watching; five is the slice that makes a try cost the gate's own seconds and
+#: a `paid start` or `paid import` wait for the claim little more than that.
 TRY_POLL_S = 5.0
 
 #: The heading the previous attempt's evidence is filed under in the next
@@ -1747,6 +1748,10 @@ class Worker:
         #: The fence's reason when the last pass was refused, carried to the nap
         #: so the card says FENCED_HEADLINE and why, rather than "Nothing to do".
         self._fenced: str | None = None
+        #: The job the last pass claimed, if it claimed one: run_forever reads
+        #: it to tell a finished job from one put back on the queue
+        #: (:meth:`_straight_on`).
+        self._claimed: int | None = None
 
     # -- logging ---------------------------------------------------------
 
@@ -1917,6 +1922,7 @@ class Worker:
         # a sentence about a queue that has since moved.
         self._idle_note = None
         self._fenced = None
+        self._claimed = None
         control = self._control()
         if control is not None and control.state == "paused":
             self.log(f"control: paused ({control.reason or 'no reason given'}); "
@@ -1976,6 +1982,7 @@ class Worker:
             self.log("queue: nothing queued")
             self._idle_round()
             return EXIT_OK
+        self._claimed = job.id
 
         waited = minutes_between(job.created_utc, db.utc_now())
         self._say_more(
@@ -2040,9 +2047,54 @@ class Worker:
                 break
             if code == EXIT_REFUSED:
                 self.log(f"worker: fenced; backing off {sleep_s:.0f}s")
+            elif code == EXIT_OK and self._straight_on():
+                continue
             self._nap(sleep_s)
         self.log("worker: stopped (SIGTERM); nothing left in flight")
         return EXIT_OK
+
+    def _straight_on(self) -> bool:
+        """Whether the next pass follows this one with no nap between.
+
+        Yes when a job is queued. The nap's card says "Nothing to do", which
+        over a queued job is false for as long as the nap lasts: on 2026-09-24
+        job 1542 sat queued under its agent's lease while job 1541 was being
+        written, 1541 finished, and for 34 s the card and `paid next` said
+        "Nothing to do" over it before the next pass claimed it. A child the
+        idle round has just spawned is queued the same way.
+
+        No when this pass's own job is back on the queue: a pause, a stop-now
+        or a restart put it there, and going straight on would claim it again
+        at once. No when the generator is not running, whose pass claims
+        nothing and would only come straight back here.
+        """
+        if self._terminating:
+            return False
+        control = self._control()
+        if control is not None and control.state != "running":
+            return False
+        if self._claimed is not None:
+            job = db.get_job(self.conn, self._claimed)
+            if job is not None and job.state == "queued":
+                return False
+        return bool(db.list_jobs(self.conn, "queued"))
+
+    def _leased_job_queued(self, leases: dict[int, Any]) -> bool:
+        """Whether a job an agent is driving is on the queue, for the nap to
+        end early (:meth:`_nap`): `paid start` and `paid import` both put one
+        there, and the agent is waiting on the claim. Not while fenced or
+        paused, whose next pass would claim nothing and nap again.
+        """
+        if self._fenced:
+            return False
+        control = self._control()
+        if control is not None and control.state != "running":
+            return False
+        for job_id in leases:
+            job = db.get_job(self.conn, int(job_id))
+            if job is not None and job.state == "queued":
+                return True
+        return False
 
     # -- the sweep -------------------------------------------------------
 
@@ -2573,6 +2625,11 @@ class Worker:
         where "next wake in 3 min 40 s" comes from, and the note the idle round
         left behind, which is where "nothing to judge, nothing to critique"
         does.
+
+        It ends early when a job an agent holds a lease on comes back to the
+        queue, which is what `paid start` and every `paid import` do: the
+        agent is polling for the claim, and until 2026-09-24 it waited out the
+        rest of the nap under a card that said "Nothing to do" over its job.
         """
         note, self._idle_note = self._idle_note, None
         wake = f"next wake in {human_gap(seconds)}"
@@ -2599,11 +2656,14 @@ class Worker:
                 return
             if time.monotonic() >= next_try:
                 next_try = time.monotonic() + TRY_POLL_S
-                if db.paid_leases(self.conn) and self._serve_tries():
+                leases = db.paid_leases(self.conn)
+                if leases and self._serve_tries():
                     # The try opened its own step on the card; say what the
                     # worker went back to, or the console would show it
                     # trying for the rest of the nap.
                     self._say(step, headline, detail)
+                if leases and self._leased_job_queued(leases):
+                    return
             time.sleep(min(1.0, left))
 
     def _pause_after_attempt(self, job_id: int) -> None:
