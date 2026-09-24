@@ -49,7 +49,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import db
@@ -920,11 +920,14 @@ def publish_index(
         before = _git_out(checkout, "rev-parse", "HEAD")
         config = gallery.Config.load(checkout)
         if write_path is not None:
-            config = gallery.Config(
-                write_path=write_path.rstrip("/"),
-                gallery_url=config.gallery_url,
-                repository=config.repository,
-            )
+            # replace(), not a new Config from the three fields this once
+            # knew: that reset the kiosk's sites, buildings and switches to
+            # their defaults, and this commits and pushes the config.json
+            # render_index writes. Any run with SKETCHGEN_WRITEPATH_URL set,
+            # which the node's units set and the deploy's ssh does not, would
+            # have taken the D12 kiosk's site and hours off the gallery
+            # (docs/plans/kiosk-mac.md §1.3). Found in review, 2026-09-24.
+            config = replace(config, write_path=write_path.rstrip("/"))
         # Only what a person has published: a kept rejection without a
         # published_utc is still waiting for that decision (spec §9), and a
         # re-render is not the place it gets made.

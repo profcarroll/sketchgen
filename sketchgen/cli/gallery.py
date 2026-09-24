@@ -19,6 +19,7 @@ import json
 import os
 import sqlite3
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from sketchgen import db
@@ -65,18 +66,14 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
 def _config(args: argparse.Namespace, dest: Path) -> gallery.Config:
     """The checkout's config.json, with the flags given on top of it."""
     config = gallery.Config.load(dest)
+    # replace(), so a flag changes its one field and keeps the rest. These
+    # built a new Config from three fields, and a render with --write-path or
+    # --gallery-url wrote a config.json without the kiosk's sites, buildings
+    # or switches — the bug publish-index had too, 2026-09-24.
     if args.write_path is not None:
-        config = gallery.Config(
-            write_path=args.write_path,
-            gallery_url=config.gallery_url,
-            repository=config.repository,
-        )
+        config = replace(config, write_path=args.write_path)
     if args.gallery_url is not None:
-        config = gallery.Config(
-            write_path=config.write_path,
-            gallery_url=args.gallery_url,
-            repository=config.repository,
-        )
+        config = replace(config, gallery_url=args.gallery_url)
     return config
 
 
