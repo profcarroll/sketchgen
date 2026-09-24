@@ -72,22 +72,64 @@ able to turn it on or off. It means *nobody is going to click anything*:
 ### 1.3 Views by the building's hours
 
 `config.json` gains `kiosk_hours`, read by `Config` like `kiosk_views` (three edits:
-dataclass, `load`, `to_json`) and absent by default:
+dataclass, `load`, `to_json`) and absent by default.
+
+The D12 lab is in the **Vera List Center** (6 East 16th Street / 79 Fifth Avenue). The New School
+posts its hours by term, with closures and 24/7 finals periods on top
+(<https://www.newschool.edu/about/campus-information/building-hours/>, read 2026-09-23). A single
+weekly table cannot say that, so the block is terms plus dated exceptions:
 
 ```json
 "kiosk_hours": {
   "tz": "America/New_York",
-  "week": { "mon": "08:00-22:00", "tue": "08:00-22:00", "wed": "08:00-22:00",
-            "thu": "08:00-22:00", "fri": "08:00-20:00", "sat": "10:00-18:00", "sun": null },
-  "closed": ["2026-11-26", "2026-11-27", "2026-12-24", "2026-12-25"]
+  "building": "Vera List Center, 6 East 16th Street",
+  "source": "https://www.newschool.edu/about/campus-information/building-hours/",
+  "terms": [
+    { "name": "Fall 2026", "from": "2026-08-17", "to": "2026-12-18",
+      "week": { "mon": "07:30-24:00", "tue": "07:30-24:00", "wed": "07:30-24:00",
+                "thu": "07:30-24:00", "fri": "07:30-24:00", "sat": "07:30-24:00",
+                "sun": "10:00-24:00" } },
+    { "name": "Winter 2026-27", "from": "2026-12-19", "to": "2027-01-18",
+      "week": { "mon": "07:30-20:00", "tue": "07:30-20:00", "wed": "07:30-20:00",
+                "thu": "07:30-20:00", "fri": "07:30-20:00", "sat": "07:30-20:00",
+                "sun": "10:00-20:00" } },
+    { "name": "Spring 2027", "from": "2027-01-19", "to": "2027-05-14",
+      "week": { "mon": "07:30-24:00", "tue": "07:30-24:00", "wed": "07:30-24:00",
+                "thu": "07:30-24:00", "fri": "07:30-24:00", "sat": "07:30-24:00",
+                "sun": "10:00-24:00" } }
+  ],
+  "exceptions": [
+    { "from": "2026-11-25", "to": "2026-11-29", "hours": null,          "why": "Thanksgiving" },
+    { "from": "2026-11-30", "to": "2026-11-30", "hours": "07:30-24:00", "why": "24/7 begins" },
+    { "from": "2026-12-01", "to": "2026-12-17", "hours": "00:00-24:00", "why": "24/7 finals" },
+    { "from": "2026-12-18", "to": "2026-12-18", "hours": "00:00-24:00", "why": "24/7 ends at the usual close" },
+    { "from": "2026-12-24", "to": "2027-01-03", "hours": null,          "why": "Winter break" },
+    { "from": "2027-01-18", "to": "2027-01-18", "hours": null,          "why": "MLK Day" },
+    { "from": "2027-02-15", "to": "2027-02-15", "hours": null,          "why": "Presidents' Day" },
+    { "from": "2027-04-26", "to": "2027-05-14", "hours": "00:00-24:00", "why": "24/7 finals" }
+  ]
 }
 ```
 
-*(The hours above are placeholders — see §4, decision 1.)*
+The rule for one instant, in `tz`: the first `exceptions` range that contains today decides
+(`null` is closed); otherwise the term that contains today, by weekday; **a date in no term is
+closed.** That last clause is the maintenance contract: the posted schedule ends on 2027-05-14,
+and summer 2027 is not published yet. When the list runs out the wall keeps playing and stops
+counting, and the title says `not counting: no posted hours` so `kiosk-status` shows it — a
+schedule nobody extended must under-count, never over-count. Extending it is one edit to the
+gallery's `config.json` a term, when the university posts the next one.
+
+`24:00` is the midnight close, and a span is within one calendar day: the posted hours never
+cross midnight except during 24/7, which is whole days.
+
+Two things on the university's page to know about, not to fix: Labor Day weekend (5–7 September)
+has passed and is left out; and the Winter heading says *December 19, 2025 to January 18, 2026*
+while its closures are 2026–27 and Spring starts 19 January 2027 — the year in that heading is
+stale, and the block above uses 2026–27.
 
 `countingViews()` becomes: no write path, `?views=0` or `kiosk_views: false` → no, as now; then
 **if `kiosk_hours` is set, count exactly when the wall clock in `tz` is inside today's span and
-today is not in `closed`**, and the attendance rule is not consulted; otherwise the 8-hour rule,
+today is open by the rule above**, and the attendance rule is not consulted; otherwise the 8-hour rule,
 unchanged. The 10-second dwell and once-per-seat guard stand in both cases — they are what stop a
 per-frame bug, not what decides whether anyone is there.
 
@@ -119,7 +161,10 @@ Against `tests/js/kiosk.js`, which already steps timers and rAF by hand:
   succeeds; `body.idle` from the first frame; frame has `pointer-events: none`;
 - refresh: a new `build` reloads once, at a seat boundary, never mid-sketch; new entries join
   without a reload; an unchanged 304 does nothing; attended pages never refresh;
-- hours: inside counts, outside does not, `closed` does not, a malformed block counts nothing,
+- hours, against the real block above: 07:29 on a fall Monday does not count and 07:30 does;
+  23:59 counts and 00:00 does not; a winter Tuesday at 20:30 does not; Thanksgiving Thursday
+  does not; 03:00 on 2026-12-08 does (24/7); 2027-05-15 does not (no term); an exception beats
+  its term; a malformed block counts nothing,
   absent falls back to the 8 h rule (the existing tests, unchanged); the time zone is the
   config's and not the machine's (stub `Intl` with a fixed instant);
 - the 600-frame one-view test runs again under hours;
@@ -311,8 +356,9 @@ Nothing about ordinary gallery work touches the Mac: publishing an entry, or dep
 
 ## 4. Decisions for the operator
 
-1. **The building's hours.** The actual open hours for the D12 lab's building, by weekday, and
-   the semester's closure days. The block in §1.3 is a placeholder and must not ship as is.
+1. **Building hours, not the lab's.** §1.3 counts by the Vera List Center's posted hours
+   (settled 2026-09-23). If D12 itself locks earlier than the building, say so and the spans
+   narrow; nothing else changes.
 2. **FileVault off** on this Mac, for auto-login. Recommended — the wall shows only what is
    public, and the alternative is a login window after every power cut.
 3. **A dedicated `kiosk` standard user**, or the current account. Recommended: dedicated, with
