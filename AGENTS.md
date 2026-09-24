@@ -343,5 +343,12 @@ worker and web, resume. Traps:
   CHECK: rebuild the table as `007` and `014` do, same column order.
 - Provenance is who **answered**, never who was asked: model ids on attempts,
   entries, critiques and verdicts are the model that produced the text.
+- **p5 runs the gate's instance hook for every `createGraphics()` too.** The
+  Graphics constructor calls `p5.prototype._initializeInstanceVariables` on
+  the buffer, so a wrapper on it must check `this instanceof p5` before it
+  calls `this` the sketch. Until `HARNESS_VERSION` 5 the gate did not, and
+  `is_looping`, `frame_advancing`, `uses(webgl)` and `size` on every report
+  for a sketch that made a buffer are the buffer's: 92 entries, all but one
+  reading `is_looping` false (job 1542, 2026-09-24; `gate/README.md`).
 - Match the house style: comments say *why*, with the incident or date that
   made it necessary; commit messages are prose, not bullet lists.
