@@ -25,6 +25,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,7 @@ GATE_DIR = REPO_ROOT / "gate"
 GATE = GATE_DIR / "sketch_gate.py"
 ACCEPT = GATE_DIR / "accept.sh"
 FIXTURES = GATE_DIR / "fixtures"
+HOOK_HARNESS = REPO_ROOT / "tests" / "js" / "gate_hook.js"
 
 sys.path.insert(0, str(REPO_ROOT))
 from sketchgen import executor, ghostshim  # noqa: E402
@@ -84,16 +86,28 @@ from sketchgen import executor, ghostshim  # noqa: E402
 #: which is the one the node and the course repo carry until this is deployed,
 #: was
 #: f64ac446bac40ebce61bfc2811684087b23c824f70220de1dd373b56928bfcbc.
-GATE_SHA256 = "4fac3c1635269d408cc74ffd3ad02c5c2b42316e0edcb4fdf31a921ebb779925"
+#:
+#: Changed 2026-09-24 by job 1542 (entry 1531): the hook that captures the
+#: sketch's p5 instance also fired for every createGraphics() buffer, because
+#: p5 1.11's Graphics constructor runs the same prototype method on itself, and
+#: it kept the last one. So a sketch that made a buffer read is_looping false
+#: and skipped frame_advancing though it never called noLoop(), and took
+#: uses(webgl) and size(w,h) off the buffer. The hook now keeps only a p5. The
+#: previous value, which is the one the node and the course repo carry until
+#: this is deployed, was
+#: 4fac3c1635269d408cc74ffd3ad02c5c2b42316e0edcb4fdf31a921ebb779925.
+GATE_SHA256 = "f5991aacb816ed674afcb47b42811d50bf24d29f9cf69ff8cd59c435694eb540"
 
-#: How long the eleven fixtures are allowed to take together. On the node a
-#: single gate run is about four seconds and the harness does twenty-one of them
-#: — except bad-frame-budget, which is a third of a second a frame by design and
-#: costs tens of seconds before the budget stops it. That fixture is why this
-#: number is 900 and not 600, and the three image fixtures (2026-09-22) are why
-#: it is 1200 now: they fetch from a real host, and the one that asserts
-#: loads(image) will wait out the whole 60 s timeout for a canvas if that host
-#: is having a bad morning.
+#: How long the fourteen fixtures are allowed to take together. On the node a
+#: single gate run is about four seconds and the harness does twenty-four of
+#: them — except bad-frame-budget, which is a third of a second a frame by
+#: design and costs tens of seconds before the budget stops it. That fixture is
+#: why this number is 900 and not 600, and the three image fixtures
+#: (2026-09-22) are why it is 1200 now: they fetch from a real host, and the one
+#: that asserts loads(image) will wait out the whole 60 s timeout for a canvas
+#: if that host is having a bad morning. The three createGraphics fixtures
+#: (2026-09-24) add six ordinary runs and did not move it: all fourteen took
+#: 82 s on the laptop.
 ACCEPT_TIMEOUT_S = 1200
 
 
@@ -667,6 +681,80 @@ class LoadsImageWiringTests(unittest.TestCase):
         source = (FIXTURES / "good-image" / "sketch.js").read_text(encoding="utf-8")
         self.assertIn("https://picsum.photos/seed/sketchgen/400/300", source)
         self.assertIn("function preload()", source)
+
+
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+class InstanceHookTests(unittest.TestCase):
+    """The hook that finds the sketch's p5, run in node (job 1542, 2026-09-24).
+
+    p5 1.11's Graphics constructor runs p5.prototype._initializeInstanceVariables
+    on the buffer it is building, and the gate's hook on that method kept every
+    `this` it saw. So from the first createGraphics() on, is_looping,
+    frame_advancing, uses(webgl) and size(w,h) were read off a buffer: 92
+    entries on the node, all but one reading is_looping false. The three
+    fixtures are the real proof and need Playwright; this is the same three
+    cases against the real INIT_JS, so a laptop without a browser still fails
+    when the guard goes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        gate = _gate_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            init = Path(tmp) / "init.js"
+            init.write_text(gate.INIT_JS.replace("__SEED__", "1"), encoding="utf-8")
+            done = subprocess.run(
+                [shutil.which("node"), str(HOOK_HARNESS), str(init)],
+                capture_output=True, text=True, timeout=60,
+            )
+        if done.returncode != 0:
+            raise AssertionError(done.stdout + done.stderr)
+        cls.report = json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_a_buffer_made_after_the_canvas_is_not_the_sketch(self):
+        got = self.report["webgl_sketch_2d_buffer"]
+        self.assertTrue(got["inst_is_sketch"])
+        # The buffer itself has no draw loop, which is the whole bug: read off
+        # it, a sketch that never called noLoop() declared itself static.
+        self.assertFalse(got["buffer_is_looping"])
+        self.assertIs(True, got["isLooping"])
+        self.assertEqual(86, got["frameCount"])
+        self.assertEqual((640, 480), (got["width"], got["height"]))
+
+    def test_uses_webgl_reads_the_sketch_s_renderer_both_ways(self):
+        self.assertIs(True, self.report["webgl_sketch_2d_buffer"]["webgl"])
+        reverse = self.report["two_d_sketch_webgl_buffer"]
+        self.assertTrue(reverse["inst_is_sketch"])
+        self.assertIs(False, reverse["webgl"])
+        self.assertEqual((640, 480), (reverse["width"], reverse["height"]))
+
+    def test_the_seed_hook_is_the_sketch_s_alone(self):
+        # Instance mode seeds through an accessor on `setup`; a buffer made
+        # inside setup() must neither take the instance's place nor get one.
+        got = self.report["instance_mode"]
+        self.assertTrue(got["inst_is_sketch"])
+        self.assertTrue(got["seeded"])
+        self.assertEqual("p5 instance setup", got["hook"])
+        self.assertTrue(got["accessor_on_sketch"])
+        self.assertFalse(got["accessor_on_buffer"])
+
+    def test_the_three_graphics_fixtures_are_in_the_repo_and_expected(self):
+        expected = json.loads((FIXTURES / "expected.json").read_text(encoding="utf-8"))
+        for name in ("good-graphics", "good-webgl-2d-buffer", "good-2d-webgl-buffer"):
+            with self.subTest(name):
+                source = (FIXTURES / name / "sketch.js").read_text(encoding="utf-8")
+                code = "\n".join(line.split("//", 1)[0] for line in source.splitlines())
+                # Their comments talk about noLoop(); their code never calls it,
+                # which is what makes is_looping false a misread and not a
+                # declaration.
+                self.assertIn("createGraphics(", code)
+                self.assertNotIn("noLoop(", code)
+                self.assertIs(True, expected[name]["checks"]["is_looping"])
+                self.assertIs(True, expected[name]["checks"]["frame_advancing"])
+        wants = expected["assertions_expected"]
+        self.assertIs(True, wants["good-graphics"]["size(640,480)"])
+        self.assertIs(True, wants["good-webgl-2d-buffer"]["uses(webgl)"])
+        self.assertIs(False, wants["good-2d-webgl-buffer"]["uses(webgl)"])
 
 
 #: Scripts both validators are run over, and what each one is. The gate's copy

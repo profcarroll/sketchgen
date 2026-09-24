@@ -141,6 +141,45 @@
     },
     "notes": "The sketch that carried its own picture — one of the 39 clean attempts thrown away for an assertion built its own image as a data: URI when it could not fetch one (gate/README.md). It draws a real raster image, nothing failed to arrive, and the canvas is not flat; loads(image) still misses, because the word is about the web (DECIDE[image-pass]). The detail is what this fixture is really for: it must name the data: URI rather than say \"no image arrived\", which would send the next attempt hunting a network fault that is not there."
   },
+  "good-graphics": {
+    "exit": 0,
+    "checks": {
+      "console_clean": true,
+      "is_looping": true,
+      "frame_advancing": true,
+      "sound_lib_ok": null,
+      "audio_context_running": null,
+      "frame_budget": true
+    },
+    "notes": "Job 1542 (entry 1531, 2026-09-24): a looping sketch that paints two createGraphics() buffers and never calls noLoop(). The gate read is_looping false and skipped frame_advancing as if it had, because p5 1.11's Graphics constructor runs p5.prototype._initializeInstanceVariables on the buffer and the gate's hook on that method kept the last object it was called with — a buffer, which has no draw loop. So any createGraphics sketch that froze would have escaped the freeze check. The same read took p5's width and height from the last buffer, 160x160, which is why size(640,480) is asserted. Measured on the laptop with the gate before the fix: is_looping false, frame_advancing null, size(640,480) false; after it, true, true, true."
+  },
+  "good-webgl-2d-buffer": {
+    "exit": 0,
+    "checks": {
+      "console_clean": true,
+      "is_looping": true,
+      "frame_advancing": true,
+      "sound_lib_ok": null,
+      "audio_context_running": null,
+      "frame_budget": true
+    },
+    "notes": "The uses(webgl) half of good-graphics: a WEBGL sketch whose texture is a 2D createGraphics() buffer made after the canvas. Before the fix uses(webgl) read the buffer's renderer and missed with \"renderer context is 2D\" on a sketch that is WebGL throughout — an off-plan miss for a person to puzzle over, or a repair attempt spent changing a renderer that was already right. is_looping and frame_advancing are listed because the same misread took them too."
+  },
+  "good-2d-webgl-buffer": {
+    "exit": 0,
+    "checks": {
+      "console_clean": true,
+      "is_looping": true,
+      "frame_advancing": true,
+      "sound_lib_ok": null,
+      "audio_context_running": null,
+      "frame_budget": true
+    },
+    "assertion_detail": {
+      "uses(webgl)": "renderer context is 2D"
+    },
+    "notes": "The reverse of good-webgl-2d-buffer: a 2D sketch that renders one solid into a WEBGL createGraphics() buffer. Before the fix uses(webgl) passed on the buffer's renderer and size(640,480) read the buffer's 200x200. uses(webgl) is expected to miss here, and assertion_detail pins why: a miss that said \"unreadable\" would be the right verdict for the wrong reason."
+  },
   "assertions_expected": {
     "ghost-echo": {
       "no_motion": true
@@ -164,6 +203,18 @@
     },
     "good-static-noloop": {
       "no_motion": true
+    },
+    "good-graphics": {
+      "motion(idle)": true,
+      "size(640,480)": true
+    },
+    "good-webgl-2d-buffer": {
+      "motion(idle)": true,
+      "uses(webgl)": true
+    },
+    "good-2d-webgl-buffer": {
+      "size(640,480)": true,
+      "uses(webgl)": false
     }
   }
 }
