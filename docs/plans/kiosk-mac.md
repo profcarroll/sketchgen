@@ -103,7 +103,8 @@ weekly table cannot say that, so a building is terms plus dated exceptions:
 
 ```json
 "vera-list": {
-  "name": "Vera List Center, 6 East 16th Street / 79 Fifth Avenue",
+  "name": "Vera List Center",
+  "address": "6 East 16th Street / 79 Fifth Avenue",
   "tz": "America/New_York",
   "source": "https://www.newschool.edu/about/campus-information/building-hours/",
   "terms": [
@@ -165,9 +166,9 @@ per-frame bug, not what decides whether anyone is there.
   is the audience, and the rule should be one sentence long.
 - The menu names the site, and the footer copy gains the rule: *D12 lab · counts a view after
   ten seconds on screen, during Vera List Center hours.* A default kiosk's footer is unchanged.
-- **The site is not sent with the view** in this packet: `/view` still carries only
-  `source: "kiosk"`, so D1 knows a view came from *a* projector, not which. See §4, decision 7 —
-  it is the one choice here that cannot be made later for the views already counted.
+- **The site is sent with the view** (§4, decision 7): `{entry_id, source: "kiosk", site:
+  "d12"}`, and the Worker bumps a `kiosk_views (entry_id, site)` row in the same D1 batch as
+  `views.kiosk_count`. Nothing reads it yet. D1 gets the table **before** the Worker deploys.
 
 ### 1.4 The title is the status line
 
@@ -387,9 +388,8 @@ Nothing about ordinary gallery work touches the Mac: publishing an entry, or dep
 
 ## 4. Decisions for the operator
 
-1. **Building hours, not the lab's.** §1.3 counts by the Vera List Center's posted hours
-   (settled 2026-09-23). If D12 itself locks earlier than the building, say so and the spans
-   narrow; nothing else changes.
+1. **Building hours, not the lab's.** Settled 2026-09-23: D12 is open whenever the Vera List
+   Center is, so §1.3's spans are the building's as posted.
 2. **FileVault off** on this Mac, for auto-login. Recommended — the wall shows only what is
    public, and the alternative is a login window after every power cut.
 3. **A dedicated `kiosk` standard user**, or the current account. Recommended: dedicated, with
@@ -400,7 +400,7 @@ Nothing about ordinary gallery work touches the Mac: publishing an entry, or dep
    Going dark (`pmset repeat` and a black page) saves the display but adds a wake path that is one
    more thing to fail on a morning nobody is watching. Revisit if the display has burn-in risk.
 6. **Audio**: on, at what volume, or muted.
-7. **Tag views with the site?** Recommended **yes, in Packet A**, for the reason
+7. **Tag views with the site?** **Decided yes, 2026-09-23, in Packet A**, for the reason
    `kiosk-views.md` §3.4 gave for keeping `kiosk_count`: a split not recorded now is gone for
    every view counted before it. It is a D1 table `kiosk_views (entry_id, site, count,
    updated_utc)` bumped beside `views.kiosk_count`, `/view` accepting an optional `site` matching
