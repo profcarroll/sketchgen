@@ -10,7 +10,7 @@ node opens no port for any of this.
 - `worker.js` — the Worker. `/login` `/callback` `/me` `/logout` `/vote` `/like`
   `/view` `/counts` `/prompt` `/critique` `/pull`. Its comments, not this file,
   are authoritative.
-- `schema.sql` — the D1 tables: `votes`, `likes`, `views`, `view_log`,
+- `schema.sql` — the D1 tables: `votes`, `likes`, `views`, `kiosk_views`, `view_log`,
   `oauth_state`, `submissions`. `IF NOT EXISTS` throughout and safe to rerun,
   which is how a new table gets there.
 - `wrangler.toml` — names and placeholders. No secret is ever written here.
@@ -51,8 +51,12 @@ The kiosk page is signed out and always will be, so nothing here restrains it
 and it restrains itself instead (`docs/plans/kiosk-views.md`). It names itself
 with `source: "kiosk"` on `/view`, which lands in `views.kiosk_count` — a
 subset of `count`, kept so the projector's views can still be told from the
-ones a person clicked. `/counts` and `/pull` report `count` and only `count`,
-so the gallery and the node see one number, as they always have.
+ones a person clicked. A kiosk may also send `site`, the room id from its
+launch URL (`?site=d12`, `[a-z0-9-]{1,32}`) — a place, not a person — which
+bumps `kiosk_views` for that entry and room in the same batch. `site` on
+anything but a kiosk view is refused. `/counts` and `/pull` report `count` and
+only `count`, so the gallery and the node see one number, as they always have;
+nothing reads `kiosk_count` or `kiosk_views` yet.
 
 `/counts` is public because the gallery shows view and like counts to human
 visitors. The agent-judge code (packet 5.2) must never call it — engagement is
@@ -121,6 +125,18 @@ Nothing below has been done. Each step is the instructor's.
    ```
    wrangler d1 execute sketchgen-writepath --remote \
      --command="ALTER TABLE views ADD COLUMN kiosk_count INTEGER NOT NULL DEFAULT 0;"
+   ```
+
+   A new table is the same rule: rerun the file, or run the one statement, and
+   check the table exists **before** the deploy — the 2026-09-16 deploy put
+   routes live ahead of `submissions` and signed every visitor out. The
+   per-site kiosk counts (`kiosk_views`, 2026-09-23):
+
+   ```
+   wrangler d1 execute sketchgen-writepath --remote \
+     --command="CREATE TABLE IF NOT EXISTS kiosk_views (entry_id INTEGER NOT NULL, site TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, updated_utc TEXT NOT NULL, PRIMARY KEY (entry_id, site));"
+   wrangler d1 execute sketchgen-writepath --remote \
+     --command="SELECT name FROM sqlite_master WHERE name = 'kiosk_views';"
    ```
 4. **Secrets** — four, from this directory, each read from `env` at runtime:
    - `wrangler secret put GITHUB_CLIENT_ID` — from step 1

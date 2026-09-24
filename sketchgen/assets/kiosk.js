@@ -46,6 +46,21 @@
  * Any of that can be turned off without a deploy: kiosk_views in config.json
  * for the gallery, ?views=0 for one projector.
  *
+ * A kiosk told where it lives (docs/plans/kiosk-mac.md §1.3) counts by its
+ * building instead of by its keyboard. ?site=d12 names a room in config.json's
+ * kiosk_sites, the room names a building in kiosk_buildings, and the building
+ * carries its posted hours: condition 3 becomes "the building is open", and
+ * the view carries the site, a room and not a person. A kiosk with no site=
+ * never reads either key, and one whose site= cannot be resolved counts
+ * nothing rather than falling back to the rule it was told to leave.
+ *
+ * And ?unattended=1 (kiosk-mac.md §1.1–1.2), for a machine nobody will touch
+ * again: no start card, a manifest that never stops being retried, no cursor
+ * from the first frame, and kiosk.json and config.json read again every
+ * fifteen minutes — a new build reloads the page between two sketches, new
+ * entries join the rotation without one. document.title carries the state,
+ * which is how the machine's watchdog reads it; a title is not a write.
+ *
  * And the one parameter it adds to anything (docs/plans/auto-mouse.md):
  *
  *   <root><sketch>?ghost=click,drag&ghost_loop=6000
@@ -100,6 +115,20 @@
    * browser has backgrounded is neither playing nor being watched. */
   var VIEW_AFTER_S = 10;
   var VIEW_STOP_S = 8 * 60 * 60;
+
+  /* An unattended kiosk (kiosk-mac.md §1.1): how soon it asks again for a
+   * manifest that did not come — ten seconds, doubling, never more than five
+   * minutes, never giving up, because at boot the network is often the last
+   * thing up and nobody is there to press Start again — and how often it
+   * looks for a new one once it is playing. */
+  var RETRY_FIRST_MS = 10000;
+  var RETRY_MAX_MS = 300000;
+  var DEFAULT_REFRESH_S = 900;
+
+  /* What a site id may look like: it rides in a URL, a title and a POST, and
+   * the write path holds it to the same pattern. */
+  var SITE_ID = /^[a-z0-9-]{1,32}$/;
+  var DAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
   /* The write path answers one statement per ask and its database binds at
    * most a hundred parameters, which is the number gallery.js batches on. */
@@ -218,6 +247,7 @@
   var SOURCES = {};           /* entry id -> sketch.js text, fetched once */
   var config = null;
   var frame = null;           /* the one iframe, or null (spec §4.5) */
+  var BUILD = null;           /* kiosk.json's build, as this page was loaded */
 
   var state = {
     every: DEFAULT_EVERY,
@@ -234,7 +264,13 @@
     sinceInput: 0,      /* playing seconds since the last key or mouse move */
     viewsOff: false,    /* ?views=0, which is not a key and is not persisted */
     ghost: true,        /* M, persisted beside every and order */
-    ghostOff: false     /* ?ghost=0, which is not a key and is not persisted */
+    ghostOff: false,    /* ?ghost=0, which is not a key and is not persisted */
+    unattended: false,  /* ?unattended=1, the same kind of setting */
+    site: null,         /* ?site=, the same kind again: where this kiosk lives */
+    refresh: null,      /* ?refresh= seconds, for testing the refresh; else the default */
+    nextEntries: null,  /* a newer manifest's entries, waiting for a seat boundary */
+    reloadDue: false,   /* a newer build: reload at the next seat boundary */
+    reloading: false    /* asked for, and the page has not gone yet */
   };
 
   /* ---- small helpers ---------------------------------------------------- */
@@ -301,6 +337,7 @@
       .then(function (response) { return response.json(); })
       .then(function (data) {
         ENTRIES = (data && data.entries) || [];
+        BUILD = (data && data.build) || null;
         return ENTRIES;
       });
   }
@@ -341,7 +378,9 @@
     fetch(base() + "/view", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ entry_id: entry.id, source: "kiosk" })
+      body: JSON.stringify(state.site === null
+        ? { entry_id: entry.id, source: "kiosk" }
+        : { entry_id: entry.id, source: "kiosk", site: state.site })
     }).catch(function () { /* the room is not told, and does not need to be */ });
   }
 
@@ -352,12 +391,190 @@
   }
 
   /* Every condition in one place, so there is one line to read when asking
-   * why a kiosk is or is not counting. A gallery with no write path has
-   * nowhere to post; the other three are the restraints. */
-  function countingViews() {
-    if (!base() || state.viewsOff) { return false; }
-    if (config && config.kiosk_views === false) { return false; }
-    return state.sinceInput < VIEW_STOP_S;
+   * why a kiosk is or is not counting — and, since the title prints `why`,
+   * so that the machine can be asked too. A gallery with no write path has
+   * nowhere to post; the rest are the restraints. */
+  function viewStatus() {
+    if (!base()) { return { on: false, why: "no write path" }; }
+    if (state.viewsOff) { return { on: false, why: "views=0" }; }
+    if (config && config.kiosk_views === false) { return { on: false, why: "views off" }; }
+    // A kiosk that knows where it lives counts by its building, and the
+    // keyboard is not consulted: nobody touches a wall, which is the whole
+    // reason for this branch (kiosk-mac.md §0, gap 5).
+    if (state.site !== null) { return siteOpen(); }
+    if (state.sinceInput >= VIEW_STOP_S) { return { on: false, why: "nobody here for 8 h" }; }
+    return { on: true, why: "" };
+  }
+
+  function countingViews() { return viewStatus().on; }
+
+  /* ---- where this kiosk lives (kiosk-mac.md §1.3) ----------------------- */
+
+  function own(object, key) {
+    return !!object && typeof object === "object" &&
+      Object.prototype.hasOwnProperty.call(object, key);
+  }
+
+  function isDate(text) { return typeof text === "string" && /^\d{4}-\d{2}-\d{2}$/.test(text); }
+
+  /* "07:30-24:00" as minutes, [450, 1440]; null is closed; anything else is
+   * not a span. A span stays inside one day: the posted hours only cross
+   * midnight when the building is open round the clock, which is whole days. */
+  function span(text) {
+    var m;
+    var from;
+    var to;
+    if (text === null) { return { closed: true }; }
+    m = typeof text === "string" && /^(\d{2}):(\d{2})-(\d{2}):(\d{2})$/.exec(text);
+    if (!m) { return null; }
+    from = parseInt(m[1], 10) * 60 + parseInt(m[2], 10);
+    to = parseInt(m[3], 10) * 60 + parseInt(m[4], 10);
+    if (parseInt(m[2], 10) > 59 || parseInt(m[4], 10) > 59 || from >= to || to > 1440) {
+      return null;
+    }
+    return { from: from, to: to };
+  }
+
+  /* The whole building, checked before any of it is used: a typo in next
+   * term's hours is found the day it is typed, in the title, rather than the
+   * morning that term starts. Returns an error or null. */
+  function badBuilding(building) {
+    var at;
+    var day;
+    var term;
+    var one;
+    if (!building || typeof building !== "object") { return "no building"; }
+    if (typeof building.tz !== "string" || !zoned(building.tz, new Date())) { return "bad time zone"; }
+    if (!(building.terms instanceof Array)) { return "no terms"; }
+    for (at = 0; at < building.terms.length; at += 1) {
+      term = building.terms[at];
+      if (!term || !isDate(term.from) || !isDate(term.to) || !term.week) { return "bad term"; }
+      for (day = 0; day < DAYS.length; day += 1) {
+        // An absent day is a closed one, as the university's table has it.
+        if (own(term.week, DAYS[day]) && !span(term.week[DAYS[day]])) { return "bad hours"; }
+      }
+    }
+    one = building.exceptions || [];
+    if (!(one instanceof Array)) { return "bad exceptions"; }
+    for (at = 0; at < one.length; at += 1) {
+      if (!one[at] || !isDate(one[at].from) || !isDate(one[at].to) ||
+          !own(one[at], "hours") || !span(one[at].hours)) { return "bad exception"; }
+    }
+    return null;
+  }
+
+  /* The wall clock in the building's zone, not the machine's: a Mac whose own
+   * zone is wrong still counts New York's hours. null if the zone is not one. */
+  var zoners = {};
+
+  function zoned(tz, when) {
+    var parts;
+    var got = {};
+    var at;
+    try {
+      if (!zoners[tz]) {
+        zoners[tz] = new Intl.DateTimeFormat("en-US", {
+          timeZone: tz, hourCycle: "h23", weekday: "short",
+          year: "numeric", month: "2-digit", day: "2-digit",
+          hour: "2-digit", minute: "2-digit"
+        });
+      }
+      parts = zoners[tz].formatToParts(when);
+    } catch (err) { return null; }
+    for (at = 0; at < parts.length; at += 1) { got[parts[at].type] = parts[at].value; }
+    return {
+      date: got.year + "-" + got.month + "-" + got.day,
+      day: String(got.weekday).slice(0, 3).toLowerCase(),
+      // Some engines still say 24 for the first hour of the day under h23.
+      minute: (parseInt(got.hour, 10) % 24) * 60 + parseInt(got.minute, 10)
+    };
+  }
+
+  /* Remembered per config and per minute: tick() asks every frame for as long
+   * as a closed building leaves a seat uncounted, and the answer only moves on
+   * the minute. */
+  var opened = { config: null, minute: -1, answer: null };
+
+  function siteOpen() {
+    var minute = Math.floor(new Date().getTime() / 60000);
+    if (opened.config !== config || opened.minute !== minute) {
+      opened = { config: config, minute: minute, answer: siteOpenNow() };
+    }
+    return opened.answer;
+  }
+
+  function siteOpenNow() {
+    var sites = config && config.kiosk_sites;
+    var buildings = config && config.kiosk_buildings;
+    var site;
+    var building;
+    var bad;
+    var now;
+    var at;
+    var hours;
+    var rule = null;
+    if (!SITE_ID.test(state.site) || !own(sites, state.site)) {
+      return { on: false, why: "unknown site " + state.site };
+    }
+    site = sites[state.site];
+    if (!site || !own(buildings, site.building)) {
+      return { on: false, why: "unknown building " + (site && site.building) };
+    }
+    building = buildings[site.building];
+    bad = badBuilding(building);
+    if (bad) { return { on: false, why: bad }; }
+    now = zoned(building.tz, new Date());
+    // The first exception that holds today decides, before any term does:
+    // that is what an exception is.
+    for (at = 0; at < (building.exceptions || []).length; at += 1) {
+      if (building.exceptions[at].from <= now.date && now.date <= building.exceptions[at].to) {
+        rule = building.exceptions[at].hours;
+        break;
+      }
+    }
+    if (rule === null && at === (building.exceptions || []).length) {
+      for (at = 0; at < building.terms.length; at += 1) {
+        if (building.terms[at].from <= now.date && now.date <= building.terms[at].to) { break; }
+      }
+      // A date in no term is closed. The posted schedule always ends
+      // somewhere, and a list nobody extended must under-count, never over.
+      if (at === building.terms.length) { return { on: false, why: "no posted hours" }; }
+      rule = own(building.terms[at].week, now.day) ? building.terms[at].week[now.day] : null;
+    }
+    hours = span(rule);
+    if (hours.closed || now.minute < hours.from || now.minute >= hours.to) {
+      return { on: false, why: "closed" };
+    }
+    return { on: true, why: "" };
+  }
+
+  function siteNames() {
+    var sites = config && config.kiosk_sites;
+    var buildings = config && config.kiosk_buildings;
+    var site = own(sites, state.site) ? sites[state.site] : null;
+    var building = site && own(buildings, site.building) ? buildings[site.building] : null;
+    return {
+      site: (site && site.name) || state.site,
+      building: (building && building.name) || null
+    };
+  }
+
+  /* ---- the title: the state, for the machine's watchdog (§1.4) ---------- */
+
+  function paintTitle(waiting) {
+    var parts = ["sketchgen kiosk"];
+    var entry = current();
+    var views;
+    if (state.site !== null) { parts.push(state.site); }
+    if (waiting) {
+      parts.push(waiting);
+    } else {
+      if (entry) { parts.push("#" + entry.id); }
+      views = viewStatus();
+      parts.push(views.on ? "counting" : "not counting: " + views.why);
+    }
+    if (BUILD) { parts.push(String(BUILD).slice(0, 6)); }
+    document.title = parts.join(" · ");
   }
 
   function loadCounts() {
@@ -486,6 +703,16 @@
     // The same, for the same reason: whether the sketches on this projector
     // move by themselves is a property of the projector somebody set up.
     state.ghostOff = params.get("ghost") === "0";
+    // Where the machine is, and whether anybody will ever click it: both are
+    // set where the machine is set up, in its launch URL, and a keyboard
+    // cannot move a kiosk to another building (kiosk-mac.md §1.1, §1.3). An
+    // empty site= is still a site asked for, and it resolves to nothing.
+    state.unattended = params.get("unattended") === "1";
+    state.site = params.get("site");
+    every = params.get("refresh");
+    if (every !== null && every !== "" && !isNaN(Number(every))) {
+      state.refresh = Math.max(30, Math.min(3600, Math.round(Number(every))));
+    }
   }
 
   /* The launch link and the address bar are the same parameters, built the
@@ -504,7 +731,11 @@
       // to reproduce the projector, and a projector that counts nothing is
       // not reproduced by a link that counts.
       (state.viewsOff ? "&views=0" : "") +
-      (state.ghostOff ? "&ghost=0" : "");
+      (state.ghostOff ? "&ghost=0" : "") +
+      (state.unattended ? "&unattended=1" : "") +
+      // The one value here from no fixed vocabulary, so the one escaped.
+      (state.site !== null ? "&site=" + encodeURIComponent(state.site) : "") +
+      (state.refresh !== null ? "&refresh=" + state.refresh : "");
   }
 
   /* Both halves of §1.8 at once. The address bar keeps only what query()
@@ -1059,6 +1290,29 @@
     $("m-overlays").innerHTML = rows.join("");
     $("m-count").textContent = shown.length + " of " + OVERLAYS.length + " on";
     $("launch").textContent = "kiosk.html?" + query();
+    paintNote();
+  }
+
+  /* The one place the room is told how it is counted, so a site-specific
+   * kiosk says which rule it is on. A default kiosk keeps the template's. */
+  var DEFAULT_NOTE = null;
+
+  function paintNote() {
+    var names;
+    var status;
+    if (DEFAULT_NOTE === null) { DEFAULT_NOTE = $("m-note").textContent; }
+    if (state.site === null) { $("m-note").textContent = DEFAULT_NOTE; return; }
+    names = siteNames();
+    status = viewStatus();
+    if (/^unknown|^bad|^no (building|terms)/.test(status.why)) {
+      $("m-note").textContent = "This kiosk's site, " + state.site +
+        ", cannot be read from the gallery's settings (" + status.why +
+        "), so nothing it plays is counted as a view.";
+      return;
+    }
+    $("m-note").textContent = names.site + " · views and likes are live from the write path; " +
+      "a sketch counts as a view once it has been on screen for ten seconds, during " +
+      (names.building ? names.building + " hours" : "building hours") + ".";
   }
 
   function sizeAt(key) {
@@ -1110,6 +1364,7 @@
     showEntry(entry);
     paint(entry);
     paintStatus();
+    paintTitle();
   }
 
   /* A fresh permutation every time a random sequence wraps, so a day-long run
@@ -1131,11 +1386,42 @@
     return seats;
   }
 
+  /* Take the newer entries, keeping the sketch on screen where the new
+   * order puts it and the step asked for, so the rotation carries on from
+   * here rather than from the top. Returns the step's new target. */
+  function adopt(to) {
+    var showing = current();
+    var step = to - state.i;
+    var at;
+    ENTRIES = state.nextEntries;
+    state.nextEntries = null;
+    state.seq = sequence(state.order);
+    state.i = 0;
+    for (at = 0; showing && at < state.seq.length; at += 1) {
+      if (ENTRIES[state.seq[at]].id === showing.id) { state.i = at; break; }
+    }
+    // A sketch that has left the gallery takes its place with it: the step
+    // lands on what is now first rather than on what was after it.
+    if (showing && at === state.seq.length) { return 0; }
+    return state.i + step;
+  }
+
   /* Move by one, with the fade: the timer's end, and manual next/previous. */
   function go(to) {
     var len = state.seq.length;
     var stage = $("stage");
     if (!len) { return; }
+    // Between two sketches is the one moment a newer manifest can be taken
+    // without anybody seeing a sketch cut short (kiosk-mac.md §1.2).
+    // Once: the page does not go away the instant it is asked to, and
+    // tick() would otherwise ask again on every frame until it did.
+    if (state.reloading) { return; }
+    if (state.reloadDue) { state.reloading = true; window.location.reload(); return; }
+    if (state.nextEntries) {
+      to = adopt(to);
+      len = state.seq.length;
+      if (!len) { return; }
+    }
     // reshuffled() reads the sketch on screen, so it runs before the sequence
     // it is replacing is thrown away.
     if (state.order === "random" && to >= len) { state.seq = reshuffled(); }
@@ -1273,6 +1559,39 @@
     if (handled) { persist(); paintMenu(); paintStatus(); openMenu(); }
   }
 
+  /* ---- unattended: staying current (kiosk-mac.md §1.2) ------------------ */
+
+  /* Unlike loadConfig, a failure here is a failure: a config.json that did
+   * not arrive must not replace the one this page is running on with {}.
+   * no-cache rather than no-store, so an unchanged manifest costs a 304. */
+  function fetchFresh(name) {
+    return fetch(ROOT + name, { cache: "no-cache" }).then(function (response) {
+      if (response.ok === false) { throw new Error(name + " " + response.status); }
+      return response.json();
+    });
+  }
+
+  function refreshMs() { return 1000 * (state.refresh || DEFAULT_REFRESH_S); }
+
+  function refresh() {
+    Promise.all([fetchFresh("kiosk.json"), fetchFresh("config.json")])
+      .then(function (both) {
+        var manifest = both[0];
+        if (both[1] && typeof both[1] === "object") { config = both[1]; }
+        if (!manifest || !(manifest.entries instanceof Array) || !manifest.entries.length) { return; }
+        // A new build is a new page: only a reload runs it.
+        if ((manifest.build || null) !== BUILD) { state.reloadDue = true; return; }
+        if (JSON.stringify(manifest.entries) !== JSON.stringify(ENTRIES)) {
+          state.nextEntries = manifest.entries;
+        }
+      })
+      .catch(function () { /* the wall keeps what it has; the next look is in fifteen minutes */ })
+      .then(function () {
+        paintTitle();
+        window.setTimeout(refresh, refreshMs());
+      });
+  }
+
   /* ---- start ------------------------------------------------------------ */
 
   function play() {
@@ -1284,6 +1603,14 @@
     last = now();
     window.requestAnimationFrame(tick);
     window.requestAnimationFrame(scrollCode);
+    if (state.unattended) {
+      // No menu opening by itself: it is there to teach the person who
+      // pressed Start, and nobody did. And no cursor from the first frame,
+      // rather than from the first mouse move that on a wall never comes.
+      document.body.classList.add("idle");
+      window.setTimeout(refresh, refreshMs());
+      return;
+    }
     window.setTimeout(openMenu, START_MENU_MS);
   }
 
@@ -1315,15 +1642,19 @@
     if (note) { note.textContent = CANNOT_LOAD; }
   }
 
+  function begin() {
+    $("welcome").hidden = true;
+    document.body.classList.add("playing");
+    play();
+  }
+
   function wireStart() {
     $("go").addEventListener("click", function () {
       // The manifest is already in hand, so this click only starts: it is
       // spent on the gesture the browser wants before it will run audio or go
       // full screen, and on nothing else.
-      if (!ENTRIES.length) { return; }
-      $("welcome").hidden = true;
-      document.body.classList.add("playing");
-      play();
+      if (!ENTRIES.length || state.playing) { return; }
+      begin();
     });
   }
 
@@ -1350,12 +1681,19 @@
     wireIdle();
     wireStart();
     waitToStart();
-    // Both files are asked for on load, not on the click: the card is the
-    // wait, so that the click is not.
+    if (state.unattended) { document.body.classList.add("unattended"); }
+    boot(0);
+  });
+
+  /* Both files are asked for on load, not on the click: the card is the
+   * wait, so that the click is not. An unattended kiosk that cannot load
+   * asks again, for ever; an attended one says so and waits for a person. */
+  function boot(tries) {
+    paintTitle(tries ? "waiting for the gallery (try " + (tries + 1) + ")" : "loading");
     Promise.all([loadManifest(), loadConfig()]).then(function () {
       // An empty gallery is nothing to play, and says so rather than starting
       // into a black screen.
-      if (!ENTRIES.length) { cannotStart(); return; }
+      if (!ENTRIES.length) { throw new Error("empty"); }
       loadCounts();
       // Ten minutes: a projector runs all day, and a like recorded at noon
       // should show up before the room empties.
@@ -1366,8 +1704,13 @@
       paintMenu();
       paintStatus();
       offerStart();
+      if (state.unattended) { begin(); }
     }).catch(function () {
       cannotStart();
+      if (!state.unattended) { return; }
+      paintTitle("waiting for the gallery (try " + (tries + 1) + ")");
+      window.setTimeout(function () { boot(tries + 1); },
+        Math.min(RETRY_MAX_MS, RETRY_FIRST_MS * Math.pow(2, tries)));
     });
-  });
+  }
 })();
