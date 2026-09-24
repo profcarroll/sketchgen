@@ -1,0 +1,23 @@
+#!/bin/bash
+# kiosk-status — what the laptop runs:  ssh d12-kiosk kiosk-status   (docs/plans/kiosk-mac.md §3)
+# Installed by install.sh at ~/bin/kiosk-status. Reads only.
+STATE="$HOME/Library/Caches/sketchgen-kiosk"
+TS=$(command -v tailscale || echo /Applications/Tailscale.app/Contents/MacOS/Tailscale)
+agent=$(launchctl print "gui/$(id -u)/org.sketchgen.kiosk" 2>/dev/null)
+pid=$(echo "$agent" | awk -F' = ' '/^\tpid = / {print $2}')
+
+echo "host      $(hostname -s)   $(uptime | sed 's/^ *//')"
+# One tab deep: launchctl print nests other "state =" lines inside the job's own.
+echo "agent     $(echo "$agent" | awk -F' = ' '/^\tstate = / {s=$2} /^\tpid = / {p=$2} /^\tlast exit code = / {e=$2}
+                                  END {print (s ? s : "not loaded") "  pid " p "  last exit " e}')"
+if [ -n "$pid" ]; then
+    # Chrome's helpers are children of the browser process the agent started.
+    pids=$({ echo "$pid"; pgrep -P "$pid"; } | paste -sd, -)
+    echo "chrome    $(ps -o rss= -p "$pids" 2>/dev/null \
+        | awk '{kb += $1; n++} END {printf "%d processes, %.0f MB resident\n", n, kb / 1024}')"
+fi
+echo "title     $("$HOME/Library/sketchgen-kiosk/kiosk-watchdog.sh" --title)"
+echo "memory    $(memory_pressure 2>/dev/null | tail -1)"
+echo "tailscale $("$TS" status --self --peers=false 2>/dev/null | head -1)"
+echo "watchdog  (last 5)"; tail -5 "$STATE/watchdog.log" 2>/dev/null | sed 's/^/  /'
+echo "launcher  (last 3)"; grep 'launch-kiosk:' "$STATE/chrome.log" 2>/dev/null | tail -3 | sed 's/^/  /'

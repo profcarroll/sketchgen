@@ -12,7 +12,8 @@ Two halves, because they happen in two places:
   deployed from the laptop **before** the on-device session, so that the session only has to
   point a browser at a page that already knows how to run unattended.
 - **The session** — on the Mac, with the operator in the room: probe, configure, then break it on
-  purpose and watch it recover. The draft scripts are in `docs/plans/kiosk-mac/`.
+  purpose and watch it recover. The scripts are in `kiosk-mac/` (drafts first, made to run on
+  2026-09-24).
 
 ## 0. What the code does today, and why it will not survive a reboot
 
@@ -300,7 +301,7 @@ Each line is reversible, and each is there because of what happens without it.
 ### 2.4 The browser, supervised
 
 Chrome, because Safari has no kiosk mode and Chrome's `--kiosk` has no chrome, no menu bar and
-no dock. Three draft files in `docs/plans/kiosk-mac/`, installed under `~/Library/`:
+no dock. The files are in `kiosk-mac/`, installed under `~/Library/` by `kiosk-mac/install.sh`:
 
 - **`launch-kiosk.sh`** — waits until the gallery answers (so Chrome never boots into its own
   offline page), clears Chrome's "crashed" flag so there is no *Restore pages?* bubble, nudges the
@@ -368,7 +369,7 @@ Chrome memory after the 04:30 restart, and that the title moved through the nigh
 
 ### 2.6 What goes back into the repository
 
-The drafts in `docs/plans/kiosk-mac/` become whatever the session found they had to be, and the
+The drafts, now `kiosk-mac/`, become whatever the session found they had to be, and the
 operations notes get a short *D12 kiosk* section in `docs/OPERATIONS.md`: hostname, how to reach
 it, the four remote commands, and the Mac's settings that differ from stock.
 
