@@ -3937,6 +3937,9 @@ class SwipeManifestTests(GalleryTestCase):
             gallery._entries(self.conn, "published"), key=lambda row: int(row["id"])
         )
         alone = {
+            # The page's build stamp sits beside the rows (kiosk-mac.md §1.2);
+            # this test is about the rows.
+            "build": gallery._kiosk_build(),
             "entries": [
                 gallery._kiosk_entry(
                     self.conn, row, self.config, parent, children, scores
