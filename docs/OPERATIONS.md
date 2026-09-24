@@ -1509,6 +1509,32 @@ scp 'sld-gpu:sketchgen/bench-*.json' 'sld-gpu:sketchgen/*.json' ~/sketchgen-back
 Remove the `sld-gpu` block from `~/.ssh/config` afterwards so nothing tries to
 reach an address Oracle has given to somebody else.
 
+## A new private node: install.sh
+
+Written 2026-09-24, when the second D12 lab box (`d12-node-flux`) was the
+third node in a week set up by hand. `install.sh` is steps 3–4 and 6–8 of
+*A rented GPU node* in one command, for any Ubuntu node with Ollama already
+on it: packages, linger, the app at a pinned build, the venv and Chromium
+(launched once to prove it), a fresh database, a private gallery, the units
+and a `node.conf` drop-in. It stops at the enable line; enabling is yours.
+
+```bash
+scp install.sh d12-node-flux: && ssh -t d12-node-flux 'bash install.sh --ref a72f076 --operator profcarroll --shape "D12 box 2: Ryzen 7 9800X3D, 64G + RTX 5080 16G"'
+ssh d12-node-flux 'systemctl --user enable --now sketchgen-worker.service sketchgen-web.service sketchgen-backup.timer'
+```
+
+- **`-t` is for sudo.** Missing packages, or Chromium's system libraries, need
+  root. Without a terminal it stops (exit 2) and prints the line to rerun;
+  with one, sudo asks once.
+- **Run it again freely.** An existing app, gallery or `node.conf` is left as
+  it is; a flag that disagrees with `node.conf` is printed, not written. A
+  database it did not create keeps its switch; one it did create comes up
+  paused, because a new node benches first.
+- **Not for sld-cloud.** The public node's gallery checkout, deploy keys and
+  write-path token are *Recovery*, steps 8–9, and they stay by hand.
+- **Not Ollama or the driver.** Both are pinned to the other nodes' versions,
+  as in *A rented GPU node*, steps 2 and 5.
+
 ## The operator UI as a service
 
 `install-unit` also copies `systemd/sketchgen-web.service`. It runs `sketchgen web`
