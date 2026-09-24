@@ -178,6 +178,16 @@ slot from about 21:30 to 00:30 UTC, every pass was refused, the preflight read
 the process count alone and said READY, and the agent driving job 1524 polled
 `next` for 13 minutes over a queue nothing was going to claim.
 
+Nor is the nap where a finished job goes. Until 2026-09-24 every pass was
+followed by a thirty-second nap, the one that had just run a job included, so
+a job queued behind another sat under *Nothing to do* until the next pass: job
+1542, queued under its agent's lease while job 1541 was written, did for 34 s.
+A pass now goes straight into the next one when anything is queued, unless its
+own job is back on the queue (a pause, a stop-now, a restart) or the generator
+is not running. And while an agent holds a lease the nap looks every five
+seconds for that agent's job back on the queue, which is where `paid start`
+and every `paid import` put it, and ends when it finds it.
+
 Each job has a directory under `$SKETCHGEN_JOBS` (default `~/sketchgen/jobs`):
 `job.log`, then `attempt-1/`, `attempt-2/` … holding the prompt, the raw response,
 the sketch, and the gate's own output under `attempt-N/.gate/`. That is the
@@ -1783,9 +1793,12 @@ python3 bin/sketchgen paid models add claude-sonnet-5
 python3 bin/sketchgen paid preflight --as claude-sonnet-5   # READY, or what to fix
 ```
 
-`preflight` checks the schema, the registration, that exactly one worker is
-running (or the drip timer is on), and that the generator is running; each
-failure names its fix and whether the agent or the operator owns it. It also
+`preflight` checks the schema, that exactly one worker is running (or the drip
+timer is on), and that the generator is running; each failure names its fix and
+whether the agent or the operator owns it. It reports the registration and
+never fails on it, because `paid start` registers the agent's own name; until
+2026-09-24 a missing name was a failure, so every model's first preflight said
+NOT READY and exit 3 over something `start` does itself. It also
 reports what the worker is doing this second, every live lease, and every job
 parked for a plan or an attempt — whose it is and the command that moves it.
 

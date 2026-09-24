@@ -1957,6 +1957,64 @@ class TestStatusCard(IdleTestCase):
         run._nap(0.0)
         self.assertEqual("idle", db.current_activity(self.conn)["step"])
 
+    def test_a_finished_job_goes_straight_on_to_the_next_queued_one(self):
+        # 2026-09-24: job 1542 sat queued under its agent's lease while job
+        # 1541 was written; 1541 finished, the worker napped, and for 34 s the
+        # card and `paid next` said "Nothing to do" over it.
+        import signal
+        jobs = [self.enqueue(), self.enqueue(prompt="a second field")]
+        run = self.make_worker()
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.SIG_DFL)
+        naps = []
+
+        def nap(seconds):
+            naps.append([db.get_job(self.conn, job).state for job in jobs])
+            run._terminating = True
+
+        run._nap = nap
+        self.assertEqual(0, run.run_forever(sleep_s=30.0))
+        # one nap, and only once nothing was left on the queue to say it over
+        self.assertEqual(1, len(naps))
+        self.assertNotIn("queued", naps[0])
+
+    def test_going_straight_on_needs_a_queue_the_last_pass_did_not_put_back(self):
+        job_id = self.enqueue()
+        run = self.make_worker()
+        # a pass that claimed nothing, over a job queued since: the idle
+        # round's spawned child, or an agent's `paid start` mid-pass
+        self.assertTrue(run._straight_on())
+        # the pass's own job, back on the queue: a pause, a stop-now or a
+        # restart put it there, and going straight on would claim it again
+        run._claimed = job_id
+        self.assertFalse(run._straight_on())
+        run._claimed = None
+        db.set_control(self.conn, "paused", "a person paused it")
+        self.assertFalse(run._straight_on())
+        db.set_control(self.conn, "running", None)
+        db.transition(self.conn, job_id, "executing")
+        self.assertFalse(run._straight_on())  # nothing queued: nap
+
+    def test_the_nap_ends_when_a_leased_job_comes_back_to_the_queue(self):
+        # `paid start` and every `paid import` put the agent's job on the
+        # queue, and the agent polls for the claim: the rest of a thirty-second
+        # nap was time it spent reading "Nothing to do" over its own job.
+        job_id = self.enqueue()
+        db.lease_paid(self.conn, job_id, "claude-sonnet-5", 20)
+        run = self.make_worker()
+        started = time.monotonic()
+        run._nap(30.0)
+        self.assertLess(time.monotonic() - started, worker.TRY_POLL_S)
+        # Not while fenced or paused: that next pass would claim nothing and
+        # nap again, so waking early would only turn the log over faster.
+        for fenced, control in (("another client holds the inference slot", "running"),
+                                (None, "paused")):
+            with self.subTest(fenced=fenced, control=control):
+                run._fenced = fenced
+                db.set_control(self.conn, control, None)
+                started = time.monotonic()
+                run._nap(1.2)
+                self.assertGreaterEqual(time.monotonic() - started, 1.1)
+
     def test_a_sweep_that_re_queues_nothing_says_nothing(self):
         # The sweep runs on every pass. A step per pass would push whatever the
         # worker is really doing off the card.

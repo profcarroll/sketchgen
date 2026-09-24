@@ -1579,9 +1579,10 @@ def preflight(
 
     ``ready`` is true only when every check passes. Each failed check carries
     ``fix``: the one command that repairs it, and ``who`` may run it — ``you``
-    for the one thing an agent may do for itself (register its own name, which
-    is a name and not a key), ``operator`` for everything else, which the agent
-    reports rather than attempts (AGENTS.md: report and stop).
+    for the one thing an agent may do for itself (name its own model id),
+    ``operator`` for everything else, which the agent reports rather than
+    attempts (AGENTS.md: report and stop). Registration is reported and never
+    fails: `start` does it.
     """
     checks: list[dict[str, Any]] = []
 
@@ -1604,15 +1605,21 @@ def preflight(
     check("schema", version >= MIN_SCHEMA, f"schema {version}, needs {MIN_SCHEMA}",
           "deploy main to the node: bash ~/sketchgen/app/update.sh")
 
+    # Reported, never failed: `start` registers the name before it runs this
+    # preflight, and nothing else an agent does needs it registered first. Until
+    # 2026-09-24 a missing name failed here as the agent's one `fix (you)`, so
+    # the preflight AGENTS.md asks for before `start` said NOT READY, exit 3,
+    # to every model on its first run, and the stop rule said to stop there;
+    # the session that drove job 1542 went on only because the fix was marked
+    # its own.
     registered = models.is_paid(model, conn)
     check(
         "registered",
-        registered,
-        f"{model} is {'' if registered else 'not '}a registered paid model — "
-        + ("the worker parks its steps for you" if registered
-           else "the worker would send it to Ollama, which answers 404"),
-        f"sketchgen paid models add {model}",
-        who="you",
+        True,
+        f"{model} is a registered paid model — the worker parks its steps for you"
+        if registered else
+        f"{model} is not registered yet — `paid start` registers it (a name, "
+        "not a key), and the worker parks its steps for you from then on",
     )
 
     running = workers()
@@ -1896,9 +1903,10 @@ def start(
     is not ready, ``{"started": False, "preflight": …}`` with nothing queued —
     the CLI exits 3 and prints the checks, and the stop rule applies.
 
-    Registration happens here rather than being the agent's one `fix (you)`,
-    because it is a name and not a key and there is no reason to make an agent
-    run two commands to say who it is. It is reported, so the operator can
+    Registration happens here rather than as a fix the preflight hands the
+    agent, because it is a name and not a key and there is no reason to make an
+    agent run two commands to say who it is; the preflight reports a missing
+    name and passes it (:func:`preflight`). It is reported, so the operator can
     `paid models remove` it.
 
     ``since`` is what `date -u +%FT%TZ` printed when the agent began — the
