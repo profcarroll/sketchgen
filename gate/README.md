@@ -11,8 +11,9 @@ and the repo is the copy that leads: the three copies — here, the node, the
 course repo at `sld-fall-2026/examples/week11-self-hosted-ai/sketch-gate/` —
 share one sha256, recorded as `GATE_SHA256` in `tests/test_gate_fixtures.py`,
 and the other two match it once this branch is deployed. The frame budget below
-changed that hash, and so did the ghost window, and so did `loads(image)`;
-until `update.sh` runs on the node, the node's copy is the one before it.
+changed that hash, and so did the ghost window, and so did `loads(image)`, and
+so did reading the sketch rather than its buffers; until `update.sh` runs on
+the node, the node's copy is the one before it.
 
 ## What it checks
 
@@ -270,9 +271,50 @@ serves the sketch from `http://sketch.localhost` without opening a socket. The
 long comment at the top of `sketch_gate.py` explains each of those and says
 where determinism stops; read it before changing any sampling window.
 
+## The sketch, not its buffers
+
+Fixed 2026-09-24, after job 1542 (entry 1531). `is_looping`,
+`frame_advancing`, `uses(webgl)` and `size(w,h)` are all read off the
+sketch's own p5 instance, which the in-page hook finds by wrapping
+`p5.prototype._initializeInstanceVariables` — the one prototype method p5's
+constructor still calls. p5 1.11's `p5.Graphics` constructor calls it too, on
+the buffer it is building, and the hook kept whatever it saw last. So from a
+sketch's first `createGraphics()` on, the gate was reading a buffer: no draw
+loop, so `is_looping` false and `frame_advancing` skipped as though the sketch
+had called `noLoop()`; a `frameCount` copied off the prototype at 0; and the
+buffer's own width, height and renderer. Job 1542 made two gradient buffers in
+`setup()` and read `is_looping` false; the same sketch with
+`document.createElement('canvas')` read true, `frameCount` 86 → 122. The hook
+now keeps only a `p5` — a Graphics extends `p5.Element` — and the three
+`createGraphics()` fixtures below are the three ways it read wrong.
+`tests/js/gate_hook.js` runs the same three cases against the real `INIT_JS`
+in node, so a machine without a browser still notices if the guard goes.
+
+**What it did to the record.** It was there from the first `createGraphics()`
+the node ever gated (2026-09-14) to `HARNESS_VERSION` 5. On 2026-09-24 the node
+held 1,532 entries, and 92 kept a sketch that calls `createGraphics()`, 60 of
+them published. 91 of those 92 reports say `is_looping` false and none says
+true; the 92nd stopped on its frame budget before it was read. Re-gated on the
+laptop with this fix and each entry's own assertions, 79 loop and 13 really are
+static, so 78 of the 91 falses are wrong and the other 13 are right by
+accident. Of the 79, 76 advance; the 3 that do not all throw inside `draw()`
+and had already failed on their console, so no frozen sketch got past the gate
+this way. `uses(webgl)` changes on 25 entries, every one a WEBGL sketch with a
+2D buffer that had read *renderer context is 2D*: 15 of them are published with
+an OFF-PLAN chip the misread alone put there, and 4 ended `failed-kept` under
+harness 1 on nothing else (*checks failed: is_looping; assertions failed:
+uses(webgl)*). `size(800,600)` changes on entry 1027, whose last buffer was an
+800x1 strip. Repair prompts carried the misread too: 38 told a sketch that
+never calls `noLoop()` that it did.
+
+None of those records has been rewritten — not the reports on the node, not
+`offplan_json`, not the published `meta.json`. An entry's `harness_version` is
+how to tell which referee read it: 4 or earlier, and a `createGraphics()`
+call, means the four readings above are the buffer's.
+
 ## The fixtures and `accept.sh`
 
-`fixtures/` holds eleven sketch directories, each one a bug the gate was built to
+`fixtures/` holds fourteen sketch directories, each one a bug the gate was built to
 catch (or a clean pass it must not fail), and `fixtures/expected.json` records
 for each the expected exit code, the expected value of the checks that fixture
 is about, the assertions a planner would have chosen for it, and a note saying
@@ -290,7 +332,12 @@ that is not there and still passes every fixed check, and
 All three expect exit 0 from the plain run, because — as with `bad-frozen` —
 only the assertion knows the difference, and each carries an
 `assertion_detail` fragment so that the right verdict for the wrong reason is
-a mismatch.
+a mismatch. The three `createGraphics()` fixtures are a set too, and are a bug
+in the gate rather than in a sketch (see *The sketch, not its buffers*):
+`good-graphics` is job 1542's shape, `good-webgl-2d-buffer` a WEBGL sketch
+with a 2D texture buffer, and `good-2d-webgl-buffer` the reverse. All three
+must read `is_looping` and `frame_advancing` true, and between them they hold
+`size(w,h)` and `uses(webgl)`, both ways, to the sketch's own canvas.
 
 A fixture's expected `checks` object need not name every check — only the keys
 it lists are compared. `bad-frame-budget` and `good-image` both use that;

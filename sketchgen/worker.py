@@ -818,7 +818,13 @@ ADVISORY_CHECKS = frozenset({"is_looping"})
 #: 4 — from 2026-09-22: `loads(image)` exists; the gate reports
 #:     `resources_loaded`; the canvas wait runs to the timeout when the word is
 #:     asserted.
-HARNESS_VERSION = 4
+#: 5 — from 2026-09-24: the gate reads is_looping, frame_advancing,
+#:     uses(webgl) and size(w,h) off the sketch's own p5 instance. Under 4 and
+#:     every version before it, a sketch that called createGraphics() read them
+#:     off its last buffer: is_looping false and frame_advancing skipped on a
+#:     sketch that never called noLoop(), and a WEBGL sketch with a 2D buffer
+#:     missing uses(webgl) (job 1542, entry 1531). A frozen one now fails.
+HARNESS_VERSION = 5
 
 QA_CHECKS = frozenset({
     "console_clean", "frame_advancing", "sound_lib_ok",

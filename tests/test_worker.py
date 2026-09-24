@@ -857,8 +857,9 @@ class TestEntries(WorkerTestCase):
 
         row = self.entries(job_id)[0]
         # The referee changed what it draws, so the entry says which referee.
-        # 4 since 2026-09-22 and loads(image); the ghost window was 3.
-        self.assertEqual(4, row["harness_version"])
+        # 5 since 2026-09-24, when it stopped reading createGraphics() buffers
+        # as the sketch; loads(image) was 4 and the ghost window 3.
+        self.assertEqual(5, row["harness_version"])
         self.assertEqual(worker.HARNESS_VERSION, row["harness_version"])
         # And what it draws for the judge and the critic did not move.
         self.assertTrue(row["strip_path"].endswith(".gate/strip.png"))

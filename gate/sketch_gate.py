@@ -530,6 +530,17 @@ INIT_JS = r"""
   // fixed checks read; and it installs an accessor for `setup` on the instance,
   // which is how an instance-mode sketch hands p5 its setup function -- a plain
   // assignment, so the accessor survives it.
+  //
+  // It does both for a p5 and nothing else.  The p5.Graphics constructor calls
+  // this same method on the buffer it is building (p5 1.11.3:
+  // p5.prototype._initializeInstanceVariables.apply(graphics)), and a Graphics
+  // extends p5.Element, not p5.  Keeping every `this` made the last buffer the
+  // sketch as far as state() could tell: no _loop, so is_looping false and
+  // frame_advancing skipped as if the sketch had called noLoop(); a frameCount
+  // copied from the prototype and never advanced; and the buffer's own size and
+  // renderer for size(w,h) and uses(webgl).  Job 1542 (entry 1531, 2026-09-24)
+  // made two gradient buffers and never called noLoop(), and read is_looping
+  // false until they were plain canvases.
   function patchP5(P) {
     if (!P || !P.prototype || P.__gatePatched) return;
     const init = P.prototype._initializeInstanceVariables;
@@ -537,6 +548,7 @@ INIT_JS = r"""
     P.__gatePatched = true;
     P.prototype._initializeInstanceVariables = function () {
       const r = init.apply(this, arguments);
+      if (!(this instanceof P)) return r;
       g.inst = this;
       const self = this;
       let userSetup = null, wrapped = null;
