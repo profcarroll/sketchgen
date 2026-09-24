@@ -85,7 +85,7 @@ def stub_executor(out_root):
 
 
 def stub_gate():
-    def run(*, source_dir, assertions, out_dir):
+    def run(*, source_dir, assertions, out_dir, revises=None, revision_min_lines=None):
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         report = {"seed": 1, "checks": {}, "assertions": {}, "artefacts": {}, "exit": 0}

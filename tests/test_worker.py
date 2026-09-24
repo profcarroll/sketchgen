@@ -152,10 +152,12 @@ class StubGate:
         self.on_call = on_call
         self.calls = []
 
-    def __call__(self, *, source_dir, assertions, out_dir):
+    def __call__(self, *, source_dir, assertions, out_dir, revises=None,
+                 revision_min_lines=None):
         n = len(self.calls) + 1
         self.calls.append({"source_dir": source_dir, "assertions": list(assertions),
-                           "out_dir": out_dir})
+                           "out_dir": out_dir, "revises": revises,
+                           "revision_min_lines": revision_min_lines})
         code = self.verdicts[min(n, len(self.verdicts)) - 1]
         if self.reports is not None:
             report = self.reports[min(n, len(self.reports)) - 1]
@@ -857,9 +859,11 @@ class TestEntries(WorkerTestCase):
 
         row = self.entries(job_id)[0]
         # The referee changed what it draws, so the entry says which referee.
-        # 5 since 2026-09-24, when it stopped reading createGraphics() buffers
-        # as the sketch; loads(image) was 4 and the ghost window 3.
-        self.assertEqual(5, row["harness_version"])
+        # 6 since 2026-09-24, when a child's attempts began to be held to a
+        # floor of changed lines against the parent; reading the sketch rather
+        # than its createGraphics() buffers was 5, loads(image) 4 and the
+        # ghost window 3.
+        self.assertEqual(6, row["harness_version"])
         self.assertEqual(worker.HARNESS_VERSION, row["harness_version"])
         # And what it draws for the judge and the critic did not move.
         self.assertTrue(row["strip_path"].endswith(".gate/strip.png"))
@@ -2463,6 +2467,31 @@ class TestBriefWithSource(unittest.TestCase):
         # none, because the model rewrites the half it cannot see.
         self.assertNotIn("createCanvas", out)
 
+    def test_a_parent_carries_the_line_the_lead_tells_the_model_to_act_on(self):
+        # PARENT_LEAD says "change what the `Revise:` line asks for", and until
+        # 2026-09-24 there was no such line in the prompt: job 1653 returned
+        # entry 1531's 207 lines byte for byte.
+        given = self.given("parent")
+        given.revision = "the same discs, and this time they glow"
+        out = worker.brief_with_source("A brief.", given)
+        line = "Revise: the same discs, and this time they glow"
+        self.assertIn(line, out)
+        self.assertLess(out.index(worker.PARENT_LEAD), out.index(line))
+        self.assertLess(out.index(line), out.index("```js"))
+
+    def test_the_line_survives_a_sketch_too_long_to_show(self):
+        given = self.given(shown=False)
+        given.revision = "the same discs, and this time they glow"
+        out = worker.brief_with_source("A brief.", given, 120)
+        self.assertIn("Revise: the same discs, and this time they glow", out)
+        self.assertIn("not shown.", out)
+
+    def test_a_previous_attempt_carries_no_revise_line(self):
+        given = self.given("previous")
+        given.revision = "never shown under this heading"
+        self.assertNotIn("never shown",
+                         worker.brief_with_source("A brief.", given))
+
     def test_the_source_goes_above_the_evidence(self):
         """brief -> source -> what the gate found, in that order."""
         out = worker.brief_with_evidence(
@@ -2672,6 +2701,172 @@ class TestSourceInTheAttempt(SourceTestCase):
         )
 
 
+class TestRevisionFloor(SourceTestCase):
+    """HARNESS_VERSION 6: a child's attempts are gated against the parent.
+
+    The stub gate does not measure anything; what is tested here is what the
+    worker asks the gate, and what it does with a `revised` the gate answers.
+    The measuring is tests/test_gate_fixtures.py's RevisionTests, and the real
+    run is accept.sh's bad-revision-unchanged and good-revision.
+    """
+
+    def unrevised(self, sketch_dir, *, exit_code=1):
+        return make_report(
+            sketch_dir, checks={"revised": False},
+            notes=["revised: sketch.js is the sketch it revises, unchanged: not "
+                   "one line of code differs from the 2 it was given; comments, "
+                   "blank lines and whitespace are not counted, and a revision "
+                   "changes at least 5"],
+            exit_code=exit_code)
+
+    def test_every_attempt_of_a_child_is_gated_against_the_parent(self):
+        _job, entry_id, sketch = self.parent()
+        self.child(entry_id)
+        gate = StubGate([1, 0])
+        self.make_worker(gate_fn=gate).run_once()
+        self.assertEqual(2, len(gate.calls))
+        # Attempt 2 is SHOWN attempt 1, and still measured against the parent:
+        # the floor is about the revision, not about the repair.
+        for call in gate.calls:
+            self.assertEqual(str(sketch), call["revises"])
+            self.assertEqual(worker.REVISION_MIN_LINES_DEFAULT,
+                             call["revision_min_lines"])
+
+    def test_an_ordinary_job_is_gated_exactly_as_before(self):
+        self.enqueue()
+        gate = StubGate([0])
+        self.make_worker(gate_fn=gate).run_once()
+        self.assertIsNone(gate.calls[0]["revises"])
+        self.assertIsNone(gate.calls[0]["revision_min_lines"])
+
+    def test_a_parent_whose_sketch_is_gone_asks_nothing(self):
+        _job, entry_id, _sketch = self.parent(on_disk=False)
+        self.child(entry_id)
+        gate = StubGate([0])
+        self.make_worker(gate_fn=gate).run_once()
+        self.assertIsNone(gate.calls[0]["revises"])
+
+    def test_the_floor_is_a_meta_row_and_zero_turns_it_off(self):
+        _job, entry_id, _sketch = self.parent()
+        job = db.get_job(self.conn, self.child(entry_id))
+        self.assertEqual(5, worker.revision_min_lines(self.conn))
+        db.set_meta(self.conn, worker.REVISION_MIN_LINES_KEY, "12")
+        self.assertEqual(12, worker.revision_gate_args(
+            self.conn, job, self.jobs)["revision_min_lines"])
+        db.set_meta(self.conn, worker.REVISION_MIN_LINES_KEY, "several")
+        self.assertEqual(5, worker.revision_min_lines(self.conn))
+        db.set_meta(self.conn, worker.REVISION_MIN_LINES_KEY, "0")
+        self.assertEqual({}, worker.revision_gate_args(self.conn, job, self.jobs))
+
+    def test_the_source_switch_does_not_turn_it_off(self):
+        # The switch says what the model is SHOWN. A revision has to differ
+        # from its parent whether or not the model saw it.
+        _job, entry_id, sketch = self.parent()
+        self.child(entry_id, executor_source="none")
+        gate = StubGate([0])
+        self.make_worker(gate_fn=gate).run_once()
+        self.assertEqual(str(sketch), gate.calls[0]["revises"])
+
+    def test_default_gate_passes_both_flags(self):
+        seen = {}
+
+        def fake_run(command, **_kwargs):
+            seen["command"] = command
+            return subprocess.CompletedProcess(command, 1, "", "")
+
+        with mock.patch.object(worker.subprocess, "run", fake_run):
+            worker.default_gate(source_dir="/a", assertions=["motion(idle)"],
+                                out_dir="/a/.gate", gate_path="/g.py",
+                                revises="/p/sketch.js", revision_min_lines=5)
+        command = seen["command"]
+        self.assertEqual(["--revises", "/p/sketch.js", "--revision-min-lines", "5"],
+                         command[command.index("--revises"):command.index("--revises") + 4])
+        with mock.patch.object(worker.subprocess, "run", fake_run):
+            worker.default_gate(source_dir="/a", assertions=[], out_dir="/a/.gate",
+                                gate_path="/g.py")
+        self.assertNotIn("--revises", seen["command"])
+
+    def test_revised_false_is_a_qa_failure(self):
+        report = make_report("/a", checks={"revised": False})
+        self.assertFalse(worker.qa_clean(report))
+        self.assertTrue(worker.qa_clean(make_report("/a", checks={"revised": True})))
+        # And a report without the key — every job that is not a revision.
+        self.assertTrue(worker.qa_clean(make_report("/a")))
+
+    def test_a_child_that_never_revises_is_failed_kept_not_held(self):
+        # The queue this exists to keep clean: 24 held entries on 2026-09-24
+        # were their parents again, held because nothing failed.
+        _job, entry_id, _sketch = self.parent()
+        child = self.child(entry_id)
+        where = self.jobs / str(child)
+        gate = StubGate([1, 1, 1], reports=[
+            self.unrevised(where / f"attempt-{n}") for n in (1, 2, 3)])
+        self.make_worker(gate_fn=gate).run_once()
+        self.assertEqual("failed", db.get_job(self.conn, child).state)
+        self.assertEqual("failed-kept", self.entries(child)[0]["state"])
+        self.assertIn("revised", db.get_job(self.conn, child).last_error)
+
+    def test_a_revision_that_only_misses_an_assertion_is_still_held(self):
+        # The other side: revised true, an assertion missed, a person decides.
+        _job, entry_id, _sketch = self.parent()
+        child = self.child(entry_id)
+        where = self.jobs / str(child)
+        missed = {"motion(idle)": {"pass": False, "detail": "nothing moved"}}
+        gate = StubGate([1, 1, 1], reports=[
+            make_report(where / f"attempt-{n}", checks={"revised": True},
+                        assertions=missed, exit_code=1) for n in (1, 2, 3)])
+        self.make_worker(gate_fn=gate).run_once()
+        self.assertEqual("held", db.get_job(self.conn, child).state)
+
+    def test_the_entry_keeps_the_attempt_that_revised(self):
+        _job, entry_id, _sketch = self.parent()
+        child = self.child(entry_id)
+        where = self.jobs / str(child)
+        missed = {"motion(idle)": {"pass": False, "detail": "nothing moved"}}
+        gate = StubGate([1, 1, 1], reports=[
+            self.unrevised(where / "attempt-1"),
+            make_report(where / "attempt-2", checks={"revised": True},
+                        assertions=missed, exit_code=1),
+            self.unrevised(where / "attempt-3"),
+        ])
+        self.make_worker(gate_fn=gate).run_once()
+        entry = self.entries(child)[0]
+        self.assertEqual("held", entry["state"])
+        self.assertTrue(entry["source_dir"].endswith("attempt-2"))
+
+    def test_the_repair_reads_what_failed_how_to_fix_it_and_the_line(self):
+        _job, entry_id, _sketch = self.parent()
+        child = self.child(entry_id)
+        executor_fn = StubExecutor()
+        gate = StubGate([1, 0], reports=[
+            self.unrevised(self.jobs / str(child) / "attempt-1"),
+            make_report(self.jobs / str(child) / "attempt-2",
+                        checks={"revised": True}),
+        ])
+        self.make_worker(executor_fn=executor_fn, gate_fn=gate).run_once()
+        first = executor_fn.calls[0]["brief"]
+        second = executor_fn.calls[1]["brief"]
+        # Attempt 1: the line beside the parent's code.
+        self.assertIn("Revise: slower", first)
+        # Attempt 2 is shown attempt 1, not the parent, so the line comes
+        # with the failure instead.
+        self.assertNotIn(worker.PARENT_HEADING, second)
+        evidence = second[second.index(worker.EVIDENCE_HEADING):]
+        self.assertIn("checks failed: revised", evidence)
+        self.assertIn("revised: sketch.js is the sketch it revises, unchanged", evidence)
+        self.assertIn("fix: " + worker.CHECK_REMEDIES["revised"], evidence)
+        self.assertIn("the line to act on: Revise: slower", evidence)
+
+    def test_revise_line_is_the_last_one_and_only_on_a_child(self):
+        _job, entry_id, _sketch = self.parent()
+        grandchild = self.enqueue(
+            "root\n\nRevise: the first change\n\nRevise: the second change",
+            parent_entry_id=entry_id)
+        self.assertEqual("the second change",
+                         worker.revise_line(db.get_job(self.conn, grandchild)))
+        self.assertIsNone(worker.revise_line(db.get_job(self.conn, self.enqueue())))
+
+
 class TestSourceSwitchedOff(SourceTestCase):
     """`executor_source = none` is the control batch for MEASURE[source-follow].
 
@@ -2764,6 +2959,18 @@ class TestExecutorSourceVerb(SourceTestCase):
     def test_the_cap_travels_the_same_way(self):
         self.assertEqual(self.payload("--max-chars", "120")["source_max_chars"], 120)
         self.assertEqual(worker.source_max_chars(self.conn), 120)
+
+    def test_the_revision_floor_is_set_here_too(self):
+        self.assertEqual(self.payload()["revision_min_lines"],
+                         worker.REVISION_MIN_LINES_DEFAULT)
+        self.assertEqual(self.payload("--revision-min-lines", "8")
+                         ["revision_min_lines"], 8)
+        self.assertEqual(worker.revision_min_lines(self.conn), 8)
+        self.assertEqual(self.payload("--revision-min-lines", "0")
+                         ["revision_min_lines"], 0)
+        self.assertIn("off", self.run_cli().stdout)
+        self.assertEqual(self.run_cli("--revision-min-lines", "-1").returncode, 3)
+        self.assertEqual("0", db.get_meta(self.conn, worker.REVISION_MIN_LINES_KEY))
 
     def test_a_value_outside_the_closed_set_is_refused(self):
         self.assertEqual(self.run_cli("--set", "sometimes").returncode, 2)

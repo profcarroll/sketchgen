@@ -12,8 +12,8 @@ course repo at `sld-fall-2026/examples/week11-self-hosted-ai/sketch-gate/` —
 share one sha256, recorded as `GATE_SHA256` in `tests/test_gate_fixtures.py`,
 and the other two match it once this branch is deployed. The frame budget below
 changed that hash, and so did the ghost window, and so did `loads(image)`, and
-so did reading the sketch rather than its buffers; until `update.sh` runs on
-the node, the node's copy is the one before it.
+so did reading the sketch rather than its buffers, and so did `revised`; until
+`update.sh` runs on the node, the node's copy is the one before it.
 
 ## What it checks
 
@@ -29,6 +29,12 @@ every sketch:
 | `sound_lib_ok` | the sketch asked for p5.sound and did not get it |
 | `audio_context_running` | audio was started without a user gesture, so the context is suspended |
 | `frame_budget` | one frame of the idle window cost more wall time than `--frame-budget-ms`, or the whole run passed the `--budget-s` ceiling |
+
+and a seventh when it is given `--revises`:
+
+| check | false means |
+|---|---|
+| `revised` | fewer than `--revision-min-lines` lines of code differ from the sketch this one revises (see *`revised`* below) |
 
 ## What may fail a run, and what may not
 
@@ -312,9 +318,51 @@ None of those records has been rewritten — not the reports on the node, not
 how to tell which referee read it: 4 or earlier, and a `createGraphics()`
 call, means the four readings above are the buffer's.
 
+## `revised`: a revision has to change something
+
+Added 2026-09-24, `HARNESS_VERSION` 6. The one check that is not about whether
+the page works, and the one that is not on every sketch: it is in the report
+only when the gate is given `--revises FILE`, the `sketch.js` this one revises.
+
+    --revises FILE              the sketch this one revises
+    --revision-min-lines N      the floor, default 5
+
+`revised` is false when fewer than N lines of *code* differ between the two.
+Comments, blank lines and whitespace are not code — a sketch handed back with
+its comments reworded and its spacing changed is the same sketch — and a line
+counts once whether it was added, removed or rewritten. `report.json` carries
+what was compared and what was counted under `revision` (`sha256` of the file it
+revises, `lines_before`, `lines_after`, `changed`, `min`, `of`), null on a run
+without the flag, and one note that begins `revised:` and is what the next
+attempt reads. It is source against source, before any browser work; a file
+that cannot be read is a refusal, exit 3, as a missing `sketch.js` is.
+
+Why it exists. Since 2026-09-21 the executor on a child job — one a critique
+spawned — is handed the parent entry's `sketch.js` and asked to revise it
+(`docs/plans/child-source.md`). Of the first 156 children made that way, 27
+returned the parent unchanged and 8 more moved a number or two: entry 1574
+changed one loop bound, 200 to 300, for a critique that asked for glowing,
+coloured intersection nodes. Every one passed every check and went to the held
+queue as a revision; 24 were sitting there on 2026-09-24, and 4 byte-for-byte
+copies had already been published beside their parents. Before the source was
+given, the fewest lines any of 1,001 children changed was 14. The floor of 5
+is where the 156 divide: the smallest honest revision among them, entry 1552's
+emerald ripple, changed exactly five, and everything under it was a number
+moved.
+
+What it is not. It cannot see whether a change is visible — five rewritten
+lines can be a new palette or a renamed variable — and it does not try: it is
+a floor under the failure that happened, not a judgment of the revision, which
+is still a person's. The worker routes it as quality assurance (a job whose
+every attempt fails it ends `failed-kept`, not `held`), measures every attempt
+of a child against the parent rather than against the attempt before it, and
+passes the flag only for a child whose parent's sketch it can find. The floor
+is the node's `meta` row `revision_min_lines`, set with `sketchgen
+executor-source --revision-min-lines N`; 0 leaves `--revises` off altogether.
+
 ## The fixtures and `accept.sh`
 
-`fixtures/` holds fourteen sketch directories, each one a bug the gate was built to
+`fixtures/` holds sixteen sketch directories, each one a bug the gate was built to
 catch (or a clean pass it must not fail), and `fixtures/expected.json` records
 for each the expected exit code, the expected value of the checks that fixture
 is about, the assertions a planner would have chosen for it, and a note saying
@@ -337,7 +385,11 @@ in the gate rather than in a sketch (see *The sketch, not its buffers*):
 `good-graphics` is job 1542's shape, `good-webgl-2d-buffer` a WEBGL sketch
 with a 2D texture buffer, and `good-2d-webgl-buffer` the reverse. All three
 must read `is_looping` and `frame_advancing` true, and between them they hold
-`size(w,h)` and `uses(webgl)`, both ways, to the sketch's own canvas.
+`size(w,h)` and `uses(webgl)`, both ways, to the sketch's own canvas. The two
+revision fixtures sit either side of the floor, each revising `good-motion`:
+`bad-revision-unchanged` rewrites every comment, the spacing and one number,
+works perfectly, and fails on `revised` alone; `good-revision` adds a swelling
+ring round each disc in seven lines and passes.
 
 A fixture's expected `checks` object need not name every check — only the keys
 it lists are compared. `bad-frame-budget` and `good-image` both use that;
@@ -354,7 +406,9 @@ is the harness saying the gate played the sketch's own script and all of it. An
 optional `assertion_detail` object names, per word, a fragment that word's
 detail line has to contain; the three image fixtures carry one each, because
 `loads(image)` missing for the wrong reason is a sentence that sends the next
-attempt after a fault that is not there.
+attempt after a fault that is not there. An optional `revises` names a
+`sketch.js`, relative to the fixtures directory, that the plain run is given as
+`--revises`; the two revision fixtures carry it.
 
 `accept.sh` is the harness: for every fixture it runs the gate twice, once plain
 for the fixed checks and once with that fixture's assertions, compares both
