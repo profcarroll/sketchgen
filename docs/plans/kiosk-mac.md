@@ -65,24 +65,46 @@ able to turn it on or off. It means *nobody is going to click anything*:
     fade), with the same query string. `?unattended=1` brings it straight back.
   - entries changed → swap `ENTRIES` and rebuild `seq` at the next seat boundary; new entries
     play without a reload.
-  - `config.json` changed → take it: `kiosk_views` and `kiosk_hours` apply from the next seat.
+  - `config.json` changed → take it: `kiosk_views`, `kiosk_sites` and `kiosk_buildings` apply
+    from the next seat.
 - Unattended only. An attended kiosk keeps today's behaviour; a reload under somebody pressing
   keys would be rude.
 
-### 1.3 Views by the building's hours
+### 1.3 Views by the building's hours, for a kiosk that knows where it is
 
-`config.json` gains `kiosk_hours`, read by `Config` like `kiosk_views` (three edits:
-dataclass, `load`, `to_json`) and absent by default.
+**A default kiosk does not know where it lives.** `kiosk.html`, with or without
+`?unattended=1`, counts exactly as it does today: the 10-second dwell and the 8-hour attendance
+rule. **A kiosk is made site-specific by its URL**: `?site=d12`, carried by `query()` like
+`views=0` and never persisted, so the site is programmed where the machine is programmed (its
+launcher, §2.4), and a bumped keyboard cannot move a kiosk to another building. D12 is the case
+study and the first site.
+
+The sites and the buildings they are in live in the gallery's `config.json`, as two new keys
+read by `Config` like `kiosk_views` (dataclass, `load`, `to_json`), both absent by default:
+
+- `kiosk_sites` — site id → `{ "name", "building" }`. A room.
+- `kiosk_buildings` — building id → `{ "name", "tz", "source", "terms", "exceptions" }`. The
+  hours belong to the building, not the room, so a second kiosk in the Vera List Center is one
+  line in `kiosk_sites` and shares the schedule — one place to extend it each term.
+
+```json
+"kiosk_sites": {
+  "d12": { "name": "D12 lab", "building": "vera-list" }
+},
+"kiosk_buildings": {
+  "vera-list": { …the block below… }
+}
+```
 
 The D12 lab is in the **Vera List Center** (6 East 16th Street / 79 Fifth Avenue). The New School
 posts its hours by term, with closures and 24/7 finals periods on top
 (<https://www.newschool.edu/about/campus-information/building-hours/>, read 2026-09-23). A single
-weekly table cannot say that, so the block is terms plus dated exceptions:
+weekly table cannot say that, so a building is terms plus dated exceptions:
 
 ```json
-"kiosk_hours": {
+"vera-list": {
+  "name": "Vera List Center, 6 East 16th Street / 79 Fifth Avenue",
   "tz": "America/New_York",
-  "building": "Vera List Center, 6 East 16th Street",
   "source": "https://www.newschool.edu/about/campus-information/building-hours/",
   "terms": [
     { "name": "Fall 2026", "from": "2026-08-17", "to": "2026-12-18",
@@ -128,26 +150,30 @@ while its closures are 2026–27 and Spring starts 19 January 2027 — the year 
 stale, and the block above uses 2026–27.
 
 `countingViews()` becomes: no write path, `?views=0` or `kiosk_views: false` → no, as now; then
-**if `kiosk_hours` is set, count exactly when the wall clock in `tz` is inside today's span and
-today is open by the rule above**, and the attendance rule is not consulted; otherwise the 8-hour rule,
-unchanged. The 10-second dwell and once-per-seat guard stand in both cases — they are what stop a
+**with `?site=`, count exactly when the site's building is open by the rule above**, and the
+attendance rule is not consulted; **without it, the 8-hour rule, unchanged.** The 10-second dwell and once-per-seat guard stand in both cases — they are what stop a
 per-frame bug, not what decides whether anyone is there.
 
 - The clock is `Intl.DateTimeFormat(…, { timeZone: tz, hourCycle: "h23" }).formatToParts`,
-  so a Mac whose own time zone is wrong still counts New York's hours. An unparseable
-  `kiosk_hours` counts nothing and says so in the title — a typo must fail closed, not open.
+  so a Mac whose own time zone is wrong still counts New York's hours.
+- **Fail closed, and say so.** A `?site=` that is not in `kiosk_sites`, a site whose building is
+  missing, or a building block that does not parse counts nothing, and the title names which
+  (`not counting: unknown site d12x`). A kiosk that asked to be site-specific must never fall
+  back to the attendance rule silently — that would be counting on a rule its operator opted out
+  of.
 - Outside hours a person at the keyboard still does not count. The premise is that the building
   is the audience, and the rule should be one sentence long.
-- It is the gallery's setting, not the room's, because there is one room. If a second kiosk is
-  ever somewhere with other hours, `?hours=` on its launch URL is the per-room answer; not built
-  now.
-- Menu footer copy gains the rule when hours are set: *counts a view after ten seconds on screen,
-  during building hours.*
+- The menu names the site, and the footer copy gains the rule: *D12 lab · counts a view after
+  ten seconds on screen, during Vera List Center hours.* A default kiosk's footer is unchanged.
+- **The site is not sent with the view** in this packet: `/view` still carries only
+  `source: "kiosk"`, so D1 knows a view came from *a* projector, not which. See §4, decision 7 —
+  it is the one choice here that cannot be made later for the views already counted.
 
 ### 1.4 The title is the status line
 
-`document.title` is kept current: `sketchgen kiosk · #1234 · counting · b3f9a1` (or
-`not counting: closed`, or `waiting for the gallery (try 7)`). Nothing is written anywhere — a
+`document.title` is kept current: `sketchgen kiosk · d12 · #1234 · counting · b3f9a1` (or
+`not counting: closed`, `not counting: unknown site d12x`, or `waiting for the gallery (try 7)`;
+a default kiosk shows no site). Nothing is written anywhere — a
 title is not a write — but Chrome's DevTools endpoint on the Mac lists every tab's title, so the
 watchdog (§2.4) and `kiosk-status` read the page's state with one `curl` and no browser
 automation. A title that has not changed in twenty minutes is a hung renderer; `every` is at most
@@ -164,13 +190,15 @@ Against `tests/js/kiosk.js`, which already steps timers and rAF by hand:
 - hours, against the real block above: 07:29 on a fall Monday does not count and 07:30 does;
   23:59 counts and 00:00 does not; a winter Tuesday at 20:30 does not; Thanksgiving Thursday
   does not; 03:00 on 2026-12-08 does (24/7); 2027-05-15 does not (no term); an exception beats
-  its term; a malformed block counts nothing,
+  its term; a malformed block counts nothing; a kiosk with no `?site=` keeps the 8-hour rule
+  even when `kiosk_sites` is set; an unknown site counts nothing; `site` survives a key press
+  in the address bar (`query()`) and is never written to storage;
   absent falls back to the 8 h rule (the existing tests, unchanged); the time zone is the
   config's and not the machine's (stub `Intl` with a fixed instant);
 - the 600-frame one-view test runs again under hours;
 - `test_it_writes_one_thing_and_only_one` and `test_it_presents_no_identity` unchanged — this
   packet adds reads, never a write;
-- `Config` round-trips `kiosk_hours`; `build` is stable across two renders of unchanged code
+- `Config` round-trips `kiosk_sites` and `kiosk_buildings`; `build` is stable across two renders of unchanged code
   and moves when `kiosk.js` does.
 
 ### 1.6 Deploy
@@ -179,8 +207,9 @@ Merge → `ssh sld-cloud 'bash ~/sketchgen/app/update.sh'`, and **not** with `--
 packet touches `gallery.py`, a template and an asset, and `render-index` has to write the new
 `kiosk.json`, `kiosk.html`, `assets/kiosk.js` and `config.json`. Pull the gallery checkout on
 the node first if the PR was merged from the laptop. Then add
-`kiosk_hours` to the gallery checkout's `config.json` and run `render-index` once more (or let
-the next publish carry it). Verify on the live site with `?unattended=1&refresh=60`.
+`kiosk_sites` and `kiosk_buildings` to the gallery checkout's `config.json` and run
+`render-index` once more (or let the next publish carry it). Verify on the live site with
+`?unattended=1&site=d12&refresh=60`.
 
 ## 2. The session on the Mac
 
@@ -277,7 +306,7 @@ no dock. Three draft files in `docs/plans/kiosk-mac/`, installed under `~/Librar
   --autoplay-policy=no-user-gesture-required --disable-features=Translate
   --remote-debugging-port=9222` (loopback only; Chrome refuses a debugging port on the default
   profile, which is one more reason for the dedicated one) at
-  `…/kiosk.html?unattended=1`.
+  `…/kiosk.html?unattended=1&site=d12` — this line is where the machine learns where it lives.
 - **`org.sketchgen.kiosk.plist`** — a LaunchAgent: `RunAtLoad`, `KeepAlive`,
   `ThrottleInterval 10`. Chrome quits, crashes, or someone presses ⌘Q → it is back in ten
   seconds. This replaces any Login Item or "open at login" the first setup used.
@@ -326,7 +355,7 @@ the time from fault to a sketch playing; each should be under three minutes.
    on the node; within two minutes the title's build hash changes (or, if the code did not
    change, the new entry is in rotation). Take `refresh` back off.
 7. **Views.** With the title saying `counting`, watch one entry's count move on `/counts`;
-   temporarily set `kiosk_hours` to a span that has ended and see the title say `not counting:
+   temporarily set the Vera List Center's hours for today to a span that has ended and see the title say `not counting:
    closed` after the next refresh.
 8. **From the laptop, the whole remote kit**: `ssh d12-kiosk kiosk-status`, restart the kiosk,
    restart the Mac, open Screen Sharing once.
@@ -347,7 +376,9 @@ it, the four remote commands, and the Mac's settings that differ from stock.
 | see it | `ssh d12-kiosk kiosk-status` |
 | restart the page | `ssh d12-kiosk 'launchctl kickstart -k gui/$(id -u)/org.sketchgen.kiosk'` |
 | restart the Mac | `ssh d12-kiosk 'sudo shutdown -r now'` |
-| change hours or stop counting | edit `kiosk_hours` / `kiosk_views` in the gallery's `config.json`, `render-index`; the wall takes it within 15 min |
+| extend or change hours | edit the building in `kiosk_buildings` in the gallery's `config.json`, `render-index`; every kiosk in that building takes it within 15 min |
+| stop counting everywhere | `kiosk_views: false`, same path |
+| move or add a kiosk | a line in `kiosk_sites` if the room is new; `site=` in that Mac's launcher |
 | change the URL or flags | edit `~/Library/sketchgen-kiosk/launch-kiosk.sh` over ssh, restart the page |
 | macOS updates | monthly, over ssh: `softwareupdate -l`, then install with the reboot, then `kiosk-status` |
 
@@ -369,3 +400,10 @@ Nothing about ordinary gallery work touches the Mac: publishing an entry, or dep
    Going dark (`pmset repeat` and a black page) saves the display but adds a wake path that is one
    more thing to fail on a morning nobody is watching. Revisit if the display has burn-in risk.
 6. **Audio**: on, at what volume, or muted.
+7. **Tag views with the site?** Recommended **yes, in Packet A**, for the reason
+   `kiosk-views.md` §3.4 gave for keeping `kiosk_count`: a split not recorded now is gone for
+   every view counted before it. It is a D1 table `kiosk_views (entry_id, site, count,
+   updated_utc)` bumped beside `views.kiosk_count`, `/view` accepting an optional `site` matching
+   `^[a-z0-9-]{1,32}$`, and nothing downstream reading it yet — so it is a Worker deploy with a
+   D1 change first (AGENTS.md → *Deploying*). The site is a room, not a person, so it keeps the
+   kiosk's no-identity rule. No means Packet A stays generator-only.
