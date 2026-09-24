@@ -43,6 +43,9 @@ const VIEW_WINDOW_MS = 60_000;
 // nothing here — it restrains itself instead (docs/plans/kiosk-views.md §2) —
 // so this set is a label on the count, not a permission.
 const VIEW_SOURCES = new Set(["entry", "kiosk"]);
+// A kiosk's room, from its launch URL (`?site=d12`). A place, never a person.
+// Short and lowercase so that the column holds ids, not whatever a URL carried.
+const SITE_PATTERN = /^[a-z0-9-]{1,32}$/;
 const PULL_LIMIT = 500;
 const QUESTIONS = new Set(["brief", "look"]);
 const CHOICES = new Set(["A", "B", "tie"]);
@@ -97,6 +100,12 @@ export const SQL = {
     "DO UPDATE SET count = views.count + 1, " +
     "kiosk_count = views.kiosk_count + excluded.kiosk_count, " +
     "updated_utc = excluded.updated_utc",
+  // Only ever issued in one batch with bumpView, so a room's count is never
+  // ahead of, or behind, the kiosk_count it is a part of.
+  bumpKioskSite:
+    "INSERT INTO kiosk_views (entry_id, site, count, updated_utc) VALUES (?, ?, 1, ?) " +
+    "ON CONFLICT(entry_id, site) " +
+    "DO UPDATE SET count = kiosk_views.count + 1, updated_utc = excluded.updated_utc",
   lastSeen:
     "SELECT seen_utc FROM view_log WHERE session_hash = ? AND entry_id = ?",
   touchSeen:
@@ -713,6 +722,19 @@ async function routeView(request, env, username, sessionValue) {
   if (!VIEW_SOURCES.has(source)) {
     return json({ error: "source must be entry or kiosk" }, 400, request, env);
   }
+  // The kiosk's room, if its launch URL named one. Absent is today's kiosk and
+  // changes nothing. Refused on anything but a kiosk view: an entry page has
+  // no room, and a site there would be a label nobody can vouch for. Checked
+  // before the de-duplication below, so a refusal writes nothing at all.
+  const site = body.site === undefined || body.site === null ? null : body.site;
+  if (site !== null) {
+    if (source !== "kiosk") {
+      return json({ error: "site is only for a kiosk view" }, 400, request, env);
+    }
+    if (typeof site !== "string" || !SITE_PATTERN.test(site)) {
+      return json({ error: "site must be 1 to 32 of a-z, 0-9 and -" }, 400, request, env);
+    }
+  }
 
   const now = Date.now();
   const stamp = utcNow(now);
@@ -729,7 +751,14 @@ async function routeView(request, env, username, sessionValue) {
     }
     await env.DB.prepare(SQL.touchSeen).bind(key, entryId, stamp).run();
   }
-  await env.DB.prepare(SQL.bumpView).bind(entryId, source === "kiosk" ? 1 : 0, stamp).run();
+  const bump = env.DB.prepare(SQL.bumpView).bind(entryId, source === "kiosk" ? 1 : 0, stamp);
+  if (site === null) {
+    await bump.run();
+  } else {
+    // One D1 batch is one transaction: the room's row and the total move
+    // together or not at all.
+    await env.DB.batch([bump, env.DB.prepare(SQL.bumpKioskSite).bind(entryId, site, stamp)]);
+  }
   return json({ ok: true, counted: true }, 200, request, env);
 }
 
