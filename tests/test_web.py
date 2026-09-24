@@ -32,6 +32,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from sketchgen import build  # noqa: E402
 from sketchgen import db  # noqa: E402
 from sketchgen import executor  # noqa: E402
 from sketchgen import models  # noqa: E402
@@ -3889,6 +3890,113 @@ class TestHeldBatchPage(BatchFixtures, WebTestCase):
         for line in web.HELD_SCRIPT.splitlines():
             code = line.split("//", 1)[0]
             self.assertNotRegex(code, r"\b(const|let|class)\s")
+
+
+def build_doc(**over):
+    """A `build.reading` document for a node on main and running it."""
+    sha = "a" * 40
+    doc = {
+        "checkout": {"sha": sha, "build": sha, "branch": "main", "detached": False,
+                     "dirty": False, "subject": "Merge pull request #178"},
+        "target": {"kind": "main", "sha": sha, "reason": None, "by": None, "utc": None},
+        "upstream": {"sha": sha, "fetched_utc": "2026-09-24T12:00:00Z", "fetch_error": None},
+        "main": {"on_main": True, "behind": 0, "ahead": 0},
+        "running": {"worker": {"build": sha, "utc": "x"}, "web": {"build": sha, "utc": "x"}},
+        "units": {"worker": "active", "web": "active", "update": "inactive"},
+        "schema": 18, "control": {"state": "running", "reason": None},
+        "work": {"queued": 0, "in_flight": 0, "parked": 0}, "database": True,
+        "knows_pins": True, "problems": [], "on_target": True,
+    }
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(doc.get(key), dict):
+            doc[key] = {**doc[key], **value}
+        else:
+            doc[key] = value
+    return doc
+
+
+class TestBuildChip(unittest.TestCase):
+    """docs/plans/fleet.md §1.6: the header says which build this node is."""
+
+    def chip(self, **over):
+        return web.build_chip(build_doc(**over))
+
+    def test_on_main_and_running_it_is_the_quiet_sha(self):
+        self.assertEqual(self.chip()[:2], ("aaaaaaa", "quiet"))
+
+    def test_behind_main_is_an_update_waiting(self):
+        text, css, tip = self.chip(main={"behind": 4}, problems=["4 PRs behind main"],
+                                   on_target=False)
+        self.assertEqual((text, css), ("4 behind", "warn"))
+        self.assertIn("update available", tip)
+
+    def test_a_pin_is_quiet_however_far_behind(self):
+        text, css, tip = self.chip(
+            target={"kind": "pin", "sha": "a" * 40, "reason": "hardware A/B"},
+            main={"behind": 13})
+        self.assertEqual((text, css), ("pinned aaaaaaa", "quiet"))
+        self.assertIn("hardware A/B", tip)
+        self.assertIn("13 PRs ahead", tip)
+
+    def test_what_cannot_be_trusted_is_red_first(self):
+        cases = {
+            "dirty": dict(checkout={"dirty": True}),
+            "on hotfix": dict(checkout={"branch": "hotfix"}),
+            "not on main": dict(main={"on_main": False}),
+            "off pin": dict(target={"kind": "pin", "sha": "b" * 40}),
+            "restart pending": dict(problems=["worker runs bbbbbbb, checkout is aaaaaaa: "
+                                              "restart pending"]),
+        }
+        for text, over in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(self.chip(**over)[:2], (text, "bad"))
+
+    def test_no_checkout_no_chip(self):
+        self.assertIsNone(web.build_chip(build_doc(checkout={"sha": None})))
+        self.assertIsNone(web.build_chip(None))
+
+    def test_the_layout_draws_it_only_when_something_is_watching(self):
+        page = web.layout(title="t", here="/", body="", control=None, back="/")
+        self.assertNotIn('class="pill build', page)
+
+        class Watch:
+            root = None
+
+            def reading(self, fresh=False):
+                return build_doc(main={"behind": 2}, on_target=False)
+
+        with mock.patch.object(web, "BUILD_WATCH", Watch()):
+            page = web.layout(title="t", here="/", body="", control=None, back="/")
+        self.assertIn('<a class="pill build warn" href="/build"', page)
+        self.assertIn(">2 behind</a>", page)
+
+
+class TestBuildPageList(unittest.TestCase):
+
+    def test_the_prs_waiting_are_listed_by_number_and_title(self):
+        """Against this checkout's own history: a72f076 to #178."""
+        root = Path(__file__).resolve().parent.parent
+        old = build.resolve(root, "a72f076")
+        new = build.resolve(root, "8956210")
+        if not (old and new):
+            self.skipTest("this checkout does not have the 2026-09-24 history")
+        page = web.build_page(build_doc(checkout={"sha": old, "build": old},
+                                        upstream={"sha": new}, main={"behind": 13}), root)
+        self.assertIn("Waiting to be deployed here", page)
+        self.assertIn("#178 A revision has to change something", page)
+        self.assertIn("#166 ", page)
+        self.assertNotIn("#165 ", page)
+
+
+class TestBuildPage(WebTestCase):
+
+    def test_under_test_the_page_says_it_is_not_watching(self):
+        self.assertIn("not watching its build", self.text("/build"))
+
+    def test_check_now_refuses_rather_than_fetching_under_test(self):
+        status, location = self.post("/build/check", {})
+        self.assertEqual(status, 303)
+        self.assertIn("refused", urllib.parse.unquote(location))
 
 
 class TestBindRefusal(unittest.TestCase):

@@ -8,7 +8,9 @@
 #
 # Flags:
 #   --ref REF           commit, tag or branch to check out on a fresh clone
-#                       (default: main). An A/B arm pins the other arms' build.
+#                       (default: main). An A/B arm pins the other arms' build,
+#                       and anything but main is written down as this node's
+#                       pin (step 5b), so update.sh keeps it there.
 #                       An existing ~/sketchgen/app is never moved: that is
 #                       update.sh's job, and a checkout under a running worker
 #                       is a trap.
@@ -31,6 +33,7 @@
 #   4b. Launches Chromium once; if the system libraries it needs are missing,
 #      runs `playwright install-deps chromium` under sudo, as step 1 does.
 #   5. `db init`: creates or migrates ~/sketchgen/sketchgen.db.
+#   5b. On a clone this run made at a --ref other than main, the pin.
 #   6. A private gallery: a local bare repo as the checkout's origin, so
 #      publish works and nothing leaves the box. A gallery already there is
 #      left alone — a public node's checkout is set up by hand (OPERATIONS.md).
@@ -132,9 +135,11 @@ green "✓ Linger=yes for $USER"
 # --- 3. The app --------------------------------------------------------------
 step "3. The app"
 mkdir -p "$NODE_HOME"
+cloned=no
 if [[ -d "$APP/.git" ]]; then
     dim "already cloned; left where it is (update.sh moves it, not this)"
 else
+    cloned=yes
     git clone -q "$REPO_URL" "$APP"
     git -C "$APP" checkout -q "$REF" || die "no such ref in $REPO_URL: $REF"
 fi
@@ -167,6 +172,27 @@ fresh_db=no
 [[ -e "$DB" ]] || fresh_db=yes
 sg db init --db "$DB" >/dev/null
 green "✓ $DB ($([[ $fresh_db == yes ]] && echo created || echo migrated))"
+
+# --- 5b. The pin -------------------------------------------------------------
+# Until 2026-09-24 an --ref arm was held on its build by a detached HEAD alone,
+# and update.sh's `git pull origin main` fast-forwards one without a word
+# (docs/plans/fleet.md §0). The rows are the ones `sketchgen pin` writes
+# (sketchgen/build.py, PIN_KEYS), written here directly because the build this
+# clone is at may predate the verb — a72f076 does.
+if [[ $cloned == yes && "$REF" != main ]]; then
+    pin_sha=$(git -C "$APP" rev-parse "$REF^{commit}")
+    "$PY" - "$DB" "$pin_sha" "install.sh --ref $REF" "${OPERATOR:-$USER}" <<'PY'
+import sqlite3, sys, time
+db, sha, reason, by = sys.argv[1:5]
+conn = sqlite3.connect(db, isolation_level=None)
+if not (conn.execute("SELECT value FROM meta WHERE key = 'pin.sha'").fetchone() or [None])[0]:
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for key, value in (("pin.sha", sha), ("pin.reason", reason),
+                       ("pin.by", by), ("pin.utc", now)):
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+PY
+    green "✓ pinned to ${pin_sha:0:7}; update.sh keeps it there (sketchgen pin --clear to follow main)"
+fi
 
 # --- 6. The gallery ----------------------------------------------------------
 step "6. A private gallery"
