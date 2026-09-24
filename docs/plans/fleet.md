@@ -70,10 +70,10 @@ on target
 On a pinned node the target line reads `pinned a72f076 — "hardware A/B" (profcarroll,
 2026-09-23) · main is 9 ahead`. "Behind" and "ahead" count PRs, the merges on main's
 first-parent line, because the operator thinks in PRs. `--json` gives the same thing as a
-document. Exit 0 means the checkout is the target's commit, the tree is clean, and both processes run the checkout. Exit 1
-means one of those is false, and the last line names which. The verb never exits 3: it is a
-reading, not a check. `--fetch` runs `git fetch origin main` first, with a 10 s timeout. When it
-is offline it says so and reports the last fetch.
+document. Exit 0 means the checkout is the target's commit, the tree is clean, and both
+processes run the checkout. Exit 1 means one of those is false, and the last line names which.
+The verb never exits 3: it is a reading, not a check. `--fetch` runs `git fetch origin main`
+first, with a 10 s timeout. When it is offline it says so and reports the last fetch.
 
 `paid.node_commit()` moves into a small shared module (`sketchgen/build.py`), and `paid
 preflight` reads it from there.
