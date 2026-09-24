@@ -415,6 +415,16 @@ class TestActivity(ConsoleTestCase):
                 self.step(step=step, headline="Nothing to do")
                 self.assertEqual("idle", console.activity(self.conn)["state"])
 
+    def test_a_fenced_nap_is_neither_idle_nor_running(self):
+        # An idle worker would claim the next job; a fenced one will not, and
+        # the card has to say so (2026-09-23, job 1524).
+        self.step(step="fenced", headline="Waiting for the inference slot",
+                  detail="another client holds the inference slot: 4242 opencode "
+                         "· next wake in 30 s")
+        card = console.activity(self.conn)
+        self.assertEqual("fenced", card["state"])
+        self.assertIn("4242 opencode", card["detail"])
+
     def test_paused_wins_over_whatever_the_row_claims(self):
         self.step()
         db.set_control(self.conn, "paused", "deploying the gate")

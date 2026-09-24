@@ -38,6 +38,14 @@ from sketchgen import worker  # noqa: E402
 
 import test_judge  # noqa: E402
 import test_planner  # noqa: E402
+
+
+def fenced_card(conn):
+    """The nap the worker writes after a pass the fence refused (Worker._nap)."""
+    db.begin_step(conn, step=worker.FENCED_STEP, headline=worker.FENCED_HEADLINE,
+                  detail="another client holds the inference slot: 733853 "
+                         "/home/ubuntu/.opencode/bin/opencode · next wake in 30 s",
+                  pid=os.getpid())
 import test_worker  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -1165,6 +1173,26 @@ class HarnessTests(PaidTestCase):
         self.assertTrue(self.preflight()["ready"])
         self.assertTrue(self.preflight(workers=(), drip=True)["ready"])
 
+    def test_preflight_is_not_ready_while_the_worker_is_fenced(self):
+        # 2026-09-23: READY over a worker that had been refusing every pass for
+        # an hour, and job 1524 was queued into it.
+        db.set_paid_models(self.conn, ["claude-sonnet-5"])
+        fenced_card(self.conn)
+        result = self.preflight()
+        self.assertFalse(result["ready"])
+        row = self.failed(result)["worker"]
+        self.assertEqual(row["who"], "operator")
+        self.assertIn("/home/ubuntu/.opencode/bin/opencode", row["detail"])
+        self.assertNotIn("next wake", row["detail"])
+        self.assertIn("AGENTS.md rule 1", row["fix"])
+        # the card branch (no worker argv, a live pid) reads the same row
+        self.assertFalse(self.preflight(workers=())["ready"])
+        # and the text mode puts the reason on the worker line
+        out = self.cli("paid", "preflight", "--as", "claude-sonnet-5")
+        self.assertEqual(out.returncode, 3)
+        self.assertIn("worker now: Waiting for the inference slot — another client "
+                      "holds the inference slot", out.stdout)
+
     def test_preflight_leaves_the_operators_problems_to_the_operator(self):
         db.set_paid_models(self.conn, ["claude-sonnet-5"])
         db.set_control(self.conn, "paused", "a person paused it")
@@ -1478,6 +1506,23 @@ class AgentLoopTests(PaidTestCase):
         self.assertIn(f"the worker is on job {job - 1}", result["say"])
         self.assertEqual(result["then"], f"sketchgen paid next --job {job} --as {self.MODEL}")
         self.assertTrue(said and all("is queued" in line for line in said), said)
+
+    def test_next_stops_when_the_worker_is_fenced_and_says_why(self):
+        # 2026-09-23, job 1524: three `next` calls, 13 minutes, all `wait` over
+        # "Nothing to do", while the fence refused every pass.
+        job = self.start()["job"]
+        fenced_card(self.conn)
+        result = paid.next_for(self.conn, job, self.MODEL, timeout=90)
+        self.assertEqual((result["do"], result["state"]), ("stop", "queued"))
+        self.assertIn("the worker is fenced: another client holds the inference slot: "
+                      "733853 /home/ubuntu/.opencode/bin/opencode", result["say"])
+        self.assertNotIn("next wake", result["say"])
+        self.assertEqual(result["worker"]["step"], worker.FENCED_STEP)
+        waited = paid.wait_for(self.conn, job, timeout=10)
+        self.assertEqual(waited["do"], "stop")
+        self.assertIn("fenced", waited["say"])
+        out = self.cli("paid", "next", "--job", str(job), "--as", self.MODEL)
+        self.assertEqual(out.returncode, 3, out.stdout + out.stderr)
 
     def test_next_stops_on_a_paused_generator_and_on_another_agents_job(self):
         job = self.start()["job"]
