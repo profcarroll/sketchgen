@@ -90,9 +90,9 @@ and reports:
 An assertion miss is not a failure: a sketch that ran clean and missed its
 plan goes to `held` with the miss recorded as *off-plan*, and a person decides.
 Only a check failure ends a job as `failed-kept`. Every entry records the
-`HARNESS_VERSION` it was gated under (now 4), because a change to what the
+`HARNESS_VERSION` it was gated under (now 5), because a change to what the
 gate fails splits the corpus; the file itself is hash-pinned by a test, and
-eleven fixture sketches, one bug each, are what `accept.sh` runs on the node
+fourteen fixture sketches, one bug each, are what `accept.sh` runs on the node
 after any change.
 
 ## The hypothesis
@@ -257,7 +257,7 @@ gate/                       the deterministic referee, run by the worker
   sketch_gate.py            headless Chromium: five checks, eight words,
                             the ghost window
   accept.sh                 the harness: every fixture against expected.json
-  fixtures/                 eleven sketches, one bug each, and what the gate
+  fixtures/                 fourteen sketches, one bug each, and what the gate
                             must say
 
 rig/                        an agent's local bench: p5 pinned, a probe, a
