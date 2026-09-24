@@ -64,7 +64,8 @@ from pathlib import Path
 from typing import Any
 
 from sketchgen import db
-from sketchgen.worker import DEFAULT_HOST, DEFAULT_JOBS_DIR, human_gap, node_shape
+from sketchgen.worker import (DEFAULT_HOST, DEFAULT_JOBS_DIR, FENCED_STEP, human_gap,
+                              node_shape)
 
 __all__ = [
     "ACTIVITY_IDLE_STEPS",
@@ -1275,6 +1276,8 @@ def activity(conn: sqlite3.Connection) -> dict[str, Any]:
       ``paused``   the operator's switch says so, whatever a row claims
       ``gone``     the pid that opened the step is not there any more
       ``stalled``  the pid is there and the step is past ACTIVITY_STALLED_S
+      ``fenced``   the nap after a refused pass: another client holds the
+                   inference slot, and the worker claims nothing until it goes
       ``running``  a step that is carrying a job
       ``idle``     a step that is the worker keeping itself busy
       ``unknown``  nothing has ever been recorded
@@ -1338,6 +1341,10 @@ def activity(conn: sqlite3.Connection) -> dict[str, Any]:
         detail = " · ".join(filter(None, [
             detail, "longer than any step has taken; check the transcript"
         ]))
+    elif step == FENCED_STEP:
+        # Not idle: an idle worker would claim the next job, and this one will
+        # not. The detail already carries the fence's reason (Worker._nap).
+        state = "fenced"
     elif step in ACTIVITY_IDLE_STEPS:
         state = "idle"
     else:

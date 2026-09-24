@@ -1617,7 +1617,19 @@ def preflight(
 
     running = workers()
     card = _card_worker(conn)
-    if len(running) == 1:
+    fenced = worker_fenced(worker_now(conn))
+    if fenced is not None and (len(running) == 1 or (not running and card is not None)):
+        # The worker is there and will claim nothing: its last pass was refused
+        # by the fence, and its nap says so (Worker._nap). Until 2026-09-23 this
+        # branch did not exist, the check below passed on the process count
+        # alone, and job 1524 was queued into a worker that had been fenced for
+        # an hour and stayed fenced for another.
+        check("worker", False,
+              f"the worker is fenced: {fenced} — it claims nothing until the "
+              "slot is free",
+              "free the inference slot: stop the other client (AGENTS.md rule 1); "
+              "the worker claims within ~30 s of it going")
+    elif len(running) == 1:
         check("worker", True, "one resident worker; it claims a queued job within ~30 s")
     elif not running and card is not None:
         # /proc showed no worker argv but the status card has a step open under
@@ -1686,6 +1698,38 @@ def worker_now(conn: sqlite3.Connection) -> dict[str, Any] | None:
         "model": row["model"],
         "since_utc": row["started_utc"],
     }
+
+
+def worker_fenced(now: dict[str, Any] | None) -> str | None:
+    """The fence's reason while the worker is refusing to claim, else None.
+
+    ``now`` is :func:`worker_now`. The worker's nap after a refused pass is the
+    ``fenced`` step with the reason in its detail (Worker._nap); the trailing
+    "next wake in N s" is the nap's, not the reason's, and is cut. Read by the
+    preflight, which fails its worker check on it, and by ``next`` and
+    ``wait_for``, which stop on it: a fenced worker claims nothing, so a wait
+    on a queued job would be a wait on the other client leaving, which is a
+    person's to arrange (AGENTS.md rule 1). On 2026-09-23 none of them read
+    it, and an agent polled job 1524 for 13 minutes against a card that said
+    "Nothing to do".
+    """
+    if not now or str(now.get("step") or "") != worker.FENCED_STEP:
+        return None
+    detail = str(now.get("detail") or "")
+    reason = detail.split(" · next wake in", 1)[0].strip()
+    return reason or "another client holds the inference slot"
+
+
+def _fenced_stop(base: dict[str, Any], job: db.Job,
+                 now: dict[str, Any] | None) -> dict[str, Any] | None:
+    """``next``'s stop when the worker is fenced, or None when it is not."""
+    reason = worker_fenced(now)
+    if reason is None:
+        return None
+    return {**base, "do": "stop", "worker": now, "fenced": reason,
+            "say": f"job {job.id} is {job.state} but the worker is fenced: {reason}; "
+                   "it claims nothing until the slot is free, and freeing it is "
+                   "the operator's (AGENTS.md rule 1) — report this and stop"}
 
 
 def parked_jobs(conn: sqlite3.Connection, model: str | None = None) -> list[dict[str, Any]]:
@@ -2032,6 +2076,9 @@ def next_for(
                         "say": f"job {job.id} is queued for {turn} to plan but the "
                                "generator is paused; it will not move until the "
                                "operator resumes it"}
+            fenced = _fenced_stop(base, job, worker_now(conn))
+            if fenced is not None:
+                return {**fenced, "waiting_on": turn}
             if waited >= timeout:
                 return {**base, "do": "wait", "timed_out": True, "waiting_on": turn,
                         "then": next_command(job_id, model),
@@ -2114,6 +2161,9 @@ def next_for(
                            f"{' (' + control.reason + ')' if control.reason else ''}; "
                            "it will not move until the operator resumes it"}
         now = worker_now(conn)
+        fenced = _fenced_stop(base, job, now)
+        if fenced is not None:
+            return fenced
         if waited >= timeout:
             return {**base, "do": "wait", "timed_out": True, "worker": now,
                     "then": next_command(job_id, model),
@@ -2522,6 +2572,12 @@ def wait_for(
         if control is not None and control.state == "paused" and job.state == "queued":
             result.update(do="stop", say=f"job {job.id} is queued but the generator "
                           "is paused; it will not move until the operator resumes it")
+            return result
+        fenced = worker_fenced(worker_now(conn))
+        if fenced is not None:
+            result.update(do="stop", fenced=fenced,
+                          say=f"job {job.id} is {job.state} but the worker is fenced: "
+                              f"{fenced}; it claims nothing until the slot is free")
             return result
         if waited >= timeout:
             result.update(timed_out=True, say=f"job {job.id} is still {job.state} "

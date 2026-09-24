@@ -442,6 +442,16 @@ def is_stop_now(control: db.Control | None) -> bool:
 # ---------------------------------------------------------------------------
 
 
+#: The nap after a refused pass: the step the card shows and the verbs read
+#: (paid.worker_fenced). Until 2026-09-23 that nap said "Nothing to do", and
+#: on that day it said it every 30 s for two hours while an opencode process
+#: held the inference slot: `paid preflight` read the card and said READY, and
+#: the agent driving job 1524 polled `paid next` for 13 minutes, in front of a
+#: class, over a queue the worker was never going to touch.
+FENCED_STEP = "fenced"
+FENCED_HEADLINE = "Waiting for the inference slot"
+
+
 @dataclass
 class FenceResult:
     """What the fence saw. ``ok`` false means refuse (exit 3) and back off."""
@@ -1734,6 +1744,9 @@ class Worker:
         #: What the last idle round found, carried to the nap that follows it so
         #: that "Nothing to do" can say what there was nothing of.
         self._idle_note: str | None = None
+        #: The fence's reason when the last pass was refused, carried to the nap
+        #: so the card says FENCED_HEADLINE and why, rather than "Nothing to do".
+        self._fenced: str | None = None
 
     # -- logging ---------------------------------------------------------
 
@@ -1903,6 +1916,7 @@ class Worker:
         # not found it yet; a note left over from the last idle round would be
         # a sentence about a queue that has since moved.
         self._idle_note = None
+        self._fenced = None
         control = self._control()
         if control is not None and control.state == "paused":
             self.log(f"control: paused ({control.reason or 'no reason given'}); "
@@ -1939,6 +1953,7 @@ class Worker:
             self.log(f"fence: {result.ollama_error} (not a refusal)")
         if not result.ok:
             self.log(f"fence: REFUSED — {result.reason}")
+            self._fenced = result.reason
             return EXIT_REFUSED
         self.log(
             "fence: proceeding; this run calls no model (test mode)"
@@ -2560,8 +2575,19 @@ class Worker:
         does.
         """
         note, self._idle_note = self._idle_note, None
-        detail = " · ".join(filter(None, [note, f"next wake in {human_gap(seconds)}"]))
-        self._say("idle", "Nothing to do", detail)
+        wake = f"next wake in {human_gap(seconds)}"
+        if self._fenced:
+            # The pass claimed nothing because the fence refused it, and the
+            # card must not say the queue was empty: `paid preflight` and
+            # `paid next` read this row, and an agent reading "Nothing to do"
+            # over its own queued job cannot tell a free node from a blocked
+            # one (job 1524, 2026-09-23).
+            step, headline = FENCED_STEP, FENCED_HEADLINE
+            detail = " · ".join([self._fenced, wake])
+        else:
+            step, headline = "idle", "Nothing to do"
+            detail = " · ".join(filter(None, [note, wake]))
+        self._say(step, headline, detail)
         deadline = time.monotonic() + seconds
         # The latency that matters. A try costs the gate's 5–15 s; polled here
         # every five seconds of the nap it costs that plus at most five, rather
@@ -2577,7 +2603,7 @@ class Worker:
                     # The try opened its own step on the card; say what the
                     # worker went back to, or the console would show it
                     # trying for the rest of the nap.
-                    self._say("idle", "Nothing to do", detail)
+                    self._say(step, headline, detail)
             time.sleep(min(1.0, left))
 
     def _pause_after_attempt(self, job_id: int) -> None:
