@@ -12,6 +12,21 @@ node. **Pull**: the Console gets a *Check for updates* badge and an *Update* but
 brings itself up to date. This plan does both, in that order. Both need the same thing first,
 which neither has today: a node that knows which build it is meant to be on.
 
+**Status, 2026-09-24.** Packets 1 and 2 are built (`feat/fleet`), prompted by the
+improved gate on sld-cloud (HARNESS 5 and 6, #176 and #178) that the GPU nodes need
+between their batches. Built as written, with these differences:
+
+- `--render=auto` does not use a list of render modules. It computes them from the
+  imports of what step 4 runs (`build.render_closure`), and skips only for paths known
+  not to reach a page. The render path imports `worker.py`, so a worker change renders.
+- `bin/fleet update` also refuses a node with work in hand (`--mid-batch` overrides),
+  because "between batches" is the reason for this build. There is also a
+  `bin/fleet pin`, which pins several nodes in one command.
+- `/build` on the Console has **Check now** (a fetch, nothing else). The *Update*
+  button is still Packet 3.
+- Not built yet: `sgt <name>` reading the fleet file (§2.1; the four `sgt-*`
+  functions stay as they are), and the write-path Worker's `/version` (§2.4).
+
 ## 0. What is true today
 
 A read-only survey on 2026-09-24, around 03:00Z:

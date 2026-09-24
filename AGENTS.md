@@ -314,15 +314,26 @@ If you find yourself guessing, that is a missing verb — say so.
 
 ## Deploying
 
-`ssh sld-cloud 'bash ~/sketchgen/app/update.sh'` — pull, pause the generator,
+`bin/fleet update NODE` from the laptop (or `ssh NODE 'bash
+~/sketchgen/app/update.sh'`) — move to the node's build, pause the generator,
 reinstall units, **migrate**, re-render and push every entry page, restart
-worker and web, resume. Traps:
+worker and web, resume. `bin/fleet status` says which build every node is on
+(`docs/OPERATIONS.md` → *The fleet*). Traps:
+
+- **A node's build is main unless it is pinned** (`sketchgen pin`, or
+  `install.sh --ref`). A pinned node is an A/B arm: never `--clear` a pin you
+  did not set. A node whose `update.sh` predates pins pulls main whatever it
+  is on — `bin/fleet update` refuses it without `--adopt` (2026-09-24: three
+  nodes held on a72f076 by a detached HEAD alone).
+- **Deploy between batches.** `bin/fleet update` refuses a node with jobs
+  queued or in flight: a deploy mid-batch splits it across two builds.
 
 - **update.sh only resumes what it paused.** If the node was already paused,
   `✓ all done` does not mean running. Read the `control` table.
-- **A migration in the pull:** snapshot first
-  (`sqlite3 sketchgen.db ".backup sketchgen.db.pre-NNN"`) and dry-run it on a
-  copy. `update.sh` applies it; `db init` does too.
+- **A migration in the pull:** dry-run it on a copy first. `update.sh`
+  snapshots the database to `sketchgen.db.pre-NNN` before it migrates (since
+  2026-09-24: `bin/fleet` migrates every node in one command) and keeps an
+  existing snapshot of that name; `db init` alone does not snapshot.
 - **Unit reinstall overwrites the unit files.** Settings belong in drop-ins
   (`~/.config/systemd/user/<unit>.service.d/*.conf`), which survive.
 - **`--no-render`** only when nothing touched `gallery.py`, a template, assets
