@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+from sketchgen import build  # noqa: E402
 from sketchgen import db  # noqa: E402
 from sketchgen import executor  # noqa: E402
 from sketchgen import lineage  # noqa: E402
@@ -633,6 +634,26 @@ class TestPaidPlanner(WorkerTestCase):
         self.assertEqual("a brief the stub planner wrote", job.brief)
         self.assertEqual(["motion(idle)", "responds(click)"], job.assertions)
         self.assertEqual(["executing", "gating", "held"], self.states)
+
+
+class TestBuildStamp(WorkerTestCase):
+    """Migration 018 (docs/plans/fleet.md §1.3): the build the worker is
+    running goes on every attempt and every plan it writes, so an A/B's "one
+    build" is a query rather than an archaeology of the reflog."""
+
+    def test_the_running_build_is_on_the_plan_and_every_attempt(self):
+        job_id = db.enqueue(self.conn, "sixty drifting circles", "octocat")
+        with mock.patch.object(build, "running", return_value="abc1234"):
+            self.assertEqual(0, self.make_worker(gate_fn=StubGate([1, 0])).run_once())
+        self.assertEqual("abc1234", db.get_job(self.conn, job_id).plan_build)
+        self.assertEqual(["abc1234", "abc1234"], [a.build for a in self.attempts(job_id)])
+
+    def test_going_resident_stamps_the_build_it_will_run(self):
+        run = self.make_worker()
+        run._terminating = True     # stamp, then leave before the first pass
+        with mock.patch.object(build, "running", return_value="abc1234"):
+            run.run_forever(sleep_s=0)
+        self.assertTrue(db.get_meta(self.conn, "run.worker").startswith("abc1234 "))
 
 
 class TestTheJobsOwnPlannerModel(WorkerTestCase):

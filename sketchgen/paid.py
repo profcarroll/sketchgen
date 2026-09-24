@@ -53,6 +53,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from . import build
 from . import db
 from . import executor
 from . import judge
@@ -353,6 +354,7 @@ def requeue_planned(
         assertions_json=json.dumps(result.assertions),
         planner=model,
         needs=None,
+        plan_build=build.running(),
     )
 
 
@@ -1482,25 +1484,11 @@ def spend_of(conn: sqlite3.Connection, job: db.Job,
 def node_commit() -> str | None:
     """The commit of the checkout this code is running from, or None.
 
-    DECIDE[freshness]. An agent reads AGENTS.md in its own clone and drives a
-    node that may be ahead of it: on 2026-09-21 a session read the file at
-    #131 and answered packets the node had cut under #132, whose items carried
-    a `usage` slot nothing had told it about. Null is a fine answer — a
-    tarball deploy, no git, a checkout it cannot read — and it is never a
-    failure: this is a line of information, not a check.
+    DECIDE[freshness]; the reading itself moved to :func:`build.node_commit`
+    on 2026-09-24, beside everything else that says which build a node is on.
     """
-    import subprocess
-
-    root = Path(__file__).resolve().parent.parent
-    try:
-        out = subprocess.run(
-            ["git", "-C", str(root), "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=5, check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    sha = (out.stdout or "").strip()
-    if out.returncode != 0 or not re.fullmatch(r"[0-9a-f]{7,40}", sha):
+    sha = build.node_commit()
+    if not sha or not re.fullmatch(r"[0-9a-f]{7,40}", sha):
         return None
     return sha
 

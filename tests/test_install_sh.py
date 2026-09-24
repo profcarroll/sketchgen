@@ -60,6 +60,17 @@ class InstallShTextTests(unittest.TestCase):
         self.assertIn('if [[ ! -e "$dir/node.conf" ]]', self.body)
         self.assertEqual(self.body.count('> "$dir/node.conf"'), 1)
 
+    def test_a_ref_arm_is_pinned_with_the_rows_sketchgen_pin_writes(self):
+        """fleet.md §1.4: an --ref arm was held by a detached HEAD alone, which
+        update.sh's old `git pull origin main` fast-forwarded without a word."""
+        from sketchgen import build
+        step = self.body[self.body.index("# --- 5b. The pin"):self.body.index("# --- 6.")]
+        self.assertIn('if [[ $cloned == yes && "$REF" != main ]]', step)
+        for key in build.PIN_KEYS:
+            self.assertIn(f'"{key}"', step)
+        # never over a pin someone set by hand afterwards
+        self.assertIn("SELECT value FROM meta WHERE key = 'pin.sha'", step)
+
     def test_only_a_database_it_created_is_paused(self):
         pause = self.body.index("control pause")
         self.assertIn("if [[ $fresh_db == yes ]]", self.body[pause - 200:pause])
