@@ -340,6 +340,14 @@ SOURCE_SWITCH_DEFAULT = "both"
 SOURCE_MAX_CHARS_KEY = "source_max_chars"
 SOURCE_MAX_CHARS_DEFAULT = 16000
 
+#: The `meta` row that sets how many lines of code a child's attempt must change
+#: from its parent's sketch before the gate calls it a revision (HARNESS_VERSION
+#: 6, the gate's `revised`). The default is the gate's own REVISION_MIN_LINES
+#: and is passed explicitly anyway, so every report says what it was held to.
+#: `0` turns the check off — no `--revises` at all — without a deploy.
+REVISION_MIN_LINES_KEY = "revision_min_lines"
+REVISION_MIN_LINES_DEFAULT = 5
+
 #: The executor's context window when it is holding a sketch. Since 2026-09-22
 #: executor.DEFAULT_NUM_CTX matches this value, so every executor call goes out at
 #: 16384 and the loaded runner is never torn down over a context change; the two
@@ -389,6 +397,16 @@ CHECK_REMEDIES: dict[str, str] = {
         "until a gesture, so start audio from that click — call `userStartAudio()` "
         "(or `getAudioContext().resume()`) inside `mousePressed()` on the canvas, "
         "not in `setup()` and not behind an HTML button the gate never clicks"
+    ),
+    # revised: the model on a child job had its parent's sketch in front of it
+    # and a lead sentence saying to change what the `Revise:` line asks for —
+    # and until 2026-09-24 no `Revise:` line anywhere in its prompt. Job 1653
+    # returned entry 1531's 207 lines byte for byte.
+    "revised": (
+        "this job revises a published sketch, and returning that sketch — as "
+        "it was, or with a number or two moved — is the published sketch "
+        "again, not a revision; make the change the `Revise:` line asks for "
+        "in the code that draws and moves things, and keep the rest"
     ),
 }
 
@@ -793,7 +811,9 @@ ADVISORY_CHECKS = frozenset({"is_looping"})
 #: These are quality assurance: the page threw, the sketch froze, the addon it
 #: asked for is missing, audio was started without a gesture, a frame cost more
 #: than the budget. A visitor meets the result of every one of them, so they keep
-#: their teeth.
+#: their teeth. Since HARNESS_VERSION 6 so does `revised`, on a child job only:
+#: a revision that is its parent again is what a visitor meets beside the
+#: parent, and 24 of them were in the held queue on 2026-09-24.
 #:
 #: Everything else the gate reports is an ASSERTION — whether the sketch matches
 #: a brief another model wrote. Missing one of those is not a broken sketch, it
@@ -825,11 +845,16 @@ ADVISORY_CHECKS = frozenset({"is_looping"})
 #:     off its last buffer: is_looping false and frame_advancing skipped on a
 #:     sketch that never called noLoop(), and a WEBGL sketch with a 2D buffer
 #:     missing uses(webgl) (job 1542, entry 1531). A frozen one now fails.
-HARNESS_VERSION = 5
+#: 6 — from 2026-09-24: a child job's attempts are gated with `--revises`
+#:     naming the parent's kept sketch.js, and `revised` is false — a QA
+#:     failure — when fewer than `revision_min_lines` lines of code changed.
+#:     Under 5, 35 of the first 156 children handed their parent's source
+#:     changed fewer than five lines, 27 of them none, and every one passed.
+HARNESS_VERSION = 6
 
 QA_CHECKS = frozenset({
     "console_clean", "frame_advancing", "sound_lib_ok",
-    "audio_context_running", "frame_budget",
+    "audio_context_running", "frame_budget", "revised",
 })
 
 
@@ -911,7 +936,7 @@ def _notes_for_check(name: str, notes: list[str]) -> list[str]:
 
 
 def build_evidence(report: dict[str, Any] | None, gate_exit: int | None,
-                   stderr: str = "") -> str:
+                   stderr: str = "", revision: str | None = None) -> str:
     """The text fed back to the executor after a failed gate run.
 
     Built from report.json and nothing else: the failed fixed checks with the
@@ -921,6 +946,11 @@ def build_evidence(report: dict[str, Any] | None, gate_exit: int | None,
     screenshot; this is the eye on the canvas it lacked, in the only form it can
     use (spec §3.3). The first line is a summary and is what lands in
     ``jobs.last_error`` when the last attempt fails.
+
+    *revision* is the child job's own `Revise:` sentence, carried under a
+    failed `revised` and nowhere else: an attempt after the first is shown its
+    previous attempt and not the parent, so this is the one place it can read
+    what the revision was for (HARNESS_VERSION 6).
     """
     if not report:
         if gate_exit == 3:
@@ -988,6 +1018,8 @@ def build_evidence(report: dict[str, Any] | None, gate_exit: int | None,
             remedy = CHECK_REMEDIES.get(name)
             if remedy:
                 parts.append(f"    fix: {remedy}")
+            if name == "revised" and revision:
+                parts.append(f"    the line to act on: {lineage.REVISE_HEADING} {revision}")
 
     if failed_assertions:
         parts.append("")
@@ -1237,6 +1269,10 @@ class GivenSource:
     carried into the prompt. It is still recorded on the attempt, because
     *offered and too long* and *there was nothing to offer* are different
     facts about a job and MEASURE[source-shown-rate] counts the first.
+
+    ``revision`` is the child's own `Revise:` sentence, on a ``parent`` source
+    only, and it goes in the prompt beside the code; it is not in the record
+    because the job's prompt already is.
     """
 
     kind: str
@@ -1245,6 +1281,7 @@ class GivenSource:
     lines: int
     text: str
     shown: bool
+    revision: str | None = None
 
     def record(self) -> dict[str, Any]:
         """What goes in ``attempts.given_source_json`` (migration 016).
@@ -1324,7 +1361,6 @@ def source_for(
     if switch != "both" and switch != kind:
         return None
 
-    candidates: list[Path] = []
     if kind == "previous":
         try:
             done = db.list_attempts(conn, job.id)
@@ -1333,41 +1369,14 @@ def source_for(
         previous = [a for a in done if a.n == int(n) - 1]
         if not previous:
             return None
+        candidates: list[Path] = []
         if previous[-1].source_dir:
             candidates.append(Path(previous[-1].source_dir) / "sketch.js")
         candidates.append(root / str(job.id) / f"attempt-{int(n) - 1}" / "sketch.js")
+        found = _read_sketch(candidates)
     else:
-        if not job.parent_entry_id:
-            return None
-        try:
-            entry = db.get_entry(conn, int(job.parent_entry_id))
-        except sqlite3.Error:  # pragma: no cover - the table is unreadable
-            return None
-        if entry is None:
-            return None
-        if entry["source_dir"]:
-            candidates.append(Path(entry["source_dir"]) / "sketch.js")
-        if entry["job_id"] is not None:
-            # The reconstructed path needs an attempt number, and the entry
-            # does not record which attempt it kept. The last one on the
-            # parent's job is what console._sketch_lines falls back to, and it
-            # is the attempt _create_entry chose unless an earlier one ran
-            # clean and a later one did not — in which case source_dir, which
-            # is tried first, is right and this line is never reached.
-            try:
-                rows = conn.execute(
-                    "SELECT n FROM attempts WHERE job_id = ? ORDER BY n",
-                    (int(entry["job_id"]),),
-                ).fetchall()
-            except sqlite3.Error:  # pragma: no cover - the table is unreadable
-                rows = []
-            if rows:
-                candidates.append(
-                    root / str(entry["job_id"])
-                    / f"attempt-{int(rows[-1]['n'])}" / "sketch.js"
-                )
+        found = parent_sketch(conn, job, root)
 
-    found = _read_sketch(candidates)
     if found is None:
         return None
     path, text = found
@@ -1381,7 +1390,105 @@ def source_for(
         # the prompt, and half a sketch is worse than none (DECIDE[source-cap]).
         text=text if shown else "",
         shown=shown,
+        revision=revise_line(job) if kind == "parent" else None,
     )
+
+
+def parent_sketch(
+    conn: "sqlite3.Connection",
+    job: db.Job,
+    jobs_dir: str | os.PathLike[str],
+) -> tuple[Path, str] | None:
+    """The parent entry's kept ``sketch.js`` and its text, or None.
+
+    What :func:`source_for` shows attempt 1 of a child, and what every attempt
+    of a child is gated against (``--revises``, HARNESS_VERSION 6) whatever
+    the ``executor_source`` switch says: the switch decides what a model is
+    shown, and a revision has to differ from its parent whether or not the
+    model saw it. Never raises.
+    """
+    if not job.parent_entry_id:
+        return None
+    try:
+        entry = db.get_entry(conn, int(job.parent_entry_id))
+    except sqlite3.Error:  # pragma: no cover - the table is unreadable
+        return None
+    if entry is None:
+        return None
+    root = Path(jobs_dir).expanduser()
+    candidates: list[Path] = []
+    if entry["source_dir"]:
+        candidates.append(Path(entry["source_dir"]) / "sketch.js")
+    if entry["job_id"] is not None:
+        # The reconstructed path needs an attempt number, and the entry
+        # does not record which attempt it kept. The last one on the
+        # parent's job is what console._sketch_lines falls back to, and it
+        # is the attempt _create_entry chose unless an earlier one ran
+        # clean and a later one did not — in which case source_dir, which
+        # is tried first, is right and this line is never reached.
+        try:
+            rows = conn.execute(
+                "SELECT n FROM attempts WHERE job_id = ? ORDER BY n",
+                (int(entry["job_id"]),),
+            ).fetchall()
+        except sqlite3.Error:  # pragma: no cover - the table is unreadable
+            rows = []
+        if rows:
+            candidates.append(
+                root / str(entry["job_id"])
+                / f"attempt-{int(rows[-1]['n'])}" / "sketch.js"
+            )
+    return _read_sketch(candidates)
+
+
+def revise_line(job: db.Job) -> str | None:
+    """The `Revise:` sentence this job was spawned to act on, or None.
+
+    The last one in its prompt: :func:`lineage.compose_prompt` appends one per
+    generation, and the ones above it are what the parent already is. The
+    planner reads the whole prompt and folds that sentence into a brief that
+    describes the entire sketch, so the brief alone does not say which part of
+    it is new — and the parent's source, beside it, already is most of it.
+    """
+    if not job.parent_entry_id:
+        return None
+    _root, revisions = lineage.split_prompt(job.prompt or "")
+    return revisions[-1] if revisions else None
+
+
+def revision_min_lines(conn: "sqlite3.Connection") -> int:
+    """``revision_min_lines`` from ``meta``: 0 is off, a blank or a word is
+    the default. Never raises."""
+    try:
+        raw = str(db.get_meta(conn, REVISION_MIN_LINES_KEY, "") or "").strip()
+        value = int(raw) if raw else REVISION_MIN_LINES_DEFAULT
+    except (ValueError, sqlite3.Error):
+        return REVISION_MIN_LINES_DEFAULT
+    return max(0, value)
+
+
+def revision_gate_args(
+    conn: "sqlite3.Connection",
+    job: db.Job | None,
+    jobs_dir: str | os.PathLike[str],
+) -> dict[str, Any]:
+    """What the gate is told about the sketch *job* revises, as keywords for
+    ``gate_fn``: nothing for a job with no parent, a parent whose sketch is
+    gone, or the floor set to 0; else ``revises`` and ``revision_min_lines``.
+
+    Empty rather than a pair of Nones so that a gate which predates the flag —
+    every stub in the tests, an injected one on another node — is called
+    exactly as it was for every job that is not a revision.
+    """
+    if job is None:
+        return {}
+    floor = revision_min_lines(conn)
+    if floor < 1:
+        return {}
+    found = parent_sketch(conn, job, jobs_dir)
+    if found is None:
+        return {}
+    return {"revises": str(found[0]), "revision_min_lines": floor}
 
 
 def source_too_long_line(given: GivenSource, cap: int) -> str:
@@ -1402,11 +1509,18 @@ def brief_with_source(brief: str, given: GivenSource | None,
     if given is None:
         return brief
     heading = PARENT_HEADING if given.kind == "parent" else PREVIOUS_HEADING
+    # The line PARENT_LEAD tells the model to act on. Until 2026-09-24 it was
+    # not in the prompt at all: the executor sees the planner's brief, not the
+    # job's prompt, and the brief describes the whole revised sketch — most of
+    # which the parent's code beside it already draws. 27 of the first 156
+    # children returned that code unchanged.
+    revise = (f"{lineage.REVISE_HEADING} {given.revision}\n\n"
+              if given.kind == "parent" and given.revision else "")
     if not given.shown:
-        body = source_too_long_line(given, cap)
+        body = revise + source_too_long_line(given, cap)
     else:
         lead = PARENT_LEAD if given.kind == "parent" else PREVIOUS_LEAD
-        body = f"{lead}\n\n```js\n{given.text.rstrip()}\n```"
+        body = f"{lead}\n\n{revise}```js\n{given.text.rstrip()}\n```"
     return f"{brief.rstrip()}\n\n{heading}\n\n{body}\n"
 
 
@@ -1472,16 +1586,24 @@ def default_gate(
     out_dir: str,
     gate_path: str = DEFAULT_GATE_PATH,
     timeout: float = DEFAULT_GATE_TIMEOUT_S,
+    revises: str | None = None,
+    revision_min_lines: int | None = None,
 ) -> GateOutcome:
     """Run sketch_gate.py over one attempt directory as a subprocess.
 
     ``python3 <gate> <attempt dir> --assert … --json --out <attempt dir>/.gate``,
-    exactly as the packet states it. The gate calls no model, so this is the one
-    part of a job that is safe to run while the slot is busy.
+    exactly as the packet states it, and on a child job ``--revises <parent's
+    sketch.js> --revision-min-lines N`` (:func:`revision_gate_args`). The gate
+    calls no model, so this is the one part of a job that is safe to run while
+    the slot is busy.
     """
     command = [sys.executable, str(gate_path), str(source_dir)]
     for word in assertions:
         command += ["--assert", word]
+    if revises:
+        command += ["--revises", str(revises)]
+        if revision_min_lines is not None:
+            command += ["--revision-min-lines", str(int(revision_min_lines))]
     command += ["--json", "--out", str(out_dir)]
     try:
         proc = subprocess.run(
@@ -3190,10 +3312,13 @@ class Worker:
             if not result.ok:
                 error = result.error or "the reply did not parse"
             else:
+                # The floor an import will be held to, so a try that returns
+                # the parent says so here and costs no attempt.
                 outcome = self.gate_fn(
                     source_dir=str(try_dir),
                     assertions=assertions,
                     out_dir=str(try_dir / ".gate"),
+                    **revision_gate_args(self.conn, job, self.jobs_dir),
                 )
                 summary = paid_mod.verdict_summary(outcome.report)
                 if outcome.report is None:
@@ -3405,7 +3530,14 @@ class Worker:
         gate_out = attempt_dir / ".gate"
         asked = " ".join(f"--assert {word}" for word in assertions) or "(no assertions)"
         self.log(f"job {job.id}: attempt {n} gating {attempt_dir} {asked}")
+        # Every attempt of a child is measured against the parent, not
+        # against the attempt before it: a repair that changes one line of
+        # a sketch that was already a revision is a repair, and the floor
+        # is about the revision (HARNESS_VERSION 6).
+        revising = revision_gate_args(self.conn, job, self.jobs_dir)
         looking_at = ", ".join(GATE_CHECKS_PLAIN)
+        if revising:
+            looking_at += ", revision"
         if assertions:
             looking_at += ", and " + ", ".join(assertions)
         self._say(
@@ -3419,6 +3551,7 @@ class Worker:
                 source_dir=str(attempt_dir),
                 assertions=assertions,
                 out_dir=str(gate_out),
+                **revising,
             )
         except StopNow:
             raise
@@ -3433,7 +3566,8 @@ class Worker:
             )
         passed = outcome.exit_code == 0
         gate_evidence = None if passed else build_evidence(
-            outcome.report, outcome.exit_code, outcome.stderr
+            outcome.report, outcome.exit_code, outcome.stderr,
+            revision=revise_line(job),
         )
         # The pre-flight runs only on a failure, and only ever adds to what the
         # gate said. `gate_evidence` is kept separate because its first line is

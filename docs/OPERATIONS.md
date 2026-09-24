@@ -273,6 +273,47 @@ the sha256, the line count and whether it was shown. The guard covers that hash
 as well as the evidence, so a packet cut before the sketch changed under it is
 refused at import with nothing written — export again.
 
+### A revision has to change something (HARNESS_VERSION 6)
+
+Handing the executor its parent's code had a failure nobody predicted: it
+handed the code back. Of the first 156 children given their parent's source
+(2026-09-21 to 24), 27 returned it unchanged and 8 more moved a number or two —
+entry 1574 changed one loop bound, 200 to 300, for a critique that asked for
+glowing, coloured nodes — and all of them passed the gate and were held as
+revisions. Before the source was given, the fewest lines any of 1,001
+children changed was 14. Two things changed on 2026-09-24:
+
+- **The `Revise:` line is in the prompt.** `PARENT_LEAD` had always told the
+  model to *change what the `Revise:` line asks for*, but the executor is given
+  the planner's brief, not the job's prompt, and the brief describes the whole
+  revised sketch — most of which the parent's code already draws. The job's
+  last `Revise:` sentence now sits under the lead, above the code. A repair
+  that failed `revised` gets it again under that check in the evidence
+  (*the line to act on*), because attempt 2 is shown attempt 1, not the parent.
+- **The gate fails a revision that is not one.** Every attempt of a child whose
+  parent's `sketch.js` can be found is gated with `--revises` naming it, and
+  `revised` is false when fewer than `revision_min_lines` lines of code differ
+  (comments and whitespace are not code; `gate/README.md` has the counting).
+  It is a QA check: an attempt that fails it is never the one an entry keeps
+  over one that passed it, and a job whose every attempt fails it ends
+  `failed-kept`, not `held`. Every attempt is measured against the **parent**,
+  not the attempt before it — a one-line repair of a real revision is a repair.
+  `paid try` is held to the same floor as the import it rehearses.
+
+```
+# on the node: read the floor with the other two rows
+$SG executor-source --db ~/sketchgen/sketchgen.db
+
+# stricter, or 0 to turn it off (no --revises at all)
+$SG executor-source --db ~/sketchgen/sketchgen.db --revision-min-lines 8
+```
+
+The switch above does not turn it off: `executor_source` decides what a model
+is **shown**, and a revision has to differ from its parent whether or not the
+model saw it. Entries gated before this carry `harness_version` 5 or earlier
+and nothing re-gates them: the copies already in the held queue on
+2026-09-24 are a person's to reject from the Held page.
+
 ## Where the picture a sketch loaded shows, and what is never published
 
 A sketch may fetch a photograph from a host outside itself; with

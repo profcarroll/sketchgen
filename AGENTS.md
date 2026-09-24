@@ -253,7 +253,10 @@ driving it — never release one of those — and as `no agent` once nobody is.
   global mode), optionally ```` ```html ````, and the statement the prompt asks
   for. The gate is headless Chromium on the node and is not negotiable: on a
   failure, read the evidence at the end of the next prompt and fix what it
-  names.
+  names. A prompt with `## The sketch this revises` in it is a revision, and
+  the gate fails `revised` when fewer than 5 lines of code differ from that
+  sketch (comments and whitespace do not count): make the change its
+  `Revise:` line asks for, not a number or two.
 - **Optionally, a fenced ```` ```ghost ```` block:** the pointer script the
   kiosk and the gate play when nobody is at the keyboard, in canvas fractions
   (`[{"t": 800, "type": "move", "x": 0.5, "y": 0.5}, …]`, types
