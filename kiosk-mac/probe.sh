@@ -13,6 +13,7 @@ s "FileVault"         fdesetup status
 s "me"                id
 s "users"             bash -c "dscl . list /Users | grep -v '^_'"
 s "admins"            dscl . read /Groups/admin GroupMembership
+s "am I an admin"     dsmemberutil checkmembership -U "$(whoami)" -G admin
 s "auto-login user"   defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser
 s "power"             pmset -g custom
 s "power schedule"    pmset -g sched
@@ -33,8 +34,8 @@ s "launch agents"     bash -c "launchctl list | grep -v com.apple"
 s "agent files"       bash -c "ls ~/Library/LaunchAgents /Library/LaunchAgents /Library/LaunchDaemons 2>&1"
 s "login items"       osascript -e 'tell application "System Events" to get the name of every login item'
 s "homebrew / CLT"    bash -c "which brew; xcode-select -p"
-s "tailscale"         bash -c "which tailscale; ls -d /Applications/Tailscale.app; tailscale status 2>&1 | head -5"
-s "remote login"      bash -c "launchctl print system/com.openssh.sshd >/dev/null 2>&1 && echo sshd loaded || echo sshd not loaded"
+s "tailscale"         bash -c "which tailscale; ls -d /Applications/Tailscale.app; /Applications/Tailscale.app/Contents/MacOS/Tailscale status 2>&1 | head -5"
+s "remote login"      bash -c "nc -z -G 2 127.0.0.1 22 && echo 'sshd answers on 22' || echo 'nothing on 22'; ls /etc/ssh/sshd_config.d; grep -n '^Include' /etc/ssh/sshd_config"
 s "screen sharing"    bash -c "launchctl print system/com.apple.screensharing >/dev/null 2>&1 && echo loaded || echo not loaded"
 s "disk"              df -h /
 s "memory pressure"   bash -c "memory_pressure | tail -3"
