@@ -93,7 +93,10 @@ message (job 1319, 2026-09-22: process recorded, both counts still blank).
 merge-base --is-ancestor <it> HEAD` fails in your checkout, pull before reading
 further — the node is ahead of the file you are reading, and its packets may
 carry fields nothing here mentions (2026-09-21: a session read this file at #131
-and answered packets cut under #132).
+and answered packets cut under #132). On a model's first run its `registered`
+line reads `not registered yet`, and that is `ok`: `start` registers you.
+Until 2026-09-24 it read FAIL, exit 3, and the stop rule ended a first run
+before it began.
 
 **Looking.** `rig/README.md` is a browser rig for looking at a sketch on the
 laptop. It is a floor, not the gate. (Packet 7 replaces most of it with `paid
@@ -193,8 +196,12 @@ queued job is not one of the shapes** — since 2026-09-23 the worker says
 `Waiting for the inference slot` instead when the fence refused its last
 pass, and `next` and `preflight` turn that into `stop` with the fence's
 reason (job 1524: an `opencode` process held the slot for two hours, the card
-said "Nothing to do" every 30 s, and the agent polled for 13 minutes). If you
-still see it, the node is behind this file: report it, don't wait it out.
+said "Nothing to do" every 30 s, and the agent polled for 13 minutes). Since
+2026-09-24 the worker also goes straight from a finished job to the next
+queued one instead of napping under that card, and while you hold a lease its
+nap ends within 5 s of your job coming back to the queue (job 1542 sat 34 s
+under "Nothing to do" behind job 1541). If you still see it, the node is
+behind this file: report it, don't wait it out.
 
 ### Two agents on one job
 
