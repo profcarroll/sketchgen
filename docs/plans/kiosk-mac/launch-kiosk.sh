@@ -2,7 +2,9 @@
 # launch-kiosk.sh — started by org.sketchgen.kiosk (a LaunchAgent with KeepAlive), which
 # restarts it whenever Chrome exits. Installed at ~/Library/sketchgen-kiosk/launch-kiosk.sh.
 # DRAFT: finalize in the on-device session (docs/plans/kiosk-mac.md §2.4).
-URL="https://profcarroll.github.io/sketchgen-gallery/kiosk.html?unattended=1"
+URL="https://profcarroll.github.io/sketchgen-gallery/kiosk.html?unattended=1&site=d12"
+# site= is where this machine learns where it lives (kiosk-mac.md §1.3): it switches views
+# from the attendance rule to that site's building hours. Drop it and the kiosk counts as a default one.
 PROFILE="$HOME/Library/Application Support/sketchgen-kiosk-chrome"
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 
