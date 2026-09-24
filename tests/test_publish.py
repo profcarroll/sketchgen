@@ -500,6 +500,47 @@ class PublishIndexTests(PublishTestCase):
         self.assertIsNone(sha2, "a re-render with no new data committed anyway")
         self.assertEqual(why2, "site unchanged")
 
+    def test_publish_index_with_a_write_path_keeps_the_rest_of_config_json(self):
+        # --write-path used to rebuild the config from three fields, so this
+        # pushed a config.json without the kiosk's sites and buildings, and
+        # with its switches back at their defaults. The node's units set
+        # SKETCHGEN_WRITEPATH_URL, which is that flag's default: any
+        # publish-index run there would have told the D12 kiosk it was
+        # nowhere (docs/plans/kiosk-mac.md §1.3), 2026-09-24.
+        import json as _json
+        from sketchgen import publish as publication
+
+        result = self.publish_cli("--by", "profcarroll")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sites = {"d12": {"name": "D12 lab", "building": "vera-list"}}
+        buildings = {"vera-list": {
+            "name": "Vera List Center", "tz": "America/New_York",
+            "terms": [{"from": "2026-08-17", "to": "2026-12-18",
+                       "week": {"mon": "07:30-24:00"}}],
+        }}
+        written = {
+            "write_path": "https://old-writepath.example",
+            "gallery_url": "https://example.github.io/sketchgen-gallery/",
+            "repository": "https://github.com/example/sketchgen-gallery",
+            "kiosk_views": False,
+            "kiosk_ghost": False,
+            "kiosk_ghost_loop_s": 20,
+            "kiosk_sites": sites,
+            "kiosk_buildings": buildings,
+        }
+        (self.gallery / "config.json").write_text(_json.dumps(written), encoding="utf-8")
+        git(self.gallery, "commit", "-qam", "an operator's kiosk config")
+        git(self.gallery, "push", "-q", "origin", "HEAD:main")
+
+        sha, why = publication.publish_index(
+            self.conn, self.gallery, remote=str(self.bare),
+            write_path="https://writepath.example/",
+        )
+        self.assertIsNone(why, why)
+        # What the site gets, not only what the checkout holds.
+        pushed = _json.loads(git(self.bare, "show", f"{sha}:config.json").stdout)
+        self.assertEqual(dict(written, write_path="https://writepath.example"), pushed)
+
 
     def test_publish_index_reports_every_step_to_the_bar(self):
         """update.sh draws a bar from on_step; a step it skips is a bar that lies."""
