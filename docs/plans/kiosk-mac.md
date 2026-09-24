@@ -34,8 +34,10 @@ both nobody touched the keyboard.
 
 ## 1. Packet A — `feat/kiosk-unattended`
 
-Generator only. No migration, no Worker deploy, no D1 change: `/view` already takes
-`source: "kiosk"` and D1 already keeps `kiosk_count` (`writepath/worker.js:712`).
+The generator, plus one table on the write path. `/view` already takes `source: "kiosk"` and D1
+already keeps `kiosk_count` (`writepath/worker.js:712`); tagging the site (decision 7) adds
+`kiosk_views` and an optional `site`, so the deploy order is **D1 table → Worker → gallery**. No
+node migration.
 
 ### 1.1 `?unattended=1`
 
