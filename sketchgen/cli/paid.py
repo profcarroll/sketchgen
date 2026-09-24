@@ -307,6 +307,10 @@ def _print_info(info: dict) -> None:
     now = info.get("worker_now")
     if now:
         where = now.get("headline") or now.get("step")
+        if paid_mod.worker_fenced(now):
+            # The reason is the whole message here: "Waiting for the inference
+            # slot" alone would send the reader to the node to find out why.
+            where = f"{where} — {paid_mod.worker_fenced(now)}"
         on = f" on job {now['job']}" if now.get("job") else ""
         print(f"  worker now: {where}{on} (since {now.get('since_utc')})")
     for lease_job, lease in sorted((info.get("leases") or {}).items()):

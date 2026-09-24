@@ -139,7 +139,8 @@ bin/sg paid next --job N --as $ME > packet.json     # returns within 4 minutes
 #             sketch that ran and missed an assertion; do not infer it.
 #     handoff the rest of a split job is the other paid model's. "then" is
 #             that agent's command; report it and stop — you are finished.
-#     stop    exit 3: a person is needed, the generator is paused, or another
+#     stop    exit 3: a person is needed, the generator is paused, the worker
+#             is fenced (another client holds the inference slot), or another
 #             agent holds the job. Report "say" verbatim; stop.
 
 bin/sg paid try --job N --as $ME < answer.txt       # returns within 4 minutes
@@ -186,6 +187,14 @@ and starts no idle work (no judge, no critique, no spawned child) while you
 are driving; every `next` and `import` renews it, and it lapses twenty minutes
 after your last one. **If `next` says `wait`, run `next` again.** Do not read
 the node's logs, list its processes, or start anything to hurry it.
+
+`wait` always names what the worker is doing. **"Nothing to do" over your own
+queued job is not one of the shapes** — since 2026-09-23 the worker says
+`Waiting for the inference slot` instead when the fence refused its last
+pass, and `next` and `preflight` turn that into `stop` with the fence's
+reason (job 1524: an `opencode` process held the slot for two hours, the card
+said "Nothing to do" every 30 s, and the agent polled for 13 minutes). If you
+still see it, the node is behind this file: report it, don't wait it out.
 
 ### Two agents on one job
 
