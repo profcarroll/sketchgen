@@ -775,6 +775,13 @@ body.kiosk {
  * the moment it is dismissed they go (spec §3). */
 body.kiosk.playing .bar { display: none; }
 body.kiosk.idle { cursor: none; }
+/* An unattended wall (docs/plans/kiosk-mac.md §1.1): the frame is an opaque
+ * origin, so over it the cursor is the sketch's to draw and its mouse moves
+ * never reach this page. Taking the pointer off the frame puts the whole
+ * stage under the rule above. The ghost pointer is dispatched inside the
+ * frame by its own shim and does not notice; a visitor with a real mouse can
+ * no longer click a sketch, which on a wall with no mouse is nothing. */
+body.kiosk.unattended .stage iframe.sketch { pointer-events: none; }
 
 /* ---- the room ---- */
 body.kiosk .room {

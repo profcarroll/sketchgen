@@ -53,12 +53,13 @@ Python 3.12, stdlib only: ``string.Template``, ``html``, ``json``.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import re
 import shutil
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from string import Template
 from typing import Any, Iterable
@@ -339,6 +340,11 @@ def _ghost_loop_seconds(value: Any) -> int:
     return seconds if 1 <= seconds <= 600 else DEFAULT_GHOST_LOOP_S
 
 
+def _json_object(value: Any) -> dict:
+    """``value`` if it is a JSON object, else an empty one."""
+    return value if isinstance(value, dict) else {}
+
+
 @dataclass(frozen=True)
 class Config:
     """The two URLs the generated pages need, and the repository behind them.
@@ -359,6 +365,14 @@ class Config:
     the whole gallery in one line and a ``render-index``, no deploy. The other
     two switches are ``?ghost=0`` for one projector and the ``M`` key for one
     room.
+
+    ``kiosk_sites`` and ``kiosk_buildings`` are where a kiosk can be told it
+    lives (docs/plans/kiosk-mac.md §1.3): a site is a room and the building it
+    is in, a building is its posted hours. Neither is read here beyond being
+    a JSON object — ``kiosk.js`` is what interprets them, and it fails closed
+    on anything it cannot — because the whole point of keeping them in this
+    file is that an operator extends a term's hours with one edit and a
+    ``render-index``. A kiosk opened without ``?site=`` never reads them.
     """
 
     write_path: str = ""
@@ -367,6 +381,8 @@ class Config:
     kiosk_views: bool = True
     kiosk_ghost: bool = True
     kiosk_ghost_loop_s: int = DEFAULT_GHOST_LOOP_S
+    kiosk_sites: dict = field(default_factory=dict)
+    kiosk_buildings: dict = field(default_factory=dict)
 
     @classmethod
     def load(cls, dest_dir: str | Path) -> "Config":
@@ -393,6 +409,12 @@ class Config:
             # until somebody notices the line is missing.
             kiosk_ghost=data.get("kiosk_ghost") is not False,
             kiosk_ghost_loop_s=_ghost_loop_seconds(data.get("kiosk_ghost_loop_s")),
+            # Kept as found, including shapes kiosk.js will refuse: rewriting
+            # an operator's hours here would hide the typo the kiosk's title
+            # is there to show. Only a non-object is dropped, since it cannot
+            # round-trip as the kind of thing the key promises.
+            kiosk_sites=_json_object(data.get("kiosk_sites")),
+            kiosk_buildings=_json_object(data.get("kiosk_buildings")),
         )
 
     def to_json(self) -> str:
@@ -405,6 +427,8 @@ class Config:
                     "kiosk_views": self.kiosk_views,
                     "kiosk_ghost": self.kiosk_ghost,
                     "kiosk_ghost_loop_s": self.kiosk_ghost_loop_s,
+                    "kiosk_sites": self.kiosk_sites,
+                    "kiosk_buildings": self.kiosk_buildings,
                 },
                 indent=2,
                 sort_keys=True,
@@ -3554,7 +3578,29 @@ def _manifests(
         base = _manifest_base(conn, row, config, parent, children)
         kiosk.append(_kiosk_entry(conn, row, config, parent, children, scores, base))
         swipe.append(_swipe_entry(conn, row, config, parent, children, scores, base))
-    return {"entries": kiosk}, {"entries": swipe}
+    return {"build": _kiosk_build(), "entries": kiosk}, {"entries": swipe}
+
+
+def _kiosk_build() -> str:
+    """A short hash over the three files that make up the kiosk page.
+
+    Written into ``kiosk.json`` as ``build`` so that a kiosk left running for
+    weeks can tell a deploy of its own code from a new entry
+    (docs/plans/kiosk-mac.md §1.2): the first reloads the page, the second only
+    joins the rotation. The template is hashed as this process loaded it, the
+    same text :func:`_kiosk_page` fills, so the stamp describes the page that
+    was actually written. No clock and no entry data, so a ``render-index``
+    over unchanged code leaves it unchanged and no kiosk reloads for nothing.
+    """
+    digest = hashlib.sha256()
+    for chunk in (
+        (ASSET_DIR / "kiosk.js").read_bytes(),
+        (ASSET_DIR / "gallery.css").read_bytes(),
+        _template("kiosk.html").template.encode("utf-8"),
+    ):
+        digest.update(len(chunk).to_bytes(8, "big"))
+        digest.update(chunk)
+    return digest.hexdigest()[:12]
 
 
 def _kiosk_manifest(

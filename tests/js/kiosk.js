@@ -321,11 +321,24 @@ function load(options) {
   // Every request the script made, in order, so a test can assert on what it
   // asked for as well as on what it did with the answer.
   const asked = [];
+  let manifestsServed = 0;
   window.fetch = function (url, init) {
     asked.push({ url: String(url), init: init || null });
     if (String(url).indexOf("kiosk.json") !== -1) {
+      manifestsServed += 1;
       // A manifest that never arrives is the case the start card exists for.
       if (opts.manifest === "reject") { return Promise.reject(new Error("offline")); }
+      // A machine that boots before its network: the first few asks fail.
+      if (opts.rejectFirst && manifestsServed <= opts.rejectFirst) {
+        return Promise.reject(new Error("offline"));
+      }
+      // A gallery that changes while the kiosk runs (kiosk-mac.md §1.2): the
+      // nth ask gets the nth manifest, and the last one from then on.
+      if (opts.manifests) {
+        return answer(JSON.parse(JSON.stringify(
+          opts.manifests[Math.min(manifestsServed, opts.manifests.length) - 1]
+        )));
+      }
       if (opts.manifest === "empty") { return answer({ entries: [] }); }
       const entries = JSON.parse(JSON.stringify(ENTRIES));
       // One run asks what a row the database has less of looks like: nobody
@@ -346,6 +359,8 @@ function load(options) {
       // the state every checkout is in the first time the field ships.
       if (opts.kioskGhost === false) { config.kiosk_ghost = false; }
       if (opts.ghostLoopS) { config.kiosk_ghost_loop_s = opts.ghostLoopS; }
+      // Where a kiosk can be told it lives (kiosk-mac.md §1.3).
+      if (opts.configExtra) { Object.assign(config, JSON.parse(JSON.stringify(opts.configExtra))); }
       return answer(config);
     }
     if (String(url).indexOf("/counts") !== -1) { return answer({ counts: COUNTS }); }
@@ -386,6 +401,24 @@ function load(options) {
     due.forEach(function (one) { one.fn(); });
   }
 
+  // A reload goes nowhere and is counted, as location.replace is recorded.
+  window.location.reloads = 0;
+  window.location.reload = function () { window.location.reloads += 1; };
+
+  // The wall clock, for the building's hours: opts.now plus however far the
+  // test has stepped, so an hour of frames is an hour of the day too. A
+  // constructor called with arguments is the real one.
+  const RealDate = Date;
+  const start = opts.now ? RealDate.parse(opts.now) : RealDate.now();
+  function FakeDate() {
+    if (arguments.length) { return new (Function.prototype.bind.apply(RealDate, [null].concat([].slice.call(arguments))))(); }
+    return new RealDate(start + window.clock);
+  }
+  FakeDate.now = function () { return start + window.clock; };
+  FakeDate.parse = RealDate.parse;
+  FakeDate.UTC = RealDate.UTC;
+  FakeDate.prototype = RealDate.prototype;
+
   vm.runInContext(fs.readFileSync(SCRIPT, "utf8"), vm.createContext({
     window: window,
     document: document,
@@ -393,7 +426,8 @@ function load(options) {
     URLSearchParams: URLSearchParams,
     Promise: Promise,
     console: console,
-    Date: Date,
+    Date: FakeDate,
+    Intl: Intl,
     Math: Math,
     Number: Number,
     String: String,
@@ -1083,6 +1117,236 @@ async function views() {
   };
 }
 
+/* ---- unattended (docs/plans/kiosk-mac.md §1.1–1.2) ------------------------
+ *
+ * A machine nobody will touch again: it starts itself, it outlasts a network
+ * that comes up after it, it hides the cursor before anybody moves one, and
+ * it takes a newer gallery between two sketches.
+ */
+
+function kioskAsks(asked) {
+  return asked.filter(function (one) { return one.url.indexOf("kiosk.json") !== -1; });
+}
+
+async function unattended() {
+  const wall = await load({ search: "?order=newest&every=60&unattended=1" });
+  await quiet();
+  wall.tock(1000);                         // past the moment the menu would open
+  const body = wall.document.body.className;
+  const started = {
+    welcomeUp: wall.document.getElementById("welcome").hidden === false,
+    frames: frames(wall.document).length,
+    showing: showing(wall.document),
+    idle: body.indexOf("idle") !== -1,
+    unattendedClass: body.indexOf("unattended") !== -1,
+    menuShut: wall.document.getElementById("menu").hidden === true,
+    title: wall.document.title
+  };
+
+  /* A network that comes up after the machine: two misses, then a manifest. */
+  const late = await load({ search: "?order=newest&every=60&unattended=1", rejectFirst: 2 });
+  await quiet();
+  const afterOne = { title: late.document.title, frames: frames(late.document).length };
+  late.tock(9999);
+  await quiet();
+  const beforeTen = kioskAsks(late.asked).length;
+  late.tock(1);
+  await quiet();
+  const afterTwo = { title: late.document.title, asks: kioskAsks(late.asked).length };
+  late.tock(20000);
+  await quiet();
+  const recovered = {
+    asks: kioskAsks(late.asked).length,
+    frames: frames(late.document).length,
+    welcomeUp: late.document.getElementById("welcome").hidden === false,
+    title: late.document.title
+  };
+
+  /* An attended kiosk that cannot load says so and waits for a person. */
+  const person = await load({ search: "?order=newest", manifest: "reject" });
+  await quiet();
+  person.tock(600000);
+  await quiet();
+  const attendedAsks = kioskAsks(person.asked).length;
+
+  /* The launch link keeps the machine's own parameters. */
+  press(wall.document, "y");
+  press(wall.document, "]");
+  const bar = wall.window.history.lastUrl;
+
+  return {
+    started: started,
+    afterOne: afterOne,
+    beforeTen: beforeTen,
+    afterTwo: afterTwo,
+    recovered: recovered,
+    attendedAsks: attendedAsks,
+    bar: bar
+  };
+}
+
+function withBuild(build, entries) {
+  return { build: build, entries: entries || JSON.parse(JSON.stringify(ENTRIES)) };
+}
+
+function statusText(document) { return document.getElementById("status").textContent; }
+
+async function refreshing() {
+  const NEWER = JSON.parse(JSON.stringify(ENTRIES)).concat([
+    Object.assign(JSON.parse(JSON.stringify(ENTRIES[2])), {
+      id: 44, published_utc: "2026-09-04T12:00:00Z",
+      sketch: "e/44/sketch/", source: "e/44/sketch/sketch.js", href: "e/44/"
+    })
+  ]);
+  const SEARCH = "?order=newest&every=120&unattended=1&refresh=60";
+
+  /* New entries, same build: taken at the next seat, no reload. */
+  const joined = await load({ search: SEARCH, manifests: [withBuild("aaa"), withBuild("aaa", NEWER)] });
+  await quiet();
+  const first = showing(joined.document);
+  joined.tock(60000);                      // the refresh
+  await quiet();
+  const midSketch = { showing: showing(joined.document), status: statusText(joined.document) };
+  joined.tock(60000);                      // the slot ends
+  joined.tock(FADE);
+  const next = {
+    showing: showing(joined.document),
+    status: statusText(joined.document),
+    reloads: joined.window.location.reloads
+  };
+  const refreshInits = kioskAsks(joined.asked).map(function (one) { return one.init; });
+
+  /* A new build: a reload, and only between two sketches. */
+  const rebuilt = await load({ search: SEARCH, manifests: [withBuild("aaa"), withBuild("bbb")] });
+  await quiet();
+  rebuilt.tock(60000);
+  await quiet();
+  const beforeBoundary = { reloads: rebuilt.window.location.reloads, showing: showing(rebuilt.document) };
+  rebuilt.tock(60000);
+  rebuilt.tock(FADE);
+  const atBoundary = { reloads: rebuilt.window.location.reloads, showing: showing(rebuilt.document) };
+
+  /* Nothing new: nothing happens. */
+  const same = await load({ search: SEARCH, manifests: [withBuild("aaa")] });
+  await quiet();
+  same.tock(60000);
+  await quiet();
+  same.tock(60000);
+  same.tock(FADE);
+  const unchanged = {
+    reloads: same.window.location.reloads,
+    status: statusText(same.document),
+    asks: kioskAsks(same.asked).length
+  };
+
+  /* An attended kiosk never refreshes: a reload under somebody's hands
+   * would be rude. */
+  const attended = await started({ search: "?order=newest&every=120&refresh=60" });
+  attended.tock(600000);
+  await quiet();
+
+  return {
+    first: first,
+    midSketch: midSketch,
+    next: next,
+    refreshInits: refreshInits,
+    beforeBoundary: beforeBoundary,
+    atBoundary: atBoundary,
+    unchanged: unchanged,
+    attendedAsks: kioskAsks(attended.asked).length,
+    title: joined.document.title
+  };
+}
+
+/* ---- a kiosk that knows where it lives (kiosk-mac.md §1.3) -----------------
+ *
+ * The Vera List Center's posted hours, cut down to what the cases below
+ * reach: fall and winter terms, Thanksgiving and the fall 24/7 run. Every
+ * instant is UTC, so the machine's own zone cannot help or hurt.
+ */
+const WEEK = function (open, close, sunday) {
+  return {
+    mon: open + "-" + close, tue: open + "-" + close, wed: open + "-" + close,
+    thu: open + "-" + close, fri: open + "-" + close, sat: open + "-" + close,
+    sun: sunday + "-" + close
+  };
+};
+const VERA = {
+  name: "Vera List Center",
+  tz: "America/New_York",
+  terms: [
+    { name: "Fall 2026", from: "2026-08-17", to: "2026-12-18", week: WEEK("07:30", "24:00", "10:00") },
+    { name: "Winter 2026-27", from: "2026-12-19", to: "2027-01-18", week: WEEK("07:30", "20:00", "10:00") }
+  ],
+  exceptions: [
+    { from: "2026-11-25", to: "2026-11-29", hours: null, why: "Thanksgiving" },
+    { from: "2026-11-30", to: "2026-11-30", hours: "07:30-24:00" },
+    { from: "2026-12-01", to: "2026-12-18", hours: "00:00-24:00", why: "24/7" }
+  ]
+};
+const SITES = {
+  kiosk_sites: { d12: { name: "D12 lab", building: "vera-list" } },
+  kiosk_buildings: { "vera-list": VERA }
+};
+
+async function atTime(now, extra) {
+  const opts = Object.assign({ search: "?order=newest&every=60&site=d12", now: now, configExtra: SITES }, extra || {});
+  const world = await started(opts);
+  world.tock(10000);
+  return {
+    posts: posted(world.asked).map(function (one) { return one.body; }),
+    title: world.document.title
+  };
+}
+
+async function sites() {
+  const bad = JSON.parse(JSON.stringify(SITES));
+  bad.kiosk_buildings["vera-list"].terms[1].week.tue = "7:30-20:00";
+
+  /* Ten hours of a 24/7 day with nobody at the keyboard: the building is the
+   * audience, so the attendance rule is not consulted. */
+  const allNight = await started({
+    search: "?order=newest&every=600&site=d12", now: "2026-12-08T05:00:00Z", configExtra: SITES
+  });
+  for (let step = 0; step < 60; step += 1) { allNight.tock(600000); allNight.tock(FADE); }
+  const allNightPosts = posted(allNight.asked).length;
+
+  /* The menu says which rule the room is on; the address bar keeps the site
+   * and storage never learns it. */
+  const menu = await started({
+    search: "?order=newest&every=60&site=d12&unattended=1", now: "2026-09-28T15:00:00Z", configExtra: SITES
+  });
+  press(menu.document, "y");
+  press(menu.document, "]");
+
+  const cases = {
+    mondayBeforeOpen: await atTime("2026-09-28T11:29:00Z"),     // 07:29 EDT
+    mondayAtOpen: await atTime("2026-09-28T11:30:00Z"),         // 07:30
+    mondayLastMinute: await atTime("2026-09-29T03:59:00Z"),     // 23:59
+    tuesdayMidnight: await atTime("2026-09-29T04:00:00Z"),      // 00:00
+    sundayBeforeTen: await atTime("2026-09-27T13:59:00Z"),      // 09:59
+    sundayAtTen: await atTime("2026-09-27T14:00:00Z"),          // 10:00
+    thanksgiving: await atTime("2026-11-26T17:00:00Z"),         // noon, closed
+    finalsThreeAm: await atTime("2026-12-08T08:00:00Z"),        // 03:00 EST, 24/7
+    winterEvening: await atTime("2027-01-13T00:30:00Z"),        // Tue 19:30 EST
+    winterLate: await atTime("2027-01-13T01:30:00Z"),           // Tue 20:30 EST
+    afterTheList: await atTime("2027-05-15T16:00:00Z"),         // no term
+    unknownSite: await atTime("2026-09-28T15:00:00Z", { search: "?order=newest&every=60&site=d13" }),
+    badHours: await atTime("2026-09-28T15:00:00Z", { configExtra: bad }),
+    // A default kiosk does not know where it lives, even in a gallery that
+    // knows about D12: at 03:00 on a closed Tuesday it counts by its keyboard.
+    noSite: await atTime("2026-09-29T07:00:00Z", { search: "?order=newest&every=60" }),
+    noSiteNoConfig: await atTime("2026-09-28T15:00:00Z", { search: "?order=newest&every=60", configExtra: null })
+  };
+  return {
+    cases: cases,
+    allNightPosts: allNightPosts,
+    note: menu.document.getElementById("m-note").textContent,
+    bar: menu.window.history.lastUrl,
+    stored: menu.window.localStorage.getItem("sketchgen-kiosk")
+  };
+}
+
 /* ---- the ghost pointer (docs/plans/auto-mouse.md §3.2) --------------------
  *
  * The kiosk's whole part in this is one query string on one src. Everything
@@ -1207,6 +1471,9 @@ async function main() {
     starting: await starting(),
     views: await views(),
     ghost: await ghost(),
+    unattended: await unattended(),
+    refreshing: await refreshing(),
+    sites: await sites(),
     source: { chars: SOURCE.length, bytes: Buffer.byteLength(SOURCE, "utf8") }
   };
   console.log(JSON.stringify(report));

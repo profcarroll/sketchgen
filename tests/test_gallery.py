@@ -1873,6 +1873,44 @@ class IndexTests(GalleryTestCase):
                     gallery.Config.load(dest).kiosk_ghost_loop_s,
                 )
 
+    def test_sites_and_buildings_round_trip_a_render_as_written(self):
+        # Where a kiosk can be told it lives (docs/plans/kiosk-mac.md §1.3).
+        # Kept exactly as the operator wrote them, typos included: kiosk.js is
+        # what refuses a bad span, and it says so in the kiosk's title — a
+        # render that tidied the block would hide the typo it is there to show.
+        dest = self.tmp / "sited"
+        dest.mkdir()
+        sites = {"d12": {"name": "D12 lab", "building": "vera-list"}}
+        buildings = {"vera-list": {
+            "name": "Vera List Center", "tz": "America/New_York",
+            "terms": [{"from": "2026-08-17", "to": "2026-12-18",
+                       "week": {"mon": "07:30-24:00", "sun": "10:00-24:00",
+                                "tue": "7:30-24:00"}}],
+            "exceptions": [{"from": "2026-11-25", "to": "2026-11-29", "hours": None}],
+        }}
+        (dest / "config.json").write_text(
+            json.dumps({"write_path": "https://write.example.invalid/api",
+                        "kiosk_sites": sites, "kiosk_buildings": buildings}),
+            encoding="utf-8",
+        )
+        loaded = gallery.Config.load(dest)
+        gallery.render_index(self.conn, dest, loaded)
+        after = json.loads((dest / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(sites, after["kiosk_sites"])
+        self.assertEqual(buildings, after["kiosk_buildings"])
+
+    def test_sites_that_are_not_objects_are_dropped_to_empty(self):
+        dest = self.tmp / "unsited"
+        dest.mkdir()
+        for value in (None, [], "d12", 12):
+            with self.subTest(value=value):
+                (dest / "config.json").write_text(
+                    json.dumps({"kiosk_sites": value, "kiosk_buildings": value}),
+                    encoding="utf-8")
+                loaded = gallery.Config.load(dest)
+                self.assertEqual({}, loaded.kiosk_sites)
+                self.assertEqual({}, loaded.kiosk_buildings)
+
     def test_a_config_written_before_the_kiosk_counts(self):
         # Absent is on. Every checkout is in this state the first time the
         # field ships, and none of them should go quiet.
@@ -3071,6 +3109,27 @@ class KioskManifestTests(GalleryTestCase):
         for name in ("kiosk.html", "kiosk.json"):
             with self.subTest(file=name):
                 self.assertTrue((self.dest / name).is_file())
+
+    def test_the_manifest_carries_a_build_that_only_code_moves(self):
+        # docs/plans/kiosk-mac.md §1.2: an unattended kiosk reloads when this
+        # changes and only joins new entries when it does not, so a render of
+        # new rows over the same code must leave it where it was, and a change
+        # to the page's own script must move it.
+        build = self.manifest()["build"]
+        self.assertRegex(build, r"^[0-9a-f]{12}$")
+        add_child(self.conn, self.tmp, self.ids[0], state="published")
+        self.render()
+        self.assertEqual(build, self.manifest()["build"])
+        real = gallery.ASSET_DIR
+        fake = self.tmp / "assets-moved"
+        shutil.copytree(real, fake)
+        (fake / "kiosk.js").write_text(
+            (real / "kiosk.js").read_text(encoding="utf-8") + "\n", encoding="utf-8")
+        try:
+            gallery.ASSET_DIR = fake
+            self.assertNotEqual(build, gallery._kiosk_build())
+        finally:
+            gallery.ASSET_DIR = real
 
     def test_render_index_alone_writes_them_too(self):
         # render_all is render_index plus the entry directories; a node that
