@@ -1161,12 +1161,20 @@ class HarnessTests(PaidTestCase):
     def failed(self, result):
         return {row["check"]: row for row in result["checks"] if not row["ok"]}
 
-    def test_preflight_names_the_missing_registration_and_whose_fix_it_is(self):
+    def test_preflight_passes_a_name_that_start_registers(self):
+        # 2026-09-24: a model's first preflight said NOT READY, exit 3, over the
+        # one thing `start` does for itself, and the stop rule said to stop.
         result = self.preflight()
-        self.assertFalse(result["ready"])
-        row = self.failed(result)["registered"]
-        self.assertEqual(row["who"], "you")
-        self.assertEqual(row["fix"], "sketchgen paid models add claude-sonnet-5")
+        self.assertTrue(result["ready"], result["checks"])
+        row = {r["check"]: r for r in result["checks"]}["registered"]
+        self.assertTrue(row["ok"])
+        self.assertNotIn("fix", row)
+        self.assertIn("not registered yet — `paid start` registers it", row["detail"])
+        # it reports, it does not register: that is still start's to do
+        self.assertFalse(models.is_paid("claude-sonnet-5", self.conn))
+        db.set_paid_models(self.conn, ["claude-sonnet-5"])
+        row = {r["check"]: r for r in self.preflight()["checks"]}["registered"]
+        self.assertIn("claude-sonnet-5 is a registered paid model", row["detail"])
 
     def test_preflight_is_ready_when_everything_is(self):
         db.set_paid_models(self.conn, ["claude-sonnet-5"])
@@ -1203,10 +1211,15 @@ class HarnessTests(PaidTestCase):
                 self.assertEqual(row["who"], "operator")
 
     def test_preflight_at_the_cli_exits_3_and_says_stop(self):
+        # No worker runs under the test: that is what it refuses, and the
+        # unregistered name beside it is a line of information, not a fix.
         result = self.cli("paid", "preflight", "--as", "claude-sonnet-5")
         self.assertEqual(result.returncode, 3)
         self.assertIn("NOT READY", result.stdout)
-        self.assertIn("paid models add claude-sonnet-5", result.stdout)
+        self.assertIn("FAIL worker", result.stdout)
+        self.assertIn("ok   registered  claude-sonnet-5 is not registered yet", result.stdout)
+        self.assertNotIn("paid models add", result.stdout)
+        self.assertIn("report what is the operator's, and stop", result.stdout)
 
     # -- per-job models ----------------------------------------------------------
 
