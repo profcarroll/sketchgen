@@ -1930,6 +1930,23 @@ class TryTests(AgentLoopTests):
         self.assertEqual([], db.paid_tries(self.conn)[job]["pending"])
         self.assertGreater(db.paid_leases(self.conn)[job]["until_utc"], was)
 
+    def test_a_try_on_a_child_is_held_to_the_floor_an_import_would_be(self):
+        # HARNESS_VERSION 6: the same --revises the attempt will get, so an
+        # agent that hands back the parent finds out here, for free.
+        parent_job = db.enqueue(self.conn, "the parent", "octocat", brief="b",
+                                assertions=["motion(idle)"])
+        where = self.jobs_dir / str(parent_job) / "attempt-1"
+        where.mkdir(parents=True, exist_ok=True)
+        (where / "sketch.js").write_text("function setup(){}\n", encoding="utf-8")
+        entry = db.create_entry(self.conn, parent_job, prompt="the parent",
+                                attempts=1, source_dir=str(where))
+        job = self.leased(parent_entry_id=entry)
+        gate = self.gate()
+        self.drive(self.worker(gate_fn=gate), job)
+        self.assertEqual(str(where / "sketch.js"), gate.calls[0]["revises"])
+        self.assertEqual(worker.REVISION_MIN_LINES_DEFAULT,
+                         gate.calls[0]["revision_min_lines"])
+
     def test_a_try_writes_the_ghost_script_the_candidate_carried(self):
         # The same free ride the import gets: a try is executor.run(stub=…)
         # too, so an agent can see its own script land before it commits to

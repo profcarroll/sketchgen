@@ -4,6 +4,9 @@ A drop-in subcommand (see sketchgen/cli/__init__.py). Two `meta` rows govern
 the mechanism packet 17 added (docs/plans/child-source.md): `executor_source`,
 which chooses whether an attempt is given the sketch it is revising, and
 `source_max_chars`, the length over which a sketch is named rather than shown.
+A third, `revision_min_lines` (HARNESS_VERSION 6, 2026-09-24), is what came of
+giving it: the lines of code a child's attempt must change from its parent
+before the gate calls it a revision, 0 for no floor at all.
 
 This verb exists because AGENTS.md rule 4 has no exception for a one-row
 setting: `MEASURE[source-follow]` is two batches of the same ten parents with
@@ -55,6 +58,8 @@ def _state(conn: sqlite3.Connection) -> dict:
         "executor_source_set": raw,
         "source_max_chars": worker.source_max_chars(conn),
         "source_max_chars_set": db.get_meta(conn, worker.SOURCE_MAX_CHARS_KEY),
+        "revision_min_lines": worker.revision_min_lines(conn),
+        "revision_min_lines_set": db.get_meta(conn, worker.REVISION_MIN_LINES_KEY),
     }
 
 
@@ -69,6 +74,12 @@ def cmd_executor_source(args: argparse.Namespace) -> int:
             print("refused: --max-chars must be positive", file=sys.stderr)
             return EXIT_REFUSED
         db.set_meta(conn, worker.SOURCE_MAX_CHARS_KEY, str(args.max_chars))
+    if args.revision_min_lines is not None:
+        if args.revision_min_lines < 0:
+            print("refused: --revision-min-lines must be 0 (no floor) or more",
+                  file=sys.stderr)
+            return EXIT_REFUSED
+        db.set_meta(conn, worker.REVISION_MIN_LINES_KEY, str(args.revision_min_lines))
     state = _state(conn)
     if args.json:
         print(json.dumps(state, indent=2, sort_keys=True))
@@ -77,6 +88,10 @@ def cmd_executor_source(args: argparse.Namespace) -> int:
           + ("" if state["executor_source_set"] else "  (unset; the default)"))
     print(f"source_max_chars: {state['source_max_chars']}"
           + ("" if state["source_max_chars_set"] else "  (unset; the default)"))
+    print(f"revision_min_lines: {state['revision_min_lines']}"
+          + ("  (off: a child is gated like any job)"
+             if state["revision_min_lines"] == 0 else "")
+          + ("" if state["revision_min_lines_set"] else "  (unset; the default)"))
     return EXIT_OK
 
 
@@ -94,9 +109,12 @@ def register(top: argparse._SubParsersAction) -> None:
             "control batch MEASURE[source-follow] compares against. "
             "`source_max_chars` is the length over which a sketch is named in "
             "one line instead of shown, because a model handed half a sketch "
-            "rewrites the half it cannot see. With no options, prints both. "
-            "The worker reads them at the top of every attempt: no restart, "
-            "no deploy, and no job in flight is changed."
+            "rewrites the half it cannot see. `revision_min_lines` is the "
+            "lines of code a child's attempt must change from its parent "
+            "before the gate's `revised` passes; 0 turns it off. With no "
+            "options, prints all three. The worker reads them at the top of "
+            "every attempt: no restart, no deploy, and no job in flight is "
+            "changed."
         ),
     )
     parser.add_argument(
@@ -115,6 +133,13 @@ def register(top: argparse._SubParsersAction) -> None:
         type=int,
         metavar="N",
         help=f"set source_max_chars (default {worker.SOURCE_MAX_CHARS_DEFAULT})",
+    )
+    parser.add_argument(
+        "--revision-min-lines",
+        type=int,
+        metavar="N",
+        help=("set revision_min_lines: lines of code a child must change from "
+              f"its parent (default {worker.REVISION_MIN_LINES_DEFAULT}; 0 is off)"),
     )
     parser.add_argument("--json", action="store_true", help="print JSON")
     parser.set_defaults(func=cmd_executor_source, _parser=parser)

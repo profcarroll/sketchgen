@@ -180,6 +180,34 @@
     },
     "notes": "The reverse of good-webgl-2d-buffer: a 2D sketch that renders one solid into a WEBGL createGraphics() buffer. Before the fix uses(webgl) passed on the buffer's renderer and size(640,480) read the buffer's 200x200. uses(webgl) is expected to miss here, and assertion_detail pins why: a miss that said \"unreadable\" would be the right verdict for the wrong reason."
   },
+  "bad-revision-unchanged": {
+    "exit": 1,
+    "revises": "good-motion/sketch.js",
+    "checks": {
+      "console_clean": true,
+      "is_looping": true,
+      "frame_advancing": true,
+      "sound_lib_ok": null,
+      "audio_context_running": null,
+      "frame_budget": true,
+      "revised": false
+    },
+    "notes": "HARNESS_VERSION 6 (2026-09-24): good-motion handed back as its own revision, with every comment rewritten, the spacing changed and one number moved. One line of code differs, under the floor of five, so revised is false and the run fails though the sketch works: 27 of the first 156 children given their parent's source returned it unchanged (job 1653 returned entry 1531 byte for byte), and 8 more moved a number or two."
+  },
+  "good-revision": {
+    "exit": 0,
+    "revises": "good-motion/sketch.js",
+    "checks": {
+      "console_clean": true,
+      "is_looping": true,
+      "frame_advancing": true,
+      "sound_lib_ok": null,
+      "audio_context_running": null,
+      "frame_budget": true,
+      "revised": true
+    },
+    "notes": "The other side of bad-revision-unchanged: good-motion with a ring that swells around each disc, seven lines of code changed or added. revised is true and the run passes exactly as good-motion does."
+  },
   "assertions_expected": {
     "ghost-echo": {
       "no_motion": true

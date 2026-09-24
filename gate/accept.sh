@@ -2,7 +2,7 @@
 # accept.sh -- the ACCEPT harness for the sketch gate (packet 1.2).
 #
 # For every fixtures/<name>/ directory it runs sketch_gate.py --json, compares
-# the exit code and the six fixed checks against fixtures/expected.json, then
+# the exit code and the fixed checks against fixtures/expected.json, then
 # runs the assertions listed in expected.json["assertions_expected"] for that
 # fixture and compares their pass/fail.  One line per fixture, PASS or
 # MISMATCH with what differed, a summary, and a non-zero exit on any mismatch.
@@ -15,6 +15,10 @@
 # An optional "ghost" object is compared the same way, key by key, against
 # report.json's own: ghost-echo uses it to say that the gate played the
 # sketch's own script and played all of it (auto-mouse.md section 5).
+#
+# An optional "revises" names a sketch.js, relative to the fixtures directory,
+# that the fixture revises: the plain run gets --revises with it, and "revised"
+# in the expected checks is compared like any other (HARNESS_VERSION 6).
 #
 # An optional "assertion_detail" object names, per assertion word, a substring
 # that word's detail line must contain.  The three image fixtures use it: they
@@ -64,7 +68,7 @@ expected = json.loads((fixtures / "expected.json").read_text())
 asserts_expected = expected.get("assertions_expected", {})
 
 CHECKS = ["console_clean", "is_looping", "frame_advancing",
-          "sound_lib_ok", "audio_context_running", "frame_budget"]
+          "sound_lib_ok", "audio_context_running", "frame_budget", "revised"]
 
 names = sorted(p.name for p in fixtures.iterdir()
                if p.is_dir() and (p / "index.html").is_file())
@@ -94,8 +98,12 @@ for name in names:
         return p, report, time.time() - t0
 
     # Run 1: fixed checks only.  expected.json's "exit" is the verdict of a
-    # plain run, so the assertions must not be in it.
-    p, report, took = run([], outroot / name)
+    # plain run, so the assertions must not be in it -- but a revision is
+    # still a revision of something, so --revises is.
+    plain = []
+    if want.get("revises"):
+        plain = ["--revises", str(fixtures / want["revises"])]
+    p, report, took = run(plain, outroot / name)
     if p.returncode == 3 or report is None:
         print("MISMATCH  %-24s gate refused or printed no JSON (exit %d): %s"
               % (name, p.returncode, p.stderr.strip()[:200]))

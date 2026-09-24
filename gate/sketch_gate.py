@@ -10,6 +10,7 @@ from.  Writes gate.png, strip.png, console.log and report.json into --out.
                            [--out DIR] [--timeout S] [--json]
                            [--frame-budget-ms MS] [--budget-s S]
                            [--keep-browser-log] [--no-ghost]
+                           [--revises FILE [--revision-min-lines N]]
 
 After all of that, and after every assertion has been decided, it plays a short
 pointer script through real chromium input and writes ghost.png -- four more
@@ -43,8 +44,9 @@ stated up front:
 
 Exit codes follow the delegate.py convention used elsewhere in this repo:
     0  every failable check passed and every requested assertion passed
-    1  console_clean, frame_advancing, sound_lib_ok, audio_context_running or
-       frame_budget reported false, or a requested assertion failed.
+    1  console_clean, frame_advancing, sound_lib_ok, audio_context_running,
+       frame_budget or (with --revises) revised reported false, or a requested
+       assertion failed.
        is_looping is a declaration, not a verdict, and never fails a run on its
        own.
     3  refused: no browser, unknown assertion word, unusable sketch directory
@@ -126,6 +128,31 @@ Four things it deliberately is not:
     outside the counted idle window, so timings.ms_per_frame is unchanged.
 
 --------------------------------------------------------------------------
+revised: A REVISION HAS TO CHANGE SOMETHING (2026-09-24)
+--------------------------------------------------------------------------
+Since 2026-09-21 the executor on a child job is handed its parent's sketch.js
+and asked to revise it.  Of the first 156 children made that way, 27 returned
+the parent unchanged and 37 changed fewer than five lines of code -- a loop
+bound, a speed -- and every one of them passed every check and went to a person
+as the revision the critic asked for.  Before the source was given, the fewest
+lines any of 1,001 children changed was 14.
+
+So --revises names the sketch.js this one revises, and the check `revised` is
+false when fewer than --revision-min-lines lines of code differ between the
+two.  Comments, blank lines and whitespace are not code: a sketch returned with
+its comments reworded is the same sketch.  A line counts once whether it was
+added, removed or rewritten.  The check reads source only, needs no browser,
+and is absent from a report the flag was not given to, because a sketch that
+revises nothing has no such question to answer.  It is failable, and the only
+failable check that is not about whether the page works: a visitor who meets
+a revision identical to the entry beside it has met a defect too.
+
+It cannot see whether the change is visible, and does not pretend to.  Five
+rewritten lines can be a new palette or a renamed variable.  It is a floor
+under the failure that happened, not a judgment of the revision, which is
+still a person's.
+
+--------------------------------------------------------------------------
 loads(image) AND THE PRELOAD WAIT (2026-09-22, docs/plans/media-assertion.md)
 --------------------------------------------------------------------------
 The network was always open -- p5 itself comes from cdnjs on every run -- and
@@ -162,6 +189,8 @@ import argparse
 import base64
 import binascii
 import datetime
+import difflib
+import hashlib
 import json
 import math
 import os
@@ -272,7 +301,15 @@ SKETCH_ORIGIN = "http://sketch.localhost"
 # it never fails a run on its own (spec 3.1: a sketch that calls noLoop() is
 # declaring itself static and the gate believes it).
 FAILABLE_CHECKS = ("console_clean", "frame_advancing", "sound_lib_ok",
-                   "audio_context_running", "frame_budget")
+                   "audio_context_running", "frame_budget", "revised")
+
+# The fewest lines of code a revision may change from the sketch it revises
+# (see "revised" in the module docstring).  Five is where the 156 children
+# gated between 2026-09-21 and 2026-09-24 divide: every one that changed fewer
+# was a number or two moved -- 1574 changed one loop bound, 200 to 300, for a
+# critique that asked for glowing coloured nodes -- and the smallest honest
+# revision among them, 1552's emerald ripple, changed exactly five.
+REVISION_MIN_LINES = 5
 
 # ---------------------------------------------------------------------------
 # The ghost pointer (2026-09-21, docs/plans/auto-mouse.md section 5)
@@ -792,6 +829,110 @@ INIT_JS = r"""
 # arguments
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# revised (2026-09-24): how much of a revision is new
+# ---------------------------------------------------------------------------
+
+
+def strip_js_comments(text):
+    """*text* with its // and /* */ comments removed and its strings intact.
+
+    A string is skipped whole, so the // in "https://..." is not a comment.
+    A block comment keeps its newlines, so line numbers still line up for a
+    person reading the two side by side.  A regular-expression literal is not
+    recognised: one with an unescaped // or /* in it would be cut short, on
+    both sides of the comparison alike, and no sketch in the corpus has one.
+    """
+    out = []
+    i, n = 0, len(text)
+    quote = None
+    while i < n:
+        c = text[i]
+        if quote:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            # A quote or apostrophe string cannot cross a line in JavaScript,
+            # so a stray one -- inside a regex literal, say -- costs the rest
+            # of its own line and not the rest of the file.
+            if c == quote or (c == "\n" and quote != "`"):
+                quote = None
+            i += 1
+            continue
+        if c in "\"'`":
+            quote = c
+            out.append(c)
+            i += 1
+            continue
+        if text.startswith("//", i):
+            end = text.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            stop = n if end < 0 else end + 2
+            out.append("\n" * text.count("\n", i, stop))
+            i = stop
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def code_lines(text):
+    """The lines of code in *text*: no comments, no blanks, no whitespace.
+
+    All whitespace goes, not just the ends: `x=1` and `x = 1` are one line of
+    code written two ways, and a reformat is not a revision.
+    """
+    lines = []
+    for line in strip_js_comments(text).splitlines():
+        squeezed = "".join(line.split())
+        if squeezed:
+            lines.append(squeezed)
+    return lines
+
+
+def lines_changed(before, after):
+    """How many lines of code differ between two lists from code_lines().
+
+    Each run of difference counts as its longer side, so a rewritten line is
+    one line, two lines added are two, and three lines replaced by one are
+    three: the size of the edit, not the sum of its two halves.
+    """
+    matcher = difflib.SequenceMatcher(None, before, after, autojunk=False)
+    return sum(max(i2 - i1, j2 - j1)
+               for tag, i1, i2, j1, j2 in matcher.get_opcodes() if tag != "equal")
+
+
+def revision_verdict(sketch_text, revises_text, min_lines):
+    """(passed, record, note) for a sketch against the sketch it revises."""
+    before = code_lines(revises_text)
+    after = code_lines(sketch_text)
+    changed = lines_changed(before, after)
+    passed = changed >= min_lines
+    record = {
+        "sha256": hashlib.sha256(revises_text.encode("utf-8")).hexdigest(),
+        "lines_before": len(before),
+        "lines_after": len(after),
+        "changed": changed,
+        "min": min_lines,
+    }
+    if changed == 0:
+        what = ("sketch.js is the sketch it revises, unchanged: not one line of "
+                "code differs from the %d it was given" % len(before))
+    else:
+        what = ("%d line%s of code differ%s from the sketch it revises (%d lines "
+                "of code before, %d after)"
+                % (changed, "" if changed == 1 else "s",
+                   "s" if changed == 1 else "", len(before), len(after)))
+    note = ("revised: %s; comments, blank lines and whitespace are not counted, "
+            "and a revision changes at least %d" % (what, min_lines))
+    return passed, record, note
+
+
 def parse_args(argv):
     ap = argparse.ArgumentParser(
         prog="sketch_gate.py",
@@ -816,6 +957,15 @@ def parse_args(argv):
                     help="skip the ghost window: play no pointer script and write "
                          "no ghost.png. Nothing it does can fail a run either way; "
                          "this is for a plain run that wants the old wall cost")
+    ap.add_argument("--revises", default=None, metavar="FILE",
+                    help="the sketch.js this sketch revises: adds the failable check "
+                         "`revised`, false when fewer than --revision-min-lines lines "
+                         "of code differ from it")
+    ap.add_argument("--revision-min-lines", type=int, default=REVISION_MIN_LINES,
+                    metavar="N",
+                    help="lines of code a revision must change from --revises "
+                         "(default %d; comments and whitespace are not code)"
+                         % REVISION_MIN_LINES)
     ap.add_argument("--json", action="store_true", help="print report.json to stdout as well")
     ap.add_argument("--keep-browser-log", action="store_true",
                     help="also write <out>/browser.log: the chromium build, the launch "
@@ -1680,6 +1830,25 @@ def main(argv=None):
             pass
     references_sound = bool(SOUND_RE.search(source))
 
+    # revised: source against source, before any browser work, and refused
+    # rather than guessed at when the sketch it revises cannot be read -- a
+    # caller that names a file is saying there is a comparison to make.
+    revision = None
+    if a.revises is not None:
+        if a.revision_min_lines < 1:
+            refuse("--revision-min-lines must be at least 1; to ask nothing of a "
+                   "revision, leave --revises out")
+        try:
+            revises_text = pathlib.Path(a.revises).expanduser().read_text(
+                encoding="utf-8", errors="replace")
+            sketch_text = sketch_js.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            refuse("cannot read --revises %s (%s)" % (a.revises, e))
+        passed, record, note = revision_verdict(sketch_text, revises_text,
+                                                a.revision_min_lines)
+        record["of"] = tilde(str(pathlib.Path(a.revises).expanduser()))
+        revision = {"passed": passed, "record": record, "note": note}
+
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
@@ -1698,6 +1867,11 @@ def main(argv=None):
         "audio_context_running": None,
         "frame_budget": None,
     }
+    # Only when asked: a sketch that revises nothing has no `revised` to be,
+    # not even null, and a plain run's report is the shape it always was.
+    if revision is not None:
+        checks["revised"] = revision["passed"]
+        notes.append(revision["note"])
     assertions = {}
     rec = Recorder()
     res = ResourceLog()
@@ -1972,7 +2146,7 @@ def main(argv=None):
 
     # is_looping is deliberately absent from FAILABLE_CHECKS: a sketch that
     # calls noLoop() declares itself static and the gate believes it.
-    failed = any(checks[k] is False for k in FAILABLE_CHECKS) \
+    failed = any(checks.get(k) is False for k in FAILABLE_CHECKS) \
         or any(not v["pass"] for v in assertions.values())
     code = 1 if failed else 0
 
@@ -2019,6 +2193,9 @@ def main(argv=None):
         "ghost": ({key: ghost[key] for key in
                    ("source", "script", "events", "played", "ms")}
                   if ghost is not None else None),
+        # What `revised` was measured against and what it counted: null on a
+        # run without --revises and on every report written before 2026-09-24.
+        "revision": revision["record"] if revision is not None else None,
         "artefacts": artefacts,
         "exit": code,
     }

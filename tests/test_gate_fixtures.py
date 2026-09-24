@@ -96,9 +96,20 @@ from sketchgen import executor, ghostshim  # noqa: E402
 #: previous value, which is the one the node and the course repo carry until
 #: this is deployed, was
 #: 4fac3c1635269d408cc74ffd3ad02c5c2b42316e0edcb4fdf31a921ebb779925.
-GATE_SHA256 = "f5991aacb816ed674afcb47b42811d50bf24d29f9cf69ff8cd59c435694eb540"
+#:
+#: Changed 2026-09-24 by `revised` (HARNESS_VERSION 6): since the executor on a
+#: child job was handed its parent's sketch.js, 27 of the first 156 children
+#: returned it unchanged and 8 more moved a number or two, and every one passed.
+#: With --revises naming the parent, the gate counts the lines of code that
+#: differ (comments and whitespace are not code) and fails `revised` under
+#: --revision-min-lines, 5 by default. Source against source, before any
+#: browser work; a run without the flag writes the report it always did, plus
+#: `"revision": null`. The previous value, which is the one the node and the
+#: course repo carry until this is deployed, was
+#: f5991aacb816ed674afcb47b42811d50bf24d29f9cf69ff8cd59c435694eb540.
+GATE_SHA256 = "916e2ab274f634e2103b6f12ee3ba9486b3c1ad4261b2f360f4d182066e2c25b"
 
-#: How long the fourteen fixtures are allowed to take together. On the node a
+#: How long the sixteen fixtures are allowed to take together. On the node a
 #: single gate run is about four seconds and the harness does twenty-four of
 #: them — except bad-frame-budget, which is a third of a second a frame by
 #: design and costs tens of seconds before the budget stops it. That fixture is
@@ -107,7 +118,8 @@ GATE_SHA256 = "f5991aacb816ed674afcb47b42811d50bf24d29f9cf69ff8cd59c435694eb540"
 #: that asserts loads(image) will wait out the whole 60 s timeout for a canvas
 #: if that host is having a bad morning. The three createGraphics fixtures
 #: (2026-09-24) add six ordinary runs and did not move it: all fourteen took
-#: 82 s on the laptop.
+#: 82 s on the laptop. The two revision fixtures (the same day) add two plain
+#: runs of good-motion's weight: all sixteen took 94 s on the laptop.
 ACCEPT_TIMEOUT_S = 1200
 
 
@@ -919,3 +931,137 @@ class GhostWindowTests(unittest.TestCase):
     def test_the_ghost_window_can_be_turned_off(self):
         self.assertTrue(self.gate.parse_args(["dir"]).ghost)
         self.assertFalse(self.gate.parse_args(["dir", "--no-ghost"]).ghost)
+
+
+class RevisionTests(unittest.TestCase):
+    """`revised` (HARNESS_VERSION 6): how much of a revision is new.
+
+    Pure source work, so all of it runs here; `bad-revision-unchanged` and
+    `good-revision` are what prove the check fails and passes a real run.
+    """
+
+    SKETCH = (
+        "// drifting discs\n"
+        "let t = 0;\n"
+        "function setup() {\n"
+        "  createCanvas(400, 400);\n"
+        "}\n"
+        "function draw() {\n"
+        "  background(20);\n"
+        "  t += 0.02;\n"
+        "  for (let i = 0; i < 200; i++) {\n"
+        "    ellipse(200 + 100 * sin(t + i), 200, 8, 8);\n"
+        "  }\n"
+        "}\n"
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        cls.gate = _gate_module()
+
+    def changed(self, after, before=None):
+        gate = self.gate
+        return gate.lines_changed(gate.code_lines(before or self.SKETCH),
+                                  gate.code_lines(after))
+
+    def test_revised_is_failable_and_the_floor_is_five(self):
+        self.assertIn("revised", self.gate.FAILABLE_CHECKS)
+        self.assertEqual(5, self.gate.REVISION_MIN_LINES)
+        self.assertEqual(5, self.gate.parse_args(["dir"]).revision_min_lines)
+        self.assertIsNone(self.gate.parse_args(["dir"]).revises)
+
+    def test_the_same_sketch_changes_nothing(self):
+        self.assertEqual(0, self.changed(self.SKETCH))
+
+    def test_comments_blank_lines_and_spacing_are_not_code(self):
+        reworded = (self.SKETCH.replace("// drifting discs", "// discs, adrift")
+                    .replace("  t += 0.02;", "  t+=0.02;   /* the clock */")
+                    .replace("function draw() {", "\n\nfunction draw()  {"))
+        self.assertEqual(0, self.changed(reworded))
+
+    def test_entry_1574_one_loop_bound_is_one_line(self):
+        # 200 -> 300 was the whole of entry 1574's revision of 1424, for a
+        # critique that asked for glowing, coloured intersection nodes.
+        self.assertEqual(1, self.changed(self.SKETCH.replace("200;", "300;")))
+
+    def test_a_rewritten_line_counts_once_and_an_added_one_once(self):
+        after = self.SKETCH.replace(
+            "    ellipse(200 + 100 * sin(t + i), 200, 8, 8);\n",
+            "    let r = 8 + 4 * sin(t * 3 + i);\n"
+            "    fill(255, 200, 80);\n"
+            "    ellipse(200 + 100 * sin(t + i), 200, r, r);\n",
+        )
+        self.assertEqual(3, self.changed(after))
+
+    def test_removing_code_is_changing_it(self):
+        # "Revise: try again, no circles" is a revision by deletion.
+        after = self.SKETCH.replace(
+            "  for (let i = 0; i < 200; i++) {\n"
+            "    ellipse(200 + 100 * sin(t + i), 200, 8, 8);\n"
+            "  }\n", "")
+        self.assertEqual(3, self.changed(after))
+
+    def test_a_url_in_a_string_is_not_a_comment(self):
+        before = 'let u = "https://example.org/a.png";\n'
+        after = 'let u = "https://example.org/b.png";\n'
+        self.assertEqual(['letu="https://example.org/a.png";'],
+                         self.gate.code_lines(before))
+        self.assertEqual(1, self.changed(after, before))
+
+    def test_a_stray_quote_costs_its_own_line_and_no_more(self):
+        # A regex literal with an apostrophe in it is not a string, and this
+        # file does not parse regexes; the damage stops at the newline.
+        text = "let r = /'/;\nlet a = 1; // one\nlet b = 2;\n"
+        self.assertEqual(["letr=/'/;", "leta=1;", "letb=2;"],
+                         self.gate.code_lines(text))
+
+    def test_a_template_literal_may_cross_lines(self):
+        text = "let s = `line one // not a comment\nline two`;\nlet a = 1;\n"
+        self.assertEqual(["lets=`lineone//notacomment", "linetwo`;", "leta=1;"],
+                         self.gate.code_lines(text))
+
+    def test_the_verdict_record_and_note(self):
+        passed, record, note = self.gate.revision_verdict(self.SKETCH, self.SKETCH, 5)
+        self.assertFalse(passed)
+        self.assertEqual(0, record["changed"])
+        self.assertEqual(5, record["min"])
+        self.assertEqual(hashlib.sha256(self.SKETCH.encode("utf-8")).hexdigest(),
+                         record["sha256"])
+        # The worker files a note under the check whose name it contains, and
+        # the executor reads it verbatim.
+        self.assertTrue(note.startswith("revised: sketch.js is the sketch it "
+                                        "revises, unchanged"))
+        self.assertIn("at least 5", note)
+
+        after = self.SKETCH.replace("200;", "300;")
+        passed, record, note = self.gate.revision_verdict(after, self.SKETCH, 1)
+        self.assertTrue(passed)
+        self.assertIn("1 line of code differs", note)
+
+    def test_a_revises_that_cannot_be_read_is_refused_before_any_browser(self):
+        # Refused, exit 3, and before the playwright import — so this runs
+        # on a laptop with no venv and proves the order.
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as caught:
+                self.gate.main([str(FIXTURES / "good-motion"), "--out", tmp,
+                                "--revises", str(Path(tmp) / "missing.js")])
+            self.assertEqual(3, caught.exception.code)
+
+    def test_a_floor_under_one_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(SystemExit) as caught:
+                self.gate.main([str(FIXTURES / "good-motion"), "--out", tmp,
+                                "--revises", str(FIXTURES / "good-motion" / "sketch.js"),
+                                "--revision-min-lines", "0"])
+            self.assertEqual(3, caught.exception.code)
+
+    def test_the_two_fixtures_sit_either_side_of_the_floor(self):
+        base = (FIXTURES / "good-motion" / "sketch.js").read_text(encoding="utf-8")
+        expected = json.loads((FIXTURES / "expected.json").read_text(encoding="utf-8"))
+        for name, want in (("bad-revision-unchanged", False), ("good-revision", True)):
+            self.assertEqual("good-motion/sketch.js", expected[name]["revises"])
+            self.assertIs(want, expected[name]["checks"]["revised"])
+            passed, _record, _note = self.gate.revision_verdict(
+                (FIXTURES / name / "sketch.js").read_text(encoding="utf-8"), base,
+                self.gate.REVISION_MIN_LINES)
+            self.assertIs(want, passed, name)
