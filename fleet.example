@@ -1,0 +1,8 @@
+# ~/.config/sketchgen/fleet — the nodes bin/fleet knows (docs/plans/fleet.md).
+# One per line: name, ssh host, and optionally the tunnel's local port and
+# `billing` for a node on OCI. Only the first two are read by bin/fleet today.
+#
+# name      ssh host               port  flags
+sld-cloud   sld-cloud              8081  billing
+d12         d12-node-profcarroll   8082
+d12-flux    d12-node-flux          8084

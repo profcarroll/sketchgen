@@ -124,6 +124,11 @@ button.danger { color: var(--bad); }
 .pill.warn { border-color: var(--warn); color: var(--warn); }
 .pill.bad { border-color: var(--bad); color: var(--bad); }
 .pill.quiet { border-color: var(--line); color: var(--dim); }
+/* The build chip (fleet.md §1.6): a sha is not a word, so no capitals, and it
+   is a link to /build rather than a label. */
+a.pill.build { text-transform: none; letter-spacing: 0; text-decoration: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-weight: 500; }
+pre.build { white-space: pre-wrap; margin: 0 0 10px; font-size: 13px; }
 /* The batch tray: the second row of the sticky header, on /held and nowhere
    else. It is one <form>, and every toggle and box on every card below joins it
    by form="held-batch", so the cards stay siblings in the grid and the page has
@@ -532,6 +537,7 @@ button.link:hover { border: 0; }
 <header class="top">
   <nav><span class="brand">sketchgen</span>$nav</nav>
   <div class="control">
+    $build_chip
     <span class="pill $pill_class" id="worker-pill" title="$pill_title">$pill_text</span>
     <form method="post" action="/control">
       <input type="hidden" name="back" value="$back">

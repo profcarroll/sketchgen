@@ -125,6 +125,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable, Iterable, NamedTuple
 
+from sketchgen import build
 from sketchgen import db
 from sketchgen import executor
 from sketchgen import lineage
@@ -1093,6 +1094,161 @@ def nav_html(here: str, summary: dict[str, Any]) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# The build chip and /build (docs/plans/fleet.md §1.6)
+# ---------------------------------------------------------------------------
+
+#: How often this process asks GitHub whether main has moved. Every node is on
+#: the tunnel's schedule rather than anyone's attention: sld-cloud reported
+#: itself up to date four PRs behind main on 2026-09-24 because nothing on it
+#: had fetched since its last deploy.
+BUILD_FETCH_S = float(os.environ.get("SKETCHGEN_BUILD_FETCH_S") or 900)
+#: How long one reading of the checkout is reused. A reading is a dozen git
+#: calls and a systemctl; every page draws the chip, and the operator clicking
+#: through five pages should not pay for it five times.
+BUILD_TTL_S = 30.0
+
+
+class BuildWatch:
+    """The web process's view of its own build, and the fetch that keeps it
+    current. One per server; none under ``--once-for-test``, so the suite never
+    runs git against the checkout it is testing or touches the network."""
+
+    def __init__(self, root: Path, db_path: str) -> None:
+        self.root = root
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self.fetch_error: str | None = None
+        self._doc: dict[str, Any] | None = None
+        self._at = 0.0
+
+    def reading(self, fresh: bool = False) -> dict[str, Any] | None:
+        with self.lock:
+            stale = time.monotonic() - self._at > BUILD_TTL_S
+            if fresh or self._doc is None or stale:
+                try:
+                    doc = build.reading(self.root, self.db_path)
+                except Exception as exc:  # noqa: BLE001 - never take the page down
+                    sys.stderr.write(f"{db.utc_now()} build reading failed: {exc}\n")
+                    return self._doc
+                doc["upstream"]["fetch_error"] = self.fetch_error
+                self._doc, self._at = doc, time.monotonic()
+            return self._doc
+
+    def check(self) -> str | None:
+        """Fetch main now; None on success, else why not."""
+        self.fetch_error = build.fetch(self.root)
+        self.reading(fresh=True)
+        return self.fetch_error
+
+    def start(self, every_s: float = BUILD_FETCH_S) -> None:
+        def loop() -> None:
+            while True:
+                try:
+                    self.check()
+                except Exception as exc:  # noqa: BLE001 - a daemon thread must not die
+                    sys.stderr.write(f"{db.utc_now()} build fetch failed: {exc}\n")
+                time.sleep(every_s)
+
+        threading.Thread(target=loop, name="build-fetch", daemon=True).start()
+
+
+#: Set by :func:`serve`; None under test and wherever nothing started it, and
+#: then the header simply has no chip.
+BUILD_WATCH: BuildWatch | None = None
+
+
+def build_chip(doc: dict[str, Any] | None) -> tuple[str, str, str] | None:
+    """The header's build chip: (text, css class, tooltip), or None.
+
+    One chip, the most important thing first. Red is a node that cannot be
+    trusted to be what it says (hand edits, a foreign branch, a process on
+    older code than its checkout); amber is an update waiting; quiet is on
+    target, which includes a pin — a pinned node is behind main on purpose.
+    """
+    if not doc or not doc["checkout"].get("sha"):
+        return None
+    here, target, up, rel = doc["checkout"], doc["target"], doc["upstream"], doc["main"]
+    sha = build.short(here["build"])
+    looked = up.get("fetched_utc") or "never"
+    if up.get("fetch_error"):
+        looked += f"; the last check failed: {up['fetch_error']}"
+    problems = doc.get("problems") or []
+
+    def first(fragment: str) -> str | None:
+        return next((p for p in problems if fragment in p), None)
+
+    if here.get("dirty"):
+        return "dirty", "bad", f"{sha}: tracked files changed on this node; update.sh refuses"
+    if here.get("branch") and here["branch"] != "main":
+        return (f"on {here['branch']}", "bad",
+                f"{sha} is on branch {here['branch']}; update.sh refuses anything but main")
+    if target["kind"] == "main" and rel.get("on_main") is False:
+        return "not on main", "bad", f"{sha} is not a commit on main"
+    if target["kind"] == "pin" and here["sha"] != target["sha"]:
+        return ("off pin", "bad",
+                f"pinned to {build.short(target['sha'])} but the checkout is {sha}")
+    restart = first("restart pending")
+    if restart:
+        return "restart pending", "bad", restart
+    if first("an update is running"):
+        return "updating", "warn", "sketchgen-update is running on this node"
+    if target["kind"] == "main" and rel.get("behind"):
+        n = rel["behind"]
+        return (f"{n} behind", "warn",
+                f"update available: main is {n} PR{'s' if n != 1 else ''} ahead of "
+                f"{sha} (checked {looked})")
+    if target["kind"] == "pin":
+        why = f' — {target["reason"]}' if target.get("reason") else ""
+        ahead = f"; main is {rel['behind']} PRs ahead" if rel.get("behind") else ""
+        return f"pinned {sha}", "quiet", f"pinned{why}{ahead} (checked {looked})"
+    unrecorded = first("unrecorded")
+    if unrecorded:
+        return f"{sha} ?", "warn", unrecorded
+    return sha, "quiet", f"on main (checked {looked})"
+
+
+def build_chip_html() -> str:
+    chip = build_chip(BUILD_WATCH.reading()) if BUILD_WATCH is not None else None
+    if chip is None:
+        return ""
+    text, css, tooltip = chip
+    return (f'<a class="pill build {esc(css)}" href="/build" title="{esc(tooltip)}">'
+            f'{esc(text)}</a>')
+
+
+def build_page(doc: dict[str, Any] | None, root: Path | None) -> str:
+    """/build: the reading, the PRs between here and main, and Check now."""
+    if doc is None:
+        return ('<section class="card"><h2>Build</h2><p class="dim">This process '
+                'is not watching its build (it was started for a test).</p></section>')
+    here, target, up = doc["checkout"], doc["target"], doc["upstream"]
+    parts = [
+        '<section class="card"><h2>Build</h2>',
+        f'<pre class="build">{esc(build.render(doc))}</pre>',
+        '<form method="post" action="/build/check">'
+        '<button type="submit" title="git fetch origin main — nothing on this node '
+        'moves">Check now</button></form>',
+        '</section>',
+    ]
+    main = up.get("sha")
+    if root is not None and here.get("sha") and main and doc["main"].get("behind"):
+        pending = build.commits(root, here["sha"], main)
+        label = ("On main since this node's pin" if target["kind"] == "pin"
+                 else "Waiting to be deployed here")
+        items = "".join(
+            f'<li><code>{esc(c["sha"][:7])}</code> '
+            + (f'#{esc(c["pr"])} ' if c["pr"] else "")
+            + f'{esc(c["title"])}</li>'
+            for c in pending
+        )
+        parts.append(f'<section class="card"><h2>{esc(label)}</h2><ul>{items}</ul>'
+                     '<p class="dim">Deploy from the laptop: <code>bin/fleet update '
+                     'NODE</code>, which runs <code>update.sh</code> here as the '
+                     '<code>sketchgen-update</code> unit.</p></section>')
+    return "".join(parts)
+
+
 def layout(
     *,
     title: str,
@@ -1128,6 +1284,7 @@ def layout(
         pill_text=esc(text),
         pill_class=esc(css),
         pill_title=esc(tooltip),
+        build_chip=build_chip_html(),
         back=esc(back),
         pause_dis=" disabled" if state != "running" else "",
         stop_dis=" disabled" if (state == "paused" or stop_now) else "",
@@ -6610,6 +6767,8 @@ ROUTES: list[tuple[str, re.Pattern[str], str]] = [
         "post_submission_decline",
     ),
     ("POST", re.compile(r"^/control$"), "post_control"),
+    ("GET", re.compile(r"^/build$"), "page_build"),
+    ("POST", re.compile(r"^/build/check$"), "post_build_check"),
     ("GET", re.compile(r"^/preview/(?P<job_id>\d+)/(?P<n>\d+)$"), "preview_slash"),
     (
         "GET",
@@ -7335,6 +7494,43 @@ class OpHandler(BaseHTTPRequestHandler):
             conn.close()
         self.redirect(back, message)
 
+    def page_build(self) -> None:
+        conn = self.app.connect()
+        try:
+            control = db.get_control(conn)
+            marks = nav_summary(conn)
+        finally:
+            conn.close()
+        watch = BUILD_WATCH
+        body = build_page(watch.reading() if watch else None,
+                          watch.root if watch else None)
+        self.html(
+            layout(
+                title="Build",
+                here="/build",
+                body=body,
+                control=control,
+                back="/build",
+                flash=self.flash(),
+                nav_marks=marks,
+            )
+        )
+
+    def post_build_check(self) -> None:
+        self.form()
+        watch = BUILD_WATCH
+        if watch is None:
+            self.redirect("/build", "refused: this process is not watching its build")
+            return
+        error = watch.check()
+        doc = watch.reading() or {}
+        chip = build_chip(doc)
+        if error:
+            message = f"refused: could not reach GitHub — {error}"
+        else:
+            message = f"Checked: {chip[2] if chip else 'no checkout here'}"
+        self.redirect("/build", message)
+
     def serve_job_file(self, rest: str) -> None:
         root = self.app.jobs_root
         try:
@@ -7452,6 +7648,7 @@ def serve(
     timeout_s: float = ONCE_TIMEOUT_S,
 ) -> int:
     """Run the UI. ``once_for_test`` serves until POST /_quit or ``timeout_s``."""
+    global BUILD_WATCH
     server = make_server(
         bind=bind,
         port=port,
@@ -7460,6 +7657,19 @@ def serve(
         once_for_test=once_for_test,
     )
     app: App = server.app  # type: ignore[attr-defined]
+    if not once_for_test and build.ROOT is not None:
+        # fleet.md §1.2 and §1.6: say which build this process is, and start
+        # looking for a newer main. Never under test: see BuildWatch.
+        try:
+            conn = app.connect()
+            try:
+                build.stamp_running(conn, "web")
+            finally:
+                conn.close()
+        except sqlite3.Error as exc:
+            sys.stderr.write(f"{db.utc_now()} could not stamp the web build: {exc}\n")
+        BUILD_WATCH = BuildWatch(build.ROOT, app.db_path)
+        BUILD_WATCH.start()
     where = f"http://{bind}:{server.server_port}/"
     sys.stderr.write(
         f"{db.utc_now()} sketchgen web listening on {where} "
