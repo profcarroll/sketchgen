@@ -46,6 +46,9 @@ quits any Chrome started by hand; and waits until the page's title shows up.
 
 ## Afterwards
 
+The D12 Mac's particulars, how to reach its screen, and the traps met setting it up are in
+[`docs/OPERATIONS.md`](../docs/OPERATIONS.md) → *The D12 kiosk Mac*.
+
 | to | do |
 | --- | --- |
 | see it | `ssh d12-kiosk kiosk-status` |
