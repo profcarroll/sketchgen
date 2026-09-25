@@ -371,5 +371,11 @@ worker and web, resume. `bin/fleet status` says which build every node is on
   `is_looping`, `frame_advancing`, `uses(webgl)` and `size` on every report
   for a sketch that made a buffer are the buffer's: 92 entries, all but one
   reading `is_looping` false (job 1542, 2026-09-24; `gate/README.md`).
+- **Ollama's runner is called `llama-server`.** Ollama 0.34 runs its model as
+  `/usr/local/lib/ollama/llama-server`, the same name as the D12 pair's pool
+  (`docs/plans/pooled-pair.md`). Tell them apart by path, never by name:
+  `pgrep -x llama-server` or `pkill llama-server` on the node hits Ollama's
+  runner too, and until 2026-09-25 the Console read an idle judge's runner as
+  a stranger holding the slot. `sketchgen.pair.classify` is the one test.
 - Match the house style: comments say *why*, with the incident or date that
   made it necessary; commit messages are prose, not bullet lists.
