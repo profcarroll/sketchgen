@@ -39,7 +39,7 @@ ss "network time"                  -setusingnetworktime on    -getusingnetworkti
 # wall's account only. The drop-in sorts before macOS's own 100-macos.conf because sshd keeps
 # the first value it reads for each keyword.
 D=/etc/ssh/sshd_config.d; F=$D/010-sketchgen-kiosk.conf; M=/etc/ssh/sshd_config
-# macOS before Ventura ships no drop-in directory and no Include line (the D12 Mac, 2026-09-24).
+# The D12 Mac (macOS 15.8, 2026-09-24) shipped with no drop-in directory and no Include line.
 # Add the line Ventura has, at the top so the drop-in's values come first, keeping the original
 # beside it. A macOS upgrade may put the stock file back; the probe shows whether the line is there.
 added=
