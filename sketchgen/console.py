@@ -16,6 +16,10 @@ What it reads, all of it read-only and none of it needing sudo:
   os.statvfs("/")   disk, plus a walk of the two big tenants (the model blobs
                     and the Playwright browser) so the console can name them
   GET /api/ps       what Ollama has resident, and /api/version
+  nvidia-smi        the card, and the VRAM each process on it holds
+  the D12 pair      when this node is in one: the pool's own endpoints, the
+                    partner's console document over ssh, the link's counters
+                    (:mod:`sketchgen.pair`, docs/plans/pooled-pair.md)
   the app database  the control row, the attempts, the entries, the jobs, and
                     the worker's own step-by-step account of itself (the
                     ``activity`` table, migration 008)
@@ -63,7 +67,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sketchgen import db
+from sketchgen import db, pair
 from sketchgen.worker import (DEFAULT_HOST, DEFAULT_JOBS_DIR, FENCED_STEP, human_gap,
                               node_shape)
 
@@ -781,7 +785,8 @@ def _gate_launch_s(conn: sqlite3.Connection, jobs_dir: Path) -> float | None:
 
 
 def _slot(resident: list[dict[str, Any]], top: list[dict[str, Any]],
-          job_in_flight: int | None) -> dict[str, Any]:
+          job_in_flight: int | None, pair_block: dict[str, Any] | None = None,
+          procs: dict[str, list[int]] | None = None) -> dict[str, Any]:
     """Who holds the one inference slot.
 
     The rule is worker.fence's, plus one addition the fence does not need:
@@ -794,7 +799,16 @@ def _slot(resident: list[dict[str, Any]], top: list[dict[str, Any]],
       nor this collector is burning at least :data:`BUSY_CPU_PCT`. Residency
       alone is never busy: ``KEEP_ALIVE=30m`` leaves a model loaded with nobody
       attached, which is exactly why the fence does not refuse on it.
+    * **lent** — this node is the partner in the D12 pair: ``ggml-rpc-server``
+      holds its card for the pool on the head (docs/plans/pooled-pair.md).
     * **free** — everything else.
+
+    Three processes are never the stranger in the resident rule. Ollama's own
+    runner: Ollama 0.34 runs ``llama-server`` from its library directory, and
+    until 2026-09-25 an idle judge on the D12 boxes read here as *busy —
+    llama-server*. The pool and the RPC server: on the head the pool decoding
+    with no job in flight is said separately — *the pool, not a job*, which is
+    a bench or a client that is not the worker, and worth seeing.
 
     ``holder`` names the process, never its arguments.
     """
@@ -810,10 +824,31 @@ def _slot(resident: list[dict[str, Any]], top: list[dict[str, Any]],
     opencode_pid = found["opencode"]
     if opencode_pid is not None:
         return {"state": "busy", "holder": f"opencode pid {opencode_pid}"}
+    role = (pair_block or {}).get("role")
+    if role == "partner":
+        lent = pair_block.get("lent") or {}  # type: ignore[union-attr]
+        serving = lent.get("serving")
+        return {
+            "state": "lent",
+            "holder": f"{pair.RPC_PROCESS} pid {lent.get('rpc_pid')} — "
+            + ("serving the pool" if serving else "waiting for the pool"),
+        }
+    if role == "head":
+        pool = pair_block.get("pool") or {}  # type: ignore[union-attr]
+        if pool.get("state") == "decoding":
+            return {
+                "state": "busy",
+                "holder": f"the pool ({pair.POOL_PROCESS} pid {pool.get('pid')}), not a job",
+            }
+    ours = set()
+    for key in ("runner", "pool", "rpc"):
+        ours.update((procs or {}).get(key) or [])
     if resident:
         mine = os.getpid()
         for row in top:
             if row["pid"] == mine or (row["cpu_pct"] or 0) < BUSY_CPU_PCT:
+                continue
+            if row["pid"] in ours:
                 continue
             name = (row["cmd"] or "").split(" ")[0]
             if name.startswith("ollama"):
@@ -1453,6 +1488,7 @@ def _gpu_block() -> dict[str, Any]:
         "name": None,
         "vram_mb": {"total": None, "used": None},
         "util_pct": None,
+        "apps": [],
     }
     binary = _nvidia_smi()
     if binary is None:
@@ -1477,11 +1513,53 @@ def _gpu_block() -> dict[str, Any]:
                 "name": name,
                 "vram_mb": {"total": float(total), "used": float(used)},
                 "util_pct": float(util),
+                "apps": _gpu_apps(binary),
             }
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
     _GPU_CACHE = (now, block)
     return block
+
+
+def _gpu_apps(binary: str) -> list[dict[str, Any]]:
+    """The VRAM each process holds: ``nvidia-smi --query-compute-apps``.
+
+    The one honest answer to "where does the model sit" once there is more
+    than one thing on the card. In the D12 pair the pool (llama-server), Ollama's
+    runner (also llama-server, from Ollama's own directory) and on the partner
+    ggml-rpc-server each hold their share, and the card's total cannot say whose
+    is whose. ``role`` is :func:`sketchgen.pair.classify`'s answer from the
+    process path; nvidia-smi reports it for every user's process, Ollama's too.
+    WSL answers ``[N/A]`` for the memory; that is None, not zero.
+    """
+    try:
+        done = subprocess.run(
+            [binary, "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if done.returncode != 0:
+        return []
+    apps: list[dict[str, Any]] = []
+    for line in (done.stdout or "").splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 3 or not parts[0].isdigit():
+            continue
+        try:
+            used: float | None = float(parts[-1])
+        except ValueError:
+            used = None
+        path = ",".join(parts[1:-1])
+        apps.append({
+            "pid": int(parts[0]),
+            "name": os.path.basename(path) or path,
+            "role": pair.classify(path),
+            "used_mb": used,
+        })
+    apps.sort(key=lambda app: -(app["used_mb"] or 0.0))
+    return apps
 
 
 def collect(
@@ -1532,6 +1610,19 @@ def collect(
     node["cpu_pct"] = node["cpu_pct"][:cores]
 
     node["gpu"] = _gpu_block()
+    procs = pair.processes()
+    span = after.at - before.at
+
+    def proc_cpu(pid: int) -> float | None:
+        old, new = before.procs.get(pid), after.procs.get(pid)
+        if old is None or new is None or span <= 0:
+            return None
+        return round(100.0 * (new - old) / _CLOCK_TICKS / span, 1)
+
+    # A single shot (``prev`` None, the CLI) reads the partner and the link
+    # now; the web server's poll never waits on ssh (sketchgen/pair.py).
+    pair_block = pair.block(apps=node["gpu"].get("apps") or [], procs=procs,
+                            proc_cpu=proc_cpu, sync=prev is None)
 
     base = host_url.rstrip("/")
     version = _http_json(base + "/api/version")
@@ -1556,7 +1647,7 @@ def collect(
     model = {
         "ollama_version": (version or {}).get("version"),
         "resident": resident,
-        "slot": _slot(resident, node["top"], worker["job_in_flight"]),
+        "slot": _slot(resident, node["top"], worker["job_in_flight"], pair_block, procs),
         "instant": _instant(conn),
         "gate_launch_s": _gate_launch_s(conn, jobs_path),
     }
@@ -1568,6 +1659,7 @@ def collect(
         "model": model,
         "worker": worker,
         "activity": activity(conn),
+        "pair": pair_block,
         "odometer": _odometer(conn, since),
         "funnel": _funnel(conn, since),
         "submissions": submissions(conn),
@@ -1627,6 +1719,96 @@ def _disk_text_lines(disk: dict[str, Any]) -> list[str]:
     return lines
 
 
+def _gb(mb: Any) -> str:
+    return "?" if mb is None else f"{float(mb) / 1024.0:.1f}"
+
+
+def _pair_text_lines(doc: dict[str, Any]) -> list[str]:
+    """The D12 pair, for a terminal: nothing at all when the node is not in one."""
+    block = doc.get("pair") or {}
+    role = block.get("role")
+    if role not in ("head", "partner"):
+        return []
+    link = block.get("link") or {}
+    port = link.get("rpc_port_open")
+    link_line = (
+        f"        link     {link.get('iface') or '?'} "
+        f"{link.get('speed_mbps') or '?'} Mb/s · in {link.get('rx_mb_s')} MB/s · "
+        f"out {link.get('tx_mb_s')} MB/s · rpc port "
+        + ("open" if port else "closed" if port is False else "?")
+        + f", {link.get('rpc_connections')} connection(s)"
+    )
+    worker = doc.get("worker") or {}
+    if role == "partner":
+        lent = block.get("lent") or {}
+        lines = [
+            "",
+            f"  pair  partner — this card is lent: {pair.RPC_PROCESS} pid "
+            f"{lent.get('rpc_pid')} holds {_gb(lent.get('vram_mb'))} GB, "
+            f"{lent.get('cpu_pct')}% cpu, "
+            + ("serving the pool" if lent.get("serving") else "waiting for the pool"),
+            link_line,
+        ]
+        if worker.get("control") == "running":
+            lines.append("  !     this node's generator is running while its card is lent: "
+                         "its worker can load models onto the pool's card")
+        return lines
+    pool = block.get("pool") or {}
+    gpu = (doc.get("node") or {}).get("gpu") or {}
+    held = ", ".join(
+        f"{app.get('role') or app.get('name')} {_gb(app.get('used_mb'))} GB"
+        for app in gpu.get("apps") or []
+    ) or "nothing"
+    lines = [
+        "",
+        f"  pair  head — pool {pool.get('state')} · {pool.get('model')} · "
+        f"{pool.get('build')} · ctx {pool.get('n_ctx')}",
+    ]
+    if pool.get("state") == "decoding":
+        lines.append(
+            f"        now      task {pool.get('task')}: {pool.get('n_decoded')} tokens"
+            + (f" at {pool['live_decode_tok_s']} tok/s"
+               if pool.get("live_decode_tok_s") is not None else "")
+        )
+    lines.append(
+        f"        served   decode {pool.get('decode_tok_s')} tok/s, prefill "
+        f"{pool.get('prefill_tok_s')} tok/s · {pool.get('tokens_in')} in / "
+        f"{pool.get('tokens_out')} out"
+    )
+    vram = gpu.get("vram_mb") or {}
+    lines.append(
+        f"        here     {gpu.get('name')}: {_gb(vram.get('used'))} of "
+        f"{_gb(vram.get('total'))} GB, {gpu.get('util_pct')}% busy — {held}"
+    )
+    partner = block.get("partner") or {}
+    if partner.get("host"):
+        pgpu = partner.get("gpu") or {}
+        pvram = pgpu.get("vram_mb") or {}
+        rpc = partner.get("rpc") or {}
+        if partner.get("reachable") is False and partner.get("age_s") is None:
+            detail = f"unreachable — {partner.get('error')}"
+        else:
+            detail = (
+                f"{pgpu.get('name')}: {_gb(pvram.get('used'))} of {_gb(pvram.get('total'))} GB, "
+                f"{pgpu.get('util_pct')}% busy · rpc pid {rpc.get('pid')} {rpc.get('cpu_pct')}% cpu"
+                + (f" {_gb(rpc.get('vram_mb'))} GB" if rpc.get("vram_mb") is not None else "")
+                + f" · generator {partner.get('control')}"
+                + (f" ({partner.get('reason')})" if partner.get("reason") else "")
+                + f" · read {partner.get('age_s')} s ago"
+                + ("" if partner.get("reachable") is not False
+                   else f" — last read failed: {partner.get('error')}")
+            )
+        lines.append(f"        partner  {partner.get('host')}: {detail}")
+        if partner.get("control") == "running":
+            lines.append("  !     the partner's generator is running: its worker can load "
+                         "models onto the card it lends the pool")
+        if partner.get("resident"):
+            lines.append("  !     the partner's Ollama has resident: "
+                         + ", ".join(partner["resident"]))
+    lines.append(link_line)
+    return lines
+
+
 def render_text(doc: dict[str, Any]) -> str:
     node = doc["node"]
     model = doc["model"]
@@ -1673,6 +1855,7 @@ def render_text(doc: dict[str, Any]) -> str:
             f"{instant['decode_tok_s']} tok/s (attempt {instant['from_attempt_id']}, "
             f"{instant['at_utc']})"
         )
+    lines += _pair_text_lines(doc)
     worker = doc["worker"]
     odo = doc["odometer"]
     act = doc.get("activity") or {}

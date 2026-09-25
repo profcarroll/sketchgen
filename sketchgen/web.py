@@ -361,6 +361,8 @@ def _fmt(value: Any, kind: str = "str") -> str:
     """
     if value is None:
         return "—"
+    if kind == "yn":
+        return "yes" if value else "no"
     try:
         if kind == "int":
             return f"{int(round(float(value))):,}"
@@ -1315,6 +1317,7 @@ CONSOLE_SCRIPT = """<script>
   }
   function fmt(value, kind) {
     if (value === null || value === undefined) return "\\u2014";
+    if (kind === "yn") return value ? "yes" : "no";
     var n = Number(value);
     if (kind === "int") return isNaN(n) ? String(value) : Math.round(n).toLocaleString("en-US");
     if (kind === "f1") return n.toFixed(1);
@@ -1909,6 +1912,203 @@ def billing_card(values: dict[str, Any] | None) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# The D12 pair (docs/plans/pooled-pair.md, Packet 1)
+#
+# Pooled, the executor runs on this node's card and the partner's at once, and
+# neither the Node panel (one local card) nor the Model panel (one Ollama)
+# can show it. The panel is rendered only on a node that is in a pair, the way
+# the bill is only rendered on a cloud node, and every number in it carries
+# data-k so the page's two-second poll moves it like any other.
+# ---------------------------------------------------------------------------
+
+#: What each role on a card is called on the page. ``runner`` is Ollama's own
+#: llama-server, which on the head holds the planner, judge and critic.
+PAIR_APP_LABELS = {
+    "pool": "the pool (llama-server)",
+    "runner": "Ollama (planner, judge, critic)",
+    "rpc": "ggml-rpc-server (lent to the pool)",
+}
+
+
+def _pair_warn(text: str) -> str:
+    return f'<p class="billwarn soft">{text}</p>'
+
+
+def pair_panel(doc: dict[str, Any]) -> str:
+    """The Pair panel: both cards, the pool, the link. Empty when not in a pair."""
+    role = _dig(doc, "pair.role")
+    if role == "partner":
+        return _pair_partner_panel(doc)
+    if role != "head":
+        return ""
+
+    apps = _dig(doc, "node.gpu.apps", []) or []
+    app_rows = []
+    for index, app in enumerate(apps):
+        base = f"node.gpu.apps.{index}"
+        label = PAIR_APP_LABELS.get(app.get("role") or "", app.get("name") or "?")
+        app_rows.append(
+            f"<tr><td>{esc(label)}</td>"
+            f"<td class=\"n mono\">{field(doc, base + '.pid', 'int')}</td>"
+            f"<td class=\"n\">{field(doc, base + '.used_mb', 'gb')}</td></tr>"
+        )
+    if not app_rows:
+        app_rows.append('<tr><td colspan="3" class="dim">nothing on the card</td></tr>')
+
+    here = (
+        '<div><h3>This card <span class="dim" style="font-weight:400">— '
+        + field(doc, "node.gpu.name") + "</span></h3>"
+        + _meter(
+            "vram",
+            f"{field(doc, 'node.gpu.vram_mb.used', 'gb')} of "
+            f"{field(doc, 'node.gpu.vram_mb.total', 'gb')} GB, "
+            f"{field(doc, 'node.gpu.util_pct', 'pct')} busy",
+            ratio_bar(doc, "node.gpu.vram_mb.used", "node.gpu.vram_mb.total"),
+        )
+        + '<table style="margin-top:8px"><thead><tr><th>holds it</th>'
+        '<th class="n">pid</th><th class="n">GB</th></tr></thead><tbody>'
+        + "".join(app_rows)
+        + "</tbody></table></div>"
+    )
+
+    host = _dig(doc, "pair.partner.host")
+    if host:
+        read = (
+            f"read {field(doc, 'pair.partner.age_s', 'f1')} s ago over ssh"
+            if _dig(doc, "pair.partner.age_s") is not None
+            else "not read yet"
+        )
+        there = (
+            '<div><h3>Partner\'s card <span class="dim" style="font-weight:400">— '
+            + field(doc, "pair.partner.gpu.name") + " on " + esc(host) + "</span></h3>"
+            + _meter(
+                "vram",
+                f"{field(doc, 'pair.partner.gpu.vram_mb.used', 'gb')} of "
+                f"{field(doc, 'pair.partner.gpu.vram_mb.total', 'gb')} GB, "
+                f"{field(doc, 'pair.partner.gpu.util_pct', 'pct')} busy",
+                ratio_bar(doc, "pair.partner.gpu.vram_mb.used",
+                          "pair.partner.gpu.vram_mb.total"),
+            )
+            + '<table style="margin-top:8px"><thead><tr><th>holds it</th>'
+            '<th class="n">pid</th><th class="n">cpu</th><th class="n">GB</th></tr></thead><tbody>'
+            + f"<tr><td>ggml-rpc-server <span class=\"dim\">serving "
+            f"{field(doc, 'pair.partner.rpc.serving', 'yn')}</span></td><td class=\"n mono\">"
+            f"{field(doc, 'pair.partner.rpc.pid', 'int')}</td>"
+            f"<td class=\"n\">{field(doc, 'pair.partner.rpc.cpu_pct', 'pct')}</td>"
+            f"<td class=\"n\">{field(doc, 'pair.partner.rpc.vram_mb', 'gb')}</td></tr>"
+            + f"<tr><td>generator</td><td colspan=\"3\">"
+            f"{field(doc, 'pair.partner.control')} "
+            f"<span class=\"dim\">{field(doc, 'pair.partner.reason')}</span></td></tr>"
+            + "</tbody></table>"
+            + f'<p class="dim" style="font-size:12px;margin:6px 0 0">{read} · '
+            + field(doc, "pair.partner.node") + "</p></div>"
+        )
+    else:
+        there = (
+            '<div><h3>Partner\'s card</h3><p class="dim">No partner is configured '
+            "(<code>SKETCHGEN_PAIR_PARTNER</code>), so only this side of the pool "
+            "is visible.</p></div>"
+        )
+
+    tiles = "".join([
+        _tile("pool", field(doc, "pair.pool.state"),
+              field(doc, "pair.pool.model") + " · " + field(doc, "pair.pool.build")
+              + " · ctx " + field(doc, "pair.pool.n_ctx", "int")),
+        _tile("decoding now",
+              field(doc, "pair.pool.live_decode_tok_s", "f1")
+              + ' <span class="dim" style="font-size:12px">tok/s</span>',
+              field(doc, "pair.pool.n_decoded", "int") + " tokens · task "
+              + field(doc, "pair.pool.task", "int")),
+        _tile("decode, served",
+              field(doc, "pair.pool.decode_tok_s", "f1")
+              + ' <span class="dim" style="font-size:12px">tok/s</span>',
+              field(doc, "pair.pool.tokens_out", "int") + " tokens out"),
+        _tile("prefill, served",
+              field(doc, "pair.pool.prefill_tok_s", "f1")
+              + ' <span class="dim" style="font-size:12px">tok/s</span>',
+              field(doc, "pair.pool.tokens_in", "int") + " tokens in"),
+        _tile("link in",
+              field(doc, "pair.link.rx_mb_s", "f2")
+              + ' <span class="dim" style="font-size:12px">MB/s</span>',
+              field(doc, "pair.link.iface") + " · "
+              + field(doc, "pair.link.speed_mbps", "int") + " Mb/s"),
+        _tile("link out",
+              field(doc, "pair.link.tx_mb_s", "f2")
+              + ' <span class="dim" style="font-size:12px">MB/s</span>',
+              "rpc port " + field(doc, "pair.link.rpc_port_open", "yn") + " · "
+              + field(doc, "pair.link.rpc_connections", "int") + " connected"),
+    ])
+
+    # What is wrong now, said once at render: these are states to act on, not
+    # numbers to watch, so they are not live-patched.
+    warnings = []
+    state = _dig(doc, "pair.pool.state")
+    if state == "down":
+        warnings.append(_pair_warn(
+            "The pool is not answering at " + esc(_dig(doc, "pair.pool.url") or "?")
+            + ". Nothing can be written on the pair until it is back."))
+    if _dig(doc, "pair.link.rpc_port_open") is False:
+        warnings.append(_pair_warn(
+            "Nothing is listening on the RPC port here: the tunnel to the partner "
+            "is down, and the pool cannot reach the partner's card."))
+    if host and _dig(doc, "pair.partner.reachable") is False:
+        warnings.append(_pair_warn(
+            "The last read of the partner failed: "
+            + esc(_dig(doc, "pair.partner.error") or "no reason given")
+            + ". What is shown for its card is from the last read that worked."))
+    if _dig(doc, "pair.partner.control") == "running":
+        warnings.append(_pair_warn(
+            "The partner's generator is running. While its card is lent it should "
+            "be paused: its worker can load models onto the card the pool is using."))
+    resident = _dig(doc, "pair.partner.resident", []) or []
+    if resident:
+        warnings.append(_pair_warn(
+            "The partner's Ollama has " + esc(", ".join(resident))
+            + " resident, on the card it lends the pool."))
+
+    return (
+        '<section class="panel" id="pair">'
+        '<h2>Pair <span class="dim" style="font-weight:400;text-transform:none;'
+        'letter-spacing:0">— the executor on two cards; this node is the head</span></h2>'
+        f'<div class="grid">{here}{there}</div>'
+        f'<div class="tiles" style="margin-top:12px">{tiles}</div>'
+        + "".join(warnings)
+        + "</section>"
+    )
+
+
+def _pair_partner_panel(doc: dict[str, Any]) -> str:
+    """This node's card is lent: say so, and what holds it."""
+    warning = ""
+    if _dig(doc, "worker.control") == "running":
+        warning = _pair_warn(
+            "This node's generator is running while its card is lent. Pause it: its "
+            "worker can load models onto the card the pool on the head is using.")
+    tiles = "".join([
+        _tile("lent", field(doc, "pair.lent.vram_mb", "gb")
+              + ' <span class="dim" style="font-size:12px">GB</span>',
+              "held by ggml-rpc-server pid " + field(doc, "pair.lent.rpc_pid", "int")),
+        _tile("rpc cpu", field(doc, "pair.lent.cpu_pct", "pct"), "of one core"),
+        _tile("serving", field(doc, "pair.lent.serving", "yn"),
+              field(doc, "pair.link.rpc_connections", "int") + " connected"),
+        _tile("link in", field(doc, "pair.link.rx_mb_s", "f2")
+              + ' <span class="dim" style="font-size:12px">MB/s</span>',
+              field(doc, "pair.link.iface") + " · "
+              + field(doc, "pair.link.speed_mbps", "int") + " Mb/s"),
+        _tile("link out", field(doc, "pair.link.tx_mb_s", "f2")
+              + ' <span class="dim" style="font-size:12px">MB/s</span>', ""),
+    ])
+    return (
+        '<section class="panel" id="pair">'
+        '<h2>Pair <span class="dim" style="font-weight:400;text-transform:none;'
+        'letter-spacing:0">— this card is lent to the pool on the head</span></h2>'
+        f'<div class="tiles">{tiles}</div>'
+        + warning
+        + "</section>"
+    )
+
+
 def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
                  billing: dict[str, Any] | None = None) -> str:
     """The wireframe's Console, rendered from packet 4.1's document.
@@ -2238,6 +2438,7 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
         ollama_version=field(doc, "model.ollama_version"),
         resident_rows="\n".join(resident_rows),
         activity=activity_card(doc),
+        pair_panel=pair_panel(doc),
         odometer=odometer,
         funnel_rows="\n".join(funnel_rows),
         per_sketch_rows="\n".join(per_sketch_rows),
