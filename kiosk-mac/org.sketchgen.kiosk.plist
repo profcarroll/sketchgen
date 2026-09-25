@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- ~/Library/LaunchAgents/org.sketchgen.kiosk.plist — keeps the kiosk browser running.
-     USER is replaced at install. Load: launchctl bootstrap gui/$(id -u) <this file>
-     DRAFT: finalize in the on-device session (docs/plans/kiosk-mac.md §2.4). -->
+<!-- ~/Library/LaunchAgents/org.sketchgen.kiosk.plist — keeps the kiosk browser running
+     (docs/plans/kiosk-mac.md §2.4). install.sh replaces /Users/USER with the account's home and
+     loads it; Chrome exits for any reason, and it is back ten seconds later. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -15,6 +15,7 @@
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>10</integer>
   <key>ProcessType</key><string>Interactive</string>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
   <key>StandardOutPath</key><string>/Users/USER/Library/Caches/sketchgen-kiosk/chrome.log</string>
   <key>StandardErrorPath</key><string>/Users/USER/Library/Caches/sketchgen-kiosk/chrome.log</string>
 </dict>

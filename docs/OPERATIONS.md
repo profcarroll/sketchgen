@@ -1586,6 +1586,74 @@ ssh d12-node-flux 'systemctl --user enable --now sketchgen-worker.service sketch
 - **Not Ollama or the driver.** Both are pinned to the other nodes' versions,
   as in *A rented GPU node*, steps 2 and 5.
 
+## The D12 kiosk Mac
+
+The gallery wall in the D12 lab, set up 2026-09-24 with `kiosk-mac/` (its README
+has the install; `docs/plans/kiosk-mac.md` has the reasons). Chrome runs
+`kiosk.html?unattended=1&site=d12` under a LaunchAgent that restarts it, a
+watchdog restarts it when the page's title stops changing, and views count by
+the Vera List Center's hours.
+
+| | |
+| --- | --- |
+| Mac | Mac mini 2018 (Macmini8,1, i3, 8 GB), macOS 15.8, hostname `petlab-mini-intel` |
+| wall account | `kiosk`, a standard user, logged in automatically; FileVault off |
+| admin account | `dave` |
+| network | Wi-Fi, 192.168.0.34 behind the lab's 192.168.0.1 router; Ethernet unplugged |
+| tailnet | `dt-kiosk`, 100.102.189.21, the Tailscale app (not `tailscaled`), launched at login |
+| laptop | `Host d12-kiosk` in `~/.ssh/config`: `kiosk@100.102.189.21`, `~/.ssh/id_ed25519_teaching` |
+
+```bash
+ssh d12-kiosk kiosk-status                                                   # see it
+ssh d12-kiosk 'launchctl kickstart -k gui/$(id -u)/org.sketchgen.kiosk'      # restart the page
+ssh d12-kiosk 'sudo shutdown -r now'                                         # restart the Mac
+ssh d12-kiosk 'bash ~/Library/sketchgen-kiosk/kit/install.sh'                # reinstall after an edit
+```
+
+**Screen Sharing** is `vnc://100.102.189.21` (port 5900, over the tailnet). It
+offers only Apple's own authentication (RFB types 30, 33, 35, 36: a Mac
+account's name and password), never a bare VNC password, so the viewer must
+speak Apple's type 30 and ask for a user name as well as a password — Remmina
+does; a viewer that asks only for a password will not get in. Log in as `kiosk` to
+see the wall itself; as `dave`, macOS offers to ask the person at the Mac, and
+nobody is there, or to log in as yourself, a second session beside the wall.
+
+**What differs from a stock Mac**, all set by `kiosk-mac/system.sh` and
+`install.sh`: never sleeps; boots on power; restarts after a freeze; no
+Bluetooth setup assistant; macOS updates download but do not install; New York
+time; no screen saver, no hot corners (the bottom-right one was Quick Note,
+where the launcher parks the pointer); `sshd` takes keys only, from the tailnet
+only, for `kiosk` only (`/etc/ssh/sshd_config.d/010-sketchgen-kiosk.conf`, and
+an `Include` line added to `sshd_config`, the original kept as
+`sshd_config.pre-sketchgen`); `kiosk` may run exactly `sudo shutdown -r now`
+(`/etc/sudoers.d/sketchgen-kiosk`).
+
+Traps, each met on the first night:
+
+- **Remote Login's "Allow access for" list is checked after authentication.**
+  A key the Mac accepts, then `Connection closed` with no refusal, is an
+  account missing from that list (PAM's `pam_sacl`), not a bad key.
+  `system.sh` adds `kiosk` to it.
+- **Sequoia's `sshd_config` has no `Include` line**, although Ventura's did;
+  `system.sh` adds one. A macOS upgrade may put the stock file back, and with
+  it password logins from the lab's network; the probe prints the line.
+- **`systemsetup` exits 0 after its own errors** (`### Error:-99`). Read the
+  value back (`systemsetup -getrestartfreeze`), never the exit code.
+- **Never `osascript` to System Events over ssh.** It asks macOS for
+  permission, on the wall's screen, and times out after two minutes waiting
+  for a click. JavaScript for Automation with the ObjC bridge asks nothing:
+  `CGWindowListCopyWindowInfo` lists what is on screen (a dialog over the wall
+  shows up as its owner), and the page's own screenshot is a DevTools
+  `Page.captureScreenshot` over `ssh -L 19222:127.0.0.1:9222 d12-kiosk`.
+- **Each macOS account's Tailscale login is a node of its own.** The admin
+  account's is `d12-kiosk-admin` (100.66.69.109) and is offline whenever
+  nobody is logged in as `dave`; the wall is `dt-kiosk`.
+
+Not yet done, as of 2026-09-24: the eight fault tests of the plan's §2.5 —
+above all a reboot from the laptop — and a look at the wall by eye for a
+1920×119 Chrome window at the top of the screen, which the page, at a full
+1920×1080, does not account for.
+
 ## The operator UI as a service
 
 `install-unit` also copies `systemd/sketchgen-web.service`. It runs `sketchgen web`
