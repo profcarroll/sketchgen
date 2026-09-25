@@ -374,10 +374,12 @@ class BackupUnitTests(unittest.TestCase):
         Twice (2026-09-16, 2026-09-18) a deploy pulled a new step into this
         file and then ran on without it, because bash keeps the file it
         opened. The hash is taken before the pull and checked after; a
-        change execs the pulled copy under a guard so it cannot loop.
+        change execs the pulled copy under a guard so it cannot loop. Since
+        2026-09-24 the pull is a move to the node's target — a fast-forward to
+        main or a switch to its pin — and tests/test_update_sh.py runs it.
         """
         text = (REPO_ROOT / "update.sh").read_text(encoding="utf-8")
-        pull = text.index("git pull origin main")
+        pull = text.index("git merge --quiet --ff-only origin/main")
         self.assertIn("self_before=$(script_hash)", text[:pull])
         after = text[pull:]
         self.assertIn('exec bash "$SELF" "$@"', after)

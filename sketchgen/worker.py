@@ -165,7 +165,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from . import db, executor, ghostshim, lineage, models, planner, preflight
+from . import build, db, executor, ghostshim, lineage, models, planner, preflight
 
 __all__ = [
     "DEFAULT_CRITIC_MODEL",
@@ -2153,6 +2153,10 @@ class Worker:
         """The resident mode systemd runs. Never start this from a tool call."""
         # Packet 4.1: the console's "session" column is everything since here.
         db.set_meta(self.conn, "worker_started_utc", db.utc_now())
+        # docs/plans/fleet.md §1.2: the build this process will run until it is
+        # restarted, whatever lands in the checkout meanwhile. Asked once, here,
+        # before the first job, so every attempt below carries the same answer.
+        build.stamp_running(self.conn, "worker")
         self._install_signal_handlers()
         self.log(f"worker: resident, polling every {sleep_s:.0f}s")
         # There is one worker. Anything in a running state at this moment was
@@ -3078,6 +3082,7 @@ class Worker:
             brief=plan.brief,
             assertions_json=json.dumps(assertions),
             planner=model,
+            plan_build=build.running(),
         )
         self.log(f"job {job.id}: planned, {plan.prompt_version}, assertions: "
                  f"{', '.join(assertions) or '(none)'}")
@@ -3497,6 +3502,7 @@ class Worker:
                 decode_s=execution.decode_s,
                 wall_s=execution.wall_s,
                 source_dir=execution.source_dir or str(attempt_dir),
+                build=build.running(),
                 gate_exit=None,
                 gate_report_path=None,
                 evidence=failure,
@@ -3596,6 +3602,7 @@ class Worker:
             decode_s=execution.decode_s,
             wall_s=execution.wall_s,
             source_dir=execution.source_dir or str(attempt_dir),
+            build=build.running(),
             gate_exit=outcome.exit_code,
             gate_report_path=outcome.report_path,
             evidence=new_evidence,

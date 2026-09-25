@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# update.sh — pull code on the node, re-render the gallery, and restart services.
+# update.sh — move the node to its build, re-render the gallery, restart services.
 #
-# Run from anywhere:
+# Run from the laptop, for one node or all of them (docs/plans/fleet.md):
+#   bin/fleet update sld-cloud            # as the sketchgen-update unit
+# or by hand:
 #   ssh sld-cloud 'bash ~/sketchgen/app/update.sh'
-# or if this file is on the local machine:
-#   ssh sld-cloud 'bash -s' < update.sh
+#
+# "Its build" is main, unless `sketchgen pin` has pinned the node to one commit
+# (an A/B arm): then the checkout goes to the pin and never past it, and this
+# script only re-installs units and migrates. Before 2026-09-24 step 1 was
+# `git pull origin main`, which fast-forwards a detached HEAD without a word,
+# and three nodes were held on a72f076 for the hardware A/B by nothing else.
 #
 # Flags:
 #   --no-render   Skip steps 3 and 4 (the gallery pull and the full re-render).
@@ -17,11 +23,19 @@
 #                 in doubt, leave it off: an unnecessary render costs minutes, a
 #                 skipped necessary one ships stale pages.
 #   --render      Force the render even if SKETCHGEN_SKIP_RENDER is set (default).
+#   --render=auto Render only if the deploy changed something a page is made
+#                 from: `sketchgen build --needs-render` reads the diff against
+#                 the render path's own imports, templates and assets, and
+#                 renders for anything it does not know. Equivalent:
+#                 SKETCHGEN_RENDER=auto (which wins over SKETCHGEN_SKIP_RENDER).
+#                 What bin/fleet passes, because it does not read the diff.
 #   -h, --help    Print this and exit.
 #
 # What it does, in order:
-#   1. Pulls the generator repo (~/sketchgen/app)
-#   1a. If that pull changed THIS script, hands over to the pulled copy
+#   0. Takes ~/sketchgen/update.lock: one deploy at a time on a node
+#   1. Moves the generator repo (~/sketchgen/app) to its target — refusing,
+#      before anything is paused, a dirty tree or a branch other than main
+#   1a. If that move changed THIS script, hands over to the new copy
 #   1b. Pauses the generator, letting the attempt in flight finish
 #   2. Re-installs the unit files into ~/.config/systemd/user and reloads
 #   2b. Applies any pending database migration (db init)
@@ -58,19 +72,27 @@ die() { red "FAILED: $*" >&2; exit 1; }
 usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # --- Flags -------------------------------------------------------------------
-# SKETCHGEN_SKIP_RENDER is read first so the setting survives the step-1a
-# re-exec (env is exported; the flag is also carried on "$@"). --no-render and
-# --render then have the last word, in the order given.
-case "${SKETCHGEN_SKIP_RENDER:-}" in 1|yes|true|YES|Yes) SKIP_RENDER=yes ;; *) SKIP_RENDER=no ;; esac
+# The environment is read first so the setting survives the step-1a re-exec
+# (env is exported; the flag is also carried on "$@"). SKETCHGEN_RENDER, when
+# set, wins over the older SKETCHGEN_SKIP_RENDER: a copy of this script from
+# before --render=auto exports SKIP_RENDER=no on its way to handing over, and
+# the auto that bin/fleet asked for must survive that. The flags then have the
+# last word, in the order given.
+case "${SKETCHGEN_SKIP_RENDER:-}" in 1|yes|true|YES|Yes) RENDER=no ;; *) RENDER=yes ;; esac
+case "${SKETCHGEN_RENDER:-}" in
+    auto) RENDER=auto ;; yes) RENDER=yes ;; no) RENDER=no ;;
+    "") ;; *) die "SKETCHGEN_RENDER must be auto, yes or no, not '$SKETCHGEN_RENDER'" ;;
+esac
 for arg in "$@"; do
     case "$arg" in
-        --no-render) SKIP_RENDER=yes ;;
-        --render)    SKIP_RENDER=no ;;
+        --no-render|--render=no)  RENDER=no ;;
+        --render|--render=yes)    RENDER=yes ;;
+        --render=auto)            RENDER=auto ;;
         -h|--help)   usage; exit 0 ;;
         *)           die "unknown argument: $arg (try --help)" ;;
     esac
 done
-export SKETCHGEN_SKIP_RENDER="$SKIP_RENDER"
+export SKETCHGEN_RENDER="$RENDER"
 
 # --- The generator, which is hopefully running -------------------------------
 # The worker is resident on this node (sketchgen-worker.service, not the timer),
@@ -122,15 +144,90 @@ resume_generator() {
 # call at the end is the one that decides whether this run succeeded.
 trap 'resume_generator || true' EXIT
 
-# --- 1. Pull the generator ---------------------------------------------------
+# --- 0. One deploy at a time ------------------------------------------------
+# bin/fleet and the Console both start this as the sketchgen-update unit, whose
+# name systemd will not give to two runs; a hand `ssh NODE update.sh` has no
+# unit. The lock covers all three. A copy handed over in 1a inherits the fd and
+# the lock with it, so there is no moment between the two copies when a second
+# deploy could slip in.
+LOCK="$NODE_HOME/update.lock"
+if [ "${SKETCHGEN_UPDATE_REEXEC:-}" != yes ] || ! { true >&9; } 2>/dev/null; then
+    exec 9>>"$LOCK"
+fi
+flock -n 9 || die "another update.sh is running on this node (it holds $LOCK)"
+
+# --- 1. Move the generator to its target -------------------------------------
 SELF="$APP/update.sh"
 script_hash() { sha256sum "$SELF" 2>/dev/null | cut -d' ' -f1; }
 self_before=$(script_hash)
 
-step "Pulling generator (~/sketchgen/app)"
+# One meta row, read-only and without the package, so it reads the same
+# whatever the checkout it is about to move holds.
+meta_value() {
+    "$VENV" - "$DB" "$1" 2>/dev/null <<'PY' || true
+import sqlite3, sys
+try:
+    conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (sys.argv[2],)).fetchone()
+    print(row[0] if row and row[0] else "")
+except sqlite3.Error:
+    print("")
+PY
+}
+
+step "Moving the generator to its build (~/sketchgen/app)"
 cd "$APP" || die "cannot cd to $APP"
-git pull origin main || die "git pull failed in $APP"
-green "generator up to date"
+# Both refusals come before anything moves or pauses. The second is the
+# 2026-09-22 case: a fix committed on sld-cloud on a branch nobody pushed, and
+# a pull that failed on divergent branches — which was the right outcome, now
+# said in words instead of git's.
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    git status --short --untracked-files=no | sed 's/^/    /' >&2
+    die "tracked files are changed in $APP — put them on a branch and a PR, or 'git checkout -- .'; nothing was moved or paused"
+fi
+branch=$(git symbolic-ref --quiet --short HEAD || true)
+if [ -n "$branch" ] && [ "$branch" != main ]; then
+    die "$APP is on branch '$branch', not main — 'git switch main' first; nothing was moved or paused"
+fi
+# Where this deploy started, for --render=auto. A copy handed over in 1a is
+# told by the copy before it; one handed over by a copy that predates the
+# variable is not, and then nobody knows, and auto renders.
+if [ "${SKETCHGEN_UPDATE_REEXEC:-}" = yes ]; then
+    from="${SKETCHGEN_UPDATE_FROM:-}"
+else
+    from=$(git rev-parse HEAD)
+fi
+
+pin=$(meta_value pin.sha)
+# A pinned node needs nothing from GitHub if it already has its commit, and a
+# private box that cannot reach it should still get its units and migration.
+if ! git fetch --quiet origin main; then
+    [ -n "$pin" ] || die "git fetch failed in $APP"
+    dim "git fetch failed; going on, because this node is pinned"
+fi
+if [ -n "$pin" ]; then
+    if ! git cat-file -e "${pin}^{commit}" 2>/dev/null; then
+        git fetch --quiet origin || true
+        git cat-file -e "${pin}^{commit}" 2>/dev/null \
+            || die "this node is pinned to $pin, which this checkout does not have"
+    fi
+    if [ "$(git rev-parse HEAD)" != "$pin" ]; then
+        git switch --quiet --detach "$pin" || die "could not move to the pin $pin"
+    fi
+    green "pinned at ${pin:0:7} — $(meta_value pin.reason)"
+    dim "the code stays here; 'sketchgen pin --clear --by LOGIN' to follow main again"
+else
+    # A local main with commits of its own cannot fast-forward, and finding
+    # that out after switching to it would leave the checkout moved under a
+    # worker that has not been paused.
+    if git show-ref --verify --quiet refs/heads/main \
+            && ! git merge-base --is-ancestor main origin/main; then
+        die "local main has commits origin/main does not — PR them first; nothing was moved or paused"
+    fi
+    [ -n "$branch" ] || git switch --quiet main || die "could not switch to main"
+    git merge --quiet --ff-only origin/main || die "could not fast-forward main to origin/main"
+    green "on main at $(git rev-parse --short HEAD)"
+fi
 
 # --- 1a. Hand over to the pulled copy of this script -------------------------
 # bash reads a script as it runs it, from the file it was given when it
@@ -143,10 +240,31 @@ green "generator up to date"
 # undo yet (the generator is not paused until 1b). The guard stops a loop if a
 # file somehow changes on every pull; the second copy runs on regardless.
 if [ "${SKETCHGEN_UPDATE_REEXEC:-}" != yes ] && [ "$(script_hash)" != "$self_before" ]; then
-    dim "update.sh itself changed in that pull — handing over to the new copy"
+    dim "update.sh itself changed in that move — handing over to the new copy"
     export SKETCHGEN_UPDATE_REEXEC=yes
+    export SKETCHGEN_UPDATE_FROM="$from"
     exec bash "$SELF" "$@"
 fi
+
+# --- Whether this deploy has to re-render (steps 3 and 4) -------------------
+# --render=auto asks the new code, which knows its own render path, about the
+# whole deploy: from where the first copy started to where the checkout is now.
+to=$(git rev-parse HEAD)
+if [ "$RENDER" = auto ]; then
+    if [ -z "$from" ]; then
+        RENDER=yes
+        dim "render: the copy that moved the checkout did not say where it started"
+    else
+        verdict=$("$VENV" bin/sketchgen build --needs-render "$from" "$to" 2>/dev/null) \
+            || verdict="render the diff could not be read"
+        case "$verdict" in
+            skip*) RENDER=no ;;
+            *)     RENDER=yes ;;
+        esac
+        dim "render=auto: ${verdict}"
+    fi
+fi
+if [ "$RENDER" = no ]; then SKIP_RENDER=yes; else SKIP_RENDER=no; fi
 
 # --- 1b. Pause the generator -------------------------------------------------
 step "Pausing the generator for the deploy"
@@ -184,14 +302,49 @@ green "unit files up to date"
 # schema it was written against: the 2026-09-15 deploy of packet 2 ran the
 # backfill before anyone ran `db init`, and it fell over on a column that was
 # not there yet. `db init` applies what is pending and is a no-op otherwise.
+#
+# A pending migration is snapshotted first, as AGENTS.md has always asked of a
+# person: `sketchgen.db.pre-NNN`, NNN the newest migration this deploy brings.
+# With bin/fleet one command migrates every node, and a rule kept by hand on
+# each of them is a rule skipped on one. An existing snapshot of that name is
+# kept, not overwritten: a rerun after a failed migration must not replace the
+# good copy with the half-done one.
 step "Migrating the database"
 cd "$APP"
+pending=$("$VENV" - "$DB" "$APP/migrations" 2>/dev/null <<'PY' || true
+import re, sqlite3, sys
+from pathlib import Path
+try:
+    conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
+    have = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] or 0
+except sqlite3.Error:
+    have = 0
+names = (re.match(r"(\d+)_", p.name) for p in Path(sys.argv[2]).glob("*.sql"))
+want = max((int(m.group(1)) for m in names if m), default=0)
+print(f"{want:03d}" if want > have else "")
+PY
+)
+if [ -n "$pending" ] && [ -f "$DB" ]; then
+    snapshot="$DB.pre-$pending"
+    if [ -e "$snapshot" ]; then
+        dim "a snapshot for migration $pending is already here, and kept: $snapshot"
+    else
+        "$VENV" - "$DB" "$snapshot" <<'PY' || die "could not snapshot the database before migrating; nothing was migrated"
+import sqlite3, sys
+source, copy = sqlite3.connect(sys.argv[1]), sqlite3.connect(sys.argv[2])
+source.backup(copy)
+copy.close()
+source.close()
+PY
+        green "snapshot before migrating: $snapshot"
+    fi
+fi
 "$VENV" bin/sketchgen db init --db "$DB" || die "db init (migrate) failed"
 green "database schema up to date"
 
 # --- 3 & 4. The gallery, unless --no-render ----------------------------------
 if [ "$SKIP_RENDER" = yes ]; then
-    step "Skipping the gallery pull and re-render (--no-render)"
+    step "Skipping the gallery pull and re-render"
     dim "deploying on the assumption this change touches no entry page or the index"
 else
 

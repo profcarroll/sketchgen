@@ -1,0 +1,521 @@
+#!/usr/bin/env python3
+"""fleet — every sketchgen node at once, from the laptop (docs/plans/fleet.md, Packet 2).
+
+    bin/fleet status [NODE…] [--same] [--json]    which build each node is on, and is it right
+    bin/fleet update NODE… | --all                 update.sh on each, as a detached unit
+    bin/fleet watch [NODE…]                        follow those updates until they finish
+    bin/fleet pin NODE… --to REF --reason R        hold nodes on one commit (an A/B)
+    bin/fleet pin NODE… --clear                    let them follow main again
+
+On 2026-09-24 four nodes ran sketchgen and nothing could say whether they agreed
+without an ssh session each. sld-cloud said "up to date" four PRs behind main;
+three nodes were held on a72f076 for the hardware A/B by a detached HEAD that
+update.sh would have fast-forwarded without a word. This is the one place that
+sees all of them.
+
+The nodes are named in ~/.config/sketchgen/fleet (or $SKETCHGEN_FLEET), one per
+line, `name ssh-host [tunnel-port] [billing]` — see fleet.example. `status` is
+read-only: this checkout fetches main once, which is the single definition of
+"main" for the whole report, and each node is read by sending it
+sketchgen/build.py over ssh — so a node whose own checkout predates that file is
+read exactly like one that has it.
+
+`update` refuses, per node and before starting anything there: a node with work
+in hand (a deploy splits a batch across two builds; --mid-batch), a node whose
+update.sh predates pins and so would pull main whatever it is held on
+(--adopt), and a node already updating. It then starts update.sh as the
+transient user unit `sketchgen-update`, which outlives this ssh session — a
+dropped laptop no longer SIGHUPs a deploy halfway through a migration — and
+whose name systemd will not give to a second run. It returns at once; sld-cloud's
+render alone is about 25 minutes. Its output is ~/sketchgen/logs/update-*.log
+on the node, which is what `watch` reads.
+
+Exit codes, the project's: 0 ok (status: every node on target), 1 not, 3 refused
+(nothing started). Settings: SKETCHGEN_FLEET (the file), SKETCHGEN_SSH (the ssh
+command; tests point it at a fake).
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CODE = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(CODE))
+
+from sketchgen import build  # noqa: E402  (the path above is what finds it)
+
+#: The checkout whose origin/main is "main" for the whole report — this one,
+#: unless SKETCHGEN_FLEET_REPO says otherwise (the tests' scratch repository,
+#: so that nothing here reaches GitHub under the suite).
+REPO = Path(os.environ.get("SKETCHGEN_FLEET_REPO") or CODE)
+
+EXIT_OK, EXIT_FAIL, EXIT_REFUSED = 0, 1, 3
+
+FLEET_FILE = Path(os.environ.get("SKETCHGEN_FLEET")
+                  or Path.home() / ".config" / "sketchgen" / "fleet")
+SSH_TIMEOUT_S = 25
+REMOTE = "$HOME/sketchgen"
+PY = f"{REMOTE}/.venv/bin/python3"
+PROBE = f'"{PY}" - --root "{REMOTE}/app" --db "{REMOTE}/sketchgen.db"'
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+EXITED = re.compile(r"\[fleet\] update\.sh exited (\d+)")
+
+
+# ---------------------------------------------------------------------------
+# The fleet file and ssh
+# ---------------------------------------------------------------------------
+
+
+def load_fleet(path: Path = FLEET_FILE) -> list[dict]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        raise SystemExit(f"fleet: no fleet file at {path} — copy {CODE / 'fleet.example'} "
+                         f"there and name your nodes (exit 3)") from None
+    nodes = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].split()
+        if not line:
+            continue
+        if len(line) < 2:
+            raise SystemExit(f"fleet: {path}:{number}: need `name ssh-host`, got {raw!r}")
+        nodes.append({"name": line[0], "host": line[1],
+                      "port": line[2] if len(line) > 2 else None,
+                      "flags": line[3:]})
+    return nodes
+
+
+def choose(nodes: list[dict], names: list[str]) -> list[dict]:
+    if not names:
+        return nodes
+    by_name = {n["name"]: n for n in nodes} | {n["host"]: n for n in nodes}
+    unknown = [name for name in names if name not in by_name]
+    if unknown:
+        known = ", ".join(n["name"] for n in nodes)
+        raise SystemExit(f"fleet: not in {FLEET_FILE}: {', '.join(unknown)} (known: {known})")
+    return [by_name[name] for name in names]
+
+
+def ssh(host: str, command: str, stdin: str = "",
+        timeout: float = SSH_TIMEOUT_S) -> subprocess.CompletedProcess:
+    argv = [os.environ.get("SKETCHGEN_SSH", "ssh"), "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=8", host, command]
+    try:
+        return subprocess.run(argv, input=stdin, capture_output=True, text=True,
+                              timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 255, "", f"no answer in {timeout:.0f} s")
+
+
+def last_line(text: str) -> str:
+    lines = [line.strip() for line in ANSI.sub("", text or "").replace("\r", "\n").splitlines()
+             if line.strip()]
+    return lines[-1] if lines else ""
+
+
+def parallel(nodes: list[dict], fn) -> list:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(nodes))) as pool:
+        return list(pool.map(fn, nodes))
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+#: The node's own verdicts about main are against the last time *it* fetched,
+#: which on a node that never fetches is its last deploy. They are replaced by
+#: the laptop's, against the main this report fetched once for everyone.
+NODE_MAIN_PROBLEMS = ("behind main", "never fetched main", "not on main")
+
+
+def probe(node: dict) -> dict:
+    source = (CODE / "sketchgen" / "build.py").read_text(encoding="utf-8")
+    done = ssh(node["host"], PROBE, stdin=source)
+    row = {"node": node["name"], "host": node["host"], "reachable": False,
+           "doc": None, "error": None}
+    if done.returncode != 0:
+        row["error"] = last_line(done.stderr) or f"ssh exit {done.returncode}"
+        return row
+    try:
+        row["doc"] = json.loads(done.stdout)
+    except ValueError:
+        row["error"] = "the probe did not answer with JSON: " + last_line(done.stdout or done.stderr)
+        return row
+    row["reachable"] = True
+    return row
+
+
+def judge(row: dict, main: str | None) -> dict:
+    """The laptop's verdict on one node: its problems, against this main."""
+    if not row["reachable"]:
+        row.update(problems=[f"unreachable: {row['error']}"], on_target=False,
+                   build=None, behind=None)
+        return row
+    doc = row["doc"]
+    here = doc["checkout"]
+    rel = build.relation(REPO, here.get("sha"), main)
+    problems = []
+    if doc["target"]["kind"] == "main" and here.get("sha"):
+        if rel["on_main"] is False:
+            problems.append("not on main (a commit this checkout does not have, "
+                            "or one main never merged)")
+        elif rel["behind"]:
+            n = rel["behind"]
+            problems.append(f"{n} PR{'s' if n != 1 else ''} behind main")
+    node = [p for p in doc["problems"] if not any(k in p for k in NODE_MAIN_PROBLEMS)]
+    if not doc.get("knows_pins"):
+        # Its processes cannot have stamped a build either: one line, not three.
+        node = [p for p in node if "unrecorded" not in p]
+        node.append("predates build stamps and pins: its update.sh pulls main "
+                    "whatever it is on")
+    problems += node
+    row.update(problems=problems, on_target=not problems, build=here.get("build"),
+               behind=rel["behind"], on_main=rel["on_main"])
+    return row
+
+
+def describe_row(row: dict) -> list[str]:
+    if not row["reachable"]:
+        return [row["node"], "?", "?", "?", "?", "?", "unreachable"]
+    doc = row["doc"]
+    here, target = doc["checkout"], doc["target"]
+    where = build.short(here.get("build")) + (" det." if here.get("detached") else "")
+    if target["kind"] == "pin":
+        aim = f"pin {build.short(target['sha'])}"
+    elif doc.get("knows_pins"):
+        aim = "main"
+    else:
+        aim = "main (no pins yet)"
+    if row.get("on_main") is False:
+        gap = "off main"
+    elif row.get("behind") is None:
+        gap = "?"
+    else:
+        gap = f"{row['behind']} behind" if row["behind"] else "at main"
+    runs = []
+    for role in build.RUN_ROLES:
+        stamp = (doc.get("running") or {}).get(role)
+        if (doc.get("units") or {}).get(role) != "active":
+            continue
+        if not stamp or not stamp.get("build"):
+            runs.append(f"{role} ?")
+        elif stamp["build"] != here.get("build"):
+            runs.append(f"{role} {build.short(stamp['build'])}")
+    running = "; ".join(runs) if runs else "= checkout"
+    control = (doc.get("control") or {}).get("state") or "?"
+    work = doc.get("work") or {}
+    busy = [f"{work[k]} {label}" for k, label in
+            (("queued", "queued"), ("in_flight", "in flight"), ("parked", "parked"))
+            if work.get(k)]
+    if (doc.get("units") or {}).get("update") in ("active", "activating"):
+        busy.insert(0, "UPDATING")
+    return [row["node"], where, aim, gap, running, control, ", ".join(busy) or "idle"]
+
+
+def table(rows: list[list[str]], head: list[str]) -> str:
+    widths = [max(len(str(r[i])) for r in rows + [head]) for i in range(len(head))]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    return "\n".join(fmt.format(*r).rstrip() for r in [head] + rows)
+
+
+def fetch_main() -> tuple[str | None, str | None]:
+    error = build.fetch(REPO, timeout=20)
+    return build.git(REPO, "rev-parse", "--verify", "--quiet", build.UPSTREAM), error
+
+
+def gather(nodes: list[dict]) -> tuple[list[dict], str | None, str | None]:
+    main, error = fetch_main()
+    rows = parallel(nodes, probe)
+    return [judge(row, main) for row in rows], main, error
+
+
+def report(rows: list[dict], main: str | None, fetch_error: str | None,
+           same: bool) -> tuple[str, bool]:
+    lines = [table([describe_row(r) for r in rows],
+                   ["node", "checkout", "target", "vs main", "running", "generator", "work"])]
+    subject = ""
+    if main:
+        found = build.commits(REPO, f"{main}~1", main, limit=1)
+        subject = f" (#{found[0]['pr']} {found[0]['title']})" if found and found[0]["pr"] else ""
+    lines.append("")
+    lines.append(f"main is {build.short(main)}{subject}"
+                 + (f" — fetch failed, as of the last one: {fetch_error}" if fetch_error else ""))
+    builds: dict[str, list[str]] = {}
+    for row in rows:
+        builds.setdefault(build.short(row.get("build")), []).append(row["node"])
+    lines.append(f"{len(builds)} build{'s' if len(builds) != 1 else ''} on "
+                 f"{len(rows)} node{'s' if len(rows) != 1 else ''}: "
+                 + " · ".join(f"{b} ({', '.join(names)})" for b, names in builds.items()))
+    wrong = [r for r in rows if not r["on_target"]]
+    ok = not wrong and (not same or len(builds) == 1)
+    if wrong:
+        lines.append("not on target:")
+        width = max(len(r["node"]) for r in wrong)
+        for row in wrong:
+            lines.append(f"  {row['node']:<{width}}  " + "; ".join(row["problems"]))
+    if same and len(builds) != 1:
+        lines.append("--same: the fleet is not on one build")
+    if ok:
+        lines.append("all on target" + (", one build" if same or len(builds) == 1 else ""))
+    return "\n".join(lines), ok
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    nodes = choose(load_fleet(), args.nodes)
+    rows, main, error = gather(nodes)
+    text, ok = report(rows, main, error, args.same)
+    if args.json:
+        print(json.dumps({"main": main, "fetch_error": error, "ok": ok, "nodes": rows},
+                         indent=2, sort_keys=True))
+    else:
+        print(text)
+    return EXIT_OK if ok else EXIT_FAIL
+
+
+# ---------------------------------------------------------------------------
+# update and watch
+# ---------------------------------------------------------------------------
+
+#: Sent to the node on stdin (`bash -s`). The render choice travels as the
+#: environment, never as an argument: a node's update.sh from before
+#: --render=auto dies on a flag it does not know, and it is exactly that copy
+#: which runs first on an --adopt (it pulls, then hands over to the new one).
+START = r"""
+set -e
+if systemctl --user is-active --quiet sketchgen-update.service; then
+    echo "busy: sketchgen-update is already running here"; exit 3
+fi
+systemctl --user reset-failed sketchgen-update.service >/dev/null 2>&1 || true
+mkdir -p "$HOME/sketchgen/logs"
+log="$HOME/sketchgen/logs/update-$(date -u +%Y%m%dT%H%M%SZ).log"
+systemd-run --user --unit=sketchgen-update --collect --quiet \
+    --property=StandardOutput="append:$log" --property=StandardError="append:$log" \
+    --setenv=PATH="$PATH" __ENV__ \
+    /bin/bash -c 'bash "$HOME/sketchgen/app/update.sh"; echo "[fleet] update.sh exited $?"'
+echo "started: $log"
+"""
+
+RENDER_ENV = {
+    "auto": ["SKETCHGEN_RENDER=auto"],
+    "yes": ["SKETCHGEN_RENDER=yes"],
+    # An old update.sh reads only SKIP_RENDER; a new one reads RENDER first.
+    "no": ["SKETCHGEN_RENDER=no", "SKETCHGEN_SKIP_RENDER=1"],
+}
+
+
+def refusal(row: dict, args: argparse.Namespace) -> str | None:
+    if not row["reachable"]:
+        return f"unreachable: {row['error']}"
+    doc = row["doc"]
+    if (doc.get("units") or {}).get("update") in ("active", "activating"):
+        return "an update is already running there"
+    work = doc.get("work") or {}
+    busy = sum(work.get(k) or 0 for k in ("queued", "in_flight", "parked"))
+    if busy and not args.mid_batch:
+        return (f"{work.get('queued', 0)} queued, {work.get('in_flight', 0)} in flight, "
+                f"{work.get('parked', 0)} parked — a deploy now splits that batch "
+                f"across two builds; wait for the queue to drain, or --mid-batch")
+    here = doc["checkout"]
+    if not doc.get("knows_pins") and not args.adopt:
+        held = (f"{build.short(here.get('build'))}"
+                + (", detached" if here.get("detached") else f", on {here.get('branch')}"))
+        return (f"predates pins — its update.sh pulls main whatever it is on ({held}). "
+                f"If that is what you want, --adopt; if it is an A/B arm, leave it")
+    if here.get("dirty"):
+        return "tracked files are changed on the node; update.sh would refuse"
+    if here.get("branch") and here["branch"] != "main":
+        return f"on branch {here['branch']}; update.sh would refuse"
+    return None
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    fleet = load_fleet()
+    if args.all == bool(args.nodes):
+        print("fleet: name the nodes to update, or --all (not both)", file=sys.stderr)
+        return EXIT_REFUSED
+    nodes = choose(fleet, args.nodes)
+    rows, main, error = gather(nodes)
+    refused = {row["node"]: why for row in rows if (why := refusal(row, args))}
+    for name, why in refused.items():
+        print(f"{name}: refused: {why}")
+    go = [n for n, row in zip(nodes, rows) if row["node"] not in refused]
+    if not go:
+        print("fleet: nothing started")
+        return EXIT_REFUSED
+    env = " ".join(f"--setenv={shlex.quote(e)}" for e in RENDER_ENV[args.render])
+    script = START.replace("__ENV__", env)
+    if args.dry_run:
+        for node in go:
+            print(f"{node['name']}: would start update.sh (render={args.render}) toward "
+                  f"{build.short(main)}")
+        return EXIT_OK
+    results = parallel(go, lambda node: ssh(node["host"], "bash -s", stdin=script))
+    started = []
+    for node, done in zip(go, results):
+        said = last_line(done.stdout) or last_line(done.stderr) or f"ssh exit {done.returncode}"
+        print(f"{node['name']}: {said}")
+        if done.returncode == 0:
+            started.append(node["name"])
+    if started:
+        print(f"follow with: bin/fleet watch {' '.join(started)}")
+    if args.watch and started:
+        return watch(choose(fleet, started))
+    return EXIT_OK if started and not refused else (EXIT_FAIL if started else EXIT_REFUSED)
+
+
+PEEK = r"""
+log=$(ls -t "$HOME"/sketchgen/logs/update-*.log 2>/dev/null | head -1)
+echo "state: $(systemctl --user is-active sketchgen-update.service 2>/dev/null)"
+echo "log: $log"
+[ -n "$log" ] && tail -c 6000 "$log"
+true
+"""
+
+
+def peek(node: dict) -> dict:
+    done = ssh(node["host"], "bash -s", stdin=PEEK, timeout=25)
+    lines = (done.stdout or "").split("\n", 2)
+    state = lines[0].removeprefix("state: ").strip() if lines else ""
+    log = lines[1].removeprefix("log: ").strip() if len(lines) > 1 else ""
+    tail = lines[2] if len(lines) > 2 else ""
+    exited = EXITED.findall(tail)
+    return {"node": node["name"], "reachable": done.returncode == 0,
+            "running": state in ("active", "activating"),
+            "exit": int(exited[-1]) if exited else None, "log": log,
+            "line": last_line(EXITED.sub("", tail)) or last_line(done.stderr)}
+
+
+def watch(nodes: list[dict], every_s: float = 5.0) -> int:
+    width = max(len(n["name"]) for n in nodes)
+    seen: dict[str, str] = {}
+    while True:
+        peeks = parallel(nodes, peek)
+        for p in peeks:
+            state = ("running" if p["running"] else
+                     "done" if p["exit"] == 0 else
+                     f"FAILED (exit {p['exit']})" if p["exit"] is not None else
+                     "unreachable" if not p["reachable"] else "not running")
+            line = f"{p['node']:<{width}}  {state:<18} {p['line'][:110]}"
+            if seen.get(p["node"]) != line:
+                print(line, flush=True)
+                seen[p["node"]] = line
+        if not any(p["running"] for p in peeks):
+            break
+        time.sleep(every_s)
+    print()
+    for p in peeks:
+        if p["log"]:
+            print(f"{p['node']}: log {p['log']}")
+    failed = [p["node"] for p in peeks if p["exit"] not in (0, None) or not p["reachable"]]
+    rows, main, error = gather(nodes)
+    text, ok = report(rows, main, error, same=False)
+    print()
+    print(text)
+    return EXIT_OK if ok and not failed else EXIT_FAIL
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    return watch(choose(load_fleet(), args.nodes), every_s=args.every)
+
+
+# ---------------------------------------------------------------------------
+# pin
+# ---------------------------------------------------------------------------
+
+
+def cmd_pin(args: argparse.Namespace) -> int:
+    nodes = choose(load_fleet(), args.nodes)
+    if bool(args.to) == bool(args.clear):
+        print("fleet: pin needs --to REF (with --reason) or --clear", file=sys.stderr)
+        return EXIT_REFUSED
+    if args.to:
+        sha = build.resolve(REPO, args.to)
+        if sha is None:
+            build.fetch(REPO)
+            sha = build.resolve(REPO, args.to)
+        if sha is None:
+            print(f"fleet: {args.to!r} is not a commit this checkout has", file=sys.stderr)
+            return EXIT_REFUSED
+        verb = ["pin", sha, "--reason", args.reason or "", "--by", args.by]
+    else:
+        verb = ["pin", "--clear", "--by", args.by]
+    remote = (f'"{PY}" "{REMOTE}/app/bin/sketchgen" '
+              + " ".join(shlex.quote(a) for a in verb) + f' --db "{REMOTE}/sketchgen.db"')
+    results = parallel(nodes, lambda node: ssh(node["host"], remote))
+    worst = EXIT_OK
+    for node, done in zip(nodes, results):
+        said = last_line(done.stdout) if done.returncode == 0 else (
+            last_line(done.stderr) or last_line(done.stdout) or f"ssh exit {done.returncode}")
+        if "invalid choice: 'pin'" in (done.stderr or ""):
+            said = "predates pins — update it (--adopt) before it can be pinned"
+        print(f"{node['name']}: {said}")
+        if done.returncode != 0:
+            worst = max(worst, EXIT_REFUSED if done.returncode == 3 else EXIT_FAIL)
+    return worst
+
+
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="fleet", description=__doc__.split("\n\n")[0],
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("status", help="which build each node is on, and whether it is right")
+    p.add_argument("nodes", nargs="*", help="node names (default: the whole fleet)")
+    p.add_argument("--same", action="store_true",
+                   help="also require one build across these nodes (before an A/B)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser("update", help="run update.sh on nodes, as the sketchgen-update unit")
+    p.add_argument("nodes", nargs="*")
+    p.add_argument("--all", action="store_true", help="every node in the fleet file")
+    p.add_argument("--render", choices=("auto", "yes", "no"), default="auto",
+                   help="re-render the gallery: auto (default) when the diff can "
+                        "reach a page; a node that predates auto renders")
+    p.add_argument("--mid-batch", action="store_true",
+                   help="update a node with jobs queued or in flight anyway")
+    p.add_argument("--adopt", action="store_true",
+                   help="update a node whose update.sh predates pins (it goes to main)")
+    p.add_argument("--dry-run", action="store_true", help="say what would start")
+    p.add_argument("--watch", action="store_true", help="then follow them (blocks)")
+    p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("watch", help="follow running updates until they finish")
+    p.add_argument("nodes", nargs="*")
+    p.add_argument("--every", type=float, default=5.0, help=argparse.SUPPRESS)
+    p.set_defaults(func=cmd_watch)
+
+    p = sub.add_parser("pin", help="hold nodes on one commit, or --clear")
+    p.add_argument("nodes", nargs="+")
+    p.add_argument("--to", metavar="REF")
+    p.add_argument("--reason")
+    p.add_argument("--clear", action="store_true")
+    p.add_argument("--by", default=os.environ.get("SKETCHGEN_OPERATOR", "profcarroll"),
+                   help="GitHub login (default: $SKETCHGEN_OPERATOR, else profcarroll)")
+    p.set_defaults(func=cmd_pin)
+
+    args = parser.parse_args(argv)
+    try:
+        return args.func(args)
+    except SystemExit as exc:
+        if isinstance(exc.code, str):
+            print(exc.code, file=sys.stderr)
+            return EXIT_REFUSED
+        raise
+
+
+if __name__ == "__main__":
+    sys.exit(main())

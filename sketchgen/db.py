@@ -224,6 +224,9 @@ class Job:
     # a person can queue one line with the source and one without without
     # flipping the node for every job in the queue (MEASURE[source-follow]).
     executor_source: str | None = None
+    # Migration 018: the build the process that wrote the plan was running
+    # (sketchgen/build.py `running`), NULL before 2026-09-24.
+    plan_build: str | None = None
 
     @property
     def assertions(self) -> list[str]:
@@ -263,6 +266,9 @@ class Attempt:
     # every attempt before 2026-09-21.
     given_source_json: str | None = None
     num_ctx: int | None = None
+    # Migration 018: the build the worker was running when it recorded this
+    # attempt — which gate judged it. NULL before 2026-09-24.
+    build: str | None = None
 
 
 @dataclass
@@ -441,6 +447,7 @@ _JOB_FIELDS = (
     "since_utc",
     "note",
     "executor_source",
+    "plan_build",
 )
 
 
