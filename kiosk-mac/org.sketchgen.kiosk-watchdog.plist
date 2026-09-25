@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- ~/Library/LaunchAgents/org.sketchgen.kiosk-watchdog.plist — every 5 minutes.
-     USER is replaced at install. DRAFT (docs/plans/kiosk-mac.md §2.4). -->
+<!-- ~/Library/LaunchAgents/org.sketchgen.kiosk-watchdog.plist — every 5 minutes
+     (docs/plans/kiosk-mac.md §2.4). install.sh replaces /Users/USER and loads it. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -12,5 +12,8 @@
   </array>
   <key>StartInterval</key><integer>300</integer>
   <key>RunAtLoad</key><false/>
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
+  <key>StandardOutPath</key><string>/Users/USER/Library/Caches/sketchgen-kiosk/watchdog.err</string>
+  <key>StandardErrorPath</key><string>/Users/USER/Library/Caches/sketchgen-kiosk/watchdog.err</string>
 </dict>
 </plist>
