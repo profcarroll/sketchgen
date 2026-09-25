@@ -8,7 +8,8 @@
     "gpu": {
       "name": null,
       "vram_mb": {"total": null, "used": null},
-      "util_pct": null
+      "util_pct": null,
+      "apps": []
     },
     "cores": 16,
     "uptime_s": 191244.6,
@@ -109,6 +110,26 @@
       {"headline": "Turning the prompt into a brief", "seconds": 9.4},
       {"headline": "Picking up the next job", "seconds": 0.2}
     ]
+  },
+  "pair": {
+    "role": null,
+    "pool": {
+      "url": null, "state": null, "build": null, "model": null, "n_ctx": null,
+      "pid": null, "vram_mb": null, "task": null, "prompt_tokens": null,
+      "n_decoded": null, "live_decode_tok_s": null, "decode_tok_s": null,
+      "prefill_tok_s": null, "tokens_in": null, "tokens_out": null
+    },
+    "partner": {
+      "host": null, "reachable": null, "age_s": null, "error": null, "node": null,
+      "gpu": {"name": null, "vram_mb": {"total": null, "used": null}, "util_pct": null},
+      "rpc": {"pid": null, "cpu_pct": null, "vram_mb": null, "serving": null},
+      "control": null, "reason": null, "resident": []
+    },
+    "link": {
+      "iface": null, "speed_mbps": null, "rx_mb_s": null, "tx_mb_s": null,
+      "rpc_port_open": null, "rpc_connections": null
+    },
+    "lent": {"rpc_pid": null, "cpu_pct": null, "vram_mb": null, "serving": null}
   },
   "odometer": {
     "session": {
