@@ -116,9 +116,10 @@ that.
 
 ### 1.5 The idle critic leaves imported entries alone
 
-`db.entries_to_critique` offers published entries oldest first, and these carry dates from the
-23rd to the 27th: published, they would go to the head of the list and sld-cloud would spend
-its idle rounds writing CPU-made children of GPU-made parents. The query gains `AND
+`db.entries_to_critique` offers published entries oldest first, by `created_utc`, and these
+carry dates from the 23rd to the 27th: published, they are offered ahead of everything
+sld-cloud has made since, and it would spend its idle rounds writing CPU-made children of
+GPU-made parents. The query gains `AND
 e.origin_node IS NULL`. A person can still mark *Critique* on a card; that child is made here,
 its own shape says so, and its lineage names its parent. What stops is the machine doing it
 unasked.
@@ -127,9 +128,10 @@ unasked.
 
 Published, they join the pool `pairs.py` draws from, and a verdict may set a GPU entry beside a
 CPU one. That is wanted: without standings an entry has no place in three of the kiosk's seven
-orders (*most reviewed*, *controversial*, *consensus*). But it puts a second variable into the rules-file A/B the gallery measures, as a paid
-executor does (AGENTS.md, *Other steps and settings*): **an analysis of that A/B reads `WHERE
-origin_node IS NULL`**, and the column is what makes that one clause.
+orders (*most reviewed*, *controversial*, *consensus*). But it puts a second variable into the
+rules-file A/B the gallery measures, as a paid executor does (AGENTS.md, *Other steps and
+settings*): **an analysis of that A/B reads `WHERE origin_node IS NULL`**, and the column is
+what makes that one clause.
 
 ## 2. Packet 1 — `feat/import-entries`
 
