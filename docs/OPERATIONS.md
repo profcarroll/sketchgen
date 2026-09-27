@@ -1638,8 +1638,22 @@ bin/pull-backup.sh sld-gpu            # verifies the snapshot it pulled
 scp 'sld-gpu:sketchgen/bench-*.json' 'sld-gpu:sketchgen/*.json' ~/sketchgen-backups/sld-gpu/
 ```
 
-Remove the `sld-gpu` block from `~/.ssh/config` afterwards so nothing tries to
-reach an address Oracle has given to somebody else.
+Terminate only once `pull-backup.sh` has printed its line with the manifest's
+job count matching the directories on disk: that pull is the only copy of the
+rental's work, since a private node publishes nothing. Queued jobs left at
+teardown never run; their prompts are still in the batch maps you enqueued
+from.
+
+Then remove every laptop-side hook that points at the rental, so nothing tries
+to reach an address Oracle has given to somebody else:
+
+- the `sld-gpu` block in `~/.ssh/config`;
+- the `sgt-sld-gpu` function in `~/.bashrc.d/sketchgen-tunnel.sh`, and stop its
+  tunnel first (`sgt-sld-gpu down`), or its billing refresh keeps knocking;
+- the `sld-gpu` device in the Tailscale admin console (Machines → Remove), so
+  its tailnet address is not left pointing at nothing;
+- the `a10-budget-watch` scheduled task in the desktop app, which would
+  otherwise go on reporting a cutoff for a node that no longer exists.
 
 ## A new private node: install.sh
 
