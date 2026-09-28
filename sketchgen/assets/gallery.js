@@ -306,7 +306,11 @@
   var COUNTS_BATCH = 100;
 
   function fetchCounts(ids) {
-    return fetch(base() + "/counts?entries=" + encodeURIComponent(ids.join(",")), {
+    // Anonymous from a local render, as the kiosk always is: the Worker lets a
+    // kiosk origin read counts but never with credentials, and a request that
+    // asked for them would have its answer withheld (local-gallery.md §1.6).
+    var local = !!localLabel();
+    return fetch(base() + "/counts?entries=" + encodeURIComponent(ids.join(",")), local ? {} : {
       credentials: "include",
       headers: authHeaders()
     })

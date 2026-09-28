@@ -52,8 +52,10 @@ function load(config, entryPage) {
   const document = window.document;
   window.location.pathname = entryPage ? "/e/4/" : "/index.html";
   const asked = [];
-  window.fetch = function (url) {
+  const options = [];
+  window.fetch = function (url, init) {
     asked.push(String(url));
+    options.push({ url: String(url), init: init });
     if (String(url).indexOf("config.json") !== -1) { return answer(config); }
     if (String(url).indexOf("/counts") !== -1) { return answer({}); }
     return Promise.reject(new Error("offline"));
@@ -78,7 +80,7 @@ function load(config, entryPage) {
     setTimeout: setTimeout, Error: Error
   });
   vm.runInContext(fs.readFileSync(SCRIPT, "utf8"), context, { filename: "gallery.js" });
-  return { window, document, asked };
+  return { window, document, asked, options };
 }
 
 function settle() {
@@ -121,6 +123,11 @@ async function main() {
   equal(page.asked.filter(function (u) { return u.indexOf("config.json") === -1; })
     .map(function (u) { return u.replace(/\?.*$/, ""); }),
         ["https://write.example.invalid/counts"], "a local render reads counts and nothing else");
+
+  // And anonymously: a kiosk origin is never given credentials.
+  equal(page.options.filter(function (o) { return o.url.indexOf("/counts") !== -1; })
+    .map(function (o) { return o.init === undefined || !o.init.credentials; }), [true],
+        "a local render reads counts without credentials");
 
   // An entry page of the same render: its own toggle, and the stored pick.
   page = load(LOCAL, true);

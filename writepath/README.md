@@ -150,6 +150,13 @@ Nothing below has been done. Each step is the instructor's.
 6. **Pages** — enable GitHub Pages on the `sketchgen-gallery` repo (packet 3.2's
    deploy key pushes to it). Its origin must equal `GALLERY_URL` in
    `wrangler.toml` exactly, or every browser call is refused by CORS.
+
+   `KIOSK_ORIGINS` beside it lists the loopback origins a kiosk plays a *local*
+   render from (`docs/plans/local-gallery.md` §1.6). Those may read `/counts` and
+   post kiosk views to `/view` — anonymously, never with credentials — and get no
+   CORS on any other route. A `/view` from one that is not `source: "kiosk"` is
+   refused. A non-loopback origin in the list is ignored, so it cannot open even
+   this to a public site. Changing the list is a `wrangler deploy`; no D1 change.
 7. **The token on the node** — put the `PULL_TOKEN` value in
    `~/sketchgen/writepath.token`, then `chmod 600 ~/sketchgen/writepath.token`.
    `sketchgen sync` refuses to run if the file is readable by anyone else, and
