@@ -1243,6 +1243,49 @@ body.kiosk .welcome .go:hover { border-color: var(--accent); outline: none; }
   }
 }
 
+/* A local render (docs/plans/local-gallery.md §1.7). gallery.js draws these
+ * only when config.json carries "local", which the published site's never
+ * does: the banner says the page is not the site, and the toggles collect
+ * ids for an import. */
+.chip.held { background: var(--ok-ground); color: var(--ok-ink); }
+
+.local-banner {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.25rem 0.5rem;
+  padding: 0.5rem 1rem;
+  background: var(--chip);
+  color: var(--ink);
+  border-bottom: 1px solid var(--line);
+  font-size: 0.9rem;
+}
+.local-banner textarea[hidden] { display: none; }
+.local-banner textarea {
+  flex-basis: 100%;
+  font: inherit;
+  font-family: ui-monospace, monospace;
+}
+
+.pick {
+  font: inherit;
+  font-size: 0.85rem;
+  padding: 0.15rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--ink-soft);
+  cursor: pointer;
+}
+.pick[aria-pressed="true"] {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--panel);
+}
+
 /* ---- swipe ----------------------------------------------------------------
  *
  * swipe.html and nothing else: every rule below is scoped to body.swipe, which

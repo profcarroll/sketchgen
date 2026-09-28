@@ -1119,6 +1119,49 @@ The job row is left `failed` on purpose: it is terminal, and a sixth terminal jo
 state meaning "its entry got a second look" would mean touching every count and
 funnel in the console to say nothing new.
 
+## A local render: the gallery nobody pushes
+
+`render-local` renders the same pages as the site, of any database, into a directory
+that is never a git checkout (docs/plans/local-gallery.md). It is for looking at what
+is not published — a held archive, sifted on a laptop — and for a kiosk that plays from
+its own loopback. Nothing it writes is pushed, and it refuses to write into a checkout.
+
+```bash
+SG="$HOME/sketchgen/.venv/bin/python3 $HOME/sketchgen/app/bin/sketchgen"
+A=$HOME/sketchgen-backups/sld-gpu/sketchgen          # the rented GPU's archive; its
+                                                    # database is the verified last snapshot
+$SG render-local --db $A/backups/2026-09-27T135015Z/sketchgen.db --jobs $A/jobs \
+    --out ~/sketchgen-local/sld-gpu --origin sld-gpu --include held
+```
+
+- **`--jobs` is required, and it is not a formality.** The archive's rows name the node
+  they were written on: `/home/ubuntu/sketchgen/jobs/1/…`, which on sld-cloud is
+  sld-cloud's own job 1. The database is opened read-only and every path is read through
+  a view that points it at `--jobs`; a path outside the database's jobs directory reads
+  as nothing.
+- **The database is never written**, nor anything beside it. The frames gain a
+  `strip.webp` beside each `strip.png`, as `web-frames` makes on every node: the
+  first render of a big archive encodes thousands, with the gate's Chromium, so run it
+  with the generator paused (a gate sharing the CPU reads slower frame times), or pass
+  `--no-web` for a quick look at PNGs.
+- **Held entries are shown as held**: a *held · not published* chip, no QR code, no
+  public address in `meta.json` or the kiosk's manifest. Published entries keep theirs,
+  pointing at the site.
+- **An entry the personal-data guard refuses is left out**, named on a `skipped` line,
+  and the rest render. On the site the same guard refuses the publish.
+- **Picks.** Every card and entry page gets a *Pick* toggle, kept in the browser, and
+  the banner's *Copy picked ids* gives one id per line: `--ids FILE` narrows a render to
+  such a list, and `import run --ids` (docs/plans/gpu-fold-in.md) takes the same file.
+- **Counting** is off unless `--write-path` is given, and a Worker only counts from an
+  origin it lists (local-gallery.md §1.6). `--config-from ~/sketchgen/gallery` carries
+  the kiosk's sites, buildings and ghost settings over from the site.
+
+Look at it on the laptop with `rsync -a sld-cloud:sketchgen-local/sld-gpu/ ./sld-gpu/`
+and `python3 -m http.server --bind 127.0.0.1 --directory sld-gpu`. Sketches play in
+Chrome from loopback exactly as on Pages (the spike, local-gallery.md §0.3), but not in
+the desktop app's Browser pane, which blocks the sandboxed frame
+(`net::ERR_BLOCKED_BY_CLIENT`).
+
 ## The billing card
 
 The console's last panel says what this tenancy has cost. It is the one number
