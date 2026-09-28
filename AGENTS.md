@@ -337,7 +337,9 @@ worker and web, resume. `bin/fleet status` says which build every node is on
 - **Unit reinstall overwrites the unit files.** Settings belong in drop-ins
   (`~/.config/systemd/user/<unit>.service.d/*.conf`), which survive.
 - **`--no-render`** only when nothing touched `gallery.py`, a template, assets
-  or the render path; a template change needs the full re-render (~25 min).
+  or the render path; a template change needs the full re-render (about a
+  minute and a half on sld-cloud since the pages share one forest, fit and
+  ledger; it was 110 minutes on 2026-09-28, before they did).
 - **The write-path Worker (`writepath/`) is not deployed by update.sh.** Deploy
   it by hand with `npx --yes wrangler@latest deploy` from `writepath/`, and
   apply any D1 schema change **before** the deploy, verifying the table exists

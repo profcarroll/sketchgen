@@ -942,9 +942,15 @@ def publish_index(
             if on_step is not None:
                 on_step(done, total, label)
 
+        # One forest, one Bradley–Terry fit and one ledger for every page,
+        # not one per page: rendered per page they made this loop quadratic,
+        # and on 2026-09-28 a deploy spent 110 minutes here over 1,589
+        # entries with the generator paused. Every row above is already
+        # public, so the forest needs no ``admit`` (gallery._Shared).
+        shared = gallery._shared(conn, config)
         for row in rows:
             step(f"entry {row['id']}")
-            gallery.render_entry(conn, row["id"], checkout, config)
+            gallery.render_entry(conn, row["id"], checkout, config, shared=shared)
             done += 1
         step("index")
         gallery.render_index(conn, checkout, config)
