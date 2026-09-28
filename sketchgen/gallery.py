@@ -59,7 +59,7 @@ import json
 import re
 import shutil
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from string import Template
 from typing import Any, Iterable
@@ -80,12 +80,15 @@ __all__ = [
     "META_KEYS",
     "PUBLIC_STATES",
     "Config",
+    "Local",
+    "LocalRender",
     "Unsafe",
     "UnknownEntry",
     "guard",
     "render_all",
     "render_entry",
     "render_index",
+    "render_local",
 ]
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -346,6 +349,36 @@ def _json_object(value: Any) -> dict:
 
 
 @dataclass(frozen=True)
+class Local:
+    """What a local render shows (docs/plans/local-gallery.md §1.3).
+
+    A local render is the same renderer pointed at a directory nobody pushes,
+    and this is the one thing it decides differently: which rows are on the
+    pages. ``published`` is the site's own set, stamped by a push; ``held``
+    adds the entries nobody has published, shown as held and never as
+    published; ``only`` narrows either to a list of ids. ``label`` names the
+    database on the page's banner and keys the picks in the browser, because
+    two local renders of two archives must not share one list.
+
+    Only ``label`` reaches ``config.json``. A checkout's config never has it,
+    which is how the public pages stay byte for byte what they were.
+    """
+
+    label: str
+    published: bool = True
+    held: bool = False
+    only: frozenset[int] | None = None
+
+    def admits(self, row: Any) -> bool:
+        """Whether this row is on the local render's pages."""
+        if self.only is not None and int(row["id"]) not in self.only:
+            return False
+        if self.held and row["state"] == "held":
+            return True
+        return self.published and _is_public(row)
+
+
+@dataclass(frozen=True)
 class Config:
     """The two URLs the generated pages need, and the repository behind them.
 
@@ -373,6 +406,11 @@ class Config:
     on anything it cannot — because the whole point of keeping them in this
     file is that an operator extends a term's hours with one edit and a
     ``render-index``. A kiosk opened without ``?site=`` never reads them.
+
+    ``local`` is set by ``render-local`` and by nothing else: a render into a
+    directory that is never pushed, of rows the site may not have (:class:`Local`).
+    ``load`` never reads it back, so a checkout cannot be talked into being
+    one by its own config.json.
     """
 
     write_path: str = ""
@@ -383,6 +421,7 @@ class Config:
     kiosk_ghost_loop_s: int = DEFAULT_GHOST_LOOP_S
     kiosk_sites: dict = field(default_factory=dict)
     kiosk_buildings: dict = field(default_factory=dict)
+    local: Local | None = None
 
     @classmethod
     def load(cls, dest_dir: str | Path) -> "Config":
@@ -418,26 +457,36 @@ class Config:
         )
 
     def to_json(self) -> str:
-        return (
-            json.dumps(
-                {
-                    "write_path": self.write_path,
-                    "gallery_url": self.gallery_url,
-                    "repository": self.repository,
-                    "kiosk_views": self.kiosk_views,
-                    "kiosk_ghost": self.kiosk_ghost,
-                    "kiosk_ghost_loop_s": self.kiosk_ghost_loop_s,
-                    "kiosk_sites": self.kiosk_sites,
-                    "kiosk_buildings": self.kiosk_buildings,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n"
-        )
+        data: dict[str, Any] = {
+            "write_path": self.write_path,
+            "gallery_url": self.gallery_url,
+            "repository": self.repository,
+            "kiosk_views": self.kiosk_views,
+            "kiosk_ghost": self.kiosk_ghost,
+            "kiosk_ghost_loop_s": self.kiosk_ghost_loop_s,
+            "kiosk_sites": self.kiosk_sites,
+            "kiosk_buildings": self.kiosk_buildings,
+        }
+        # Absent, not empty, on the public gallery: gallery.js draws the
+        # banner and the pick toggles for any value of this key.
+        if self.local is not None:
+            data["local"] = self.local.label
+        return json.dumps(data, indent=2, sort_keys=True) + "\n"
 
     def entry_url(self, entry_id: int) -> str:
         return f"{self.gallery_url.rstrip('/')}/e/{entry_id}/"
+
+    def public_url(self, row: Any) -> str | None:
+        """The page a code or a link may send somebody to, or None.
+
+        On the site every entry is public, so this is ``entry_url``. On a local
+        render a held entry has no public page: a QR code for it would open a
+        404 on a visitor's phone, and a link to the local copy would open
+        nothing, because the phone is not on the kiosk's loopback (§1.5).
+        """
+        if self.local is not None and not _is_public(row):
+            return None
+        return self.entry_url(int(row["id"]))
 
     def tree_url(self, entry_id: int) -> str:
         return f"{self.repository.rstrip('/')}/tree/main/e/{entry_id}"
@@ -462,17 +511,34 @@ STATE_CHIPS = {
     "rejected": ("rejected", "rejected · operator"),
 }
 
+#: The chip a held entry wears, which only a local render ever draws: the site
+#: has no held entries, and a reader of a local copy must not take one for a
+#: publication. Not in STATE_CHIPS, which ``_entry`` reads as the rejections.
+HELD_CHIP = ("held", "held · not published")
+
 
 def _state_chip(state: str) -> str:
     """The chip a public entry wears: a rejection says so, and says whose."""
-    css, label = STATE_CHIPS.get(state, (state, state))
+    css, label = HELD_CHIP if state == "held" else STATE_CHIPS.get(state, (state, state))
     return f'<span class="chip {_esc(css)}">{_esc(label)}</span>'
 
 
-def _entry(conn: sqlite3.Connection, entry_id: int, *, publishing: bool = False) -> sqlite3.Row:
+def _entry(
+    conn: sqlite3.Connection,
+    entry_id: int,
+    *,
+    publishing: bool = False,
+    config: Config | None = None,
+) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM entries WHERE id = ?", (entry_id,)).fetchone()
     if row is None:
         raise UnknownEntry(f"no entry {entry_id}")
+    if config is not None and config.local is not None and not publishing:
+        # A local render has its own rule, and it replaces the site's rather
+        # than adding to it: a held entry is on its pages *as held*.
+        if not config.local.admits(row):
+            raise UnknownEntry(f"entry {entry_id} is not in this local render")
+        return row
     if publishing and row["state"] == "held":
         # The publisher renders BEFORE the push that makes the entry public
         # (the row flips to published only on a successful push), so a held
@@ -494,21 +560,35 @@ def _entry(conn: sqlite3.Connection, entry_id: int, *, publishing: bool = False)
     return row
 
 
-def _entries(conn: sqlite3.Connection, state: str) -> list[sqlite3.Row]:
+def _entries(
+    conn: sqlite3.Connection, state: str, config: Config | None = None
+) -> list[sqlite3.Row]:
     """The rows in ``state`` that the publisher has put on the site.
 
     ``published_utc`` is set by a successful push and by nothing else. The
     worker marks a rejection ``failed-kept`` the moment the gate gives up, long
     before anyone decides to show it; without this clause the index would
     print a card, and a 404 behind it, for every rejection nobody published.
+
+    On a local render (``config.local``) the ``published`` slot — the grid,
+    the kiosk, the swipe deck — also carries the held rows it admits, in the
+    same order, so a held archive fills every page the site's entries would.
     """
-    return list(
+    local = config.local if config is not None else None
+    rows = list(
         conn.execute(
             "SELECT * FROM entries WHERE state = ? AND published_utc IS NOT NULL "
             "ORDER BY created_utc, id",
             (state,),
         )
     )
+    if local is None:
+        return rows
+    if state == "published" and local.held:
+        rows += list(conn.execute("SELECT * FROM entries WHERE state = 'held'"))
+    rows = [row for row in rows if local.admits(row)]
+    rows.sort(key=lambda row: (str(row["created_utc"] or ""), int(row["id"])))
+    return rows
 
 
 def _job(conn: sqlite3.Connection, job_id: int) -> sqlite3.Row | None:
@@ -557,15 +637,19 @@ def _parent_of(conn: sqlite3.Connection, entry_id: int) -> int | None:
     return int(row["parent_entry_id"])
 
 
-def _public_rows(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+def _public_rows(conn: sqlite3.Connection, config: Config | None = None) -> list[sqlite3.Row]:
+    """Every row with a page: the site's public ones, or a local render's."""
     rows: list[sqlite3.Row] = []
     for state in PUBLIC_STATES:
-        rows.extend(_entries(conn, state))
+        rows.extend(_entries(conn, state, config))
     return rows
 
 
 def _forest(
-    conn: sqlite3.Connection, *, admit: int | None = None
+    conn: sqlite3.Connection,
+    *,
+    admit: int | None = None,
+    config: Config | None = None,
 ) -> tuple[dict[int, int | None], dict[int, list[int]]]:
     """(parent by id, children by id) over the public entries, id order.
 
@@ -578,7 +662,7 @@ def _forest(
     site's tree pages, which render entries that are already public, pass
     nothing and are unchanged.
     """
-    ids = [int(row["id"]) for row in _public_rows(conn)]
+    ids = [int(row["id"]) for row in _public_rows(conn, config)]
     if admit is not None and int(admit) not in ids:
         ids.append(int(admit))
     parent: dict[int, int | None] = {}
@@ -637,6 +721,13 @@ def _is_public(row: Any) -> bool:
     return row["state"] in PUBLIC_STATES and bool(row["published_utc"])
 
 
+def _on_page(row: Any, config: Config | None) -> bool:
+    """Whether this render has a page for the row: the site's rule, or a local one's."""
+    if config is not None and config.local is not None:
+        return config.local.admits(row)
+    return _is_public(row)
+
+
 def _every_entry(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(conn.execute("SELECT * FROM entries ORDER BY id"))
 
@@ -689,7 +780,7 @@ def _ledger_stamp(conn: sqlite3.Connection) -> str:
     return str(stamp) if stamp else "1970-01-01T00:00:00Z"
 
 
-def _lineage_index(conn: sqlite3.Connection) -> dict[str, Any]:
+def _lineage_index(conn: sqlite3.Connection, config: Config | None = None) -> dict[str, Any]:
     """The ledger's data file: every entry, its place in its line, one shape.
 
     The entry page carries its own ancestry as static HTML — it was true when
@@ -702,6 +793,7 @@ def _lineage_index(conn: sqlite3.Connection) -> dict[str, Any]:
 
     Nothing private leaves: a non-public entry carries its shape in the line
     and nothing of its own — no strip, no prompt, not even who submitted it.
+    On a local render "public" means "has a page in this render" (:func:`_on_page`).
     """
     rows = _every_entry(conn)
     ids = [int(row["id"]) for row in rows]
@@ -712,7 +804,7 @@ def _lineage_index(conn: sqlite3.Connection) -> dict[str, Any]:
         for row in rows:
             entry_id = int(row["id"])
             link = _lineage_row(conn, entry_id)
-            public = _is_public(row)
+            public = _on_page(row, config)
             item: dict[str, Any] = {
                 "state": row["state"],
                 "public": public,
@@ -1416,9 +1508,12 @@ def _attribution(row: sqlite3.Row, config: Config) -> str:
     by = row["submitted_by"] or "an anonymous prompt"
     executor = row["executor"] or "an unrecorded model"
     rules = row["rules_file"] or "unrecorded"
+    # A held entry in a local render has no address to cite (Config.public_url).
+    public = config.public_url(row)
+    url = f"{public} " if public else ""
     return (
         f"“{prompt}” — sketchgen entry {row['id']}, prompted by {by}, written by "
-        f"{executor} under the {rules} rules file. {config.entry_url(int(row['id']))} "
+        f"{executor} under the {rules} rules file. {url}"
         f"Licensed {LICENCE}."
     )
 
@@ -1711,8 +1806,8 @@ def _meta(
             {"step": step, "model": model} for step, model in _off_node(conn, row)
         ],
         "source": {
-            "entry": config.entry_url(entry_id),
-            "repository": config.tree_url(entry_id),
+            "entry": config.public_url(row),
+            "repository": config.tree_url(entry_id) if config.public_url(row) else None,
             "sketch_js": "sketch/sketch.js",
             "index_html": "sketch/index.html",
             "attempts": [f"attempt-{int(a['n'])}" for a in attempts],
@@ -1931,7 +2026,10 @@ def _critique_form(
     ``config.json`` there is nothing to submit to and the panel is not written
     either — the entry page then simply has one panel fewer.
     """
-    if not config.write_path or row["state"] not in lineage.SPAWNABLE:
+    # Nor on a local render: its write path, if it has one, is for counting,
+    # and the Worker takes a critique from the gallery's own origin only.
+    if (not config.write_path or config.local is not None
+            or row["state"] not in lineage.SPAWNABLE):
         return ""
     return CRITIQUE_FORM.format(
         entry_id=int(row["id"]),
@@ -2099,7 +2197,7 @@ def _ghost_figure(ghost: str | None, title: str) -> str:
 LEDGER_FOLD_MIN = 2
 
 
-def _ledger_index(conn: sqlite3.Connection) -> dict[str, Any]:
+def _ledger_index(conn: sqlite3.Connection, config: Config | None = None) -> dict[str, Any]:
     """The same entries ``lineage.json`` carries, for the server's own use.
 
     The panel's ancestry is static HTML written at publish time, so it is built
@@ -2107,7 +2205,7 @@ def _ledger_index(conn: sqlite3.Connection) -> dict[str, Any]:
     One producer, one vocabulary: a row the server draws and a row the script
     draws cannot disagree about a generation or a chip.
     """
-    return _lineage_index(conn)["entries"]
+    return _lineage_index(conn, config)["entries"]
 
 
 def _ledger_chain(index: dict[str, Any], entry_id: int) -> list[int]:
@@ -2750,6 +2848,50 @@ def _source_rows(meta: dict[str, Any]) -> str:
     )
 
 
+def _qr_figure(url: str | None) -> str:
+    """The entry page's own code, or nothing where there is no page to open.
+
+    The clean URL, twice: the href and the text under the code. The kiosk's
+    code is the one that carries ?kiosk — somebody scanning a laptop on a
+    lectern did not scan a projection, and the param would be a lie in the
+    only place the difference is measurable. None is a held entry of a local
+    render, which has no public page (Config.public_url) and no qr.svg.
+    """
+    if url is None:
+        return ""
+    href = _esc(url)
+    return (
+        '    <figure class="qr">\n'
+        '      <img src="qr.svg" alt="" width="132" height="132">\n'
+        "      <figcaption>Scan to open this entry on a phone · "
+        f'<a href="{href}">{href}</a></figcaption>\n'
+        "    </figure>\n"
+    )
+
+
+@dataclass(frozen=True)
+class _Shared:
+    """What every entry page reads off the whole gallery, computed once.
+
+    ``render_entry`` works these out for itself, which is right for the one
+    entry a publish renders and quadratic for a loop over all of them: the
+    ledger alone is three queries per entry in the table, per page. At 1,500
+    entries that is most of render-all's 25 minutes; at the 3,518 of a held
+    archive it would be hours. :func:`render_local` builds one and hands it to
+    every page.
+    """
+
+    parent: dict[int, int | None]
+    children: dict[int, list[int]]
+    scores: dict[str, dict[str, dict]]
+    ledger: dict[str, Any]
+
+
+def _shared(conn: sqlite3.Connection, config: Config) -> _Shared:
+    parent, children = _forest(conn, config=config)
+    return _Shared(parent, children, _all_scores(conn), _ledger_index(conn, config))
+
+
 def render_entry(
     conn: sqlite3.Connection,
     entry_id: int,
@@ -2757,6 +2899,7 @@ def render_entry(
     config: Config | None = None,
     *,
     publishing: bool = False,
+    shared: _Shared | None = None,
 ) -> Path:
     """Write ``dest_dir/e/<entry_id>/`` — the entry page and its artefacts.
 
@@ -2770,12 +2913,16 @@ def render_entry(
     """
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
-    row = _entry(conn, int(entry_id), publishing=publishing)
+    row = _entry(conn, int(entry_id), publishing=publishing, config=config)
     attempts = _attempt_rows(conn, int(row["job_id"]))
-    parent, children = _forest(conn, admit=int(entry_id))
+    if shared is None:
+        parent, children = _forest(conn, admit=int(entry_id), config=config)
+    else:
+        parent, children = shared.parent, shared.children
     written = _Written(dest)
     try:
-        out = _write_entry(conn, row, attempts, dest, config, parent, children, written)
+        out = _write_entry(conn, row, attempts, dest, config, parent, children, written,
+                           shared=shared)
     except Exception:
         written.undo()
         raise
@@ -2792,6 +2939,8 @@ def _write_entry(
     parent: dict[int, int | None],
     children: dict[int, list[int]],
     written: _Written,
+    *,
+    shared: _Shared | None = None,
 ) -> Path:
     entry_id = int(row["id"])
     out = dest / "e" / str(entry_id)
@@ -2853,7 +3002,7 @@ def _write_entry(
     )
     written.write_text(out / "meta.json", json.dumps(meta, indent=2, sort_keys=True) + "\n")
 
-    scores = _all_scores(conn)
+    scores = shared.scores if shared is not None else _all_scores(conn)
     human_value, human_brief, human_note = _score_slot(scores, "human", entry_id)
     agent_value, agent_brief, agent_note = _score_slot(scores, "agent", entry_id)
     root = meta["lineage"]["root_entry_id"]
@@ -2920,15 +3069,14 @@ def _write_entry(
         # entry sits on both questions at once, the boxes keep the numbers.
         compass=_compass(scores, entry_id),
         compare_href=f"../../compare.html?a={entry_id}",
-        # The clean URL, twice: the href and the text under this page's own
-        # QR code. The kiosk's code is the one that carries ?kiosk — somebody
-        # scanning a laptop on a lectern did not scan a projection, and the
-        # param would be a lie in the only place the difference is measurable.
-        entry_url=_esc(config.entry_url(entry_id)),
+        qr_figure=_qr_figure(config.public_url(row)),
         critique=_critique_form(row, meta, title, revisions, config),
         source_rows=_source_rows(meta),
         provenance_rows=_provenance_rows(meta),
-        lineage=_lineage_panel(meta, has_line, _ledger_index(conn)),
+        lineage=_lineage_panel(
+            meta, has_line,
+            shared.ledger if shared is not None else _ledger_index(conn, config),
+        ),
     )
     written.write_text(out / "index.html", page)
     return out
@@ -3087,7 +3235,7 @@ def _composer(config: Config, page: str) -> str:
     With no write path in ``config.json`` there is no service to submit to, so
     the block is not written at all — the same rule the like button follows.
     """
-    if page != "index.html" or not config.write_path:
+    if page != "index.html" or not config.write_path or config.local is not None:
         return ""
     return COMPOSER
 
@@ -3454,7 +3602,13 @@ def _kiosk_entry(
     # And the clean URL, without the param — the same string meta.json already
     # publishes as source.entry. It is what the kiosk *prints* under the code
     # (§5.3), for somebody typing it, and typing is not scanning.
-    entry["url"] = config.entry_url(entry_id)
+    # Neither on a held entry of a local render: kiosk.js draws no code for a
+    # row without a url (Config.public_url).
+    url = config.public_url(row)
+    if url is None:
+        del entry["qr"]
+    else:
+        entry["url"] = url
     if base["canvas"] is not None:
         entry["canvas"] = base["canvas"]
     # Absent when there are none, as ``canvas`` is. The kiosk reads it for one
@@ -3545,7 +3699,10 @@ def _swipe_entry(
     entry["sketch"] = f"e/{entry_id}/sketch/"
     entry["meta"] = f"e/{entry_id}/meta.json"
     entry["href"] = f"e/{entry_id}/"
-    entry["url"] = config.entry_url(entry_id)
+    # swipe.js links the entry and its source from this. A held entry of a
+    # local render has no public page, and its local one is the right link:
+    # the phone that opens this deck is reading the same local copy.
+    entry["url"] = config.public_url(row) or f"e/{entry_id}/"
     return entry
 
 
@@ -3571,7 +3728,7 @@ def _manifests(
     gives the same bytes.
     """
     scores = _all_scores(conn)
-    rows = sorted(_entries(conn, "published"), key=lambda row: int(row["id"]))
+    rows = sorted(_entries(conn, "published", config), key=lambda row: int(row["id"]))
     kiosk: list[dict[str, Any]] = []
     swipe: list[dict[str, Any]] = []
     for row in rows:
@@ -3747,12 +3904,12 @@ def render_index(
     """
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
-    published = _entries(conn, "published")
+    published = _entries(conn, "published", config)
     # Both kinds of rejection on one page, as §5.2 asks: the gate's and the
     # operator's. _grid_page puts them in newest-published order.
-    failed = _entries(conn, "failed-kept") + _entries(conn, "rejected")
-    parent, children = _forest(conn)
-    by_id = {int(row["id"]): row for row in _public_rows(conn)}
+    failed = _entries(conn, "failed-kept", config) + _entries(conn, "rejected", config)
+    parent, children = _forest(conn, config=config)
+    by_id = {int(row["id"]): row for row in _public_rows(conn, config)}
 
     written = _Written(dest)
     try:
@@ -3788,7 +3945,10 @@ def render_index(
             dest / "pairs.json",
             json.dumps(
                 {
-                    "pairs": _offered_pairs(conn),
+                    # None on a local render: judging stays on the node and the
+                    # Worker (local-gallery.md §7), and the balance rule draws
+                    # from published entries a local render may not carry.
+                    "pairs": [] if config.local is not None else _offered_pairs(conn),
                     "agents": pairs_mod.agent_verdicts(conn),
                 },
                 indent=2,
@@ -3810,13 +3970,13 @@ def render_index(
         )
         written.write_text(
             dest / "lineage.json",
-            _lineage_bytes(_lineage_index(conn)).decode("utf-8"),
+            _lineage_bytes(_lineage_index(conn, config)).decode("utf-8"),
         )
         # Every public entry, not just the published ones: a kept rejection's
         # entry page links here with ?a=<itself> and the page has to know that
         # id to honour it.
         written.write_text(
-            dest / "compare.html", _compare_page(conn, _public_rows(conn))
+            dest / "compare.html", _compare_page(conn, _public_rows(conn, config))
         )
         written.write_text(dest / "kiosk.html", _kiosk_page(config))
         written.write_text(dest / "swipe.html", _swipe_page(config))
@@ -3841,7 +4001,10 @@ def render_index(
         # render-all. Every public entry, not just the published ones — a kept
         # rejection has a page too, and that page links its code.
         for entry_id in sorted(by_id):
-            url = config.entry_url(entry_id)
+            url = config.public_url(by_id[entry_id])
+            if url is None:
+                # A held entry of a local render: no page to send a phone to.
+                continue
             written.write_text(dest / "e" / str(entry_id) / "qr.svg", qr.svg(url))
             # The kiosk's code says it came off a projection; the entry page's
             # does not (§1.8). Six bytes, which is what the version-4 budget
@@ -3865,6 +4028,71 @@ def render_all(
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
     written = render_index(conn, dest, config)
-    for row in _public_rows(conn):
+    for row in _public_rows(conn, config):
         written.append(render_entry(conn, int(row["id"]), dest, config))
     return written
+
+
+@dataclass
+class LocalRender:
+    """What :func:`render_local` did: the entries on its pages, and the ones it left out."""
+
+    rendered: list[int]
+    skipped: dict[int, str]
+
+
+def render_local(
+    conn: sqlite3.Connection,
+    dest_dir: str | Path,
+    config: Config,
+    *,
+    progress: Any = None,
+) -> LocalRender:
+    """Every entry a local render admits, then the pages that index them.
+
+    Not :func:`render_all` with a flag, for two reasons (local-gallery.md §1.4,
+    §2.1). The guard: on the site a refused entry is a refused publish and the
+    operator is standing there, but a held archive is thousands of entries
+    nobody has read, and one hostname in one sketch must cost that sketch, not
+    the render. An entry the guard refuses is left out, named in ``skipped``,
+    and the index is written without it. And the cost: the entries share one
+    :class:`_Shared`, where ``render_entry`` alone would refit it per page.
+
+    Entries first, index last, so that the index never lists a skipped entry.
+    A page rendered before a later skip may still show that entry in its
+    ledger; skips are rare and the tile is only a strip and a link.
+    ``progress``, if given, is called with (done, total) every hundred entries.
+    """
+    if config.local is None:
+        raise ValueError("render_local needs a config with local set")
+    dest = Path(dest_dir)
+    rows = _public_rows(conn, config)
+    shared = _shared(conn, config)
+    rendered: list[int] = []
+    skipped: dict[int, str] = {}
+    for done, row in enumerate(rows, start=1):
+        entry_id = int(row["id"])
+        try:
+            render_entry(conn, entry_id, dest, config, shared=shared)
+            rendered.append(entry_id)
+        except Unsafe as exc:
+            # The guard's own lines, first one: the file and what it found.
+            lines = [line.strip() for line in str(exc).splitlines()[1:] if line.strip()]
+            skipped[entry_id] = lines[0] if lines else str(exc)
+        if progress is not None and (done % 100 == 0 or done == len(rows)):
+            progress(done, len(rows))
+    if skipped:
+        config = replace(
+            config, local=replace(config.local, only=frozenset(rendered))
+        )
+    render_index(conn, dest, config)
+    # Folders a previous local render wrote for entries this one does not
+    # carry: a narrower --ids, a skip. The directory is a local render's own
+    # (the CLI refuses any other), so what is not in this render goes.
+    keep = {str(entry_id) for entry_id in rendered}
+    entry_root = dest / "e"
+    if entry_root.is_dir():
+        for folder in sorted(entry_root.iterdir()):
+            if folder.is_dir() and folder.name not in keep:
+                shutil.rmtree(folder)
+    return LocalRender(rendered, skipped)

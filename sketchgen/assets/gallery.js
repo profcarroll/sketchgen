@@ -857,6 +857,8 @@
       applyFilters();
       applySort(currentSort());
       loadCounts();
+      // The cards that just arrived were rendered without their toggles.
+      if (localLabel()) { paintPicks(); }
     });
   }
 
@@ -1697,6 +1699,118 @@
     }).catch(function () {});
   }
 
+  /* ---- a local render (docs/plans/local-gallery.md §1.7) ------------------
+   *
+   * render-local writes "local" into config.json, and the site's config never
+   * has it. A local render is a person sifting an archive in one browser, so
+   * it gets one thing the site does not — a Pick toggle on every card and
+   * entry page, and a banner that copies the picked ids out, one per line,
+   * the file `sketchgen import run --ids` reads — and loses what belongs to
+   * the site: sign-in, likes, views, the prompt and critique forms. Counts
+   * are still read if there is a write path. Picks live in this browser's
+   * storage under the render's own name, and are sent nowhere. */
+  var PICKS_PREFIX = "sketchgen-picks:";
+
+  function localLabel() {
+    return config && typeof config.local === "string" ? config.local : "";
+  }
+
+  function readPicks() {
+    var list;
+    try {
+      list = JSON.parse(window.localStorage.getItem(PICKS_PREFIX + localLabel()) || "[]");
+    } catch (err) { list = []; }
+    if (!Array.isArray(list)) { return []; }
+    return list.filter(function (id) { return typeof id === "number" && id > 0 && id % 1 === 0; });
+  }
+
+  function writePicks(list) {
+    try {
+      window.localStorage.setItem(PICKS_PREFIX + localLabel(), JSON.stringify(list));
+    } catch (err) { /* private window: the toggle still shows, nothing is kept */ }
+  }
+
+  /* One id per line, ascending, newline-terminated: what import run reads. */
+  function pickedText(list) {
+    var ids = list.slice().sort(function (a, b) { return a - b; });
+    return ids.length ? ids.join("\n") + "\n" : "";
+  }
+
+  function pickTarget(el) {
+    return el.closest ? el.closest("[data-entry]") : null;
+  }
+
+  function paintPicks() {
+    var picked = readPicks();
+    var holders = Array.prototype.slice.call(document.querySelectorAll(".card[data-entry]"))
+      .concat(Array.prototype.slice.call(document.querySelectorAll("main.entry[data-entry]")));
+    holders.forEach(function (holder) {
+      var id = Number(holder.getAttribute("data-entry"));
+      var button = holder.querySelector("[data-pick]");
+      if (!button) {
+        button = document.createElement("button");
+        button.type = "button";
+        button.className = "pick";
+        button.setAttribute("data-pick", "");
+        holder.insertBefore(button, holder.firstChild);
+      }
+      var on = picked.indexOf(id) !== -1;
+      button.setAttribute("aria-pressed", on ? "true" : "false");
+      button.textContent = on ? "Picked" : "Pick";
+    });
+    var count = document.querySelector("[data-picked]");
+    if (count) { count.textContent = String(picked.length); }
+  }
+
+  function togglePick(id) {
+    var picked = readPicks();
+    var at = picked.indexOf(id);
+    if (at === -1) { picked.push(id); } else { picked.splice(at, 1); }
+    writePicks(picked);
+    paintPicks();
+  }
+
+  function copyPicks() {
+    var text = pickedText(readPicks());
+    var box = document.querySelector("[data-picks-text]");
+    // Shown as well as copied: the clipboard needs a secure context, and a
+    // local render served from a LAN address is not one.
+    if (box) {
+      box.value = text;
+      box.hidden = false;
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(function () {});
+    }
+  }
+
+  function wireLocal() {
+    var banner = document.createElement("div");
+    banner.className = "local-banner";
+    banner.setAttribute("data-local-banner", "");
+    banner.innerHTML = "Local render of <b></b> · not published · " +
+      "<span data-picked>0</span> picked · " +
+      "<button type=\"button\" data-copy-picks>Copy picked ids</button>" +
+      "<textarea data-picks-text readonly rows=\"4\" hidden></textarea>";
+    banner.querySelector("b").textContent = localLabel();
+    document.body.insertBefore(banner, document.body.firstChild);
+    document.addEventListener("click", function (event) {
+      var target = event.target;
+      if (target.closest && target.closest("[data-copy-picks]")) {
+        copyPicks();
+        return;
+      }
+      if (!target.closest || !target.closest("[data-pick]")) { return; }
+      var holder = pickTarget(target);
+      var id = holder ? Number(holder.getAttribute("data-entry")) : 0;
+      if (id) {
+        event.preventDefault();
+        togglePick(id);
+      }
+    });
+    paintPicks();
+  }
+
   ready(function () {
     // First, before any request: the token /callback handed back in the
     // fragment, stored for this origin and stripped from the address bar. A
@@ -1719,6 +1833,13 @@
     wireSort();
     if (wantsWholeGrid()) { withWholeGrid(); }
     loadConfig().then(function () {
+      if (localLabel()) {
+        wireLocal();
+        loadCounts();
+        wireCompare();
+        wireLedger();
+        return;
+      }
       sendView();
       loadCounts();
       wireLike();
