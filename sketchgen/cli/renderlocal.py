@@ -59,6 +59,25 @@ class Refused(Exception):
     """Exit 3, nothing written."""
 
 
+class _Once(argparse.Action):
+    """A --db given twice is refused, not resolved to the last one.
+
+    bin/sg appends the node's own `--db ~/sketchgen/sketchgen.db` after every
+    command. argparse keeps the last value, so `bin/sg render-local --db
+    <archive> --jobs <archive jobs>` would render the *live* database with its
+    paths read under the archive's jobs directory: this node's prompts over
+    another node's sketches, with no error anywhere (found writing the
+    tutorial, 2026-09-28, in the kit README's own example).
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest, None) is not None:
+            parser.exit(EXIT_REFUSED, f"sketchgen: refused: {option_string} given twice; "
+                        "bin/sg adds the node's own --db last, so to render another "
+                        "database run render-local on the node itself\n")
+        setattr(namespace, self.dest, values)
+
+
 def _quote(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
@@ -322,7 +341,7 @@ def register(top: argparse._SubParsersAction) -> None:
             "this code, and a --jobs that holds none of the entries."
         ),
     )
-    p.add_argument("--db", required=True, metavar="P",
+    p.add_argument("--db", required=True, metavar="P", action=_Once,
                    help="the database to render: a node's own, or an archive's snapshot")
     p.add_argument("--jobs", required=True, metavar="DIR",
                    help="the jobs directory that database's paths mean; its rows' own "
