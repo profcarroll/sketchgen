@@ -109,9 +109,11 @@ def ssh(host: str, command: str, stdin: str = "",
         timeout: float = SSH_TIMEOUT_S) -> subprocess.CompletedProcess:
     argv = [os.environ.get("SKETCHGEN_SSH", "ssh"), "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=8", host, command]
+    # errors="replace": PEEK's `tail -c` cuts by bytes, and a render bar of
+    # █ (three bytes each) cut mid-character crashed `watch` on 2026-09-28.
     try:
         return subprocess.run(argv, input=stdin, capture_output=True, text=True,
-                              timeout=timeout, check=False)
+                              errors="replace", timeout=timeout, check=False)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(argv, 255, "", f"no answer in {timeout:.0f} s")
 
