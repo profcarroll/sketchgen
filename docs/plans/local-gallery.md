@@ -288,6 +288,12 @@ nothing. Deployed by hand (`npx --yes wrangler@latest deploy` from `writepath/`)
 local render is then made with `--write-path` — the Worker first, since a page whose calls are
 refused shows `—`, never an error.
 
+As built (2026-09-28): the list is `KIOSK_ORIGINS`, space-separated, loopback only (anything
+else in it is ignored), `http://127.0.0.1:8090 http://localhost:8090` in `wrangler.toml`. A
+kiosk origin's `/view` reads no session even when one is sent. The client half is one line of
+`gallery.js`: a local render reads `/counts` without credentials, as `kiosk.js` always has,
+since the Worker never grants them to a kiosk origin.
+
 ## 4. Using it: the sld-gpu archive
 
 1. Back the archive up somewhere that is not sld-cloud. It is 8.5 GB on one instance and none of
