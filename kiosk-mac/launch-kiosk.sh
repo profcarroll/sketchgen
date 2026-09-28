@@ -8,6 +8,15 @@ URL="https://profcarroll.github.io/sketchgen-gallery/kiosk.html?unattended=1&sit
 # site= is where this machine learns where it lives (kiosk-mac.md §1.3): it switches views
 # from the attendance rule to that site's building hours. Drop it and the kiosk counts as a
 # default one.
+#
+# Or the first line of ~/Library/sketchgen-kiosk/url, when there is one: a wall that plays its
+# own copy of the gallery (local-gallery.md §3) is told so there, as
+#   http://127.0.0.1:8090/kiosk.html?unattended=1&site=<room>
+# so that switching a wall between Pages and its local copy is one line and a kickstart, and
+# an update of this script cannot switch it back.
+if [ -s "$HOME/Library/sketchgen-kiosk/url" ]; then
+    URL=$(head -n 1 "$HOME/Library/sketchgen-kiosk/url" | tr -d '[:space:]')
+fi
 PROFILE="$HOME/Library/Application Support/sketchgen-kiosk-chrome"
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 log() { echo "$(date '+%F %T') launch-kiosk: $*"; }   # stdout is ~/Library/Caches/sketchgen-kiosk/chrome.log
