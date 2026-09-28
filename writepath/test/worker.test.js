@@ -24,6 +24,7 @@ import worker, {
   CRITIQUES_PER_DAY,
   MAX_PROMPT_CHARS,
   MAX_CRITIQUE_WORDS,
+  kioskOrigins,
 } from "../worker.js";
 
 const GALLERY_URL = "https://profcarroll.github.io/sketchgen-gallery";
@@ -788,6 +789,154 @@ test("preflight is allowed from the gallery origin and refused from any other", 
     env,
   );
   assert.equal(cross.headers.get("Access-Control-Allow-Origin"), null);
+});
+
+// ---------------------------------------------------------------------------
+// Kiosk origins (docs/plans/local-gallery.md §1.6)
+// ---------------------------------------------------------------------------
+
+const KIOSK_ORIGIN = "http://127.0.0.1:8090";
+const KIOSKS = { KIOSK_ORIGINS: "http://127.0.0.1:8090 http://localhost:8090" };
+
+function fromKiosk(path, { method = "GET", body, cookie, origin = KIOSK_ORIGIN, extra = {} } = {}) {
+  const headers = { Origin: origin, ...extra };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  if (cookie) headers.Cookie = `sg_session=${cookie}`;
+  return new Request(`${WORKER}${path}`, {
+    method,
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+}
+
+test("only loopback origins are kiosk origins, whatever the list says", () => {
+  assert.deepEqual(
+    [...kioskOrigins({
+      KIOSK_ORIGINS: "https://example.invalid, http://127.0.0.1:8090/ nonsense " +
+        "http://localhost:8090 http://[::1]:8090 ftp://127.0.0.1 http://127.0.0.1.example.invalid",
+    })].sort(),
+    ["http://127.0.0.1:8090", "http://[::1]:8090", "http://localhost:8090"],
+  );
+  assert.deepEqual([...kioskOrigins({})], []);
+});
+
+test("a kiosk origin's preflight for /view is allowed, without credentials", async () => {
+  const { env } = makeEnv(KIOSKS);
+  const response = await worker.fetch(
+    fromKiosk("/view", {
+      method: "OPTIONS",
+      extra: { "Access-Control-Request-Method": "POST", "Access-Control-Request-Headers": "content-type" },
+    }),
+    env,
+  );
+  assert.equal(response.status, 204);
+  assert.equal(response.headers.get("Access-Control-Allow-Origin"), KIOSK_ORIGIN);
+  assert.equal(response.headers.get("Access-Control-Allow-Credentials"), null);
+  assert.equal(response.headers.get("Access-Control-Allow-Headers"), "Content-Type");
+});
+
+test("a kiosk origin's preflight for anything else is refused", async () => {
+  const { env } = makeEnv(KIOSKS);
+  for (const path of ["/vote", "/like", "/prompt", "/critique", "/me", "/login", "/pull"]) {
+    const response = await worker.fetch(
+      fromKiosk(path, { method: "OPTIONS", extra: { "Access-Control-Request-Method": "POST" } }),
+      env,
+    );
+    assert.equal(response.status, 403, path);
+    assert.equal(response.headers.get("Access-Control-Allow-Origin"), null, path);
+  }
+});
+
+test("a kiosk origin counts a kiosk view, with its site", async () => {
+  const { env, store, batches } = makeEnv(KIOSKS);
+  const response = await worker.fetch(
+    fromKiosk("/view", { method: "POST", body: { entry_id: 12, source: "kiosk", site: "d12-mini" } }),
+    env,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { ok: true, counted: true });
+  assert.equal(response.headers.get("Access-Control-Allow-Origin"), KIOSK_ORIGIN);
+  assert.equal(response.headers.get("Access-Control-Allow-Credentials"), null);
+  assert.equal(store.views.get(12).kiosk_count, 1);
+  assert.equal(store.kioskViews.get("12|d12-mini").count, 1);
+  assert.deepEqual(batches, [[SQL.bumpView, SQL.bumpKioskSite]]);
+});
+
+test("a kiosk origin's view that is not a kiosk view is refused and writes nothing", async () => {
+  const { env, store, statements } = makeEnv(KIOSKS);
+  for (const body of [{ entry_id: 12 }, { entry_id: 12, source: "entry" }]) {
+    const response = await worker.fetch(fromKiosk("/view", { method: "POST", body }), env);
+    assert.equal(response.status, 403);
+    assert.equal((await response.json()).error, "a kiosk origin posts kiosk views only");
+  }
+  assert.equal(store.views.size, 0);
+  assert.deepEqual(statements, []);
+});
+
+test("a kiosk origin's view reads no session, even when one is sent", async () => {
+  const { env, statements } = makeEnv(KIOSKS);
+  const cookie = await forgeSession("octocat");
+  const response = await worker.fetch(
+    fromKiosk("/view", { method: "POST", body: { entry_id: 12, source: "kiosk" }, cookie }),
+    env,
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(statements.map((s) => s.sql), [SQL.bumpView]);
+});
+
+test("a kiosk origin reads the counts", async () => {
+  const { env } = makeEnv(KIOSKS);
+  const response = await worker.fetch(fromKiosk("/counts?entries=12,13"), env);
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("Access-Control-Allow-Origin"), KIOSK_ORIGIN);
+  assert.equal(response.headers.get("Access-Control-Allow-Credentials"), null);
+  assert.deepEqual(await response.json(), {
+    12: { views: 0, likes: 0 },
+    13: { views: 0, likes: 0 },
+  });
+});
+
+test("a kiosk origin gets no allow header on the routes a person uses", async () => {
+  const { env } = makeEnv(KIOSKS);
+  const cookie = await forgeSession("octocat");
+  const cases = [
+    fromKiosk("/me", { cookie }),
+    fromKiosk("/like", { method: "POST", body: { entry_id: 12, on: true }, cookie }),
+    fromKiosk("/vote", { method: "POST", body: { entry_a: 1, entry_b: 2, question: "brief", choice: "A" }, cookie }),
+    fromKiosk("/prompt", { method: "POST", body: { text: "a tide of slow lines" }, cookie }),
+  ];
+  for (const request of cases) {
+    const response = await worker.fetch(request, env);
+    assert.equal(response.headers.get("Access-Control-Allow-Origin"), null, new URL(request.url).pathname);
+  }
+});
+
+test("a loopback origin that is not listed gets nothing, and neither does a listed one without the var", async () => {
+  const listed = makeEnv(KIOSKS);
+  const stranger = await worker.fetch(
+    fromKiosk("/counts?entries=12", { origin: "http://127.0.0.1:9999" }),
+    listed.env,
+  );
+  assert.equal(stranger.headers.get("Access-Control-Allow-Origin"), null);
+  const refused = await worker.fetch(
+    fromKiosk("/view", { method: "OPTIONS", origin: "http://127.0.0.1:9999",
+                         extra: { "Access-Control-Request-Method": "POST" } }),
+    listed.env,
+  );
+  assert.equal(refused.status, 403);
+
+  const unset = makeEnv();
+  const none = await worker.fetch(fromKiosk("/counts?entries=12"), unset.env);
+  assert.equal(none.headers.get("Access-Control-Allow-Origin"), null);
+});
+
+test("the gallery origin is unchanged by the kiosk list", async () => {
+  const { env } = makeEnv(KIOSKS);
+  const response = await worker.fetch(get("/counts?entries=12"), env);
+  assert.equal(response.headers.get("Access-Control-Allow-Origin"), GALLERY_ORIGIN);
+  assert.equal(response.headers.get("Access-Control-Allow-Credentials"), "true");
+  const entryView = await worker.fetch(post("/view", { entry_id: 12 }), env);
+  assert.equal(entryView.status, 200);
 });
 
 test("anything else is 404 JSON", async () => {

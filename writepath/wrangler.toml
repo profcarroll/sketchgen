@@ -26,3 +26,8 @@ database_id = "c345cb25-700d-41c2-a9a2-fbd47b6db26b"
 
 [vars]
 GALLERY_URL = "https://profcarroll.github.io/sketchgen-gallery"
+# Kiosks that play a local render from their own loopback (docs/plans/
+# local-gallery.md §1.6). They may read /counts and post kiosk views to /view,
+# and nothing else; a non-loopback origin here is ignored. Space-separated.
+# kiosk-mac serves the render on 127.0.0.1:8090.
+KIOSK_ORIGINS = "http://127.0.0.1:8090 http://localhost:8090"

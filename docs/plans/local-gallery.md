@@ -8,7 +8,8 @@ gallery an instance generates for itself, viewable locally, that a kiosk can run
 going through Pages — and it turns out to be the piece the other two publishing ideas were
 each missing.
 
-Two packets. Neither touches `publish.py`, the Worker or the public gallery.
+Three packets. The first two touch neither `publish.py`, the Worker nor the public gallery; the
+third is the Worker's, and only its CORS.
 
 Repositories and conventions as in `held-batch.md`: `profcarroll/sketchgen`, Python 3.12, stdlib
 only, `python3 -m unittest discover -s tests`, no network in a test. One packet per branch.
@@ -80,8 +81,9 @@ frame ran, the QR code on a published entry pointed at its github.io page, and t
 `sketchgen kiosk · #1788 · not counting: no write path · 0a362d` — the kiosk already says what a
 local wall is.
 
-So whatever blacked out the frames on 2026-09-19 was not loopback as such; the Browser pane
-itself is the suspect, and it was not tried again. **A local gallery runs in the Chrome a wall
+So whatever blacked out the frames on 2026-09-19 was not loopback as such. It was the Browser
+pane: building Packet 1 the same day, a local render opened there logged the sandboxed sketch
+frame as `net::ERR_BLOCKED_BY_CLIENT`, a block of the app's own, where Chrome loads it. **A local gallery runs in the Chrome a wall
 uses, unchanged**, and nothing in §1 is there to work around the serving. One caveat: this was
 headless Chrome, not the wall's full-screen window. The first thing Packet 2's session on a Mac
 does is the same page in a headed kiosk window, by eye.
@@ -99,13 +101,14 @@ set, no fork of `kiosk.js`. A template change reaches both targets by the same r
 It refuses, exit 3 and nothing written, a destination that is inside a git work tree, and a
 destination that is the gallery checkout (`publish.DEFAULT_GALLERY_DIR`, which
 `$SKETCHGEN_GALLERY` sets). The publisher's destination is always a checkout, so the two can
-never be the same directory. Every page it writes carries
-`<meta name="robots" content="noindex">` and a banner:
+never be the same directory. Every grid and entry page it writes shows a banner:
 
-> Local render of **sld-gpu**'s archive · 3,255 held · not published · 2026-09-28
+> Local render of **sld-gpu** · not published · 2 picked · Copy picked ids
 
-The banner is one line in `grid.html`, `entry.html` and the kiosk's menu footer, present only
-when `config.local` is set. The kiosk's wall shows nothing of it while a sketch plays.
+`gallery.js` draws it, and the Pick toggles (§1.7), when `config.json` carries `local`, which
+only a local render's does; the templates are unchanged, so the site's pages cannot grow either.
+There is no `noindex`: a local render is never on a public host, and the refusal above is what
+keeps it off one. The kiosk's wall shows none of it.
 
 ### 1.3 Which rows
 
@@ -133,13 +136,24 @@ A row with `published_utc` gets its code and its `url`, pointing at the public p
 row without gets neither, and `kiosk.js` already draws no code for it. No code on a wall ever
 points at a local address: the phone in the visitor's hand is not on the kiosk's loopback.
 
-### 1.6 No counting, until the Worker is asked
+### 1.6 Counting from a local wall: a second kind of origin
 
-The local config writes `kiosk_views: false` and `write_path: ""` unless `--write-path` is given.
-A wall on a local render therefore counts nothing, and its title already says so (`not
-counting: no write path`, §0.3), which the watchdog reads. Counting from a local origin is a
-Worker change — `GALLERY_URL` becomes a list of allowed origins — deployed by hand, D1 first
-(AGENTS.md, *Deploying*). It is not in this plan; §8 asks whether it should be the next one.
+The local config writes `kiosk_views: false` and `write_path: ""` unless `--write-path` is given,
+so a local render counts nothing by default, and a wall on it says so in its title (`not
+counting: no write path`, §0.3). **Decided 2026-09-28: a local wall should count.** That is a
+Worker change, Packet 3 (§3a), and it is narrow on purpose:
+
+- A new var, `KIOSK_ORIGINS`, lists the loopback origins a kiosk serves from
+  (`http://127.0.0.1:8090`). `GALLERY_URL` stays the one gallery origin.
+- A kiosk origin gets CORS on **`GET /counts` and `POST /view` only**, and never
+  `Access-Control-Allow-Credentials`. Sign-in, likes, votes, prompts and critiques stay the
+  gallery origin's alone: a page on somebody's loopback is not the gallery.
+- A `/view` from a kiosk origin must say `source: "kiosk"`, and no session is read for it. A
+  local wall is a kiosk and nothing else, and its `site=` is what separates its views in
+  `kiosk_views`, as for the D12 wall now.
+
+CORS is a browser's rule, not an authentication: anyone could already post a view with `curl`.
+What the allowlist decides is which *pages* may count, and a local wall is one.
 
 ### 1.7 Picks: the one thing the local render adds to a page
 
@@ -154,11 +168,11 @@ from a wall.
 ### 1.8 Web frames for held entries
 
 `render-local` calls `webimg.ensure` for every entry it renders, as `publish` does. The first
-render of the archive makes 3,255 WebP strips with the gate's own Chromium, so it runs `nice`d
-and **with the generator paused**: a gate sharing the CPU with it reads slower frame times, and
-`frame_budget` is a verdict. The copies are cached for every render after — beside the PNG for
-a node's own jobs, in `--web-cache` for a read-only archive (§2.1). `--no-web` skips them and
-copies PNGs, for a quick look at a handful.
+render of the archive makes 3,255 WebP strips with the gate's own Chromium, so it runs **with
+the generator paused**: a gate sharing the CPU with it reads slower frame times, and
+`frame_budget` is a verdict. The copies are kept beside their PNGs, as `web-frames` keeps them
+on every node, so every render after is a `stat`; an import later copies them with the job.
+The PNGs and the database are never touched. `--no-web` skips the encoding, for a quick look.
 
 ### 1.9 Served from the machine that shows it
 
@@ -180,21 +194,21 @@ read the node, and is not needed until a wall runs local for good.
 ### 2.1 The verb
 
 ```
-$ sketchgen render-local --db ~/sketchgen-backups/sld-gpu/sketchgen/sketchgen.db \
+$ sketchgen render-local --db ~/sketchgen-backups/sld-gpu/sketchgen/backups/2026-09-27T135015Z/sketchgen.db \
       --jobs ~/sketchgen-backups/sld-gpu/sketchgen/jobs \
       --out ~/sketchgen-local/sld-gpu --include held --origin sld-gpu
 rendering 3255 entries from a read-only snapshot (schema 17)
 skipped e/412: hostname-shaped string in sketch.js
 …
-rendered 3251 of 3255 → ~/sketchgen-local/sld-gpu (~750 MB); 4 skipped by the scan
-3251 web frames made, 0 cached
+rendered 3251 of 3255 → ~/sketchgen-local/sld-gpu; 4 skipped by the scan; web frames: 6502 made, 0 cached, 0 failed
 ```
 
-- `--db` is opened **read-only** (`file:…?mode=ro`, `uri=True`). The archive on sld-cloud is the
-  only copy of the rental's frames (`gpu-fold-in.md` §0); nothing about looking at it may write
-  to it. `webimg.ensure` writes its WebP beside the PNG, so it gains a cache directory, and
-  for a read-only archive `--web-cache DIR` puts them there, keyed by the PNG's path and mtime.
-  The numbers in the example are illustrative; the size is `gpu-fold-in.md` §1.2's estimate.
+- `--db` is opened **read-only**, and so that nothing is written beside it either: a WAL
+  database with no `-wal` (nobody has it open) is opened `immutable`, anything else
+  `mode=ro`. The archive's database is its verified last snapshot, a rollback-journal file.
+  Measured on the laptop's copy with the job text alone (no frames): 3,255 held entries in
+  10.5 s, 286 MB of pages, snapshot sha256 unchanged. With a WebP strip and ghost per entry
+  the tree is about 1 GB. The skip counts in the example are illustrative.
 - `--jobs` is where the rows' `jobs/<n>` paths resolve, since a snapshot's paths name the node it
   came from. The paths are resolved, never rewritten.
 - `--origin` is the banner's name and the picks' key. Required: no table records which node a
@@ -211,26 +225,31 @@ in the set, as `render_index` already removes stale `page-*.html`.
 
 ### 2.2 In the renderer
 
-- `Config` gains `local: str` (the origin label, empty for the public gallery) and `robots`,
-  and round-trips them. `publish-index` never sets them; a checkout's `config.json` never has
-  them.
-- `_entries(conn, state)` gains a `rows=` parameter (`"public"` — today's clause — or
-  `"local"`, with an id set). `render_index` and `render_entry` take it and pass it down. The
-  public call sites change by nothing but a keyword with today's value.
-- `_kiosk_entry` omits `url` and `qr` for a row without `published_utc` (§1.5), and
-  `render_index` writes no `qr*.svg` for it.
-- `grid.html`, `entry.html`, `kiosk.html`: the banner, the `noindex` meta, the Pick toggle
-  (§1.7), each behind `config.local`.
+As built (PR #189):
+
+- `Config.local` is a `Local(label, published, held, only)`. Only the label reaches
+  `config.json`, and `Config.load` never reads it back, so a checkout cannot become local by
+  its own config. `Config.public_url(row)` is the entry's public address, or None for a held
+  entry of a local render.
+- The row set is decided in four places — `_entries`, `_entry`, `_forest` and the ledger's
+  `public` flag — each taking the config. With no `local`, each runs exactly today's code.
+- `kiosk.json` omits `url` and `qr` for a row with no public address, `render_index` writes no
+  `qr*.svg` for it, the entry page's code is a template slot left empty, `meta.json`'s
+  `source.entry` and the attribution cite no address. `swipe.json` links it locally.
+- No composer, no critique form, and no offered pairs on a local render.
+- `render_local` computes the forest, the scores and the ledger once and hands them to every
+  page (`_Shared`); `render_entry` alone recomputes them per page, which is quadratic.
 
 ### 2.3 Tests
 
 `test_gallery.py`, against a scratch database built in `setUp`, as the existing ones are:
 
-- a held entry renders under `rows="local"` and is refused under `"public"`, as today;
-- the public render of the same database is byte-identical before and after this packet — the
-  proof that the publisher's output did not move;
+- a held entry renders on a local render and is refused by the site's, as today;
+- the public render of the same database is byte-identical before and after this packet,
+  except `gallery.js`, `gallery.css` and the kiosk's `build` stamp, which hashes the CSS —
+  checked by rendering one database with `main` and with the branch;
 - no `qr.svg`, no `url` in `kiosk.json` for an unpublished row; both for a published one;
-- the banner, `noindex` and Pick toggle present under `local`, absent otherwise;
+- a shared render and a page-by-page one write the same bytes;
 - every refusal in §2.1 refuses before any file exists; the read-only open refuses a write;
 - an entry the scan catches is skipped and named, and the rest render.
 
@@ -257,6 +276,24 @@ The kiosk kit (`kiosk-mac/`) learns to serve a local gallery.
 
 The watchdog does not change: it reads the title of whatever page has `/kiosk.html` in its URL.
 
+## 3a. Packet 3 — `feat/writepath-kiosk-origins`
+
+`writepath/worker.js` and `wrangler.toml`, §1.6. `corsHeaders` and `preflight` take the route:
+a kiosk origin is allowed only for `/counts` and `/view`, without credentials; `routeView`
+refuses a kiosk origin's view unless `source` is `kiosk`, and passes no session for it. No D1
+change: `kiosk_views` already keeps the site. Tests beside the Worker's own (`writepath/test/`,
+node, no network): a kiosk origin counts a view and reads counts; is refused on `/like`,
+`/vote`, `/me`, `/prompt`; gets no `Allow-Credentials`; an unlisted loopback origin gets
+nothing. Deployed by hand (`npx --yes wrangler@latest deploy` from `writepath/`), and the
+local render is then made with `--write-path` — the Worker first, since a page whose calls are
+refused shows `—`, never an error.
+
+As built (2026-09-28): the list is `KIOSK_ORIGINS`, space-separated, loopback only (anything
+else in it is ignored), `http://127.0.0.1:8090 http://localhost:8090` in `wrangler.toml`. A
+kiosk origin's `/view` reads no session even when one is sent. The client half is one line of
+`gallery.js`: a local render reads `/counts` without credentials, as `kiosk.js` always has,
+since the Worker never grants them to a kiosk origin.
+
 ## 4. Using it: the sld-gpu archive
 
 1. Back the archive up somewhere that is not sld-cloud. It is 8.5 GB on one instance and none of
@@ -266,8 +303,8 @@ The watchdog does not change: it reads the title of whatever page has `/kiosk.ht
    Resume.
 3. `rsync` the tree to the laptop. The operator sifts it in a browser from
    `python3 -m http.server`, picking; *Copy picked ids* → `picks.txt`.
-4. Optionally, the same tree on one of the new M4 minis, as a wall in the room, uncounted, while
-   the D12 wall stays on Pages and keeps counting. Whether GPU-made work earns more attention is
+4. Optionally, the same tree on one of the new M4 minis, as a wall in the room, counted with its
+   own `site=` once Packet 3 is deployed, while the D12 wall stays on Pages. Whether GPU-made work earns more attention is
    something to watch, not to measure yet (the 2026-09-24 refocus: the shortage is people
    looking, not sketches).
 5. `gpu-fold-in.md` Packet 1's `import run --ids picks.txt`, then publish from Held as for any
@@ -284,7 +321,8 @@ first import takes its ids from the picks rather than from `import list --clean
 1. `render-local` of sld-cloud's own database with `--include published` gives a tree whose
    entry folders match the public gallery's, and `render-local` into the gallery checkout is
    refused.
-2. The public `render-all` of a scratch database is byte-identical before and after Packet 1.
+2. The public `render-all` of a scratch database is byte-identical before and after Packet 1,
+   but for the two assets and the `build` stamp.
 3. `render-local` of the sld-gpu snapshot with `--include held` leaves the snapshot's sha256
    unchanged and renders every entry the scan passes; its `kiosk.json` has no `url` on any row.
 4. A Mac with the kit serves that tree on `127.0.0.1:8090`, and `kiosk.html` from it plays
@@ -312,14 +350,11 @@ first import takes its ids from the picks rather than from `import list --clean
 - **Judging a local render.** Blind pairs and verdicts stay on the node and the Worker; a local
   gallery shows standings a published entry already has, and none for a held one.
 
-## 8. Decisions for the operator
+## 8. Decisions, taken 2026-09-28
 
-1. **The origin label on the page**: the fleet name (`sld-gpu`, recommended — already public in
-   this repository), or a description (*rented A10, Sept 2026*).
-2. **Where the picks live**: `localStorage` in one browser (recommended; nothing to build on a
-   server), or a file the local server writes (needs a server that accepts a POST, which
-   `http.server` does not).
-3. **The first local wall**: an M4 mini beside the D12 wall (recommended), or the D12 wall
-   itself switched to local, which stops its counting until the Worker is changed (§1.6).
-4. **Whether the Worker should allow a second origin** so a local wall can count views. A
-   separate plan if yes.
+The operator took the recommended default on each:
+
+1. **The origin label** is the fleet name, `sld-gpu`.
+2. **Picks** live in `localStorage` in one browser.
+3. **The first local wall** is an M4 mini beside the D12 wall; the D12 wall stays on Pages.
+4. **The Worker accepts kiosk origins** for counting (§1.6), as Packet 3.
