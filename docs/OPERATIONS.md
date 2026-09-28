@@ -126,10 +126,19 @@ local `main` with commits of its own; it holds `~/sketchgen/update.lock`, so two
 deploys cannot overlap; and before a pending migration it snapshots the database
 to `sketchgen.db.pre-NNN` (an existing one is kept, never overwritten).
 
-Its slowest step is the gallery re-render (every entry page, minutes), and it is
-there for a reason: entry pages are written once by the publisher, so a change to
+Its slowest step is the gallery re-render (every entry page), and it is there
+for a reason: entry pages are written once by the publisher, so a change to
 `gallery.py`, a publisher template, or anything a generator writes onto a page
 reaches `index.html` but none of the entry pages without it.
+
+It costs about a minute and a half at sld-cloud's 1,585 entries. It cost 110
+minutes on 2026-09-28, with the generator paused throughout: every page worked
+out the whole gallery's forest, Bradley–Terry scores and lineage ledger for
+itself, so the render was quadratic in the entries. It now works them out once
+and hands them to every page (`gallery._Shared`), and writes the same bytes.
+Measured on the laptop against a copy of the node's database and frames: 48 s
+for every page and the index, where one page at a time was 2.4 s a page; the
+node ran 1.7 times slower than the laptop page for page.
 
 A change that touches **none of that** — the operator UI (`console.py`,
 `web.py`), a unit file, worker logic — does not need the render. Skip it:

@@ -4316,6 +4316,97 @@ class RenderAllRereadsTests(GalleryTestCase):
         self.assertIn(str(self.dest / "lineage.json"), result.stdout)
 
 
+class SharedFullRenderTests(GalleryTestCase):
+    """render_all and publish_index share one forest, fit and ledger, and
+    write the bytes the page-by-page render wrote.
+
+    Page by page was quadratic: 1,589 entries at about 4 s each, 110 minutes
+    of ``bin/fleet update sld-cloud`` with the generator paused (2026-09-28).
+    The speed is only worth having if no page changes, so each test renders
+    the same database both ways and compares every file. The fixture carries
+    a published grandchild, a held child (in the ledger, on no page) and
+    judgments, so the forest, the scores and the ledger all have something in
+    them to get wrong.
+    """
+
+    def setUp(self):
+        super().setUp()
+        one, two, _ = self.ids
+        self.grandchild = add_child(self.conn, self.tmp, two, state="published",
+                                    prompt="the line, a third time")
+        self.held = add_child(self.conn, self.tmp, self.grandchild, state="held",
+                              prompt="the line, not yet published")
+        for question in ("look", "brief"):
+            db.record_judgment(self.conn, one, two, "human", "profcarroll", question, "A")
+            db.record_judgment(self.conn, two, self.grandchild, "agent", "qwen3.5:4b",
+                               question, "B")
+        self.conn.commit()
+
+    def one_by_one(self, dest, config):
+        """The render as it was before _Shared: every page works it all out."""
+        gallery.render_index(self.conn, dest, config)
+        for row in gallery._public_rows(self.conn, config):
+            gallery.render_entry(self.conn, int(row["id"]), dest, config)
+
+    @staticmethod
+    def tree(root):
+        return {str(p.relative_to(root)): p.read_bytes()
+                for p in sorted(root.rglob("*")) if p.is_file()}
+
+    def assert_same_tree(self, expected, actual):
+        self.assertEqual(sorted(expected), sorted(actual))
+        for name, data in expected.items():
+            with self.subTest(path=name):
+                self.assertEqual(data, actual[name])
+
+    def test_render_all_is_the_same_bytes_as_one_by_one(self):
+        together = self.tmp / "together"
+        with mock.patch.object(gallery, "_shared", wraps=gallery._shared) as built:
+            gallery.render_all(self.conn, together, self.config)
+        self.assertEqual(1, built.call_count)
+        apart = self.tmp / "apart"
+        self.one_by_one(apart, self.config)
+        self.assertIn(f"e/{self.grandchild}/index.html", self.tree(together))
+        self.assertNotIn(f"e/{self.held}/index.html", self.tree(together))
+        self.assert_same_tree(self.tree(apart), self.tree(together))
+
+    @unittest.skipIf(shutil.which("git") is None, "git is not on PATH")
+    def test_publish_index_is_the_same_bytes_as_one_by_one(self):
+        from dataclasses import replace
+
+        from sketchgen import publish
+
+        bare, checkout = self.tmp / "remote.git", self.tmp / "checkout"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(bare)], check=True)
+        subprocess.run(["git", "clone", "-q", str(bare), str(checkout)], check=True,
+                       capture_output=True)
+        for key, value in (("user.name", "sketchgen test"),
+                           ("user.email", "sketchgen-test@example.invalid")):
+            subprocess.run(["git", "-C", str(checkout), "config", key, value], check=True)
+        (checkout / "README.md").write_text("sketchgen gallery\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(checkout), "add", "README.md"], check=True)
+        subprocess.run(["git", "-C", str(checkout), "commit", "-qm", "seed"], check=True)
+        subprocess.run(["git", "-C", str(checkout), "push", "-q", "-u", "origin", "main"],
+                       check=True, capture_output=True)
+        # The config publish_index renders with: the checkout's, and the
+        # write path it is handed.
+        config = replace(gallery.Config.load(checkout), write_path=self.config.write_path)
+
+        with mock.patch.object(gallery, "_shared", wraps=gallery._shared) as built:
+            sha, why = publish.publish_index(
+                self.conn, checkout, remote=str(bare), write_path=self.config.write_path,
+            )
+        self.assertIsNone(why, why)
+        self.assertIsNotNone(sha)
+        self.assertEqual(1, built.call_count)
+
+        apart = self.tmp / "apart"
+        self.one_by_one(apart, config)
+        together = {name: data for name, data in self.tree(checkout).items()
+                    if not name.startswith(".git/") and name != "README.md"}
+        self.assert_same_tree(self.tree(apart), together)
+
+
 class CommandLineTests(GalleryTestCase):
     """The three subcommands, as the shell sees them: --help and the codes."""
 
