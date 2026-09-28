@@ -81,8 +81,9 @@ frame ran, the QR code on a published entry pointed at its github.io page, and t
 `sketchgen kiosk · #1788 · not counting: no write path · 0a362d` — the kiosk already says what a
 local wall is.
 
-So whatever blacked out the frames on 2026-09-19 was not loopback as such; the Browser pane
-itself is the suspect, and it was not tried again. **A local gallery runs in the Chrome a wall
+So whatever blacked out the frames on 2026-09-19 was not loopback as such. It was the Browser
+pane: building Packet 1 the same day, a local render opened there logged the sandboxed sketch
+frame as `net::ERR_BLOCKED_BY_CLIENT`, a block of the app's own, where Chrome loads it. **A local gallery runs in the Chrome a wall
 uses, unchanged**, and nothing in §1 is there to work around the serving. One caveat: this was
 headless Chrome, not the wall's full-screen window. The first thing Packet 2's session on a Mac
 does is the same page in a headed kiosk window, by eye.
@@ -100,13 +101,14 @@ set, no fork of `kiosk.js`. A template change reaches both targets by the same r
 It refuses, exit 3 and nothing written, a destination that is inside a git work tree, and a
 destination that is the gallery checkout (`publish.DEFAULT_GALLERY_DIR`, which
 `$SKETCHGEN_GALLERY` sets). The publisher's destination is always a checkout, so the two can
-never be the same directory. Every page it writes carries
-`<meta name="robots" content="noindex">` and a banner:
+never be the same directory. Every grid and entry page it writes shows a banner:
 
-> Local render of **sld-gpu**'s archive · 3,255 held · not published · 2026-09-28
+> Local render of **sld-gpu** · not published · 2 picked · Copy picked ids
 
-The banner is one line in `grid.html`, `entry.html` and the kiosk's menu footer, present only
-when `config.local` is set. The kiosk's wall shows nothing of it while a sketch plays.
+`gallery.js` draws it, and the Pick toggles (§1.7), when `config.json` carries `local`, which
+only a local render's does; the templates are unchanged, so the site's pages cannot grow either.
+There is no `noindex`: a local render is never on a public host, and the refusal above is what
+keeps it off one. The kiosk's wall shows none of it.
 
 ### 1.3 Which rows
 
@@ -166,11 +168,11 @@ from a wall.
 ### 1.8 Web frames for held entries
 
 `render-local` calls `webimg.ensure` for every entry it renders, as `publish` does. The first
-render of the archive makes 3,255 WebP strips with the gate's own Chromium, so it runs `nice`d
-and **with the generator paused**: a gate sharing the CPU with it reads slower frame times, and
-`frame_budget` is a verdict. The copies are cached for every render after — beside the PNG for
-a node's own jobs, in `--web-cache` for a read-only archive (§2.1). `--no-web` skips them and
-copies PNGs, for a quick look at a handful.
+render of the archive makes 3,255 WebP strips with the gate's own Chromium, so it runs **with
+the generator paused**: a gate sharing the CPU with it reads slower frame times, and
+`frame_budget` is a verdict. The copies are kept beside their PNGs, as `web-frames` keeps them
+on every node, so every render after is a `stat`; an import later copies them with the job.
+The PNGs and the database are never touched. `--no-web` skips the encoding, for a quick look.
 
 ### 1.9 Served from the machine that shows it
 
@@ -192,21 +194,21 @@ read the node, and is not needed until a wall runs local for good.
 ### 2.1 The verb
 
 ```
-$ sketchgen render-local --db ~/sketchgen-backups/sld-gpu/sketchgen/sketchgen.db \
+$ sketchgen render-local --db ~/sketchgen-backups/sld-gpu/sketchgen/backups/2026-09-27T135015Z/sketchgen.db \
       --jobs ~/sketchgen-backups/sld-gpu/sketchgen/jobs \
       --out ~/sketchgen-local/sld-gpu --include held --origin sld-gpu
 rendering 3255 entries from a read-only snapshot (schema 17)
 skipped e/412: hostname-shaped string in sketch.js
 …
-rendered 3251 of 3255 → ~/sketchgen-local/sld-gpu (~750 MB); 4 skipped by the scan
-3251 web frames made, 0 cached
+rendered 3251 of 3255 → ~/sketchgen-local/sld-gpu; 4 skipped by the scan; web frames: 6502 made, 0 cached, 0 failed
 ```
 
-- `--db` is opened **read-only** (`file:…?mode=ro`, `uri=True`). The archive on sld-cloud is the
-  only copy of the rental's frames (`gpu-fold-in.md` §0); nothing about looking at it may write
-  to it. `webimg.ensure` writes its WebP beside the PNG, so it gains a cache directory, and
-  for a read-only archive `--web-cache DIR` puts them there, keyed by the PNG's path and mtime.
-  The numbers in the example are illustrative; the size is `gpu-fold-in.md` §1.2's estimate.
+- `--db` is opened **read-only**, and so that nothing is written beside it either: a WAL
+  database with no `-wal` (nobody has it open) is opened `immutable`, anything else
+  `mode=ro`. The archive's database is its verified last snapshot, a rollback-journal file.
+  Measured on the laptop's copy with the job text alone (no frames): 3,255 held entries in
+  10.5 s, 286 MB of pages, snapshot sha256 unchanged. With a WebP strip and ghost per entry
+  the tree is about 1 GB. The skip counts in the example are illustrative.
 - `--jobs` is where the rows' `jobs/<n>` paths resolve, since a snapshot's paths name the node it
   came from. The paths are resolved, never rewritten.
 - `--origin` is the banner's name and the picks' key. Required: no table records which node a
@@ -223,26 +225,31 @@ in the set, as `render_index` already removes stale `page-*.html`.
 
 ### 2.2 In the renderer
 
-- `Config` gains `local: str` (the origin label, empty for the public gallery) and `robots`,
-  and round-trips them. `publish-index` never sets them; a checkout's `config.json` never has
-  them.
-- `_entries(conn, state)` gains a `rows=` parameter (`"public"` — today's clause — or
-  `"local"`, with an id set). `render_index` and `render_entry` take it and pass it down. The
-  public call sites change by nothing but a keyword with today's value.
-- `_kiosk_entry` omits `url` and `qr` for a row without `published_utc` (§1.5), and
-  `render_index` writes no `qr*.svg` for it.
-- `grid.html`, `entry.html`, `kiosk.html`: the banner, the `noindex` meta, the Pick toggle
-  (§1.7), each behind `config.local`.
+As built (PR #189):
+
+- `Config.local` is a `Local(label, published, held, only)`. Only the label reaches
+  `config.json`, and `Config.load` never reads it back, so a checkout cannot become local by
+  its own config. `Config.public_url(row)` is the entry's public address, or None for a held
+  entry of a local render.
+- The row set is decided in four places — `_entries`, `_entry`, `_forest` and the ledger's
+  `public` flag — each taking the config. With no `local`, each runs exactly today's code.
+- `kiosk.json` omits `url` and `qr` for a row with no public address, `render_index` writes no
+  `qr*.svg` for it, the entry page's code is a template slot left empty, `meta.json`'s
+  `source.entry` and the attribution cite no address. `swipe.json` links it locally.
+- No composer, no critique form, and no offered pairs on a local render.
+- `render_local` computes the forest, the scores and the ledger once and hands them to every
+  page (`_Shared`); `render_entry` alone recomputes them per page, which is quadratic.
 
 ### 2.3 Tests
 
 `test_gallery.py`, against a scratch database built in `setUp`, as the existing ones are:
 
-- a held entry renders under `rows="local"` and is refused under `"public"`, as today;
-- the public render of the same database is byte-identical before and after this packet — the
-  proof that the publisher's output did not move;
+- a held entry renders on a local render and is refused by the site's, as today;
+- the public render of the same database is byte-identical before and after this packet,
+  except `gallery.js`, `gallery.css` and the kiosk's `build` stamp, which hashes the CSS —
+  checked by rendering one database with `main` and with the branch;
 - no `qr.svg`, no `url` in `kiosk.json` for an unpublished row; both for a published one;
-- the banner, `noindex` and Pick toggle present under `local`, absent otherwise;
+- a shared render and a page-by-page one write the same bytes;
 - every refusal in §2.1 refuses before any file exists; the read-only open refuses a write;
 - an entry the scan catches is skipped and named, and the rest render.
 
@@ -308,7 +315,8 @@ first import takes its ids from the picks rather than from `import list --clean
 1. `render-local` of sld-cloud's own database with `--include published` gives a tree whose
    entry folders match the public gallery's, and `render-local` into the gallery checkout is
    refused.
-2. The public `render-all` of a scratch database is byte-identical before and after Packet 1.
+2. The public `render-all` of a scratch database is byte-identical before and after Packet 1,
+   but for the two assets and the `build` stamp.
 3. `render-local` of the sld-gpu snapshot with `--include held` leaves the snapshot's sha256
    unchanged and renders every entry the scan passes; its `kiosk.json` has no `url` on any row.
 4. A Mac with the kit serves that tree on `127.0.0.1:8090`, and `kiosk.html` from it plays
