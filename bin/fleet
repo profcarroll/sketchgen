@@ -26,9 +26,10 @@ update.sh predates pins and so would pull main whatever it is held on
 (--adopt), and a node already updating. It then starts update.sh as the
 transient user unit `sketchgen-update`, which outlives this ssh session — a
 dropped laptop no longer SIGHUPs a deploy halfway through a migration — and
-whose name systemd will not give to a second run. It returns at once; sld-cloud's
-render alone is about 25 minutes. Its output is ~/sketchgen/logs/update-*.log
-on the node, which is what `watch` reads.
+whose name systemd will not give to a second run. It returns at once; a deploy
+is minutes (the render was 110 of them on 2026-09-28, before it shared one
+forest and ledger across pages). Its output is ~/sketchgen/logs/update-*.log on
+the node, which is what `watch` reads.
 
 Exit codes, the project's: 0 ok (status: every node on target), 1 not, 3 refused
 (nothing started). Settings: SKETCHGEN_FLEET (the file), SKETCHGEN_SSH (the ssh

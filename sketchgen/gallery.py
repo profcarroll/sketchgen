@@ -2875,10 +2875,15 @@ class _Shared:
 
     ``render_entry`` works these out for itself, which is right for the one
     entry a publish renders and quadratic for a loop over all of them: the
-    ledger alone is three queries per entry in the table, per page. At 1,500
-    entries that is most of render-all's 25 minutes; at the 3,518 of a held
-    archive it would be hours. :func:`render_local` builds one and hands it to
-    every page.
+    ledger alone is three queries per entry in the table, per page. On
+    2026-09-28 ``bin/fleet update sld-cloud`` re-rendered 1,589 entries at
+    about 4 s a page, 110 minutes with the generator paused; at the 3,518 of
+    a held archive it would be hours. :func:`render_local`, :func:`render_all`
+    and ``publish.publish_index`` build one and hand it to every page.
+
+    Only for pages of entries that are already public (or, locally, admitted):
+    ``_forest`` here admits nothing, and the one held entry a publish renders
+    needs ``admit`` to find its own parent. That path stays one by one.
     """
 
     parent: dict[int, int | None]
@@ -4028,8 +4033,9 @@ def render_all(
     dest = Path(dest_dir)
     config = _resolve_config(dest, config)
     written = render_index(conn, dest, config)
+    shared = _shared(conn, config)
     for row in _public_rows(conn, config):
-        written.append(render_entry(conn, int(row["id"]), dest, config))
+        written.append(render_entry(conn, int(row["id"]), dest, config, shared=shared))
     return written
 
 
