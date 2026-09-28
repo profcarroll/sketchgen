@@ -1627,10 +1627,17 @@
     button.textContent = "loading…";
   }
 
+  /* Focus, so Space or Enter presses Start as a click would. A kiosk driven by
+   * a controller has no pointer to aim — on the Retroid Flip 2 under ROCKNIX
+   * (2026-09-28) the only way to Start was steering a stick-driven cursor onto
+   * the button, while Start on the pad already sent Space. It is here and not
+   * in the markup's autofocus because the button is disabled until now, and a
+   * disabled button cannot take focus. */
   function offerStart() {
     var button = $("go");
     button.disabled = false;
     button.textContent = "Start";
+    button.focus();
   }
 
   function cannotStart() {
