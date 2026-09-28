@@ -784,6 +784,15 @@ class KioskTests(unittest.TestCase):
         self.assertFalse(starting["loaded"]["disabled"])
         self.assertEqual("Start", starting["loaded"]["label"])
 
+    def test_start_takes_the_focus_so_a_key_can_press_it(self):
+        # A controller with no pointer to aim (the Flip 2, 2026-09-28) sends
+        # Space; a focused button takes that as its click. Not while it is
+        # still loading, and not on a card that cannot start.
+        starting = self.report["starting"]
+        self.assertFalse(starting["beforeAnything"]["focused"])
+        self.assertTrue(starting["loaded"]["focused"])
+        self.assertFalse(starting["failed"]["focused"])
+
     def test_a_manifest_that_never_arrives_says_so_on_the_card(self):
         # Taking the click and fetching afterwards is how a projector ends up
         # black and deaf: card gone, nothing playing, and because nothing is
