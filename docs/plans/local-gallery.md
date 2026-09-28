@@ -8,7 +8,8 @@ gallery an instance generates for itself, viewable locally, that a kiosk can run
 going through Pages — and it turns out to be the piece the other two publishing ideas were
 each missing.
 
-Two packets. Neither touches `publish.py`, the Worker or the public gallery.
+Three packets. The first two touch neither `publish.py`, the Worker nor the public gallery; the
+third is the Worker's, and only its CORS.
 
 Repositories and conventions as in `held-batch.md`: `profcarroll/sketchgen`, Python 3.12, stdlib
 only, `python3 -m unittest discover -s tests`, no network in a test. One packet per branch.
@@ -133,13 +134,24 @@ A row with `published_utc` gets its code and its `url`, pointing at the public p
 row without gets neither, and `kiosk.js` already draws no code for it. No code on a wall ever
 points at a local address: the phone in the visitor's hand is not on the kiosk's loopback.
 
-### 1.6 No counting, until the Worker is asked
+### 1.6 Counting from a local wall: a second kind of origin
 
-The local config writes `kiosk_views: false` and `write_path: ""` unless `--write-path` is given.
-A wall on a local render therefore counts nothing, and its title already says so (`not
-counting: no write path`, §0.3), which the watchdog reads. Counting from a local origin is a
-Worker change — `GALLERY_URL` becomes a list of allowed origins — deployed by hand, D1 first
-(AGENTS.md, *Deploying*). It is not in this plan; §8 asks whether it should be the next one.
+The local config writes `kiosk_views: false` and `write_path: ""` unless `--write-path` is given,
+so a local render counts nothing by default, and a wall on it says so in its title (`not
+counting: no write path`, §0.3). **Decided 2026-09-28: a local wall should count.** That is a
+Worker change, Packet 3 (§3a), and it is narrow on purpose:
+
+- A new var, `KIOSK_ORIGINS`, lists the loopback origins a kiosk serves from
+  (`http://127.0.0.1:8090`). `GALLERY_URL` stays the one gallery origin.
+- A kiosk origin gets CORS on **`GET /counts` and `POST /view` only**, and never
+  `Access-Control-Allow-Credentials`. Sign-in, likes, votes, prompts and critiques stay the
+  gallery origin's alone: a page on somebody's loopback is not the gallery.
+- A `/view` from a kiosk origin must say `source: "kiosk"`, and no session is read for it. A
+  local wall is a kiosk and nothing else, and its `site=` is what separates its views in
+  `kiosk_views`, as for the D12 wall now.
+
+CORS is a browser's rule, not an authentication: anyone could already post a view with `curl`.
+What the allowlist decides is which *pages* may count, and a local wall is one.
 
 ### 1.7 Picks: the one thing the local render adds to a page
 
@@ -257,6 +269,18 @@ The kiosk kit (`kiosk-mac/`) learns to serve a local gallery.
 
 The watchdog does not change: it reads the title of whatever page has `/kiosk.html` in its URL.
 
+## 3a. Packet 3 — `feat/writepath-kiosk-origins`
+
+`writepath/worker.js` and `wrangler.toml`, §1.6. `corsHeaders` and `preflight` take the route:
+a kiosk origin is allowed only for `/counts` and `/view`, without credentials; `routeView`
+refuses a kiosk origin's view unless `source` is `kiosk`, and passes no session for it. No D1
+change: `kiosk_views` already keeps the site. Tests beside the Worker's own (`writepath/test/`,
+node, no network): a kiosk origin counts a view and reads counts; is refused on `/like`,
+`/vote`, `/me`, `/prompt`; gets no `Allow-Credentials`; an unlisted loopback origin gets
+nothing. Deployed by hand (`npx --yes wrangler@latest deploy` from `writepath/`), and the
+local render is then made with `--write-path` — the Worker first, since a page whose calls are
+refused shows `—`, never an error.
+
 ## 4. Using it: the sld-gpu archive
 
 1. Back the archive up somewhere that is not sld-cloud. It is 8.5 GB on one instance and none of
@@ -266,8 +290,8 @@ The watchdog does not change: it reads the title of whatever page has `/kiosk.ht
    Resume.
 3. `rsync` the tree to the laptop. The operator sifts it in a browser from
    `python3 -m http.server`, picking; *Copy picked ids* → `picks.txt`.
-4. Optionally, the same tree on one of the new M4 minis, as a wall in the room, uncounted, while
-   the D12 wall stays on Pages and keeps counting. Whether GPU-made work earns more attention is
+4. Optionally, the same tree on one of the new M4 minis, as a wall in the room, counted with its
+   own `site=` once Packet 3 is deployed, while the D12 wall stays on Pages. Whether GPU-made work earns more attention is
    something to watch, not to measure yet (the 2026-09-24 refocus: the shortage is people
    looking, not sketches).
 5. `gpu-fold-in.md` Packet 1's `import run --ids picks.txt`, then publish from Held as for any
@@ -312,14 +336,11 @@ first import takes its ids from the picks rather than from `import list --clean
 - **Judging a local render.** Blind pairs and verdicts stay on the node and the Worker; a local
   gallery shows standings a published entry already has, and none for a held one.
 
-## 8. Decisions for the operator
+## 8. Decisions, taken 2026-09-28
 
-1. **The origin label on the page**: the fleet name (`sld-gpu`, recommended — already public in
-   this repository), or a description (*rented A10, Sept 2026*).
-2. **Where the picks live**: `localStorage` in one browser (recommended; nothing to build on a
-   server), or a file the local server writes (needs a server that accepts a POST, which
-   `http.server` does not).
-3. **The first local wall**: an M4 mini beside the D12 wall (recommended), or the D12 wall
-   itself switched to local, which stops its counting until the Worker is changed (§1.6).
-4. **Whether the Worker should allow a second origin** so a local wall can count views. A
-   separate plan if yes.
+The operator took the recommended default on each:
+
+1. **The origin label** is the fleet name, `sld-gpu`.
+2. **Picks** live in `localStorage` in one browser.
+3. **The first local wall** is an M4 mini beside the D12 wall; the D12 wall stays on Pages.
+4. **The Worker accepts kiosk origins** for counting (§1.6), as Packet 3.
