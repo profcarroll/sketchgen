@@ -284,6 +284,19 @@ class FleetTests(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
         self.assertIn("FAILED (exit 1)", done.stdout)
 
+    def test_watch_survives_a_tail_that_cuts_the_render_bar_mid_character(self):
+        # PEEK sends the last 6000 bytes; the render bar is █, three bytes each.
+        # Pad the end so the cut lands on a continuation byte (2026-09-28).
+        home = self.node("alpha", **self.stamped(self.c3))
+        logs = home / "sketchgen" / "logs"
+        logs.mkdir()
+        end = "\n✓ all done\n[fleet] update.sh exited 0\n"
+        end = "." * ((1 - len(end.encode())) % 3) + end
+        (logs / "update-20260928T160000Z.log").write_text("█" * 3000 + end)
+        done = self.fleet("watch", "alpha")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertRegex(done.stdout, r"alpha\s+done\s+✓ all done")
+
     # -- pin -----------------------------------------------------------------
 
     def test_pin_sends_a_full_sha_and_a_node_without_the_verb_is_named(self):
