@@ -276,6 +276,18 @@ The kiosk kit (`kiosk-mac/`) learns to serve a local gallery.
 
 The watchdog does not change: it reads the title of whatever page has `/kiosk.html` in its URL.
 
+As built (2026-09-28): the server is `serve-gallery.py`, not a bare `http.server` line: it
+refuses a non-loopback bind, writes no access log (a wall's requests would outgrow the disk),
+and sends the manifests `no-store`. `serve-gallery.sh` checks the Command Line Tools at every
+start, before `python3`. `install.sh --local` adds the agent, a plain reinstall keeps it, and
+`--remove-local` takes it out. `sync-local.sh` streams the render node → laptop → Mac as one
+tar (no key on the wall, nothing stored on the laptop) into `releases/<stamp>`, then swaps the
+`gallery` link with `os.replace`, since BSD and GNU `mv` both follow a link to a directory; it
+keeps two releases. Proven on the D12 Mac without touching its agents: 14 MB in 3 s; a live
+swap while serving; the kiosk from `127.0.0.1:8090` in Chrome 154 playing sketches, and reading
+`/counts` from the deployed Worker anonymously (200) and refused with credentials. Everything
+was removed afterwards, and the wall counted throughout.
+
 ## 3a. Packet 3 — `feat/writepath-kiosk-origins`
 
 `writepath/worker.js` and `wrangler.toml`, §1.6. `corsHeaders` and `preflight` take the route:

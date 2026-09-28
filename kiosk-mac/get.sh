@@ -12,7 +12,9 @@ REF=${1:-main}
 RAW="https://raw.githubusercontent.com/profcarroll/sketchgen/$REF/kiosk-mac"
 KIT="$HOME/Library/sketchgen-kiosk/kit"
 FILES="prep.sh system.sh install.sh probe.sh launch-kiosk.sh kiosk-watchdog.sh kiosk-status
-       org.sketchgen.kiosk.plist org.sketchgen.kiosk-watchdog.plist README.md"
+       serve-gallery.sh serve-gallery.py
+       org.sketchgen.kiosk.plist org.sketchgen.kiosk-watchdog.plist org.sketchgen.gallery.plist
+       README.md"
 
 mkdir -p "$KIT"
 for f in $FILES; do curl -fsSL "$RAW/$f" -o "$KIT/$f"; done

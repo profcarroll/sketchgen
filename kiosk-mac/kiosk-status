@@ -17,6 +17,14 @@ if [ -n "$pid" ]; then
         | awk '{kb += $1; n++} END {printf "%d processes, %.0f MB resident\n", n, kb / 1024}')"
 fi
 echo "title     $("$HOME/Library/sketchgen-kiosk/kiosk-watchdog.sh" --title)"
+D="$HOME/Library/sketchgen-kiosk"
+echo "url       $(head -n 1 "$D/url" 2>/dev/null || echo "Pages (launch-kiosk.sh's default)")"
+# The local gallery, only on a wall that serves one (local-gallery.md §3).
+if launchctl print "gui/$(id -u)/org.sketchgen.gallery" >/dev/null 2>&1; then
+    served=$(curl -fsS --max-time 3 http://127.0.0.1:8090/kiosk.json 2>/dev/null \
+        | grep -o '"build": "[^"]*"' | head -1)
+    echo "gallery   $(readlink "$D/gallery" 2>/dev/null || echo "nothing synced")  ${served:-not answering on 127.0.0.1:8090}"
+fi
 echo "memory    $(memory_pressure 2>/dev/null | tail -1)"
 echo "tailscale $("$TS" status --self --peers=false 2>/dev/null | head -1)"
 echo "watchdog  (last 5)"; tail -5 "$STATE/watchdog.log" 2>/dev/null | sed 's/^/  /'

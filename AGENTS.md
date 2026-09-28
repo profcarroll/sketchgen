@@ -341,7 +341,11 @@ worker and web, resume. `bin/fleet status` says which build every node is on
   minute and a half on sld-cloud since the pages share one forest, fit and
   ledger; it was 110 minutes on 2026-09-28, before they did).
 - **The write-path Worker (`writepath/`) is not deployed by update.sh.** Deploy
-  it by hand with `npx --yes wrangler@latest deploy` from `writepath/`, and
+  it by hand from `writepath/`, with the API token the laptop keeps in
+  `~/.config/sketchgen/cloudflare.env` (mode 600; never print it):
+  `set -a && . ~/.config/sketchgen/cloudflare.env && set +a && npx --yes wrangler@latest deploy`.
+  The browser login expires in days and cannot be renewed non-interactively
+  (2026-09-28: a deploy waited on it for an evening). Also
   apply any D1 schema change **before** the deploy, verifying the table exists
   in between — a Worker that queries a missing table signs every visitor out.
 
