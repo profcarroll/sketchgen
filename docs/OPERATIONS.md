@@ -1130,12 +1130,16 @@ funnel in the console to say nothing new.
 
 ## A local render: the gallery nobody pushes
 
+*New to it? `docs/tutorial-local-gallery.md` walks through all of it in four exercises.*
+
 `render-local` renders the same pages as the site, of any database, into a directory
 that is never a git checkout (docs/plans/local-gallery.md). It is for looking at what
 is not published — a held archive, sifted on a laptop — and for a kiosk that plays from
 its own loopback. Nothing it writes is pushed, and it refuses to write into a checkout.
 
 ```bash
+# On the node itself, not through bin/sg: bin/sg adds the node's own --db last, and
+# render-local refuses a second one rather than render the wrong database.
 SG="$HOME/sketchgen/.venv/bin/python3 $HOME/sketchgen/app/bin/sketchgen"
 A=$HOME/sketchgen-backups/sld-gpu/sketchgen          # the rented GPU's archive; its
                                                     # database is the verified last snapshot
