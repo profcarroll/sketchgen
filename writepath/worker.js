@@ -409,6 +409,48 @@ function galleryOrigin(env) {
   }
 }
 
+// A kiosk served from its own machine (docs/plans/local-gallery.md §1.6): a
+// wall that plays a local render of the gallery from 127.0.0.1 rather than
+// from GitHub Pages, and should still count what it plays. Its origin is not
+// the gallery, so it gets exactly what counting needs — a read of the counts
+// and an anonymous kiosk view — and nothing a person does: no sign-in, no
+// like, no vote, no prompt, no critique, and never credentials. The list is
+// KIOSK_ORIGINS, and only a loopback origin can be on it, so a typo cannot
+// hand a public site even this much. CORS is the browser's rule, not an
+// authentication: anybody can post a view with curl, as they always could.
+// What the list decides is which *pages* may count.
+const KIOSK_ROUTES = new Set(["/counts", "/view"]);
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
+
+/** The loopback origins env.KIOSK_ORIGINS names; anything else in it is ignored. */
+export function kioskOrigins(env) {
+  const found = new Set();
+  for (const piece of String(env.KIOSK_ORIGINS || "").split(/[\s,]+/)) {
+    if (!piece) continue;
+    let url;
+    try {
+      url = new URL(piece);
+    } catch {
+      continue;
+    }
+    if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+    if (!LOOPBACK_HOSTS.has(url.hostname)) continue;
+    found.add(url.origin);
+  }
+  return found;
+}
+
+function routePath(request) {
+  return new URL(request.url).pathname.replace(/\/+$/, "") || "/";
+}
+
+/** The request's Origin, if it is a listed kiosk origin on a route a kiosk may use. */
+function kioskOrigin(request, env) {
+  const origin = request.headers.get("Origin");
+  if (!origin || !KIOSK_ROUTES.has(routePath(request))) return null;
+  return kioskOrigins(env).has(origin) ? origin : null;
+}
+
 function corsHeaders(request, env) {
   const allowed = galleryOrigin(env);
   const origin = request.headers.get("Origin");
@@ -416,6 +458,11 @@ function corsHeaders(request, env) {
   if (allowed && origin === allowed) {
     headers["Access-Control-Allow-Origin"] = allowed;
     headers["Access-Control-Allow-Credentials"] = "true";
+  } else {
+    const kiosk = kioskOrigin(request, env);
+    // No Allow-Credentials: a kiosk presents nobody, and a page that tried to
+    // send a cookie from here would have its response withheld, as it should.
+    if (kiosk) headers["Access-Control-Allow-Origin"] = kiosk;
   }
   return headers;
 }
@@ -439,6 +486,21 @@ function redirect(location, extra = {}) {
 function preflight(request, env) {
   const allowed = galleryOrigin(env);
   const origin = request.headers.get("Origin");
+  const kiosk = kioskOrigin(request, env);
+  if (kiosk && origin !== allowed) {
+    // /view's JSON body makes it a preflighted call. Content-Type and nothing
+    // else: no Authorization, because a kiosk has no session to send.
+    return new Response(null, {
+      status: 204,
+      headers: {
+        "Access-Control-Allow-Origin": kiosk,
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+        "Access-Control-Max-Age": "600",
+        Vary: "Origin",
+      },
+    });
+  }
   if (!allowed || origin !== allowed) {
     // Any other origin, including a missing one, gets a refusal with no
     // Access-Control-Allow-Origin header, so the browser blocks the call.
@@ -708,7 +770,7 @@ async function routeLike(request, env, username) {
   return json({ ok: true, entry_id: entryId, on }, 200, request, env);
 }
 
-async function routeView(request, env, username, sessionValue) {
+async function routeView(request, env, username, sessionValue, { kioskOnly = false } = {}) {
   const body = await readJson(request);
   if (!body) return json({ error: "bad json" }, 400, request, env);
   const entryId = body.entry_id;
@@ -721,6 +783,11 @@ async function routeView(request, env, username, sessionValue) {
   const source = body.source === undefined || body.source === null ? "entry" : body.source;
   if (!VIEW_SOURCES.has(source)) {
     return json({ error: "source must be entry or kiosk" }, 400, request, env);
+  }
+  // A kiosk origin's page is a wall, never an entry page somebody opened: its
+  // views are kiosk views or they are not taken (local-gallery.md §1.6).
+  if (kioskOnly && source !== "kiosk") {
+    return json({ error: "a kiosk origin posts kiosk views only" }, 403, request, env);
   }
   // The kiosk's room, if its launch URL named one. Absent is today's kiosk and
   // changes nothing. Refused on anything but a kiosk view: an entry page has
@@ -874,6 +941,11 @@ export default {
     }
 
     if (request.method === "POST" && path === "/view") {
+      // From a kiosk origin no session is read, whatever the request carries:
+      // the route is anonymous for it, as kiosk.js already is.
+      if (kioskOrigin(request, env) && request.headers.get("Origin") !== galleryOrigin(env)) {
+        return routeView(request, env, null, null, { kioskOnly: true });
+      }
       return routeView(request, env, username, sessionValue);
     }
 
