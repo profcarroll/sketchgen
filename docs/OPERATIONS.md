@@ -1171,6 +1171,11 @@ Chrome from loopback exactly as on Pages (the spike, local-gallery.md §0.3), bu
 the desktop app's Browser pane, which blocks the sandboxed frame
 (`net::ERR_BLOCKED_BY_CLIENT`).
 
+**On a wall.** `kiosk-mac/README.md` → *A wall that plays its own copy*: `install.sh --local`
+on the Mac (Command Line Tools required), then `kiosk-mac/sync-local.sh NODE:DIR WALL` from the
+laptop for each new render, and the wall's URL in `~/Library/sketchgen-kiosk/url`. Render it
+with `--config-from ~/sketchgen/gallery --write-path …` and the wall counts, under its `site=`.
+
 ## The billing card
 
 The console's last panel says what this tenancy has cost. It is the one number
