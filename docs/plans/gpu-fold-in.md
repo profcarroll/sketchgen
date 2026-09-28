@@ -86,6 +86,11 @@ The published tree is 349 MB for 1,515 entry folders, about 230 KB each since th
 with room for sld-cloud's own. Past that is `gallery-hub.md` Step 2, not a bigger push. The
 repository's `.git` is 1.4 GB already and every published frame is in it for good.
 
+**Amended 2026-09-28 by `local-gallery.md`.** The cap limits what is *published*, not what is
+*seen*: a local render shows the whole archive on the laptop or a wall with no push, and the
+selection becomes the operator's picks from it (`local-gallery.md` §4) rather than a filter
+applied before anyone has looked. The filters below stay, as a way to narrow a first render.
+
 The first import is small — a couple of hundred — and goes on a wall before there is a
 second. Whether GPU-made work earns more attention than what is already playing is something to
 look at, not to assume (the 2026-09-24 refocus: the shortage is people looking, not sketches).
@@ -264,7 +269,8 @@ Between batches, with the tray on Held empty.
 
 1. `bin/fleet update sld-cloud` with both packets merged. It brings #179–#184 and migrations
    018 and 019, and Packet 2 changes a template, so it is the full render.
-2. `bin/sg control pause --reason "import"`, then `import list … --ids > first-200.txt`, then
+2. `bin/sg control pause --reason "import"`, then the operator's `picks.txt` from the local
+   render (`local-gallery.md` §4; `import list … --ids` if there is none), then
    `import run --dry-run`, then `import run`. Resume.
 3. Held now has 200 more cards. Publish from there, in batches (`held-batch.md`): one push and
    one index per batch. The index re-renders every entry page, so it grows with the gallery:
