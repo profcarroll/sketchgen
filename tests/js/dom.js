@@ -361,6 +361,8 @@ class Element {
 
   remove() { if (this.parentNode) { this.parentNode.removeChild(this); } }
 
+  get firstChild() { return this.childNodes[0] || null; }
+
   get nextSibling() {
     if (!this.parentNode) { return null; }
     var at = this.parentNode.childNodes.indexOf(this);
