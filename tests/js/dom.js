@@ -401,6 +401,17 @@ class Element {
     (this.listeners[name] = this.listeners[name] || []).push(fn);
   }
 
+  /* Focus as a browser gives it: a disabled control refuses it, and otherwise
+   * the document's activeElement is this one. kiosk.js focuses Start the
+   * moment it enables it, so a key can press it; a test reads activeElement to
+   * see that the focus landed, and that it did not land early. */
+  focus() {
+    if (this.disabled === true) { return; }
+    var node = this;
+    while (node.parentNode) { node = node.parentNode; }
+    if (node instanceof Document) { node.activeElement = this; }
+  }
+
   click() {
     const el = this;
     (this.listeners.click || []).forEach(function (fn) {

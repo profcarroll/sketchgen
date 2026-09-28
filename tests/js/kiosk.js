@@ -978,6 +978,7 @@ function card(document) {
   return {
     welcomeUp: document.getElementById("welcome").hidden === false,
     disabled: button.disabled === true,
+    focused: document.activeElement === button,
     label: button.textContent,
     note: document.querySelector(".welcome .note").textContent,
     frames: frames(document).length,
