@@ -309,6 +309,15 @@ class RefusalTests(LocalTestCase):
         code, _, err = self.run_cli()
         self.assertRefused(code, err, "schema 999")
 
+    def test_a_second_db_is_refused_not_resolved_to_the_last(self):
+        # What bin/sg does: the node's own --db goes after the command's.
+        stderr = io.StringIO()
+        with redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+            self.run_cli("--db", str(self.tmp / "other.db"))
+        self.assertEqual(3, caught.exception.code)
+        self.assertIn("--db given twice", stderr.getvalue())
+        self.assertFalse(self.out.exists())
+
     def test_nothing_to_render(self):
         ids = self.tmp / "ids.txt"
         ids.write_text("9999\n")

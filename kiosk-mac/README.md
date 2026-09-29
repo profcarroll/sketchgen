@@ -56,9 +56,11 @@ a stub that puts an installer dialog over the wall, so `install.sh --local` refu
 ```bash
 # once, at the Mac if the tools are missing:  xcode-select --install
 ssh WALL 'bash ~/Library/sketchgen-kiosk/kit/install.sh --local'
-# on the node: the render (see docs/OPERATIONS.md → A local render)
-bin/sg render-local --db … --jobs … --out ~/sketchgen-local/NAME --origin NAME --include … \
-    --config-from ~/sketchgen/gallery --write-path https://sketchgen-writepath.sketchgen.workers.dev
+# on the node, not through bin/sg (which adds the node's own --db; render-local refuses two):
+# the render (see docs/OPERATIONS.md → A local render)
+ssh sld-cloud '~/sketchgen/.venv/bin/python3 ~/sketchgen/app/bin/sketchgen render-local \
+    --db … --jobs … --out ~/sketchgen-local/NAME --origin NAME --include … \
+    --config-from ~/sketchgen/gallery --write-path https://sketchgen-writepath.sketchgen.workers.dev'
 # on the laptop: onto the wall, as a new release
 kiosk-mac/sync-local.sh sld-cloud:sketchgen-local/NAME WALL
 # point the wall at it, and restart the page
