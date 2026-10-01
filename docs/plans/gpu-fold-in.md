@@ -223,6 +223,43 @@ archive built in `setUp`: ids renumbered and origins kept; all five paths rewrit
 resolving; `created_utc` unchanged; a second run imports nothing; every refusal refuses before
 any row or directory exists; a copy that fails half way leaves neither. No network, no browser.
 
+### 2.6 As built (2026-10-01)
+
+`sketchgen/cli/importentries.py`, migration `019_origins.sql`, and the inserts in `db.py`
+(`import_job`, `import_attempt`, `import_entry`, `register_origin`). Where the plan was silent:
+
+- **The archive is read through `render-local`'s read-only open**, and `--ids` through its
+  parser, so a local render's *Copy picked ids* and `import list --ids` are one format. The
+  archive's own ids are what `--ids` names. `--ids -` reads stdin, for `bin/sg` from the laptop.
+- **"Verified" is `backup verify`**: the manifest's sha256 and sizes, `integrity_check`, the
+  schema and every table's row count. `list` lists an unverified snapshot and says so in its
+  last line; `run` refuses it.
+- **Copied columns are the snapshot's and this node's in common**, less the ids, the state,
+  `parent_entry_id`, the publication columns and the two build columns (migration 018). An
+  entry or job with a parent is failed, not imported: its parent is an id in the other node's
+  sequence. So is an entry that was itself imported (an archive at 019).
+- **`origins.shape`** is every shape its entries carry, most common first; **`first_utc` and
+  `last_utc`** are its earliest job's `created_utc` and its latest job's `updated_utc`;
+  **`build`** is the manifest's `git.app.commit`. An origin is registered from one snapshot,
+  and `run` refuses a second snapshot under the same name: Packet 2's *Made on* line names it.
+- **Two refusals the plan did not list**: a `--node` that is not a fleet-shaped name or carries
+  Oracle's `instance-` mark (§3.1), and a jobs directory with a numbered directory past this
+  node's last job row — the id an import would take. A directory that appears there during
+  a run stops it (the next entry would be handed the same id) and the rest are reported as
+  not attempted.
+- **`list --no-buffers`** is the §7.1 recommendation as a filter. `--prompt-of ENTRY` names an
+  entry of *this* node: the GPU's takes of something published here.
+- **Output for 3,255.** `run` prints one line per skipped or failed entry, a progress line on
+  stderr every 100, and the summary; nothing per imported entry. The margin is 2 GB.
+- **`--dry-run` refuses exactly as `run` does**, the pause included, so a dry run that passes
+  predicts the run.
+
+Checked on the laptop against a copy of the real snapshot (schema 17) with the job text
+alone: `list` read all 3,255 held in half a second, 2,852 clean and 1,119 with
+`--clean --one-per-prompt --no-buffers`, 203 held entries' kept sketches calling
+`createGraphics()`; three imported into a scratch node, paths rewritten, and a second run
+imported nothing.
+
 ## 3. Packet 2 — `feat/origin-on-the-page`
 
 ### 3.1 The entry page and `meta.json`

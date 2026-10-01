@@ -349,6 +349,35 @@ worker and web, resume. `bin/fleet status` says which build every node is on
   apply any D1 schema change **before** the deploy, verifying the table exists
   in between — a Worker that queries a missing table signs every visitor out.
 
+## Importing another node's entries
+
+`sketchgen import` brings entries of a finished archive — a node's whole
+`~/sketchgen`, as the rented A10's sits on sld-cloud at
+`~/sketchgen-backups/sld-gpu/sketchgen` — into this node as `held` entries,
+each under a new id with its job directory copied and `origin_node`,
+`origin_entry_id` and `origin_job_id` saying where it came from
+(`docs/plans/gpu-fold-in.md`, migration 019). Generator paused. On the node
+itself — or through `bin/sg` with `--ids -`, since an ids file is read where
+the command runs:
+
+```bash
+A=$HOME/sketchgen-backups/sld-gpu/sketchgen
+$SG import list --from $A --clean --one-per-prompt --ids > picks.txt   # or a local render's picks
+$SG import run --from $A --node sld-gpu --ids picks.txt --by profcarroll \
+    --note "rented OCI A10, terminated 2026-09-27" --dry-run          # then without --dry-run
+```
+
+`run` takes only the ids it is given; a second run of the same ids imports
+nothing. The idle critic never picks an imported entry, and any analysis of the
+rules-file A/B reads `WHERE origin_node IS NULL`. Traps:
+
+- **The laptop's mirror.** An imported entry adds its whole job directory,
+  frames included (about 2.4 MB), to `~/sketchgen/jobs`, and
+  `bin/pull-backup.sh` mirrors all of `jobs/`. Pull with `--no-jobs` until the
+  laptop has room for what the import added.
+- **Do not delete the archive after an import.** `import run` copies. What was
+  not chosen is still only there.
+
 ## Working on the code
 
 - Tests: `python3 -m unittest discover -s tests` from the repo root — stdlib,
