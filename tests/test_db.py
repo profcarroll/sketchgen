@@ -27,6 +27,7 @@ EXPECTED_TABLES = {
     "likes",
     "lineage",
     "meta",
+    "origins",
     "schema_version",
     "submissions",
     "sync_state",
@@ -316,6 +317,31 @@ class TestEntriesToCritique(DbTestCase):
         self.parent_without_a_strip()
         sighted = self.parent(prompt="a root with a strip")
         self.assertEqual([sighted], db.entries_to_critique(self.conn, "critic-v3", 1))
+
+    def imported_parent(self, prompt="made on the rented A10"):
+        """A published entry another node made, dated before anything here."""
+        db.register_origin(self.conn, "sld-gpu", "octocat", note="rented OCI A10")
+        job = db.import_job(self.conn, prompt=prompt, submitted_by="octocat",
+                            created_utc="2026-09-24T01:59:37Z",
+                            updated_utc="2026-09-24T02:37:55Z")
+        entry = db.import_entry(self.conn, job, origin_node="sld-gpu", origin_entry_id=412,
+                                origin_job_id=412, prompt=prompt, strip_path="/tmp/strip.png",
+                                created_utc="2026-09-24T02:37:55Z")
+        db.entry_transition(self.conn, entry, "published",
+                            published_utc="2026-10-01T12:00:00Z")
+        self.conn.commit()
+        return entry
+
+    def test_an_imported_entry_does_not_block_the_one_behind_it(self):
+        """gpu-fold-in.md §1.5: the idle critic leaves another node's work alone.
+
+        The imported entry carries the rental's date, so oldest-first puts it at
+        the head of the list; it is not offered, and the entry behind it is.
+        """
+        imported = self.imported_parent()
+        here = self.parent(prompt="made here")
+        self.assertEqual([here], db.entries_to_critique(self.conn, "critic-v3", 1))
+        self.assertNotIn(imported, db.entries_to_critique(self.conn, "critic-v3", 50))
 
     def test_a_parent_with_no_child_is_offered_oldest_first(self):
         one = self.parent("first")
