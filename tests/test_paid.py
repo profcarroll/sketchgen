@@ -827,7 +827,9 @@ class CritiqueTests(PaidTestCase):
         item = self.export()["items"][0]
         row = db.get_entry(self.conn, item["inputs"]["entry"])
         self.assertEqual(item["prompt"],
-                         lineage.critique_prompt(row, row["statement"], row["brief"]))
+                         lineage.critique_prompt(
+                             row, row["statement"], row["brief"],
+                             recent=lineage.recent_critiques(self.conn)))
         self.assertEqual(item["images"], [row["strip_path"]])
         self.assertEqual(item["guard"], paid.sha256_file(row["strip_path"]))
         self.assertEqual(item["prompt_version"], "critic-v4")

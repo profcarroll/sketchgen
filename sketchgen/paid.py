@@ -808,7 +808,10 @@ class CritiqueAdapter(Adapter):
             items.append(
                 {
                     "key": f"entry {entry_id}",
-                    "prompt": lineage.critique_prompt(row, row["statement"], row["brief"]),
+                    "prompt": lineage.critique_prompt(
+                        row, row["statement"], row["brief"],
+                        recent=lineage.recent_critiques(conn),
+                    ),
                     "images": images,
                     "guard": guard,
                     "prompt_version": version,
