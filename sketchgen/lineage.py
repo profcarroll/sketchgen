@@ -755,8 +755,20 @@ def critique_prompt(
         words = json.loads(raw_assertions) if raw_assertions else []
     except (TypeError, ValueError):
         words = []
+    # critic-v4 shows the line's root and its revisions apart. Under critic-v3
+    # they arrived as one {prompt} with every Revise: line stapled on, and the
+    # critic asked lineage 1405 to "spiral inward from the edges" at generation
+    # 1 and again, word for word, at generation 5 (2026-10-02).
+    prompt = str(_get(entry_row, "prompt", "") or "").strip()
+    root, revisions = split_prompt(prompt)
+    history = "\n".join(
+        f"{n}. {revision}" for n, revision in enumerate(revisions, start=1)
+    ) or "(nothing yet: this sketch is where the line starts)"
     return (
-        text.replace("{prompt}", str(_get(entry_row, "prompt", "") or "").strip())
+        text.replace("{prompt}", prompt)
+        .replace("{root}", root or "(no prompt on record)")
+        .replace("{history}", history)
+        .replace("{generation}", str(len(revisions)))
         .replace("{brief}", str(brief or "").strip() or "(no brief on record)")
         .replace(
             "{statement}",

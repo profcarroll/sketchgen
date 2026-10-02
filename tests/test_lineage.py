@@ -650,22 +650,43 @@ class TestTheLinePage(LineageTestCase):
 
 
 class TestCritique(LineageTestCase):
-    def test_prompts_critic_md_is_v3_and_leaves_no_placeholders(self):
-        self.assertEqual("critic-v3", lineage.prompt_version())
+    def test_prompts_critic_md_is_v4_and_leaves_no_placeholders(self):
+        self.assertEqual("critic-v4", lineage.prompt_version())
         row = self.conn.execute(
             "SELECT * FROM entries WHERE id = ?", (self.root_entry,)
         ).fetchone()
         rendered = lineage.critique_prompt(row, row["statement"], row["brief"])
-        self.assertNotIn("{prompt}", rendered)
-        self.assertNotIn("{brief}", rendered)
-        self.assertNotIn("{statement}", rendered)
-        self.assertNotIn("{assertions}", rendered)
+        for slot in ("{prompt}", "{root}", "{history}", "{generation}",
+                     "{brief}", "{statement}", "{assertions}"):
+            self.assertNotIn(slot, rendered)
         self.assertNotIn("prompt_version:", rendered)
         self.assertIn("sixty circles drifting", rendered)
         self.assertIn("motion(idle)", rendered)
+        # a root has no history, and says so rather than leaving a blank
+        self.assertIn("this sketch is where the line starts", rendered)
+        self.assertIn("revised 0 times", rendered)
+
+    def test_the_line_history_is_shown_apart_from_its_root(self):
+        """critic-v4: lineage 1405 was asked to "spiral inward from the edges"
+        at generation 1 and again at generation 5, with every Revise: line
+        stapled to one {prompt}. The history is now its own numbered list."""
+        prompt = lineage.compose_prompt(
+            lineage.compose_prompt("rings of concentric circles",
+                                   "the same rings, and this time spiral inward."),
+            "the same rings, and this time pulse.",
+        )
+        row = {"prompt": prompt, "assertions_json": '["motion(idle)"]'}
+        rendered = lineage.critique_prompt(row, "rings", "a brief")
+        started = rendered.index("WHERE THIS LINE STARTED")
+        history = rendered.index("WHAT THIS LINE HAS ALREADY ASKED FOR")
+        self.assertIn("rings of concentric circles", rendered[started:history])
+        self.assertNotIn("Revise:", rendered)
+        self.assertIn("1. the same rings, and this time spiral inward.\n"
+                      "2. the same rings, and this time pulse.", rendered)
+        self.assertIn("revised 2 times", rendered)
 
     def test_the_rendered_prompt_tells_the_critic_the_image_beats_the_words(self):
-        """critic-v3's whole point: the statement is a claim, the strip is not.
+        """critic-v3's whole point, kept in v4: the statement is a claim, the strip is not.
 
         Entry 20 said 'interlocking planes of colour' and is a blue blob; its
         child said 'blue-to-purple gradient' and is a red rectangle. A critic
@@ -677,15 +698,16 @@ class TestCritique(LineageTestCase):
         rendered = lineage.critique_prompt(row, row["statement"], row["brief"])
         self.assertIn("WHAT THE SKETCH ACTUALLY SHOWS", rendered)
         self.assertIn("four frames", rendered)
-        self.assertIn("the image wins", rendered)
+        self.assertIn("the images win", rendered)
         # the new section comes before the words it is telling the critic to
         # distrust, or it is advice arriving after the fact
         self.assertLess(
             rendered.index("WHAT THE SKETCH ACTUALLY SHOWS"),
-            rendered.index("THE PROMPT IT WAS MADE FROM"),
+            rendered.index("WHERE THIS LINE STARTED"),
         )
-        # and the contract the version bump does not touch
-        self.assertIn("One sentence. Fewer than forty words.", rendered)
+        # and the contract validate() enforces, with the move in front
+        self.assertIn("the move, a colon, then one sentence. Fewer than forty "
+                      "words in all.", " ".join(rendered.split()))
 
     def test_the_prompt_never_shows_the_judge_who_made_it_or_who_liked_it(self):
         row = self.conn.execute(
@@ -708,7 +730,7 @@ class TestCritique(LineageTestCase):
             result.text,
         )
         self.assertEqual("gemma4:e4b", result.model)
-        self.assertEqual("critic-v3", result.prompt_version)
+        self.assertEqual("critic-v4", result.prompt_version)
 
     def test_a_saved_two_sentence_output_is_refused(self):
         with self.assertRaises(lineage.CritiqueFailed) as caught:
@@ -808,8 +830,8 @@ class TestTheGhostImage(LineageTestCase):
             ("strip",), lineage.critic_images(self.critic_file(images="sonogram"))
         )
 
-    def test_critic_v3_on_disk_asks_for_the_strip_alone(self):
-        self.assertEqual(("strip",), lineage.critic_images())
+    def test_critic_v4_on_disk_asks_for_the_strip_then_the_ghost(self):
+        self.assertEqual(("strip", "ghost"), lineage.critic_images())
 
     def test_the_setting_is_not_sent_to_the_model(self):
         path = self.critic_file()
@@ -848,10 +870,12 @@ class TestTheGhostImage(LineageTestCase):
 
         An entry with a ghost window, critiqued under critic-v3, sends exactly
         what critic-v3 has always sent — or the version would hold sighted and
-        half-sighted critiques mixed together.
+        half-sighted critiques mixed together. critic-v4 is on disk now, so the
+        v3 header is this test's own.
         """
         entry = self.publish("a jigsaw with a ghost", ghost="png")
-        sent, result, payload = self.images_sent(entry)
+        sent, result, payload = self.images_sent(
+            entry, self.critic_file(images=None, version="critic-v3"))
         self.assertEqual([self.strip_of(entry)], sent)
         self.assertEqual("critic-v3", result.prompt_version)
         self.assertEqual("", result.ghost_path)
@@ -966,7 +990,7 @@ class TestCli(LineageTestCase):
         )
         self.assertEqual(0, done.returncode, done.stderr)
         document = json.loads(done.stdout)
-        self.assertEqual("critic-v3", document["prompt_version"])
+        self.assertEqual("critic-v4", document["prompt_version"])
         self.assertTrue(document["critique"].startswith("the same field"))
         self.assertTrue(
             (out / f"entry-{self.root_entry}-critique.json").is_file()

@@ -586,6 +586,19 @@ Run it as a deliberate batch, not as a surprise on a Sunday:
    many entries even have a ghost window whose frames differ from their strip —
    is what says whether the second image was worth a version at all.
 
+**critic-v4 is that cut, and it also changes what a critique asks for**
+(2026-10-02). Under critic-v3 every critique was "the same <X>, and this time
+<one visible change>", and children shrank toward the revision floor: the median
+child changed 82% of its parent's lines when it could not see them, and 35%, then
+29, 27, 24 and 19% from 09-22 to 10-01 once it could. critic-v4 shows the line's
+root and its earlier revisions apart, says how many there have been, and asks
+the critic to choose a move first: `refine` (one thing), `transform` (keep one
+quality, change the rest) or `depart` (one idea into a different form), with no
+refining after two revisions. The move word leads the sentence (`depart: take
+…`) and travels into the child's `Revise:` line; nothing routes on it yet.
+Before cutting it, read twenty of its sentences with `rig/critic_dryrun.py`,
+which runs a prompt file over real entries on the node and records nothing.
+
 ## When a job goes wrong
 
 Two things the worker does for itself, both written after job 5 spent a night
