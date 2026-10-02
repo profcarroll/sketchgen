@@ -830,7 +830,7 @@ class CritiqueTests(PaidTestCase):
                          lineage.critique_prompt(row, row["statement"], row["brief"]))
         self.assertEqual(item["images"], [row["strip_path"]])
         self.assertEqual(item["guard"], paid.sha256_file(row["strip_path"]))
-        self.assertEqual(item["prompt_version"], "critic-v3")
+        self.assertEqual(item["prompt_version"], "critic-v4")
 
     def give_every_entry_a_ghost(self):
         """The gate's second picture in each entry's attempt directory.
@@ -878,9 +878,13 @@ class CritiqueTests(PaidTestCase):
         self.assertNotIn("ghost_path", item["inputs"])
 
     def test_the_file_alone_does_not_put_it_in_the_packet(self):
-        """critic-v3 on disk: the prompt version is the switch, not the file."""
+        """critic-v3's header: the prompt version is the switch, not the file."""
         self.give_every_entry_a_ghost()
-        item = self.export()["items"][0]
+        body = lineage.PROMPT_PATH.read_text(encoding="utf-8").split("\n\n", 1)[1]
+        path = self.tmp / "critic-v3.md"
+        path.write_text("prompt_version: critic-v3\n\n" + body, encoding="utf-8")
+        with mock.patch.object(lineage, "PROMPT_PATH", path):
+            item = self.export()["items"][0]
         row = db.get_entry(self.conn, item["inputs"]["entry"])
         self.assertEqual(item["images"], [row["strip_path"]])
         self.assertNotIn("ghost_path", item["inputs"])
@@ -909,7 +913,7 @@ class CritiqueTests(PaidTestCase):
                     conn, eid, model="claude-opus-5", stub=reply),
                 log_stream=devnull,
             )
-            self.assertTrue(run._critique_one(entry_id, "critic-v3"))
+            self.assertTrue(run._critique_one(entry_id, lineage.prompt_version()))
         self.assertEqual(landed, (self.critique_rows(), self.child_jobs()))
 
     def test_an_exported_entry_is_the_paid_critics_and_the_idle_loop_skips_it(self):
