@@ -50,6 +50,11 @@ __all__ = [
     "get_entry",
     "get_job",
     "get_meta",
+    "get_origin",
+    "import_attempt",
+    "import_entry",
+    "import_job",
+    "imported_entry",
     "init",
     "list_jobs",
     "pending_submissions",
@@ -57,6 +62,7 @@ __all__ = [
     "record_billing",
     "record_critique",
     "record_judgment",
+    "register_origin",
     "release_submission",
     "requeue",
     "schema_version",
@@ -685,6 +691,110 @@ def get_entry(conn: sqlite3.Connection, entry_id: int) -> sqlite3.Row | None:
     ).fetchone()
 
 
+# ---------------------------------------------------------------------------
+# Imported entries — migration 019, work made on another node
+# ---------------------------------------------------------------------------
+
+#: The columns an import never takes from the archive, per table. The ids are
+#: this node's to issue; the state is ``held`` whatever it was there, because a
+#: person here decides what is published here; ``build`` and ``plan_build`` are
+#: what *this* node's worker was running (migration 018), and nobody kept which
+#: build the other node's worker ran (gpu-fold-in.md §1.4); a parent names an
+#: entry in the other node's sequence, which means nothing here.
+IMPORT_NEVER = {
+    "jobs": frozenset({"id", "state", "needs", "parent_entry_id", "plan_build"}),
+    "attempts": frozenset({"id", "job_id", "build"}),
+    "entries": frozenset({"id", "job_id", "state", "parent_entry_id", "published_utc",
+                          "publish_commit", "reject_reason", "origin_node",
+                          "origin_entry_id", "origin_job_id", "imported_utc"}),
+}
+
+
+def table_columns(conn: sqlite3.Connection, table: str, schema: str = "main") -> list[str]:
+    """The columns of ``table`` in order, as this database has them."""
+    return [row[1] for row in conn.execute(f"PRAGMA {schema}.table_info({table})")]
+
+
+def importable_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """The columns of ``table`` an import may copy into, in this database."""
+    return [name for name in table_columns(conn, table) if name not in IMPORT_NEVER[table]]
+
+
+def _insert_copied(conn: sqlite3.Connection, table: str, fixed: dict[str, Any],
+                   copied: dict[str, Any]) -> int:
+    allowed = importable_columns(conn, table)
+    _check_fields(copied.keys(), allowed, f"importable {table}")
+    columns = list(fixed) + sorted(copied)
+    values = [fixed[name] for name in fixed] + [copied[name] for name in sorted(copied)]
+    cur = conn.execute(
+        f"INSERT INTO {table} ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
+        values,
+    )
+    return int(cur.lastrowid)
+
+
+def get_origin(conn: sqlite3.Connection, node: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM origins WHERE node = ?", (node,)).fetchone()
+
+
+def register_origin(
+    conn: sqlite3.Connection, node: str, registered_by: str, **fields: Any
+) -> sqlite3.Row:
+    """Record a node entries are imported from. Once: an existing row is kept."""
+    _check_fields(fields.keys(), ("shape", "first_utc", "last_utc", "build", "snapshot",
+                                  "snapshot_sha256", "note"), "origin")
+    columns = ["node", "registered_by", "registered_utc", *sorted(fields)]
+    values = [node, registered_by, utc_now(), *(fields[k] for k in sorted(fields))]
+    conn.execute(
+        f"INSERT OR IGNORE INTO origins ({','.join(columns)}) "
+        f"VALUES ({','.join('?' for _ in columns)})",
+        values,
+    )
+    return get_origin(conn, node)
+
+
+def imported_entry(conn: sqlite3.Connection, node: str, origin_entry_id: int) -> int | None:
+    """This node's id for entry ``origin_entry_id`` of ``node``, if it was imported."""
+    row = conn.execute(
+        "SELECT id FROM entries WHERE origin_node = ? AND origin_entry_id = ?",
+        (node, int(origin_entry_id)),
+    ).fetchone()
+    return int(row["id"]) if row else None
+
+
+def import_job(conn: sqlite3.Connection, **copied: Any) -> int:
+    """Insert another node's job, as written there, as a ``held`` job here.
+
+    Not :func:`enqueue`: that one stamps the clock and starts at ``queued``, and
+    an imported job never runs here. ``created_utc`` and ``updated_utc`` are the
+    archive's. The caller holds the transaction (``sketchgen import run``).
+    """
+    return _insert_copied(conn, "jobs", {"state": "held"}, copied)
+
+
+def import_attempt(conn: sqlite3.Connection, job_id: int, **copied: Any) -> int:
+    """Insert another node's attempt under this node's ``job_id``, ``n`` kept."""
+    return _insert_copied(conn, "attempts", {"job_id": int(job_id)}, copied)
+
+
+def import_entry(
+    conn: sqlite3.Connection, job_id: int, *, origin_node: str, origin_entry_id: int,
+    origin_job_id: int, **copied: Any
+) -> int:
+    """Insert another node's entry as ``held`` here, with where it came from.
+
+    Not :func:`create_entry`, which stamps ``created_utc`` with now: the sketch
+    was made when it was made (gpu-fold-in.md §1.4). The unique index on
+    ``(origin_node, origin_entry_id)`` refuses a second copy of the same entry.
+    """
+    fixed = {
+        "job_id": int(job_id), "state": "held", "origin_node": origin_node,
+        "origin_entry_id": int(origin_entry_id), "origin_job_id": int(origin_job_id),
+        "imported_utc": utc_now(),
+    }
+    return _insert_copied(conn, "entries", fixed, copied)
+
+
 def entry_transition(
     conn: sqlite3.Connection, entry_id: int, new_state: str, **fields: Any
 ) -> sqlite3.Row:
@@ -911,6 +1021,14 @@ def entries_to_critique(
     paid critic's claims, when the local one asks (:func:`paid_claims`). It is
     in the query and not filtered afterwards for the reason above: at LIMIT 1 an
     excluded entry at the head of the list would block every entry behind it.
+
+    An entry imported from another node (migration 019) is not offered either,
+    and for the same reason it is in the query. The rented A10's entries carry
+    its dates, 2026-09-23 to 09-27: published, they would head this
+    oldest-first list ahead of everything this node has made since, and the
+    idle critic would spend its rounds writing CPU-made children of GPU-made
+    parents (gpu-fold-in.md §1.5). A person can still mark Critique on one;
+    what stops is the machine doing it unasked.
     """
     if int(limit) <= 0:
         return []
@@ -931,6 +1049,7 @@ def entries_to_critique(
         "  AND NOT EXISTS (SELECT 1 FROM critiques q WHERE q.entry_id = e.id "
         "                    AND q.prompt_version = ?) "
         "  AND e.strip_path IS NOT NULL AND TRIM(e.strip_path) <> '' "
+        "  AND e.origin_node IS NULL "
         + not_in
         + "ORDER BY e.created_utc, e.id LIMIT ?",
         (prompt_version, *skip, int(limit)),

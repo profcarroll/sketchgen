@@ -71,10 +71,10 @@ Pick a handful, press **Copy picked ids**, and save the text as `picks.txt`: one
 Picks live in this browser only (`localStorage`, under `sketchgen-picks:sld-gpu`), so copy them
 out before you change browsers.
 
-**Next, not built yet:** `sketchgen import run --ids picks.txt` brings picked entries into
-sld-cloud as held entries to publish (`docs/plans/gpu-fold-in.md`, Packet 1). Until then the
-picks file is the record. You can already narrow a render to it with
-`render-local … --ids picks.txt`.
+**Next:** `sketchgen import run --ids picks.txt` brings picked entries into sld-cloud as held
+entries to publish (`docs/plans/gpu-fold-in.md`, Packet 1; `docs/OPERATIONS.md` → *Importing
+another node's entries*). The ids in `picks.txt` are the archive's own, which is what the
+import reads. You can also narrow a render to it with `render-local … --ids picks.txt`.
 
 ## 2. Put a local render on a wall
 
