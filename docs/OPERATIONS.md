@@ -1180,6 +1180,55 @@ on the Mac (Command Line Tools required), then `kiosk-mac/sync-local.sh NODE:DIR
 laptop for each new render, and the wall's URL in `~/Library/sketchgen-kiosk/url`. Render it
 with `--config-from ~/sketchgen/gallery --write-path …` and the wall counts, under its `site=`.
 
+## Importing another node's entries
+
+`sketchgen import` brings entries of a finished archive into this node as `held` entries
+(docs/plans/gpu-fold-in.md, Packet 1). An archive is a node's whole `~/sketchgen`: its
+`backups/<stamp>/` snapshots and its `jobs/`. The rented A10's is on sld-cloud at
+`~/sketchgen-backups/sld-gpu/sketchgen`, and is the only copy with the frames.
+
+```bash
+SG="$HOME/sketchgen/.venv/bin/python3 $HOME/sketchgen/app/bin/sketchgen"
+A=$HOME/sketchgen-backups/sld-gpu/sketchgen
+$SG import list --from $A | less                       # every held entry; reads only
+$SG import list --from $A --clean --one-per-prompt --no-buffers --ids > picks.txt
+$SG control pause --reason import                      # wait for `db status`: paused
+$SG import run --from $A --node sld-gpu --ids picks.txt --by profcarroll \
+    --note "rented OCI A10, terminated 2026-09-27" --dry-run
+$SG import run --from $A --node sld-gpu --ids picks.txt --by profcarroll \
+    --note "rented OCI A10, terminated 2026-09-27"
+$SG control resume
+```
+
+- **`list`** reads the archive's newest snapshot, verified, and never writes. Columns:
+  the entry's id *there*, the prompt, executor, rules file, attempts, `buffers` (the kept
+  sketch calls `createGraphics()`, which harness 4 read as the sketch) and `here` (the
+  entry published on this node with the same prompt). Filters: `--clean`,
+  `--one-per-prompt` (the earliest of each prompt among what the other filters keep),
+  `--executor`, `--rules`, `--prompt-of ENTRY` (this node's entry), `--no-buffers`,
+  `--not-imported --node NAME`. `--ids` prints the ids alone; `--json` everything.
+- **`run`** takes the archive's ids — `list --ids`, or a local render's *Copy picked ids*
+  — and refuses (exit 3, nothing written) unless the generator is paused, the snapshot
+  verifies, this node is at migration 019 and not older than the snapshot, every id is
+  held there, the node is registered (`--note` registers it the first time, from the
+  snapshot's manifest), the jobs directory has no directory past the last job row, and
+  the disk has the selection's size and 2 GB free. Then one transaction per entry: a new
+  job id, the directory copied to `jobs/.import-<id>` and renamed into place, the attempts
+  and the entry with their five paths rewritten onto it. One that fails is undone and
+  named, and the run goes on (exit 1). An entry already imported says `already e/<id>`.
+- **What is kept and what is new.** Prompt, brief, statement, models, prompt versions,
+  rules file, seed, every count and timing, `shape`, `harness_version`, `offplan_json` and
+  `created_utc` are the archive's. The ids are this node's; `origin_entry_id` and
+  `origin_job_id` keep the old ones, which is what a `report.json` inside the copied
+  directory still names. `attempts.build` stays NULL: nobody kept which build the other
+  node's worker was running.
+- **Afterwards** the entries are on Held like any others. The idle critic never picks one
+  (`entries_to_critique`); the judge does, so an analysis of the rules-file A/B reads
+  `WHERE origin_node IS NULL`. `SELECT origin_node, COUNT(*) FROM entries GROUP BY 1`
+  separates the two populations.
+- **Do not delete the archive** after an import, and pull the laptop's backup with
+  `--no-jobs` until it has room for what the import added (AGENTS.md).
+
 ## The billing card
 
 The console's last panel says what this tenancy has cost. It is the one number

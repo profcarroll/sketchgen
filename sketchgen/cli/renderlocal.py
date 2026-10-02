@@ -197,17 +197,21 @@ def check_out(out: Path) -> None:
             )
 
 
-def _read_ids(path: Path) -> frozenset[int]:
+def parse_ids(text: str, where: str) -> frozenset[int]:
     """One id per line, the shape ``import list --ids`` and Copy picked ids write."""
     ids: set[int] = set()
-    for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
-        text = line.split("#", 1)[0].strip()
-        if not text:
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        word = line.split("#", 1)[0].strip()
+        if not word:
             continue
-        if not text.isdigit():
-            raise Refused(f"{path}:{line_no}: not an entry id: {text!r}")
-        ids.add(int(text))
+        if not word.isdigit():
+            raise Refused(f"{where}:{line_no}: not an entry id: {word!r}")
+        ids.add(int(word))
     return frozenset(ids)
+
+
+def _read_ids(path: Path) -> frozenset[int]:
+    return parse_ids(path.read_text(encoding="utf-8"), str(path))
 
 
 def _web_frames(conn: sqlite3.Connection, ids: list[int]) -> dict[str, int]:
