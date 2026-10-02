@@ -91,6 +91,16 @@ viewer sees a field; the machine sees one draw call.
 
 ## Verifying
 
-There is no test runner. A sketch is correct when it runs in a browser with no
-console errors and does what was asked. Say plainly which parts you could not
-verify by reading the code.
+The test runner is the gate: headless Chromium runs the sketch with seeded
+`random()` and `noise()` and a hand-stepped clock. It fails a sketch that logs a
+console error, never advances a frame, needs a sound library or audio context
+that is not there, or runs over the frame budget above. Then it checks every
+assertion the brief names (`motion(idle)`, `responds(click)`, `size(w,h)` and
+the rest). A sketch that revises another fails when fewer than five lines of
+code differ from it. A failed attempt comes back with what the gate found: fix
+what it names and keep the rest.
+
+If you can run the gate before you reply, run it. If you cannot, check by
+reading: every assertion in the brief has code that satisfies it, every function
+you call comes from a library `index.html` loads, and nothing grows without
+bound. Say plainly which parts you could not verify by reading the code.
