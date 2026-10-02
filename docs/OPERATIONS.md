@@ -1934,17 +1934,17 @@ the node reports, asked once per process — and a box for somebody else's usern
 opens when you ask for one; with neither source the box is back and required. The same
 login is what a critique on Held is signed by. The parent entry is a card, not a number:
 type an id or pick one of the recent held, published or kept entries and the page draws
-its strip, state, generation and prompt, presets its models and rules from it the way
+its strip, state, generation and prompt, presets its models from it the way
 `lineage.spawn` does, and refuses a rejected or archived one before the queue sees it;
 `/new?parent=<id>` is what the job page's "descended from" link opens. **Planner** and
 **Executor** are the models this node actually has (see below). Assertions and
 the run options open the way you last saved them — **Save as defaults** keeps the
 current ticks and options in the database's `meta` row, **Forget them** goes back to the
 built-in ones, and either leaves the prompt you were typing where it is. **One job per
-line** queues a batch of prompts under one setting, which is the cheap way to feed
-`rules=random` for the A/B measurement; the button counts them, and every line shares
-the one submitter, parent, assertions and options. Recent root prompts sit under the box
-to run again under other rules.
+line** queues a batch of prompts under one setting; the button counts them, and every
+line shares the one submitter, parent, assertions and options. Recent root prompts sit
+under the box to run again. There is no rules-file choice: every job runs under
+`treatment` since the A/B was retired on 2026-10-02 (README → *The A/B experiment*).
 
 ### Which models run a job
 
@@ -2033,9 +2033,8 @@ attempt and on the entry, so provenance says which ones made it, and `lineage.sp
 carries both to a child: a revision written by a different model is a revision of
 nothing.
 
-**The executor is a second variable.** The A/B rig measures the rules file across one
-population (spec §9), scored with Bradley–Terry. Varying the executor per job puts
-another difference into the same gallery. It is recorded per attempt and per entry so
+**The executor is a variable.** Varying it per job puts a difference into one gallery
+that the Bradley–Terry scores do not separate on their own. It is recorded per attempt and per entry so
 the analysis can control for it, but "recoverable" is not "controlled" — change it on
 purpose, and preferably for a run you mean to compare on its own.
 
@@ -2363,7 +2362,7 @@ model. `judge` and `critique` are what the idle loop runs: a local tag replaces
 `SKETCHGEN_JUDGE_MODEL` / `SKETCHGEN_CRITIC_MODEL`, and a paid model makes the
 idle loop leave that step alone for `paid export`. With a step assigned,
 `paid export --step S` needs no `--as`. New job shows the assignment under the
-Run options, and says plainly what a paid executor does to the A/B.
+Run options, and says plainly what a paid executor does to the gallery.
 
 **An exported critique is assigned, not raced.** `critiques` holds one row per entry
 per prompt version, so an entry in a critique packet is claimed for the model the

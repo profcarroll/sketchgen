@@ -256,19 +256,19 @@ class PickPairTests(PairsTestCase):
             self.assertIn(pair[0], self.ids)
             self.assertIn(pair[1], self.ids)
 
-    def test_it_mixes_the_rules_files_when_both_arms_exist(self):
+    def test_the_rules_file_no_longer_steers_the_pair(self):
+        """Until 2026-10-02 an untouched pool offered only control against
+        treatment. The A/B is retired: same-arm pairs tie with mixed ones."""
         rules = {
             int(row["id"]): row["rules_file"]
             for row in self.conn.execute("SELECT id, rules_file FROM entries")
         }
         self.assertEqual(set(rules.values()), {"control", "treatment"})
-        for seed in range(40):
-            pair = self.pick(seed=seed)
-            with self.subTest(seed=seed):
-                self.assertNotEqual(
-                    rules[pair[0]], rules[pair[1]],
-                    "an untouched pool should offer control against treatment",
-                )
+        mixed = {
+            rules[pair[0]] != rules[pair[1]]
+            for pair in (self.pick(seed=seed) for seed in range(40))
+        }
+        self.assertEqual({True, False}, mixed)
 
     def test_it_prefers_the_pairs_nobody_has_judged(self):
         loaded = (self.ids[0], self.ids[1])

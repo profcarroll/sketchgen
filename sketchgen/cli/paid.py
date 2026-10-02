@@ -342,7 +342,7 @@ def cmd_start(args: argparse.Namespace) -> int:
             prompt = sys.stdin.read()
         result = paid_mod.start(
             conn, model=args.model, prompt=prompt, by=args.by,
-            planner=args.planner, executor=args.executor, rules_file=args.rules,
+            planner=args.planner, executor=args.executor,
             max_attempts=args.max_attempts, publication=args.publication,
             since=args.since, note=args.note,
         )
@@ -525,9 +525,9 @@ def cmd_assign(args: argparse.Namespace) -> int:
             assignment.get("execute") and ":" not in assignment["execute"]
         ):
             notes.append(
-                "a paid executor is a second variable in the A/B the gallery "
-                "runs on the rules file, and a much larger one than two local "
-                "models; every entry it writes is badged off-node"
+                "a paid executor is a much larger difference in the gallery "
+                "than two local models; every entry it writes is badged "
+                "off-node"
             )
         if args.json:
             print(json.dumps({"assignment": assignment, "notes": notes},
@@ -728,8 +728,6 @@ def register(top: argparse._SubParsersAction) -> None:
                       help="yourself (default), `local`, an Ollama tag, or a "
                            "registered paid model (`paid models list`), whose "
                            "session answers the attempts")
-    sta_.add_argument("--rules", choices=("control", "treatment", "random"),
-                      default=None, help="rules file for the executor")
     sta_.add_argument("--since", default=None, metavar="ISO",
                       help="when your work on this began, UTC, as `date -u "
                            "+%%FT%%TZ` prints it: the first command AGENTS.md "

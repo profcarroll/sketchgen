@@ -874,7 +874,7 @@ class CritiqueAdapter(Adapter):
                 critique_by=model,
                 submitted_by=row["submitted_by"] or "",
                 max_depth=ctx.lineage_depth,
-                rules_file=lineage.parent_rules_file(conn, row),
+                rules_file=worker.DEFAULT_RULES,
                 publication="hold",
             )
         except ValueError as exc:
