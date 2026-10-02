@@ -451,8 +451,8 @@ class ExecuteTests(PaidTestCase):
         )
 
     def queue(self, executor_model="claude-opus-5", max_attempts=3, rules="random"):
-        # 'random' by default, so the export has to resolve the coin the way
-        # the worker will; the like-for-like test below pins one side.
+        # 'random' by default: a job queued before the A/B was retired
+        # (2026-10-02) has to resolve to treatment on the paid path too.
         return db.enqueue(self.conn, "a breathing field", "octocat",
                           brief="A grey field that brightens and dims, forever.",
                           assertions=["motion(idle)"], executor=executor_model,

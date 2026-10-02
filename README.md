@@ -122,14 +122,30 @@ their own choice.
 
 ### The A/B experiment
 
-Every job records its **rules file**. `treatment` carries structured p5.js
-conventions (the library trap, global mode, canvas sizing, verification norms).
-`control` carries the class repo's generic context. The gallery's own paired
-comparisons score the difference, making sketchgen an A/B rig measuring whether
-structured context improves creative output from the same model on the same
-prompts. Anything else that changes what a model is shown — a paid executor,
-the parent's source on a child — is recorded on the attempt so it can be kept
-apart from that measurement rather than folded into it.
+**Retired 2026-10-02.** Every job recorded its **rules file**. `treatment`
+carries structured p5.js conventions (the library trap, global mode, canvas
+sizing, frame budget). `control` carried the class repo's generic context. The
+question (`MEASURE[agents-md-ab]`) was whether structured context improves what
+the same model makes from the same prompts, scored by the gate and by the
+gallery's own paired comparisons.
+
+The raw totals favoured treatment (69% vs 57% first-attempt gate pass), but
+they were confounded: treatment was the default, children inherited their
+parent's arm, and control all but stopped after 2026-09-22. On the jobs that
+were randomized (`rules=random`, qwen3-coder 30b, first attempts, about 300
+per arm):
+
+| | treatment | control |
+|---|---|---|
+| gate pass | 66.4% | 59.9% (difference +6.5 points, 95% CI about −1 to +14) |
+| gate pass, root prompts | 57.6% | 56.2% |
+| agent judge prefers it (brief · look) | 49.0% · 49.9% | — |
+
+Weak evidence that the p5 conventions help a sketch pass the gate's own checks,
+mostly on revisions; none that they make a sketch closer to its brief or nicer
+to look at. The only agent judge was `gemma4:e4b`, and three human judges
+answered too few mixed pairs to read. Every job now runs under `treatment`;
+`control.md` stays in the repo because 362 published entries name it.
 
 ## The self-generating loop
 

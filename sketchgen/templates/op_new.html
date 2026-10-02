@@ -54,10 +54,6 @@ $chips
         <select id="executor" name="executor">$executor_options</select>
       </div>
       <div>
-        <label for="rules">Rules file</label>
-        <select id="rules" name="rules">$rules_options</select>
-      </div>
-      <div>
         <label for="publication">Publication</label>
         <select id="publication" name="publication">$publication_options</select>
       </div>
@@ -81,8 +77,7 @@ $chips
       executor's the ones that can complete. One on this node costs
       electricity; one under <em>off this node</em> sends the prompt away.
       The executor is recorded on every attempt and on the entry, so a gallery
-      with more than one in it can still be read — but it is a second variable
-      beside the rules file the A/B is measuring, so change it on purpose.
+      with more than one in it can still be read — but change it on purpose.
       A <em>paid</em> executor is the largest such difference: it is answered
       off this node, one round trip per attempt through <code>sketchgen
       paid</code>, and every entry it writes is badged off-node.</p>

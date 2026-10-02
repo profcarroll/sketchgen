@@ -396,7 +396,7 @@ def artefact_hash(entry_a: Any, entry_b: Any, *, conn: sqlite3.Connection | None
 def _published(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return list(
         conn.execute(
-            "SELECT id, rules_file, seed FROM entries WHERE state = 'published' "
+            "SELECT id, seed FROM entries WHERE state = 'published' "
             "ORDER BY id"
         )
     )
@@ -434,12 +434,12 @@ def _ranked(
     exclude_seen: bool,
 ) -> list[tuple[tuple[int, int], tuple[int, int]]]:
     """[(balance key, pair)], best first. The key is the balance rule itself:
+    fewest judgments already recorded on the pair, so every pair gets looked
+    at before any pair gets looked at twice.
 
-    1. fewest judgments already recorded on the pair — every pair gets looked
-       at before any pair gets looked at twice;
-    2. a pair that mixes the two rules files before one that does not, so the
-       control/treatment A/B in spec §9 actually gets scored rather than
-       accumulating pairs inside one arm.
+    Until 2026-10-02 a second key put a pair that mixed the two rules files
+    first, so the control/treatment A/B in spec §9 got scored. The A/B is
+    retired (``worker.resolve_rules``), and the judge's time is the gallery's.
 
     Pairs sort by entry id after that, so the list is deterministic; the two
     equal-key pairs that fall out of it are what the rng chooses between.
@@ -447,25 +447,15 @@ def _ranked(
     rows = _published(conn)
     if len(rows) < 2:
         return []
-    rules = {int(row["id"]): (row["rules_file"] or "") for row in rows}
     ids = [int(row["id"]) for row in rows]
     load = _pair_load(conn)
     skip = _answered_by(conn, judge_kind, judge_id) if exclude_seen else set()
-    both_arms = {"control", "treatment"} <= set(rules.values())
-
-    def mixed(low: int, high: int) -> bool:
-        left, right = rules[low], rules[high]
-        return bool(left) and bool(right) and left != right
-
     out: list[tuple[tuple[int, int], tuple[int, int]]] = []
     for index, low in enumerate(ids):
         for high in ids[index + 1 :]:
             if (low, high) in skip:
                 continue
-            key = (
-                load.get((low, high), 0),
-                0 if (both_arms and mixed(low, high)) else 1,
-            )
+            key = (load.get((low, high), 0),)
             out.append((key, (low, high)))
     out.sort(key=lambda item: (item[0], item[1]))
     return out
