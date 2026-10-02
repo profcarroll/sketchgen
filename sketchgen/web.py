@@ -2850,11 +2850,6 @@ def executor_column(value: str) -> str:
     return menu_column(EXECUTOR_MENU, value)
 
 
-RULES_CHOICES = (
-    ("treatment", "treatment — the rules the course teaches"),
-    ("control", "control — the A/B control file"),
-    ("random", "random — resolved per attempt, for MEASURE[agents-md-ab]"),
-)
 PUBLICATION_CHOICES = (
     ("hold", "hold — a person publishes it"),
     ("auto", "auto — publish on a green gate"),
@@ -2912,7 +2907,6 @@ DEFAULTS_KEY = "new_job_defaults"
 BUILTIN_DEFAULTS: dict[str, Any] = {
     "planner": LOCAL,
     "executor": LOCAL,
-    "rules": "treatment",
     "publication": "hold",
     "max_attempts": "3",
     "assert": [],
@@ -2972,9 +2966,6 @@ def defaults_from(form: dict[str, list[str]]) -> dict[str, Any]:
 
     planner_choice = check_planner(one("planner", LOCAL))
     executor_choice = check_executor(one("executor", LOCAL))
-    rules = one("rules", "treatment")
-    if rules not in {value for value, _ in RULES_CHOICES}:
-        raise ValueError("rules must be control, treatment or random")
     publication = one("publication", "hold")
     if publication not in {value for value, _ in PUBLICATION_CHOICES}:
         raise ValueError("publication must be hold or auto")
@@ -2989,7 +2980,6 @@ def defaults_from(form: dict[str, list[str]]) -> dict[str, Any]:
     return {
         "planner": planner_choice,
         "executor": executor_choice,
-        "rules": rules,
         "publication": publication,
         "max_attempts": raw_attempts,
         "assert": ticked,
@@ -3006,7 +2996,7 @@ def save_defaults(conn: sqlite3.Connection, form: dict[str, list[str]]) -> str:
     words = ", ".join(doc["assert"]) or "none"
     return (
         f"Saved as defaults — {doc['planner']} · {doc['executor']} · "
-        f"{doc['rules']} · {doc['publication']} · {doc['max_attempts']} "
+        f"{doc['publication']} · {doc['max_attempts']} "
         f"attempts · assertions: {words}"
     )
 
@@ -3319,7 +3309,6 @@ def new_page(
             executor_groups(), executor_selected(one("executor", LOCAL))
         ),
         chips=_chips(picked, one("size_w", "400"), one("size_h", "400")),
-        rules_options=_options(RULES_CHOICES, one("rules", "treatment")),
         publication_options=_options(PUBLICATION_CHOICES, one("publication", "hold")),
         max_attempts=esc(one("max_attempts", "3")),
         queue_note=esc(_queue_note(conn, control)),
@@ -3331,9 +3320,9 @@ def new_page(
 def _assignment_note(conn: sqlite3.Connection) -> str:
     """Which model each step is assigned to, and the warning where it matters.
 
-    agentic-cli §3.5: a paid executor is a much larger second variable in the
-    A/B than two local models are, and the place to say so is where the choice
-    is made, not in a document.
+    agentic-cli §3.5: a paid executor is a much larger difference in the
+    gallery than two local models are, and the place to say so is where the
+    choice is made, not in a document.
     """
     assignment = db.get_assignment(conn)
     parts = [
@@ -3350,8 +3339,7 @@ def _assignment_note(conn: sqlite3.Connection) -> str:
             f'<p class="err">Every job that names no executor is written by '
             f"{esc(executor_model)}, off this node: one round trip per attempt "
             "through <code>sketchgen paid</code>, and each entry badged off-node. "
-            "That is a far larger difference than two local models, inside an "
-            "experiment measuring the rules file.</p>"
+            "That is a far larger difference than two local models.</p>"
         )
     return note
 
@@ -3381,8 +3369,6 @@ def form_from_query(
             written = _model_word(row["executor"])
             if written in executor_values():
                 form["executor"] = [written]
-            if row["rules_file"] in {value for value, _ in RULES_CHOICES}:
-                form["rules"] = [str(row["rules_file"])]
     prompt = (query.get("prompt") or [""])[0]
     if prompt.strip():
         form["prompt"] = [prompt]
@@ -3441,9 +3427,6 @@ def create_job(conn: sqlite3.Connection, form: dict[str, list[str]]) -> tuple[in
         )
     planner_choice = check_planner(one("planner", LOCAL))
     executor_choice = check_executor(one("executor", LOCAL))
-    rules = one("rules", "treatment")
-    if rules not in {value for value, _ in RULES_CHOICES}:
-        raise ValueError("rules must be control, treatment or random")
     publication = one("publication", "hold")
     if publication not in {value for value, _ in PUBLICATION_CHOICES}:
         raise ValueError("publication must be hold or auto")
@@ -3489,7 +3472,7 @@ def create_job(conn: sqlite3.Connection, form: dict[str, list[str]]) -> tuple[in
     options: dict[str, Any] = {
         "planner": planner_column(planner_choice),
         "executor": executor_column(executor_choice),
-        "rules_file": rules,
+        "rules_file": worker.DEFAULT_RULES,
         "publication": publication,
         "max_attempts": int(raw_attempts),
         "parent_entry_id": parent,
@@ -3513,8 +3496,7 @@ def create_jobs(
     """One job, or with ``many`` ticked one per non-empty line of the prompt.
 
     Every line gets the same submitter, parent, assertions and options — the
-    point of the tick is a batch of prompts under one setting, which is what
-    MEASURE[agents-md-ab] wants fed to ``rules=random``. The lines are all
+    point of the tick is a batch of prompts under one setting. The lines are all
     checked before any is queued, so a bad line refuses the lot rather than
     half of it.
     """
@@ -6811,8 +6793,7 @@ def release_submission(
 ) -> tuple[str, int | None, str]:
     """Turn one submission into a job. Returns ``(outcome, job_id, message)``.
 
-    A prompt is enqueued with ``rules_file='random'`` (decision §1.6, so public
-    work cannot skew the treatment/control split) and ``publication='hold'``,
+    A prompt is enqueued under ``treatment`` and ``publication='hold'``,
     signed with the visitor's own login. A critique goes through
     :func:`sketchgen.lineage.spawn` with every default it already has —
     including the depth limit, which needs no exception here because a line at
@@ -6845,7 +6826,7 @@ def release_submission(
             conn,
             text,
             submitted_by=username,
-            rules_file="random",
+            rules_file=worker.DEFAULT_RULES,
             publication="hold",
         )
         db.release_submission(conn, submission_id, job_id)

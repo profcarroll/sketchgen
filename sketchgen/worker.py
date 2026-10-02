@@ -265,8 +265,9 @@ PLAN_TRIES = 2
 
 #: The shape of every timestamp this system writes (db.utc_now).
 UTC_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
-#: The rules file a job gets when it names none. The A/B (spec §9) is opt-in per
-#: job; a job that says nothing is executed under the rules the course teaches.
+#: The rules file every attempt runs under. Until 2026-10-02 a job could name
+#: `control` or `random` for the rules-file A/B (spec §9); the A/B is retired
+#: (see `resolve_rules`), and this is now the only answer.
 DEFAULT_RULES = "treatment"
 
 #: What `sketchgen paid import --step execute` leaves in an attempt directory:
@@ -772,17 +773,18 @@ def read_statement(source_dir: str | os.PathLike[str] | None) -> str | None:
 
 
 def resolve_rules(rules_file: str | None, job_id: int) -> str:
-    """``random`` becomes control or treatment by a seeded coin on the job id.
+    """Every job runs under ``treatment``, whatever its row says.
 
-    Deterministic and stable: the same job always lands on the same side of the
-    A/B, whatever order the queue is worked in, and the resolved value is what
-    the attempt row records (spec §9).
+    The rules-file A/B (spec §9, MEASURE[agents-md-ab]) is retired as of
+    2026-10-02. Until then ``random`` was a seeded coin on the job id and
+    ``control`` ran the class repo's generic CLAUDE.md. On the ~300 randomized
+    first attempts per arm, treatment passed the gate 66% to 60% (95% CI on the
+    difference about -1 to +14 points, all of it in child jobs), and the
+    agent judge split 50/50 on both questions; three human judges were too few
+    to read. A job queued before the retirement that says ``control`` or
+    ``random`` runs under treatment like any other. The column and its CHECK
+    stay, so the entries made under control keep saying so.
     """
-    if rules_file in ("control", "treatment"):
-        return rules_file
-    if rules_file == "random":
-        digest = hashlib.sha256(f"sketchgen-rules-{job_id}".encode("utf-8")).digest()
-        return "treatment" if digest[0] % 2 else "control"
     return DEFAULT_RULES
 
 
@@ -2574,16 +2576,6 @@ class Worker:
                 )
         return recorded
 
-    def _parent_rules_file(self, entry_row) -> str | None:
-        """The rules file the parent's JOB named, not the one it resolved to.
-
-        ``entries.rules_file`` holds the resolved side of the A/B ('control' or
-        'treatment'); the job may have said 'random'. A line inherits the
-        *setting*, so a random line stays random and the coin is tossed again
-        per child (spec §9).
-        """
-        return lineage.parent_rules_file(self.conn, entry_row)
-
     def _critique_one(self, entry_id: int, version: str,
                       model: str | None = None) -> bool:
         """One entry: critique it, spawn its child, record what happened."""
@@ -2641,7 +2633,7 @@ class Worker:
                 critique_by=critique.model,
                 submitted_by=row["submitted_by"] or "",
                 max_depth=self.lineage_depth,
-                rules_file=self._parent_rules_file(row),
+                rules_file=DEFAULT_RULES,
                 publication="hold",
             )
         except ValueError as exc:
