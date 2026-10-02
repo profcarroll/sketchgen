@@ -10,7 +10,7 @@ Both write verbs go through :mod:`sketchgen.web`'s own
 :func:`~sketchgen.web.release_submission` and
 :func:`~sketchgen.web.decline_submission`, so the page and the terminal cannot
 drift apart about what releasing means — one of them queues the job with
-``rules_file='random'`` and the other must not quietly do something else.
+``publication='hold'`` and the other must not quietly do something else.
 Importing that module starts no server; it is where this project keeps the
 operator's decisions.
 
@@ -181,9 +181,8 @@ def register(top: argparse._SubParsersAction) -> None:
         "release",
         help="queue one submission as a job, held for review",
         description=(
-            "A prompt is queued with rules_file='random' so public work cannot "
-            "skew the treatment/control split, and publication='hold' like "
-            "every other job. A critique spawns the child through "
+            "A prompt is queued with publication='hold' like every other "
+            "job. A critique spawns the child through "
             "lineage.spawn() with its existing defaults and is recorded in "
             "`critiques` as human:<login>. Exits 3 on a submission somebody "
             "has already decided; exits 1 when the parent had been rejected, "

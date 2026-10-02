@@ -308,9 +308,8 @@ If you find yourself guessing, that is a missing verb — say so.
   for `paid export`. Never needed for your own job.
 - `paid preflight --as $ME` is what `start` runs; run it alone to see the
   node's state (worker step, leases, parked jobs) without queuing anything.
-- Everything you make is badged **off-node**, and a paid executor is a second
-  variable in the rules-file A/B the gallery measures: keep a paid run as its
-  own batch and say so.
+- Everything you make is badged **off-node**: keep a paid run as its own
+  batch and say so.
 
 ## Deploying
 

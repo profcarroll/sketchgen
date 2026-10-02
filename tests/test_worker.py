@@ -811,21 +811,27 @@ class TestMalformedExecutorResponse(WorkerTestCase):
         self.assertTrue(job.last_error.startswith("executor:"))
 
 
-class TestRandomRules(WorkerTestCase):
-    def test_random_resolves_deterministically_per_job_id(self):
-        seen = {job_id: worker.resolve_rules("random", job_id) for job_id in range(1, 21)}
-        for job_id, choice in seen.items():
-            self.assertIn(choice, ("control", "treatment"))
-            self.assertEqual(choice, worker.resolve_rules("random", job_id))
-        self.assertEqual({"control", "treatment"}, set(seen.values()))
+class TestRetiredRules(WorkerTestCase):
+    """The rules-file A/B is retired (2026-10-02): every job runs treatment."""
 
-    def test_the_resolved_side_is_what_the_attempt_records(self):
-        job_id = self.enqueue(rules_file="random")
-        expected = worker.resolve_rules("random", job_id)
-        executor_fn = StubExecutor()
-        self.assertEqual(0, self.make_worker(executor_fn=executor_fn).run_once())
-        self.assertEqual(expected, self.attempts(job_id)[0].rules_file)
-        self.assertEqual(expected, executor_fn.calls[0]["rules_file"])
+    def test_every_setting_resolves_to_treatment(self):
+        for setting in ("control", "random", "treatment", None):
+            for job_id in range(1, 21):
+                with self.subTest(setting=setting, job_id=job_id):
+                    self.assertEqual(
+                        "treatment", worker.resolve_rules(setting, job_id)
+                    )
+
+    def test_a_job_queued_under_an_old_arm_runs_and_records_treatment(self):
+        for setting in ("control", "random"):
+            with self.subTest(setting=setting):
+                job_id = self.enqueue(rules_file=setting)
+                executor_fn = StubExecutor()
+                self.assertEqual(
+                    0, self.make_worker(executor_fn=executor_fn).run_once()
+                )
+                self.assertEqual("treatment", self.attempts(job_id)[0].rules_file)
+                self.assertEqual("treatment", executor_fn.calls[0]["rules_file"])
 
     def test_a_job_that_names_no_rules_file_gets_the_default(self):
         job_id = self.enqueue()
@@ -1144,8 +1150,8 @@ class TestIdleRound(IdleTestCase):
         self.assertEqual("octocat", child["submitted_by"])  # the parent's, not a model
         self.assertEqual("gemma4:e4b", child["critique_by"])
         self.assertEqual("hold", child["publication"])
-        # the line inherits the SETTING, so a random line stays random
-        self.assertEqual("random", child["rules_file"])
+        # a child of a random line no longer inherits it: the A/B is retired
+        self.assertEqual("treatment", child["rules_file"])
         self.assertIn(lineage.REVISE_HEADING, child["prompt"])
 
     def test_a_blind_entry_does_not_stall_the_idle_critic(self):

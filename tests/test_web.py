@@ -1018,7 +1018,8 @@ class TestForms(WebTestCase):
             conn.close()
         self.assertEqual(job.state, "queued")
         self.assertEqual(job.submitted_by, "student-three")
-        self.assertEqual(job.rules_file, "random")
+        # a form from before 2026-10-02 still says random; the A/B is retired
+        self.assertEqual(job.rules_file, "treatment")
         self.assertEqual(job.max_attempts, 2)
         self.assertEqual(sorted(job.assertions), ["no_motion", "responds(click)",
                                                   "size(600,400)"])
@@ -1134,14 +1135,14 @@ class TestNewJob(WebTestCase):
 
     # -- the parent ------------------------------------------------------------
 
-    def test_the_parent_is_drawn_and_presets_planner_and_rules(self):
+    def test_the_parent_is_drawn_and_presets_the_planner(self):
         page = self.text(f"/new?parent={self.entry_id}")
         self.assertIn(f'value="{self.entry_id}"', page)
         self.assertIn(f'<a href="/entry/{self.entry_id}">entry {self.entry_id}</a>', page)
         self.assertIn("three circles breathing", page)
         self.assertIn("generation 0", page)
-        # the entry ran under control; spawn() would keep it, and so does this
-        self.assertIn('<option value="control" selected>', page)
+        # the entry ran under control, but the A/B is retired: no rules to preset
+        self.assertNotIn('name="rules"', page)
         self.assertIn('class="pick on"', page)
         self.assertIn("recent entries a line can grow from", page)
 
@@ -1192,7 +1193,7 @@ class TestNewJob(WebTestCase):
         self.assertIn("still being typed", body)
         fresh = self.text("/new")
         self.assertIn("Defaults saved", fresh)
-        self.assertIn('<option value="random" selected>', fresh)
+        self.assertNotIn('name="rules"', fresh)
         self.assertIn('<option value="auto" selected>', fresh)
         self.assertIn('value="5"', fresh)
         self.assertIn('value="responds(click)" checked', fresh)
@@ -1206,7 +1207,7 @@ class TestNewJob(WebTestCase):
         )
         self.assertEqual(status, 303)
         job = self.newest_job()
-        self.assertEqual(("random", "auto", 5), (job.rules_file, job.publication, job.max_attempts))
+        self.assertEqual(("treatment", "auto", 5), (job.rules_file, job.publication, job.max_attempts))
 
     def test_forget_them_goes_back_to_the_built_in_ones(self):
         self.post_page("/new/defaults", {"action": "save", "rules": "random", "max_attempts": "7"})
@@ -1216,10 +1217,10 @@ class TestNewJob(WebTestCase):
         self.assertEqual(status, 200)
         self.assertIn("Forgot the saved defaults", body)
         self.assertIn("kept", body)
-        self.assertIn('<option value="treatment" selected>', body)
+        self.assertIn('<option value="hold" selected>', body)
         fresh = self.text("/new")
         self.assertIn("Built-in defaults", fresh)
-        self.assertIn('<option value="treatment" selected>', fresh)
+        self.assertIn('<option value="hold" selected>', fresh)
         self.assertIn('value="3"', fresh)
 
     def test_bad_defaults_are_refused_and_nothing_is_saved(self):
@@ -1251,7 +1252,7 @@ class TestNewJob(WebTestCase):
         finally:
             conn.close()
         self.assertEqual(["first line", "second line", "third line"], prompts)
-        self.assertEqual({"random"}, rules)
+        self.assertEqual({"treatment"}, rules)
         # blank lines only is no job at all
         status, body = self.post_page(
             "/new", {"prompt": "\n  \n", "submitted_by": "student-two", "many": "1"}
@@ -2246,7 +2247,7 @@ class TestSubmissions(WebTestCase):
 
     # -- releasing ---------------------------------------------------------
 
-    def test_release_on_a_prompt_queues_a_random_rules_job_held_and_signed(self):
+    def test_release_on_a_prompt_queues_a_treatment_job_held_and_signed(self):
         submission_id = self.add(
             120, username="hubot", text="a tide of small triangles that drifts"
         )
@@ -2260,7 +2261,7 @@ class TestSubmissions(WebTestCase):
         job = self.job(row["job_id"])
         self.assertEqual("queued", job.state)
         self.assertEqual("a tide of small triangles that drifts", job.prompt)
-        self.assertEqual("random", job.rules_file)
+        self.assertEqual("treatment", job.rules_file)
         self.assertEqual("hold", job.publication)
         self.assertEqual("hubot", job.submitted_by)
         self.assertIsNone(job.parent_entry_id)
@@ -2440,7 +2441,7 @@ class TestSubmissionsCLI(unittest.TestCase):
             job = db.get_job(conn, document["job_id"])
         finally:
             conn.close()
-        self.assertEqual("random", job.rules_file)
+        self.assertEqual("treatment", job.rules_file)
         self.assertEqual("hold", job.publication)
         self.assertEqual("octocat", job.submitted_by)
 
