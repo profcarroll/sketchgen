@@ -29,11 +29,15 @@ WHAT THE MODEL SAID IT BUILT
 WHAT THE GATE ASKED OF IT
 {assertions}
 
+WHAT THE GALLERY HAS ASKED FOR LATELY, NEWEST FIRST
+{recent}
+
 CHOOSE ONE MOVE
 refine — the sketch works, and one visible thing holds it back. Fix that one
 thing.
 transform — the idea is worth keeping, but the sketch has settled into it. Keep
-one quality you can see and change how everything else looks or moves.
+one quality you can see, named in five words or fewer, and change how
+everything else looks or moves.
 depart — the line has said what it can say. Take one idea from this sketch into
 a form that does not look like it.
 
@@ -43,6 +47,11 @@ How to choose:
 - If the images look like where the line started with only colour, speed or
   size changed, depart.
 - Never ask for anything the line has already asked for, or for its reverse.
+- Do not send this sketch where the gallery has lately sent others: not their
+  destinations, not their materials, not their words.
+- Whatever the move, the result must still do what the gate asks of it. If the
+  gate asks for motion(idle), it keeps moving with nobody touching it; if it
+  asks for responds(click), a click still changes what is seen.
 - A change a viewer would not notice from across the room is not a move. When
   two moves both fit, take the riskier one: a sketch that fails costs less than
   a sketch nobody looks at twice.
@@ -54,7 +63,7 @@ remark, no second sentence, no heading. One of these three shapes, with the
 blanks filled from THIS sketch and nothing else:
 
   refine: the same <what the brief calls it>, and this time <one visible change>
-  transform: keep <one quality you can see>, and this time <how the rest changes>
+  transform: keep <one quality, five words or fewer>, and this time <how the rest changes>
   depart: take <one idea from this sketch> into <a different form>
 
 Do not introduce sound, a microphone, a camera, a keyboard, text, or any input

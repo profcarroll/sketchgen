@@ -685,6 +685,31 @@ class TestCritique(LineageTestCase):
                       "2. the same rings, and this time pulse.", rendered)
         self.assertIn("revised 2 times", rendered)
 
+    def test_the_gallery_s_recent_critiques_are_shown_newest_first(self):
+        """critic-v4 dry run, 2026-10-02: four of sixteen departures went
+        somewhere "crystalline". The critic is shown where the last few went."""
+        row = {"prompt": "a field", "assertions_json": "[]"}
+        rendered = lineage.critique_prompt(
+            row, "", "", recent=["depart: take A into B", "transform: keep C"])
+        self.assertIn("1. depart: take A into B\n2. transform: keep C", rendered)
+        empty = lineage.critique_prompt(row, "", "")
+        self.assertIn("(nothing recorded yet)", empty)
+        self.assertNotIn("{recent}", empty)
+
+    def test_recent_critiques_skip_the_rejected_and_come_newest_first(self):
+        for n, (text, rejected) in enumerate(
+            (("older one", None), ("refused one", "two sentences"), ("newer one", None))
+        ):
+            self.conn.execute(
+                "INSERT INTO critiques (entry_id, critique, critique_by, "
+                "prompt_version, rejected_reason, created_utc) "
+                "VALUES (?, ?, 'gemma4:e4b', ?, ?, ?)",
+                (self.root_entry, text, f"v{n}", rejected,
+                 f"2026-10-02T00:00:0{n}Z"),
+            )
+        self.assertEqual(["newer one", "older one"],
+                         lineage.recent_critiques(self.conn)[:2])
+
     def test_the_rendered_prompt_tells_the_critic_the_image_beats_the_words(self):
         """critic-v3's whole point, kept in v4: the statement is a claim, the strip is not.
 

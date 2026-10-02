@@ -86,7 +86,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from sketchgen import db
 from sketchgen import ghostshim
@@ -725,11 +725,30 @@ def critic_images(path: str | Path | None = None) -> tuple[str, ...]:
     return tuple(out)
 
 
+def recent_critiques(conn: sqlite3.Connection, limit: int = 8) -> list[str]:
+    """The gallery's newest accepted critiques, newest first, for critic-v4.
+
+    The 2026-10-02 dry run of critic-v4 sent four of sixteen sketches toward
+    something "crystalline" and three toward "bioluminescent" or "deep-sea":
+    a critic that departs from each line on its own still converges on its
+    own favourite destinations across the gallery. Showing it where the last
+    few went is the cheapest way to make it go somewhere else. Rejected
+    critiques never became a prompt, so they are not shown.
+    """
+    rows = conn.execute(
+        "SELECT critique FROM critiques WHERE rejected_reason IS NULL "
+        "AND critique IS NOT NULL ORDER BY created_utc DESC, id DESC LIMIT ?",
+        (int(limit),),
+    ).fetchall()
+    return [" ".join(str(row["critique"]).split()) for row in rows]
+
+
 def critique_prompt(
     entry_row: Any,
     statement: str | None,
     brief: str | None,
     path: str | Path | None = None,
+    recent: Sequence[str] = (),
 ) -> str:
     """Fill ``prompts/critic.md`` for one entry — the words half of the request.
 
@@ -764,8 +783,12 @@ def critique_prompt(
     history = "\n".join(
         f"{n}. {revision}" for n, revision in enumerate(revisions, start=1)
     ) or "(nothing yet: this sketch is where the line starts)"
+    shown = "\n".join(
+        f"{n}. {line}" for n, line in enumerate(recent, start=1)
+    ) or "(nothing recorded yet)"
     return (
         text.replace("{prompt}", prompt)
+        .replace("{recent}", shown)
         .replace("{root}", root or "(no prompt on record)")
         .replace("{history}", history)
         .replace("{generation}", str(len(revisions)))
@@ -836,6 +859,7 @@ def critique(
     seed: int = 1,
     prompt_path: str | Path | None = None,
     timeout: float = 300.0,
+    recent: Sequence[str] | None = None,
 ) -> Critique:
     """One sentence of critique for one entry. With ``stub``, call nothing.
 
@@ -868,7 +892,11 @@ def critique(
     strip, strip_path = _strip_bytes(row)
     strip_sha256 = hashlib.sha256(strip).hexdigest()
     version = prompt_version(prompt_path)
-    rendered = critique_prompt(row, row["statement"], row["brief"], prompt_path)
+    if recent is None:
+        recent = recent_critiques(conn)
+    rendered = critique_prompt(
+        row, row["statement"], row["brief"], prompt_path, recent
+    )
     tokens: dict[str, int] = {}
 
     images = [strip]

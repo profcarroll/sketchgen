@@ -28,9 +28,12 @@ from sketchgen import lineage  # noqa: E402
 
 
 def sample(conn: sqlite3.Connection, n: int, since: str) -> list[int]:
-    """The line tips the idle critic would reach next, deepest first, one per
-    root, plus a few roots: tips are where stagnation shows, roots are the
-    control for "the move vocabulary on a sketch with no history"."""
+    """Line tips the idle critic could reach, one per root, spread evenly over
+    four bands of generation (0, 1-2, 3-4, 5+), newest first in each band.
+
+    The first dry run (2026-10-02) took the deepest tips only, all generation
+    5 or 6, so critic-v4's "no refine after two revisions" meant it never had
+    the chance to refine. The bands are so every move is on the table."""
     parent = {r["child_entry_id"]: r["parent_entry_id"]
               for r in conn.execute("SELECT * FROM lineage")}
     has_child = set(parent.values())
@@ -53,11 +56,17 @@ def sample(conn: sqlite3.Connection, n: int, since: str) -> list[int]:
     by_root: dict[int, int] = {}
     for e in sorted(tips, key=lambda e: (-gen_of(e), e)):
         by_root.setdefault(root_of(e), e)
-    deep = sorted(by_root.values(), key=lambda e: (-gen_of(e), e))
-    roots = [e for e in tips if gen_of(e) == 0]
-    n_roots = min(len(roots), max(1, n // 5))
-    picked = deep[: n - n_roots] + roots[-n_roots:]
-    return [(e, gen_of(e)) for e in picked]
+    bands = ((0, 0), (1, 2), (3, 4), (5, 999))
+    per_band = max(1, n // len(bands))
+    seen_roots: set[int] = set()
+    picked = []
+    for low, high in bands:
+        band = [e for e in sorted(tips, reverse=True)
+                if low <= gen_of(e) <= high and root_of(e) not in seen_roots]
+        for e in band[:per_band]:
+            seen_roots.add(root_of(e))
+            picked.append((e, gen_of(e)))
+    return picked
 
 
 def main() -> int:
@@ -78,6 +87,12 @@ def main() -> int:
     conn.row_factory = sqlite3.Row
     prompts = [p.split("=", 1) for p in args.prompt]
     entries = [(e, None) for e in args.entry] or sample(conn, args.sample, args.since)
+    # What a deployed critic-v4 would see as "recent" is mostly its own last
+    # few sentences, so each prompt's own outputs from this run go in front of
+    # the recorded ones. Keyed by prompt and model: v4 on one model should not
+    # be steered by another's.
+    written: dict[tuple[str, str], list[str]] = {}
+    recorded = lineage.recent_critiques(conn)
     for entry_id, gen in entries:
         for name, path in prompts:
             for model in args.model:
@@ -86,9 +101,12 @@ def main() -> int:
                 started = time.monotonic()
                 out = {"entry": entry_id, "gen": gen, "prompt": name, "model": model}
                 try:
+                    mine = written.setdefault((name, model), [])
+                    recent = (mine[::-1] + recorded)[:8]
                     result = lineage.critique(conn, entry_id, model=model,
                                               host=args.host, prompt_path=path,
-                                              timeout=args.timeout)
+                                              timeout=args.timeout, recent=recent)
+                    mine.append(result.text)
                     out.update(text=result.text, ghost=bool(result.ghost_sha256))
                 except (lineage.CritiqueFailed, lineage.CritiqueRefused) as exc:
                     out.update(error=str(exc), raw=getattr(exc, "raw", None))
