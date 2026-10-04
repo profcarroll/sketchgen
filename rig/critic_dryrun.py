@@ -87,12 +87,6 @@ def main() -> int:
     conn.row_factory = sqlite3.Row
     prompts = [p.split("=", 1) for p in args.prompt]
     entries = [(e, None) for e in args.entry] or sample(conn, args.sample, args.since)
-    # What a deployed critic-v4 would see as "recent" is mostly its own last
-    # few sentences, so each prompt's own outputs from this run go in front of
-    # the recorded ones. Keyed by prompt and model: v4 on one model should not
-    # be steered by another's.
-    written: dict[tuple[str, str], list[str]] = {}
-    recorded = lineage.recent_critiques(conn)
     for entry_id, gen in entries:
         for name, path in prompts:
             for model in args.model:
@@ -101,13 +95,13 @@ def main() -> int:
                 started = time.monotonic()
                 out = {"entry": entry_id, "gen": gen, "prompt": name, "model": model}
                 try:
-                    mine = written.setdefault((name, model), [])
-                    recent = (mine[::-1] + recorded)[:8]
                     result = lineage.critique(conn, entry_id, model=model,
                                               host=args.host, prompt_path=path,
-                                              timeout=args.timeout, recent=recent)
-                    mine.append(result.text)
+                                              timeout=args.timeout)
                     out.update(text=result.text, ghost=bool(result.ghost_sha256))
+                    if name != "v3":
+                        out["lens"] = lineage.critic_lens(
+                            entry_id, lineage.prompt_version(path))
                 except (lineage.CritiqueFailed, lineage.CritiqueRefused) as exc:
                     out.update(error=str(exc), raw=getattr(exc, "raw", None))
                 out["s"] = round(time.monotonic() - started, 1)

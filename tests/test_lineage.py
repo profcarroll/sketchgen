@@ -685,30 +685,26 @@ class TestCritique(LineageTestCase):
                       "2. the same rings, and this time pulse.", rendered)
         self.assertIn("revised 2 times", rendered)
 
-    def test_the_gallery_s_recent_critiques_are_shown_newest_first(self):
-        """critic-v4 dry run, 2026-10-02: four of sixteen departures went
-        somewhere "crystalline". The critic is shown where the last few went."""
-        row = {"prompt": "a field", "assertions_json": "[]"}
-        rendered = lineage.critique_prompt(
-            row, "", "", recent=["depart: take A into B", "transform: keep C"])
-        self.assertIn("1. depart: take A into B\n2. transform: keep C", rendered)
-        empty = lineage.critique_prompt(row, "", "")
-        self.assertIn("(nothing recorded yet)", empty)
-        self.assertNotIn("{recent}", empty)
+    def test_each_entry_gets_one_lens_and_keeps_it(self):
+        """critic-v4, 2026-10-03: a list of recent critiques primed the 4B
+        critic toward the places it already went. A lens from outside it,
+        fixed per entry and version, is what it gets instead."""
+        row = {"id": 1862, "prompt": "rings", "assertions_json": "[]"}
+        rendered = lineage.critique_prompt(row, "", "")
+        lens = lineage.critic_lens(1862, lineage.prompt_version())
+        self.assertIn(lens, lineage.CRITIC_LENSES)
+        self.assertIn(f"A LENS FOR THIS ONE\n{lens}\n", rendered)
+        self.assertNotIn("{lens}", rendered)
+        self.assertEqual(rendered, lineage.critique_prompt(row, "", ""))
+        # another version is another draw over the same entries
+        drawn = {lineage.critic_lens(entry, "critic-v4") for entry in range(200)}
+        self.assertGreater(len(drawn), len(lineage.CRITIC_LENSES) // 2)
 
-    def test_recent_critiques_skip_the_rejected_and_come_newest_first(self):
-        for n, (text, rejected) in enumerate(
-            (("older one", None), ("refused one", "two sentences"), ("newer one", None))
-        ):
-            self.conn.execute(
-                "INSERT INTO critiques (entry_id, critique, critique_by, "
-                "prompt_version, rejected_reason, created_utc) "
-                "VALUES (?, ?, 'gemma4:e4b', ?, ?, ?)",
-                (self.root_entry, text, f"v{n}", rejected,
-                 f"2026-10-02T00:00:0{n}Z"),
-            )
-        self.assertEqual(["newer one", "older one"],
-                         lineage.recent_critiques(self.conn)[:2])
+    def test_no_lens_points_where_the_critic_already_goes(self):
+        for lens in lineage.CRITIC_LENSES:
+            for word in ("crystal", "luminous", "glow", "biolumin", "cosmic",
+                         "deep-sea", "molten", "text", "sound"):
+                self.assertNotIn(word, lens.lower())
 
     def test_the_rendered_prompt_tells_the_critic_the_image_beats_the_words(self):
         """critic-v3's whole point, kept in v4: the statement is a claim, the strip is not.

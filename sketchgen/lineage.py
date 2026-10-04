@@ -86,7 +86,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from sketchgen import db
 from sketchgen import ghostshim
@@ -725,22 +725,44 @@ def critic_images(path: str | Path | None = None) -> tuple[str, ...]:
     return tuple(out)
 
 
-def recent_critiques(conn: sqlite3.Connection, limit: int = 8) -> list[str]:
-    """The gallery's newest accepted critiques, newest first, for critic-v4.
+#: One of these is handed to critic-v4 per entry, as a direction from outside
+#: the model. The second dry run (2026-10-03) showed the gallery's recent
+#: critiques to the critic so it would go somewhere else, and it went to the
+#: same places harder: "crystal" in 5 of 16, then four in a row underground
+#: (subterranean, molten iron, magma, lava tubes) once the first was in the
+#: list. A 4B model copies what is in its context. A lens is randomness it did
+#: not write. None of them is luminous, crystalline, cosmic, deep-sea or molten,
+#: because those are where it goes on its own, and none needs text, sound or an
+#: input the gate cannot test.
+CRITIC_LENSES = (
+    "material: cut paper", "material: woven thread", "material: chalk on slate",
+    "material: rubber bands", "material: wet ink on newsprint",
+    "material: corrugated cardboard", "material: poured concrete",
+    "material: folded origami", "material: knitted wool", "material: ceramic tile",
+    "material: rust on sheet steel", "material: beeswax",
+    "scale: seen from a satellite", "scale: under a microscope",
+    "scale: small enough to hold in one hand", "scale: one city block",
+    "scale: a single grain of sand", "scale: a mountain range",
+    "era: a 1920s Bauhaus exercise", "era: a Victorian botanical plate",
+    "era: a 1980s arcade cabinet", "era: an Edo woodblock print",
+    "era: a 1960s pen plotter drawing", "era: a medieval tapestry",
+    "mechanism: gears and cams", "mechanism: a flock following three rules",
+    "mechanism: a pendulum", "mechanism: a loom", "mechanism: tides",
+    "mechanism: a crack spreading", "mechanism: a slime mould searching",
+    "mechanism: a row of falling dominoes", "mechanism: a spring under tension",
+    "mechanism: erosion",
+)
 
-    The 2026-10-02 dry run of critic-v4 sent four of sixteen sketches toward
-    something "crystalline" and three toward "bioluminescent" or "deep-sea":
-    a critic that departs from each line on its own still converges on its
-    own favourite destinations across the gallery. Showing it where the last
-    few went is the cheapest way to make it go somewhere else. Rejected
-    critiques never became a prompt, so they are not shown.
+
+def critic_lens(entry_id: Any, version: str) -> str:
+    """The lens for one entry under one prompt version: a hash, not a coin.
+
+    The same entry asked again under the same version gets the same lens, so a
+    dry run, the idle critic and a paid critique packet all render one prompt,
+    and a critique can be read later beside the lens it was given.
     """
-    rows = conn.execute(
-        "SELECT critique FROM critiques WHERE rejected_reason IS NULL "
-        "AND critique IS NOT NULL ORDER BY created_utc DESC, id DESC LIMIT ?",
-        (int(limit),),
-    ).fetchall()
-    return [" ".join(str(row["critique"]).split()) for row in rows]
+    digest = hashlib.sha256(f"{version}:{entry_id}".encode("utf-8")).digest()
+    return CRITIC_LENSES[int.from_bytes(digest[:4], "big") % len(CRITIC_LENSES)]
 
 
 def critique_prompt(
@@ -748,7 +770,6 @@ def critique_prompt(
     statement: str | None,
     brief: str | None,
     path: str | Path | None = None,
-    recent: Sequence[str] = (),
 ) -> str:
     """Fill ``prompts/critic.md`` for one entry — the words half of the request.
 
@@ -766,6 +787,8 @@ def critique_prompt(
     the version line, because neither is anything to say to a model.
     """
     text = _read_prompt_file(path)
+    version_match = _PROMPT_VERSION_RE.search(text)
+    version = version_match.group(1) if version_match else ""
     text = _PROMPT_VERSION_RE.sub("", text, count=1)
     head, sep, body = text.partition("\n\n")
     text = (_IMAGES_RE.sub("", head, count=1) + sep + body).lstrip("\n")
@@ -783,12 +806,9 @@ def critique_prompt(
     history = "\n".join(
         f"{n}. {revision}" for n, revision in enumerate(revisions, start=1)
     ) or "(nothing yet: this sketch is where the line starts)"
-    shown = "\n".join(
-        f"{n}. {line}" for n, line in enumerate(recent, start=1)
-    ) or "(nothing recorded yet)"
     return (
         text.replace("{prompt}", prompt)
-        .replace("{recent}", shown)
+        .replace("{lens}", critic_lens(_get(entry_row, "id"), version))
         .replace("{root}", root or "(no prompt on record)")
         .replace("{history}", history)
         .replace("{generation}", str(len(revisions)))
@@ -859,7 +879,6 @@ def critique(
     seed: int = 1,
     prompt_path: str | Path | None = None,
     timeout: float = 300.0,
-    recent: Sequence[str] | None = None,
 ) -> Critique:
     """One sentence of critique for one entry. With ``stub``, call nothing.
 
@@ -892,11 +911,7 @@ def critique(
     strip, strip_path = _strip_bytes(row)
     strip_sha256 = hashlib.sha256(strip).hexdigest()
     version = prompt_version(prompt_path)
-    if recent is None:
-        recent = recent_critiques(conn)
-    rendered = critique_prompt(
-        row, row["statement"], row["brief"], prompt_path, recent
-    )
+    rendered = critique_prompt(row, row["statement"], row["brief"], prompt_path)
     tokens: dict[str, int] = {}
 
     images = [strip]
