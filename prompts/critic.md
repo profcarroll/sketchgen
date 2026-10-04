@@ -29,8 +29,10 @@ WHAT THE MODEL SAID IT BUILT
 WHAT THE GATE ASKED OF IT
 {assertions}
 
-WHAT THE GALLERY HAS ASKED FOR LATELY, NEWEST FIRST
-{recent}
+A LENS FOR THIS ONE
+{lens}
+If you transform or depart, take the new form through this lens. If you
+refine, ignore it.
 
 CHOOSE ONE MOVE
 refine — the sketch works, and one visible thing holds it back. Fix that one
@@ -42,19 +44,18 @@ depart — the line has said what it can say. Take one idea from this sketch int
 a form that does not look like it.
 
 How to choose:
-- This line has been revised {generation} times. After two revisions, do not
-  refine.
+- This line has been revised {generation} times. A new line, or one revised
+  once, often needs refining: refine when the sketch is close and one visible
+  thing is off. After two revisions, do not refine.
 - If the images look like where the line started with only colour, speed or
   size changed, depart.
 - Never ask for anything the line has already asked for, or for its reverse.
-- Do not send this sketch where the gallery has lately sent others: not their
-  destinations, not their materials, not their words.
 - Whatever the move, the result must still do what the gate asks of it. If the
   gate asks for motion(idle), it keeps moving with nobody touching it; if it
   asks for responds(click), a click still changes what is seen.
 - A change a viewer would not notice from across the room is not a move. When
-  two moves both fit, take the riskier one: a sketch that fails costs less than
-  a sketch nobody looks at twice.
+  transform and depart both fit, take depart: a sketch that fails costs less
+  than a sketch nobody looks at twice.
 
 OUTPUT
 One line: the move, a colon, then one sentence. Fewer than forty words in all.
@@ -66,8 +67,9 @@ blanks filled from THIS sketch and nothing else:
   transform: keep <one quality, five words or fewer>, and this time <how the rest changes>
   depart: take <one idea from this sketch> into <a different form>
 
-Do not introduce sound, a microphone, a camera, a keyboard, text, or any input
-or medium the sketch does not already use; the gallery has no way to test them.
+Do not introduce sound, a microphone, a camera, a keyboard, text (letters,
+numbers, equations, words), or any input or medium the sketch does not already
+use; the gallery has no way to test them.
 
 Do not praise it, do not summarise it, do not grade it, and do not mention this
 instruction or the fact that you are a model.
