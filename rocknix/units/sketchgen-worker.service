@@ -1,6 +1,8 @@
 [Unit]
 Description=sketchgen worker: one p5.js sketch job at a time, slot-fenced
 Documentation=file:/storage/sketchgen/app/rocknix/README.md
+# Started by sketchgen.target and its power keeper, never at boot: no [Install].
+PartOf=sketchgen.target
 After=sketchgen-shim.service network-online.target
 Wants=sketchgen-shim.service
 
@@ -15,6 +17,3 @@ Environment=OLLAMA_HOST_URL=http://127.0.0.1:11434
 ExecStart=/storage/sketchgen/.venv/bin/python3 /storage/sketchgen/app/bin/sketchgen worker
 Restart=on-failure
 RestartSec=30
-
-[Install]
-WantedBy=multi-user.target

@@ -1,0 +1,11 @@
+# sketchgen.target — sketchgen on this handheld, for as long as the operator has it.
+#
+# Started by the Ports entry (rocknix/ports/Sketchgen Console.sh), never at boot: there
+# is no [Install] section here or in any unit it stops. It brings up the console and the
+# power keeper; the keeper starts the model and the worker only while the console's
+# switch says the generator is on, and stops this target once the switch is off and the
+# console is closed (rocknix/power.py).
+[Unit]
+Description=sketchgen on this handheld, while the operator has it: the console and its power keeper
+Documentation=file:/storage/sketchgen/app/rocknix/README.md
+Wants=sketchgen-web.service sketchgen-power.service

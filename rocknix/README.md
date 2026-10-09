@@ -30,10 +30,19 @@ of this was written (`flip2-12g`, ROCKNIX 20261001):
 - **No public gallery.** `publish-local.sh` renders held and published entries into
   `/storage/sketchgen/gallery-local`, which `sketchgen-gallery.service` serves on
   127.0.0.1:8090 for Firefox's kiosk mode. A person sifts there (the Pick toggle).
+- **Off unless the operator has it on.** A battery handheld is not a node, and its operator
+  has a gamepad, not a terminal. Nothing sketchgen starts at boot: no unit but the gallery
+  has an `[Install]` section. **Ports → Sketchgen Console** starts `sketchgen.target` (the
+  console and `rocknix/power.py`, no model) and opens the console in Firefox. The console's
+  own switch is the only one: **Resume** and the keeper starts the worker, which brings up
+  the shim and llama-server (about a minute to load); **Pause** and it stops all three,
+  giving back the ~8 GB the model holds; close Firefox (Guide) with the generator off and
+  the keeper stops the target and itself. A generator left on keeps working with Firefox
+  closed, until the console is opened again and paused.
 - **Root, `/storage`, system units.** ROCKNIX runs everything as root with `HOME=/storage`,
   so `~/sketchgen` is `/storage/sketchgen` and the node commands in AGENTS.md hold. Units
-  are system units in `/storage/.config/system.d`, enabled with `systemctl enable --now`.
-  Per-device settings are one file, `/storage/sketchgen/node.env`, read by every unit.
+  are system units in `/storage/.config/system.d`. Per-device settings are one file,
+  `/storage/sketchgen/node.env`, read by every unit.
 - **pip `--no-compile`.** The system Python 3.14 cannot write `.pyc` files where pip
   expects them; a wheel install without the flag fails on an assertion.
 
@@ -44,9 +53,11 @@ scp rocknix/install.sh flip2-12g:/storage/
 ssh flip2-12g 'bash /storage/install.sh --ref main --operator profcarroll'
 ```
 
-Then the lines it prints: enable the model, the shim and the console; look at
-http://127.0.0.1:8081/ in Firefox on the device; enable the worker and resume the
-generator; after the first `publish-local.sh`, enable the gallery and open the kiosk.
+It enables nothing. Update the gamelists from EmulationStation's menu (or reboot) so
+Ports lists **Sketchgen Console**; from then on the operator turns the generator on and
+off there, from the gamepad. A fresh database starts paused, so the first Resume is a decision too. After the
+first `publish-local.sh`, enable the gallery and open the kiosk, as install.sh prints.
+Updating a device set up by the kit before 2026-10-09 disables the units it enabled.
 
 The GPU: the Adreno 650 generates slower than the four A77 cores but reads prompts 1.4×
 faster and runs Gemma's vision encoder 6.6× faster (ollamadreno
@@ -64,3 +75,6 @@ the three lines that move the encoder onto it (the `bin-ocl` build, its `env.sh`
   gallery or it opens the public one.
 - The shim refuses any model name but its own with Ollama's own 404, so a worker left at
   the default `gemma4:e4b` fails loudly rather than being answered by the wrong weights.
+- Never `systemctl enable` the model, the shim, the console or the worker here. Enabled,
+  llama-server comes back with every boot and holds ~8 GB, and the device does not sleep
+  (car12, 2026-10-09). The units have no `[Install]` section so that `enable` refuses.

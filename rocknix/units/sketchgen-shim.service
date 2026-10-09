@@ -1,6 +1,8 @@
 [Unit]
 Description=sketchgen llama-shim: Ollama's API on 127.0.0.1:11434 over llama-server
 Documentation=file:/storage/sketchgen/app/rocknix/README.md
+# Started by sketchgen.target and its power keeper, never at boot: no [Install].
+PartOf=sketchgen.target
 After=sketchgen-llama.service
 Wants=sketchgen-llama.service
 
@@ -11,6 +13,3 @@ WorkingDirectory=/storage/sketchgen/app
 ExecStart=/storage/sketchgen/.venv/bin/python3 /storage/sketchgen/app/bin/sketchgen llama-shim --upstream http://127.0.0.1:${LLAMA_PORT} --name ${SKETCHGEN_PLANNER_MODEL} --port 11434
 Restart=on-failure
 RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
