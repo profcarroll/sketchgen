@@ -182,6 +182,21 @@ class Reading(unittest.TestCase):
         make_db(self.db, {k.replace("_", "."): v for k, v in meta.items()})
         return build.reading(self.node, self.db, units=units or {})
 
+    def test_a_tree_with_no_git_reads_its_build_file(self):
+        """rocknix/install.sh unpacks a tarball on a box with no git (the Flip 2,
+        2026-10-09) and stamps app/BUILD; the checkout facts come from it."""
+        root = Path(self.tmp.name) / "archive"
+        root.mkdir()
+        (root / build.BUILD_FILE).write_text(
+            "github profcarroll/sketchgen main\nfetched 2026-10-09T02:00:00Z\n")
+        facts = build.checkout(root)
+        self.assertEqual(facts["build"], "github profcarroll/sketchgen main")
+        self.assertIsNone(facts["sha"])
+        self.assertEqual(build.short(facts["build"]), "github ")
+        empty = Path(self.tmp.name) / "bare"
+        empty.mkdir()
+        self.assertIsNone(build.checkout(empty)["build"])
+
     def test_on_main_with_both_processes_on_it_is_on_target(self):
         run = f"{self.repo.c4} 2026-09-24T10:00:00Z"
         doc = self.read(units={"worker": "active", "web": "active"},

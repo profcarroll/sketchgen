@@ -311,6 +311,17 @@ If you find yourself guessing, that is a missing verb — say so.
 - Everything you make is badged **off-node**: keep a paid run as its own
   batch and say so.
 
+## A handheld node (ROCKNIX)
+
+`rocknix/README.md`. The Retroid Flip 2 runs the whole generator except the coder:
+Gemma under `llama-server` behind `sketchgen llama-shim` (Ollama's API on
+loopback), the executor on sld-cloud's Ollama over the tailnet
+(`SKETCHGEN_EXECUTOR_HOST`), the node's own Chromium build for the gate. Traps:
+no git (the app is a tarball, `app/BUILD` says which), pip needs `--no-compile`,
+units are system units in `/storage/.config/system.d`, `pgrep -f`/`pkill -f`
+match the shell running them, and a `nohup … &` inside `ssh` holds the session
+unless it is `setsid`-ed with stdin from `/dev/null`.
+
 ## Deploying
 
 `bin/fleet update NODE` from the laptop (or `ssh NODE 'bash

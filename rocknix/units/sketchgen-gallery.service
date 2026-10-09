@@ -1,0 +1,14 @@
+[Unit]
+Description=sketchgen local gallery on 127.0.0.1:8090 (what publish-local.sh renders)
+Documentation=file:/storage/sketchgen/app/rocknix/README.md
+After=network.target
+
+[Service]
+Type=simple
+# The wall's own server from the Mac kit: loopback only, no access log, manifests no-store.
+ExecStart=/usr/bin/python3 /storage/sketchgen/app/kiosk-mac/serve-gallery.py --directory /storage/sketchgen/gallery-local --port 8090
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

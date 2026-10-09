@@ -84,6 +84,9 @@ Environment=SKETCHGEN_DB=%h/sketchgen/sketchgen.db
 Environment=SKETCHGEN_JOBS=%h/sketchgen/jobs
 Environment=SKETCHGEN_GATE=%h/sketchgen/app/gate/sketch_gate.py
 Environment=OLLAMA_HOST_URL=http://127.0.0.1:11434
+# SKETCHGEN_EXECUTOR_HOST, when the coder lives on another box (the Flip 2
+# reaches sld-cloud's over the tailnet, 2026-10-09), goes in node.conf, as
+# every per-node setting does; unset, the executor uses OLLAMA_HOST_URL.
 ExecStart=%h/sketchgen/.venv/bin/python3 %h/sketchgen/app/bin/sketchgen worker
 Restart=on-failure
 RestartSec=30

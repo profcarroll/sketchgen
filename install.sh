@@ -17,6 +17,10 @@
 #   --executor TAG      SKETCHGEN_EXECUTOR_MODEL (default: qwen3-coder:30b).
 #   --ollama-url URL    OLLAMA_HOST_URL (default: http://127.0.0.1:11434). A box
 #                       whose Ollama listens on its tailnet address needs it.
+#   --executor-url URL  SKETCHGEN_EXECUTOR_HOST: the executor model's Ollama when
+#                       it is not --ollama-url (a box too small for the coder,
+#                       reaching another node's over the tailnet). Default: unset,
+#                       and the executor uses --ollama-url like every other step.
 #   --rate DOLLARS      SKETCHGEN_RATE_PER_HOUR, for a node that bills by the
 #                       hour. Leave it off a node that does not.
 #   --shape TEXT        SKETCHGEN_SHAPE, what the Node card calls this machine.
@@ -63,6 +67,7 @@ PLANNER="gemma4:e4b"
 REF=main
 EXECUTOR="qwen3-coder:30b"
 OLLAMA_URL="http://127.0.0.1:11434"
+EXECUTOR_URL=""
 RATE=""
 SHAPE=""
 OPERATOR=""
@@ -82,6 +87,7 @@ while [[ $# -gt 0 ]]; do
         --ref)        need_value "$@"; REF="$2"; shift 2 ;;
         --executor)   need_value "$@"; EXECUTOR="$2"; shift 2 ;;
         --ollama-url) need_value "$@"; OLLAMA_URL="$2"; shift 2 ;;
+        --executor-url) need_value "$@"; EXECUTOR_URL="$2"; shift 2 ;;
         --rate)       need_value "$@"; RATE="$2"; shift 2 ;;
         --shape)      need_value "$@"; SHAPE="$2"; shift 2 ;;
         --operator)   need_value "$@"; OPERATOR="$2"; shift 2 ;;
@@ -218,6 +224,7 @@ conf=$(
     printf '# the unit files, which install-unit and update.sh overwrite.\n[Service]\n'
     printf 'Environment=OLLAMA_HOST_URL=%s\n' "$OLLAMA_URL"
     printf 'Environment=SKETCHGEN_EXECUTOR_MODEL=%s\n' "$EXECUTOR"
+    [[ -z "$EXECUTOR_URL" ]] || printf 'Environment=SKETCHGEN_EXECUTOR_HOST=%s\n' "$EXECUTOR_URL"
     printf 'Environment=OLLAMA_MODELS=%s\n' "$models"
     [[ -z "$RATE" ]]     || printf 'Environment=SKETCHGEN_RATE_PER_HOUR=%s\n' "$RATE"
     [[ -z "$SHAPE" ]]    || printf 'Environment="SKETCHGEN_SHAPE=%s"\n' "$SHAPE"
@@ -249,10 +256,13 @@ fi
 # --- 9. Ollama ---------------------------------------------------------------
 step "9. Ollama"
 if tags=$(curl -fsS --max-time 5 "$OLLAMA_URL/api/tags" 2>/dev/null); then
-    for m in "$EXECUTOR" "$PLANNER"; do
-        if grep -q "\"name\":\"$m\"" <<<"$tags"; then green "✓ $m"
-        else red "⚠ $m is not pulled here: ollama pull $m"; fi
-    done
+    # The executor's model is asked for where the executor will ask for it.
+    executor_tags=$tags
+    [[ -z "$EXECUTOR_URL" ]] || executor_tags=$(curl -fsS --max-time 5 "$EXECUTOR_URL/api/tags" 2>/dev/null || echo "")
+    if grep -q "\"name\":\"$EXECUTOR\"" <<<"$executor_tags"; then green "✓ $EXECUTOR"
+    else red "⚠ $EXECUTOR is not pulled at ${EXECUTOR_URL:-$OLLAMA_URL}: ollama pull $EXECUTOR"; fi
+    if grep -q "\"name\":\"$PLANNER\"" <<<"$tags"; then green "✓ $PLANNER"
+    else red "⚠ $PLANNER is not pulled here: ollama pull $PLANNER"; fi
 else
     red "⚠ nothing answers at $OLLAMA_URL. Install Ollama at the other nodes' version:"
     echo "    curl -fsSL https://ollama.com/install.sh | OLLAMA_VERSION=<version> sh"

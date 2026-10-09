@@ -283,6 +283,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
         jobs_dir=os.path.expanduser(args.jobs_dir),
         gate_path=os.path.expanduser(args.gate),
         host=args.host,
+        executor_host=args.executor_host,
         executor_fn=executor_fn,
         planner_fn=planner_fn,
         judge_fn=judge_fn,
@@ -890,6 +891,11 @@ def build_parser() -> argparse.ArgumentParser:
     worker_parser.add_argument("--host", default=worker.DEFAULT_HOST, metavar="URL",
                                help="Ollama base URL (default: $OLLAMA_HOST_URL, else "
                                     "http://127.0.0.1:11434)")
+    worker_parser.add_argument("--executor-host", dest="executor_host",
+                               default=worker.DEFAULT_EXECUTOR_HOST, metavar="URL",
+                               help="the executor model's Ollama, when it is not --host "
+                                    "(default: $SKETCHGEN_EXECUTOR_HOST, else --host); "
+                                    "the fence and /api/ps stay on --host")
     worker_parser.add_argument("--sleep", type=float, default=worker.DEFAULT_SLEEP_S,
                                metavar="S",
                                help="seconds between passes when resident "

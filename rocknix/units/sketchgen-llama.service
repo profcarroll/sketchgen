@@ -1,0 +1,22 @@
+[Unit]
+Description=sketchgen's model on this handheld: llama-server with Gemma and its vision projector
+Documentation=file:/storage/sketchgen/app/rocknix/README.md
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/storage/sketchgen/node.env
+# The four A77 cores (4-7) and the CPU backend: what the ollamadreno lab measured as the
+# fastest place for the language model on this chip (Findings_20260928_s2). LLAMA_ENV is a
+# file to source first: the OpenCL kit's env.sh, which points the loader at the private
+# rusticl driver, when LLAMA_SERVER is the bin-ocl build and LLAMA_ARGS puts the vision
+# encoder on the Adreno (-mmdev); /dev/null otherwise. -np 1: one completion at a time,
+# the way the worker drives it; -c is the window /api/ps reports.
+ExecStart=/bin/sh -c '. ${LLAMA_ENV}; exec taskset -c ${LLAMA_CPUS} ${LLAMA_SERVER} -m ${LLAMA_MODEL} --mmproj ${LLAMA_MMPROJ} ${LLAMA_ARGS} --host 127.0.0.1 --port ${LLAMA_PORT}'
+Restart=on-failure
+RestartSec=15
+# A 5 GB gguf takes about a minute to come up on the SD card (66 s measured 2026-10-09).
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target
