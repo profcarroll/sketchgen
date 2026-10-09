@@ -8,7 +8,11 @@ Wants=sketchgen-llama.service
 Type=simple
 EnvironmentFile=/storage/sketchgen/node.env
 WorkingDirectory=/storage/sketchgen/app
-ExecStart=/storage/sketchgen/.venv/bin/python3 /storage/sketchgen/app/bin/sketchgen llama-shim --upstream http://127.0.0.1:${LLAMA_PORT} --name ${SKETCHGEN_PLANNER_MODEL} --port 11434
+# SHIM_ARGS carries the shim's own options from node.env: on this device
+# `--max-image-px 1280`, which is what makes a judgement take a minute and a
+# half on the Adreno instead of ten (two 5132×900 strips were 2253 image
+# tokens, 605 s, 2026-10-09). The strip on disk is untouched.
+ExecStart=/storage/sketchgen/.venv/bin/python3 /storage/sketchgen/app/bin/sketchgen llama-shim --upstream http://127.0.0.1:${LLAMA_PORT} --name ${SKETCHGEN_PLANNER_MODEL} --port 11434 $SHIM_ARGS
 Restart=on-failure
 RestartSec=5
 

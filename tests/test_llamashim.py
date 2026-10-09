@@ -219,6 +219,24 @@ class ShimTests(unittest.TestCase):
         self.assertTrue(parts[2]["image_url"]["url"].startswith("data:image/jpeg;base64,"))
         self.assertTrue(any("2 image(s)" in line for line in self.lines))
 
+    def test_max_image_px_shrinks_what_the_model_is_shown_and_says_so(self):
+        import struct, zlib
+        w, h = 2560, 200
+        rows = b"".join(b"\x00" + bytes(w * 4) for _ in range(h))
+        ihdr = struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)
+        big = (b"\x89PNG\r\n\x1a\n" + llamashim.pngscale._chunk(b"IHDR", ihdr)
+               + llamashim.pngscale._chunk(b"IDAT", zlib.compress(rows))
+               + llamashim.pngscale._chunk(b"IEND", b""))
+        self.shim.max_image_px = 1280
+        self.fake.reply = "B"
+        self._post("/api/chat", {"model": NAME, "stream": False,
+                                 "messages": [{"role": "user", "content": "?", "images": [judge_b64(big)]}]})
+        _, body = self.fake.requests[-1]
+        url = body["messages"][0]["content"][1]["image_url"]["url"]
+        shown = base64.b64decode(url.split(",", 1)[1])
+        self.assertEqual(llamashim.pngscale.dimensions(shown), (1280, 100))
+        self.assertTrue(any("shown at ≤1280 px" in line for line in self.lines))
+
     # -- the verb ------------------------------------------------------------
 
     def test_main_refuses_a_bind_off_loopback_and_a_bare_name(self):

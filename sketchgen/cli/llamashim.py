@@ -14,7 +14,8 @@ from sketchgen import llamashim
 
 def _run(args: argparse.Namespace) -> int:
     argv = ["--upstream", args.upstream, "--name", args.name,
-            "--bind", args.bind, "--port", str(args.port), "--timeout", str(args.timeout)]
+            "--bind", args.bind, "--port", str(args.port), "--timeout", str(args.timeout),
+            "--max-image-px", str(args.max_image_px)]
     return llamashim.main(argv)
 
 
@@ -41,4 +42,7 @@ def register(top: argparse._SubParsersAction) -> None:
                    help=f"port (default {llamashim.DEFAULT_PORT}, Ollama's own)")
     p.add_argument("--timeout", type=float, default=llamashim.DEFAULT_TIMEOUT_S,
                    metavar="S", help="ceiling on one completion, seconds")
+    p.add_argument("--max-image-px", dest="max_image_px", type=int, default=0, metavar="PX",
+                   help="shrink every image sent to the model so its longer side is at most "
+                        "PX (default 0: as sent); the file on disk is untouched")
     p.set_defaults(func=_run, _parser=p)

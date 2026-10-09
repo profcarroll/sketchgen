@@ -24,6 +24,10 @@
 #   --mmproj FILE        its vision projector, beside it by default; fetched from Hugging Face
 #                        (google/gemma-4-E4B-it-qat-q4_0-gguf, 991 MB) when missing.
 #   --name TAG           what the records call that model (default: gemma4:e4b-qat-q4_0).
+#   --turnip FILE        the lab's patched Turnip (turnip_fix0009-26.2.3.so from the ollamadreno
+#                        repo's drivers/), copied to /storage/sketchgen/turnip with an ICD file
+#                        and the Vulkan tuning the lab measured, so the vision encoder runs on
+#                        the Adreno. Without it the encoder runs on the CPU, minutes per judgement.
 #   --operator LOGIN     SKETCHGEN_OPERATOR, a GitHub username.
 #   -h, --help           Print this and exit.
 #
@@ -59,6 +63,8 @@ MODEL="$MODELS/gemma-4-E4B_q4_0-it.gguf"
 MMPROJ=""
 NAME="gemma4:e4b-qat-q4_0"
 OPERATOR=""
+TURNIP=""
+TURNIP_DIR="$NODE_HOME/turnip"
 
 red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -79,6 +85,7 @@ while [[ $# -gt 0 ]]; do
         --mmproj)        need_value "$@"; MMPROJ="$2"; shift 2 ;;
         --name)          need_value "$@"; NAME="$2"; shift 2 ;;
         --operator)      need_value "$@"; OPERATOR="$2"; shift 2 ;;
+        --turnip)        need_value "$@"; TURNIP="$2"; shift 2 ;;
         -h|--help)       usage; exit 0 ;;
         *)               die "unknown argument: $1 (try --help)" ;;
     esac
@@ -109,6 +116,23 @@ else
     red "⚠ $EXECUTOR_HOST does not list $EXECUTOR (is tailscale up here, and the node's Ollama on the tailnet?)"
 fi
 green "✓ ROCKNIX, $(python3 -V), $LLAMA_SERVER, $(basename "$MODEL") + $(basename "$MMPROJ")"
+
+# --- 1b. The Turnip for the vision encoder -------------------------------------
+# The stock Turnip and the OpenCL kit cannot run Gemma's image encoder on this chip; the
+# lab's build with the ir3 register-cap fix (ollamadreno patches/upstream/mesa-0009) can,
+# and the Flip measured it on 2026-10-09. The ICD names the .so; env.sh is what the llama
+# unit sources, with the Vulkan tuning the lab's Findings_20260928_s2 recipes use.
+if [[ -n "$TURNIP" ]]; then
+    step "1b. Turnip for the vision encoder"
+    [[ -s "$TURNIP" ]] || die "no Turnip driver at $TURNIP"
+    mkdir -p "$TURNIP_DIR"
+    cp "$TURNIP" "$TURNIP_DIR/$(basename "$TURNIP")"
+    printf '{"ICD":{"api_version":"1.3.0","library_arch":"64","library_path":"%s/%s"},"file_format_version":"1.0.1"}\n' \
+        "$TURNIP_DIR" "$(basename "$TURNIP")" > "$TURNIP_DIR/icd.json"
+    printf 'export VK_ICD_FILENAMES=%s/icd.json\nexport ODR_VK_SUBGROUP=64\nexport ODR_VK_NO_SUBGROUP_REDUCE=1\nexport ODR_VK_MM_M=128,64,64,32,64,2,4,4\n' \
+        "$TURNIP_DIR" > "$TURNIP_DIR/env.sh"
+    green "✓ $TURNIP_DIR: $(basename "$TURNIP"), icd.json, env.sh"
+fi
 
 # --- 2. The app ---------------------------------------------------------------
 step "2. The app"
@@ -168,8 +192,15 @@ conf=$(
     printf '# Written by rocknix/install.sh on %s. This device'"'"'s settings; never overwritten.\n' "$(date -u +%F)"
     printf '# See rocknix/node.env.example for what each line is.\n'
     printf 'LLAMA_SERVER=%s\nLLAMA_MODEL=%s\nLLAMA_MMPROJ=%s\n' "$LLAMA_SERVER" "$MODEL" "$MMPROJ"
-    printf 'LLAMA_ARGS=-dev none -t 4 -tb 4 -fa on -c 8192 -np 1 --cache-ram 0\n'
-    printf 'LLAMA_CPUS=4-7\nLLAMA_PORT=8092\nLLAMA_ENV=/dev/null\n'
+    if [[ -s "$TURNIP_DIR/env.sh" ]]; then
+        printf 'LLAMA_ENV=%s/env.sh\n' "$TURNIP_DIR"
+        printf 'LLAMA_ARGS=-dev none -mmdev Vulkan0 -fa off --jinja -rea off -t 4 -c 8192 -np 1 --cache-ram 0\n'
+    else
+        printf 'LLAMA_ENV=/dev/null\n'
+        printf 'LLAMA_ARGS=-dev none -t 4 -tb 4 -fa on -c 8192 -np 1 --cache-ram 0\n'
+    fi
+    printf 'LLAMA_CPUS=4-7\nLLAMA_PORT=8092\n'
+    printf 'SHIM_ARGS=--max-image-px 1280\n'
     printf 'SKETCHGEN_PLANNER_MODEL=%s\nSKETCHGEN_JUDGE_MODEL=%s\nSKETCHGEN_CRITIC_MODEL=%s\n' "$NAME" "$NAME" "$NAME"
     printf 'SKETCHGEN_EXECUTOR_MODEL=%s\nSKETCHGEN_EXECUTOR_HOST=%s\n' "$EXECUTOR" "$EXECUTOR_HOST"
     printf 'SKETCHGEN_SHAPE=%s\n' "$(sed -n 's/^HW_CPU="\(.*\)"/\1/p' /etc/os-release | head -1) handheld, ROCKNIX $(sed -n 's/^OS_VERSION="\(.*\)"/\1/p' /etc/os-release)"

@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import json
 import os
 import socket
@@ -53,6 +54,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
+
+from sketchgen import pngscale
 
 __all__ = [
     "DEFAULT_PORT",
@@ -114,6 +117,13 @@ class Shim:
     name: str
     timeout: float = DEFAULT_TIMEOUT_S
     log: Callable[[str], None] = field(default=lambda line: print(line, file=sys.stderr))
+    #: Shrink every image a caller sends so its longer side is at most this
+    #: many pixels, before llama-server's encoder sees it. 0 forwards images
+    #: as they came. On the Flip (2026-10-09) two of the gate's 5132×900 strips
+    #: were 2253 image tokens and 605 s of prompt reading with the encoder on
+    #: the Adreno; the model prices an image by its tiles. The strip on disk is
+    #: untouched and the log line says what was shown.
+    max_image_px: int = 0
 
     def base(self) -> str:
         return self.upstream.rstrip("/")
@@ -244,8 +254,18 @@ def _sampling(body: dict[str, Any], out: dict[str, Any]) -> None:
         out["chat_template_kwargs"] = {"enable_thinking": False}
 
 
-def _image_part(encoded: str) -> dict[str, Any]:
-    """One Ollama ``images`` entry (base64) as an OpenAI ``image_url`` part."""
+def _image_part(encoded: str, max_px: int = 0) -> dict[str, Any]:
+    """One Ollama ``images`` entry (base64) as an OpenAI ``image_url`` part,
+    shrunk first when ``max_px`` asks and the bytes are a PNG this can read."""
+    if max_px > 0:
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error):
+            raw = b""
+        if raw:
+            smaller = pngscale.downscale(raw, max_px)
+            if smaller is not raw:
+                encoded = base64.b64encode(smaller).decode("ascii")
     head = encoded[:8]
     if head.startswith("iVBOR"):
         mime = "image/png"
@@ -260,15 +280,16 @@ def _image_part(encoded: str) -> dict[str, Any]:
     return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{encoded}"}}
 
 
-def _message(role: str, content: str, images: list[str] | None) -> dict[str, Any]:
+def _message(role: str, content: str, images: list[str] | None,
+             max_px: int = 0) -> dict[str, Any]:
     if not images:
         return {"role": role, "content": content}
     parts: list[dict[str, Any]] = [{"type": "text", "text": content}]
-    parts.extend(_image_part(str(image)) for image in images)
+    parts.extend(_image_part(str(image), max_px) for image in images)
     return {"role": role, "content": parts}
 
 
-def generate_body(body: dict[str, Any]) -> dict[str, Any]:
+def generate_body(body: dict[str, Any], max_px: int = 0) -> dict[str, Any]:
     """An ``/api/generate`` body as a ``/v1/chat/completions`` body.
 
     The prompt is one user turn, which is what Ollama makes of it when it
@@ -281,13 +302,13 @@ def generate_body(body: dict[str, Any]) -> dict[str, Any]:
         messages.append({"role": "system", "content": system})
     images = body.get("images")
     messages.append(_message("user", str(body.get("prompt") or ""),
-                             images if isinstance(images, list) else None))
+                             images if isinstance(images, list) else None, max_px))
     out: dict[str, Any] = {"messages": messages, "stream": False}
     _sampling(body, out)
     return out
 
 
-def chat_body(body: dict[str, Any]) -> dict[str, Any]:
+def chat_body(body: dict[str, Any], max_px: int = 0) -> dict[str, Any]:
     """An ``/api/chat`` body as a ``/v1/chat/completions`` body."""
     messages = []
     for item in body.get("messages") or []:
@@ -296,7 +317,7 @@ def chat_body(body: dict[str, Any]) -> dict[str, Any]:
         images = item.get("images")
         messages.append(_message(str(item.get("role") or "user"),
                                  str(item.get("content") or ""),
-                                 images if isinstance(images, list) else None))
+                                 images if isinstance(images, list) else None, max_px))
     out: dict[str, Any] = {"messages": messages, "stream": False}
     _sampling(body, out)
     return out
@@ -451,7 +472,7 @@ class _Handler(BaseHTTPRequestHandler):
                              "response": "", "done": True, "done_reason": "load"})
             return
         try:
-            content, fields = _completion(self.shim, generate_body(body))
+            content, fields = _completion(self.shim, generate_body(body, self.shim.max_image_px))
         except UpstreamError as exc:
             self.shim.log(f"{utc_now()}  POST /api/generate {self.shim.name}: {exc.message}")
             self._error(exc.status, exc.message)
@@ -462,7 +483,7 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _chat(self, body: dict[str, Any]) -> None:
         try:
-            content, fields = _completion(self.shim, chat_body(body))
+            content, fields = _completion(self.shim, chat_body(body, self.shim.max_image_px))
         except UpstreamError as exc:
             self.shim.log(f"{utc_now()}  POST /api/chat {self.shim.name}: {exc.message}")
             self._error(exc.status, exc.message)
@@ -475,6 +496,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _log(self, verb: str, fields: dict[str, Any], *, images: int = 0) -> None:
         pictures = f"  {images} image(s)" if images else ""
+        if images and self.shim.max_image_px:
+            pictures += f" shown at ≤{self.shim.max_image_px} px"
         self.shim.log(
             f"{utc_now()}  POST /api/{verb} {self.shim.name}  "
             f"{fields['prompt_eval_count']}→{fields['eval_count']} tok  "
@@ -515,12 +538,16 @@ def main(argv: list[str] | None = None) -> int:
                         help=f"port (default {DEFAULT_PORT}, Ollama's own)")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S, metavar="S",
                         help=f"ceiling on one completion (default {DEFAULT_TIMEOUT_S:.0f})")
+    parser.add_argument("--max-image-px", type=int, default=0, metavar="PX",
+                        help="shrink every image sent to the model so its longer side is at "
+                             "most PX (default 0: as sent). The strip on disk is untouched.")
     args = parser.parse_args(argv)
     if ":" not in args.name:
         print(f"sketchgen: refused: --name {args.name!r} is not name:tag, which is "
               "what every model id in the database looks like", file=sys.stderr)
         return EXIT_REFUSED
-    shim = Shim(upstream=args.upstream, name=args.name, timeout=args.timeout)
+    shim = Shim(upstream=args.upstream, name=args.name, timeout=args.timeout,
+                max_image_px=max(0, args.max_image_px))
     try:
         server = serve(args.bind, args.port, shim)
     except ValueError as exc:
@@ -531,7 +558,8 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_FAIL
     up = "up" if shim.healthy() else "not answering yet (it will be asked again per request)"
     shim.log(f"{utc_now()}  {VERSION} on http://{args.bind}:{server.server_address[1]}/ "
-             f"serving {args.name} over {args.upstream} ({up})")
+             f"serving {args.name} over {args.upstream} ({up})"
+             + (f"; images shown at ≤{shim.max_image_px} px" if shim.max_image_px else ""))
     try:
         server.serve_forever()
     except KeyboardInterrupt:  # pragma: no cover - operator's Ctrl-C

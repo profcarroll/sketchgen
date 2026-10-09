@@ -48,11 +48,23 @@ Then the lines it prints: enable the model, the shim and the console; look at
 http://127.0.0.1:8081/ in Firefox on the device; enable the worker and resume the
 generator; after the first `publish-local.sh`, enable the gallery and open the kiosk.
 
-The GPU: the Adreno 650 generates slower than the four A77 cores but reads prompts 1.4×
-faster and runs Gemma's vision encoder 6.6× faster (ollamadreno
-`docs/Findings_20260930_opencl.md`, `Findings_20260928_s2.md`). `node.env.example` shows
-the three lines that move the encoder onto it (the `bin-ocl` build, its `env.sh`, and
-`-mmdev GPUOpenCL`). The judge and the critic are the steps that pay for the encoder.
+**The GPU carries the eyes.** The Adreno 650 generates text slower than the four A77
+cores, but it runs Gemma's vision encoder, which is what the judge and the critic need.
+Measured 2026-10-09 on this unit, through the kit's own units:
+
+| judging two gate strips (5132×900 each) | prompt tokens | time |
+|---|---|---|
+| CPU encoder | — | not finished in 10 min |
+| OpenCL build, encoder on the Adreno | — | aborts (unsupported CLIP ops, CL −5), and the fault poisons the GPU |
+| Vulkan, the lab's patched Turnip, full-size strips | 2253 | 605 s |
+| the same, strips shown at ≤1280 px (`SHIM_ARGS=--max-image-px 1280`) | 209 | **22.5 s** |
+
+So the kit runs the language model on cores 4–7 and the encoder on the Adreno
+(`LLAMA_ARGS … -mmdev Vulkan0`, `LLAMA_ENV` sourcing the Turnip ICD and the lab's Vulkan
+tuning), and the shim shrinks what the model is shown. The driver is the ollamadreno
+lab's `turnip_fix0009-26.2.3.so` (upstream Mesa 26.2.3 with the ir3 register-cap fix),
+given to `install.sh --turnip`; the stock Turnip and the ETK series are untested for this.
+The strip on disk is never changed; the shim's log line says what was shown.
 
 ## Traps
 
