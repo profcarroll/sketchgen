@@ -3048,6 +3048,30 @@ class TestTheCardSaysLoadingBeforeWriting(WorkerTestCase):
             warm.calls,
         )
 
+    def test_the_load_and_the_resident_check_go_to_the_executor_host(self):
+        """The Flip 2 (2026-10-09): the coder is on sld-cloud over the tailnet,
+        so /api/ps for the executor's window and the warm-up load are asked
+        there, while the fence keeps watching this box."""
+        self.enqueue("cold start", executor="qwen3.5:9b")
+        asked = []
+
+        def resident(host, **kwargs):
+            asked.append(host)
+            return {}, None
+
+        warm = self.recorder()
+        w = worker.Worker(
+            self.conn, jobs_dir=self.jobs, gate_path="/nonexistent/sketch_gate.py",
+            host="http://127.0.0.1:11434", executor_host="http://100.76.50.85:11434",
+            executor_fn=StubExecutor(), gate_fn=StubGate([0]), planner_fn=stub_plan(),
+            judge_fn=StubJudge(judged=0), critic_fn=StubCritic(),
+            probe=lambda: dict(FREE_SLOT), log_stream=self.log,
+            warm_fn=warm, resident_fn=resident,
+        )
+        w.run_once()
+        self.assertEqual(asked, ["http://100.76.50.85:11434"])
+        self.assertEqual(warm.calls[0]["host"], "http://100.76.50.85:11434")
+
     def test_the_loading_step_closes_when_writing_opens(self):
         self.enqueue("cold start", executor="qwen3.5:9b")
         self.make_worker(
@@ -3100,3 +3124,33 @@ class TestTheCardSaysLoadingBeforeWriting(WorkerTestCase):
         w = self.make_worker(executor_fn=StubExecutor())
         self.assertIsNone(w.warm_fn)
         self.assertIsNone(w.resident_fn)
+
+
+class TestTheExecutorHost(WorkerTestCase):
+    """One step may run on another box's Ollama (2026-10-09, the Flip 2)."""
+
+    def test_unset_it_is_the_host(self):
+        w = self.make_worker()
+        self.assertEqual(w.executor_host, w.host)
+
+    def test_the_executor_is_called_on_it(self):
+        self.enqueue("split hosts")
+        hosts = []
+        stub = StubExecutor()
+
+        def executor_fn(**kwargs):
+            hosts.append(kwargs["host"])
+            return stub(**kwargs)
+
+        w = worker.Worker(
+            self.conn, jobs_dir=self.jobs, gate_path="/nonexistent/sketch_gate.py",
+            host="http://127.0.0.1:11434", executor_host="http://100.76.50.85:11434",
+            executor_fn=executor_fn, gate_fn=StubGate([0]), planner_fn=stub_plan(),
+            judge_fn=StubJudge(judged=0), critic_fn=StubCritic(),
+            probe=lambda: dict(FREE_SLOT), log_stream=self.log,
+        )
+        w.run_once()
+        self.assertEqual(hosts, ["http://100.76.50.85:11434"])
+        # Everything else still reads this box's: the fence probe, the planner,
+        # the judge and the critic are built on self.host, not executor_host.
+        self.assertEqual(w.host, "http://127.0.0.1:11434")

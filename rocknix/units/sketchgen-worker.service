@@ -1,0 +1,20 @@
+[Unit]
+Description=sketchgen worker: one p5.js sketch job at a time, slot-fenced
+Documentation=file:/storage/sketchgen/app/rocknix/README.md
+After=sketchgen-shim.service network-online.target
+Wants=sketchgen-shim.service
+
+[Service]
+Type=simple
+EnvironmentFile=/storage/sketchgen/node.env
+WorkingDirectory=/storage/sketchgen/app
+Environment=SKETCHGEN_DB=/storage/sketchgen/sketchgen.db
+Environment=SKETCHGEN_JOBS=/storage/sketchgen/jobs
+Environment=SKETCHGEN_GATE=/storage/sketchgen/app/gate/sketch_gate.py
+Environment=OLLAMA_HOST_URL=http://127.0.0.1:11434
+ExecStart=/storage/sketchgen/.venv/bin/python3 /storage/sketchgen/app/bin/sketchgen worker
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

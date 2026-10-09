@@ -2601,6 +2601,12 @@ def queue_page(conn: sqlite3.Connection, doc: dict[str, Any], control) -> str:
 #: environment variable as the worker's, because it is the same Ollama: a UI
 #: offering a model the worker cannot reach would be a menu of lies.
 OLLAMA_HOST = models.DEFAULT_HOST
+#: Where the executor menu looks instead, when the coder is on another box
+#: (``SKETCHGEN_EXECUTOR_HOST``, the Flip 2's case; see
+#: :data:`sketchgen.worker.DEFAULT_EXECUTOR_HOST`). The same variable the
+#: worker reads, for the same reason as :data:`OLLAMA_HOST`: the menu must
+#: offer what the step will actually reach.
+EXECUTOR_HOST = worker.DEFAULT_EXECUTOR_HOST
 
 #: The planner choice that means "whatever the worker is configured with". It
 #: was the only local choice until 2026-09-19 and is still what a saved default,
@@ -2831,19 +2837,19 @@ def planner_column(value: str) -> str:
 
 
 def executor_groups(host: str | None = None) -> list[tuple[str, list[tuple[str, str]]]]:
-    return menu_groups(EXECUTOR_MENU, host)
+    return menu_groups(EXECUTOR_MENU, host or EXECUTOR_HOST)
 
 
 def executor_values(host: str | None = None) -> set[str]:
-    return menu_values(EXECUTOR_MENU, host)
+    return menu_values(EXECUTOR_MENU, host or EXECUTOR_HOST)
 
 
 def executor_selected(value: str, host: str | None = None) -> str:
-    return menu_selected(EXECUTOR_MENU, value, host)
+    return menu_selected(EXECUTOR_MENU, value, host or EXECUTOR_HOST)
 
 
 def check_executor(value: str, host: str | None = None) -> str:
-    return check_menu(EXECUTOR_MENU, value, host)
+    return check_menu(EXECUTOR_MENU, value, host or EXECUTOR_HOST)
 
 
 def executor_column(value: str) -> str:

@@ -170,6 +170,7 @@ from . import build, db, executor, ghostshim, lineage, models, planner, prefligh
 __all__ = [
     "DEFAULT_CRITIC_MODEL",
     "DEFAULT_GATE_PATH",
+    "DEFAULT_EXECUTOR_HOST",
     "DEFAULT_HOST",
     "DEFAULT_IDLE_CRITIQUE",
     "DEFAULT_IDLE_JUDGE",
@@ -225,6 +226,14 @@ DEFAULT_GATE_PATH = os.environ.get(
     "SKETCHGEN_GATE", str(Path.home() / "sketchgen" / "gate" / "sketch_gate.py")
 )
 DEFAULT_HOST = os.environ.get("OLLAMA_HOST_URL", "http://127.0.0.1:11434")
+#: Where the executor's model is, when it is not where the others are. On the
+#: Retroid Flip 2 (2026-10-09) the planner, judge and critic are a Gemma on the
+#: handheld behind ``sketchgen llama-shim``, and the 30B coder is sld-cloud's
+#: Ollama over the tailnet: one box cannot hold both, and the executor is the
+#: one step that needs the big model. Unset, it is :data:`DEFAULT_HOST`, which
+#: is every node before this one. The fence and ``/api/ps`` stay on
+#: :data:`DEFAULT_HOST`: the slot being guarded is this box's.
+DEFAULT_EXECUTOR_HOST = os.environ.get("SKETCHGEN_EXECUTOR_HOST") or DEFAULT_HOST
 
 DEFAULT_SLEEP_S = 30.0
 DEFAULT_PLANNER_MODEL = os.environ.get("SKETCHGEN_PLANNER_MODEL", "gemma4:e4b")
@@ -1811,6 +1820,7 @@ class Worker:
         jobs_dir: str | os.PathLike[str] = DEFAULT_JOBS_DIR,
         gate_path: str | os.PathLike[str] = DEFAULT_GATE_PATH,
         host: str = DEFAULT_HOST,
+        executor_host: str | None = None,
         executor_model: str = executor.DEFAULT_MODEL,
         planner_model: str = DEFAULT_PLANNER_MODEL,
         judge_model: str = DEFAULT_JUDGE_MODEL,
@@ -1835,6 +1845,9 @@ class Worker:
         self.jobs_dir = Path(jobs_dir).expanduser()
         self.gate_path = str(gate_path)
         self.host = host
+        #: The executor's model host: ``host`` unless told otherwise. See
+        #: :data:`DEFAULT_EXECUTOR_HOST` for the node that needs otherwise.
+        self.executor_host = executor_host or host
         self.executor_model = executor_model
         self.planner_model = planner_model
         self.planner_fn = planner_fn or default_planner
@@ -1974,7 +1987,7 @@ class Worker:
         """
         if self.warm_fn is None or self.resident_fn is None:
             return
-        resident, error = self.resident_fn(self.host)
+        resident, error = self.resident_fn(self.executor_host)
         if error is not None:
             # The fence already records an unreachable Ollama; do not say
             # "loading" on a guess, and do not fail the attempt over the card.
@@ -1990,7 +2003,7 @@ class Worker:
             model=model,
         )
         try:
-            took = self.warm_fn(self.host, model, num_ctx)
+            took = self.warm_fn(self.executor_host, model, num_ctx)
         except OSError as exc:
             self.log(
                 f"job {job_id}: {model} could not be loaded up front ({exc}); "
@@ -2161,6 +2174,9 @@ class Worker:
         build.stamp_running(self.conn, "worker")
         self._install_signal_handlers()
         self.log(f"worker: resident, polling every {sleep_s:.0f}s")
+        if self.executor_host != self.host:
+            self.log(f"worker: the executor's models are at {self.executor_host}; "
+                     f"the fence and every other step use {self.host}")
         # There is one worker. Anything in a running state at this moment was
         # left there by the previous one and nobody is attending it, however
         # recent its timestamp: back on the queue now, not in thirty minutes.
@@ -3144,7 +3160,7 @@ class Worker:
             assertions=assertions,
             rules_file=rules_file,
             model=answered,
-            host=self.host,
+            host=self.executor_host,
             out_dir=str(attempt_dir),
             stub=str(attempt_dir / PAID_REPLY),
         )
@@ -3298,7 +3314,7 @@ class Worker:
                 assertions=assertions,
                 rules_file=rules,
                 model=model,
-                host=self.host,
+                host=self.executor_host,
                 out_dir=str(try_dir),
                 stub=str(try_dir / TRY_REPLY),
             )
@@ -3452,7 +3468,7 @@ class Worker:
                     rules_file=rules,
                     out_dir=str(attempt_dir),
                     model=model,
-                    host=self.host,
+                    host=self.executor_host,
                     num_ctx=num_ctx,
                 )
         except StopNow:
