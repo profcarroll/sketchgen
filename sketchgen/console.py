@@ -1538,9 +1538,17 @@ def _gpu_block() -> dict[str, Any]:
 #: no ``load`` file on this kernel (ollamadreno Handoff_20261001: "no GPU busy
 #: figure"), so busy is computed from the clients instead.
 ADRENO_DEVFREQ_GLOB = "/sys/class/devfreq/*.gpu"
-#: debugfs, readable as root (which ROCKNIX runs everything as): the line
-#: ``revision: 650 (06050002)`` is the only place the kernel names the part.
-ADRENO_DEBUGFS = "/sys/kernel/debug/dri/0/gpu"
+#: Where the part's name comes from: the GPU's device-tree node, reachable
+#: from the devfreq directory, whose ``compatible`` reads
+#: ``qcom,adreno-650.2\0qcom,adreno\0``. NOT ``/sys/kernel/debug/dri/0/gpu``,
+#: which names it too: reading that file while the GPU is busy makes the
+#: a6xx driver touch registers mid-job and the GPU faults, every read, every
+#: time (2026-10-09, twelve reads, twelve ``gpu fault ring 0 … status
+#: 00800005`` lines, Firefox blanking on each). The console polls every two
+#: seconds, so the first version of this card blanked the Flip's screen
+#: whenever anything was drawing, and two reboots did not help because the
+#: cause was the card itself.
+ADRENO_OF_COMPATIBLE = "device/of_node/compatible"
 #: What a DRM client's fdinfo carries on msm (read 2026-10-09 on the Flip):
 #: ``drm-engine-gpu`` in ns, which is the GPU time this client has been
 #: charged, and ``drm-resident-memory`` in KiB. Busy per process is the
@@ -1556,14 +1564,19 @@ def _adreno_present() -> str | None:
     return found[0] if found else None
 
 
-def _adreno_name() -> str:
+def _adreno_name(devfreq: str) -> str:
+    """``Adreno 650`` from the device tree; ``Adreno (msm)`` when it is terse."""
     try:
-        with open(ADRENO_DEBUGFS, encoding="utf-8") as handle:
-            for line in handle:
-                if line.startswith("revision:"):
-                    return "Adreno " + line.split(":", 1)[1].split("(")[0].strip()
+        with open(f"{devfreq}/{ADRENO_OF_COMPATIBLE}", "rb") as handle:
+            words = handle.read().split(b"\0")
     except OSError:
-        pass
+        return "Adreno (msm)"
+    for word in words:
+        text = word.decode("ascii", "replace").strip()
+        if text.startswith("qcom,adreno-"):
+            number = text[len("qcom,adreno-"):].split(".")[0]
+            if number.isdigit():
+                return f"Adreno {number}"
     return "Adreno (msm)"
 
 
@@ -1576,8 +1589,11 @@ def _read_int(path: str) -> int | None:
 
 
 def _adreno_clients(proc: str = "/proc") -> dict[int, dict[str, Any]]:
-    """Every process holding the msm render node, with its engine time (ns) and
-    resident memory (KiB): one fdinfo per process, the first that says msm."""
+    """Every process holding an msm DRM fd, with its engine time (ns) and
+    resident memory (KiB) summed over all of them. Summed, not the first: a
+    Wayland app holds the display node (card0, engine time always 0) *and* the
+    render node, and Firefox's drawing is all on the second (2026-10-09, the
+    first version read one fd per process and showed Firefox at 0 %)."""
     clients: dict[int, dict[str, Any]] = {}
     try:
         pids = [name for name in os.listdir(proc) if name.isdigit()]
@@ -1611,8 +1627,9 @@ def _adreno_clients(proc: str = "/proc") -> dict[int, dict[str, Any]]:
                 resident = int(fields.get("drm-resident-memory", "0").split()[0])
             except (ValueError, IndexError):
                 resident = 0
-            clients[pid] = {"engine_ns": engine, "resident_kib": resident}
-            break
+            seen = clients.setdefault(pid, {"engine_ns": 0, "resident_kib": 0})
+            seen["engine_ns"] += engine
+            seen["resident_kib"] += resident
     return clients
 
 
@@ -1662,7 +1679,7 @@ def _adreno_block(proc: str = "/proc") -> dict[str, Any] | None:
         })
     apps.sort(key=lambda app: (-(app["busy_pct"] or 0.0), -(app["used_mb"] or 0.0)))
     return {
-        "name": _adreno_name(),
+        "name": _adreno_name(devfreq),
         "vram_mb": {"total": None,
                     "used": round(sum(a["used_mb"] or 0.0 for a in apps), 1)},
         "util_pct": round(min(100.0, sum(busy.values())), 1) if busy else None,

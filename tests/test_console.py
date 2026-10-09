@@ -551,11 +551,19 @@ class AdrenoBlockTests(unittest.TestCase):
         self.devfreq.mkdir(parents=True)
         (self.devfreq / "cur_freq").write_text("305000000\n")
         (self.devfreq / "max_freq").write_text("925000000\n")
-        self.debugfs = root / "gpu"
-        self.debugfs.write_text("06050002 Status:\ngpu-initialized: 1\nrevision: 650 (06050002)\n")
+        # The device-tree node, as the Flip's kernel exposes it. Never debugfs:
+        # see console.ADRENO_OF_COMPATIBLE.
+        (self.devfreq / "device" / "of_node").mkdir(parents=True)
+        (self.devfreq / "device" / "of_node" / "compatible").write_bytes(
+            b"qcom,adreno-650.2\0qcom,adreno\0")
         self.proc = root / "proc"
         self._client(4242, "llama-server", engine_ns=1_000_000_000, resident_kib=1_430_940)
         self._client(77, "chrome", engine_ns=50_000_000, resident_kib=20_480)
+        # A Wayland app's display fd: msm too, engine time 0. The render fd
+        # above (fd 9) carries the drawing; the two are summed per process.
+        (self.proc / "77" / "fdinfo" / "4").write_text(
+            "pos:\t0\ndrm-driver:\tmsm\ndrm-client-id:\t12\n"
+            "drm-engine-gpu:\t0 ns\ndrm-resident-memory:\t0 KiB\n")
         (self.proc / "1").mkdir(parents=True)  # a process with no fds at all
         console._ADRENO_LAST = None
         self.addCleanup(setattr, console, "_ADRENO_LAST", None)
@@ -571,8 +579,7 @@ class AdrenoBlockTests(unittest.TestCase):
             f"drm-total-memory:\t2063560 KiB\ndrm-resident-memory:\t{resident_kib} KiB\n")
 
     def _block(self):
-        with mock.patch.object(console, "ADRENO_DEVFREQ_GLOB", str(self.devfreq)), \
-                mock.patch.object(console, "ADRENO_DEBUGFS", str(self.debugfs)):
+        with mock.patch.object(console, "ADRENO_DEVFREQ_GLOB", str(self.devfreq)):
             return console._adreno_block(proc=str(self.proc))
 
     def test_the_first_sample_has_the_clock_and_the_clients_but_no_busy(self):
@@ -598,6 +605,13 @@ class AdrenoBlockTests(unittest.TestCase):
         self.assertAlmostEqual(block["apps"][0]["busy_pct"], 40.0, delta=1.0)
         self.assertAlmostEqual(block["apps"][1]["busy_pct"], 1.0, delta=0.5)
         self.assertAlmostEqual(block["util_pct"], 41.0, delta=1.5)
+
+    def test_the_name_never_comes_from_debugfs(self):
+        """Reading /sys/kernel/debug/dri/0/gpu faults a busy Adreno (2026-10-09)."""
+        source = Path(console.__file__).read_text(encoding="utf-8")
+        body = source[source.index("def _adreno_name"):source.index("def _read_int")]
+        self.assertNotIn("debug", body)
+        self.assertFalse(hasattr(console, "ADRENO_DEBUGFS"))
 
     def test_a_box_without_an_adreno_answers_none(self):
         with mock.patch.object(console, "ADRENO_DEVFREQ_GLOB", str(self.tmp.name) + "/none/*.gpu"):
