@@ -53,6 +53,7 @@ Python 3.12, stdlib only. Timestamps are UTC, ISO 8601 with a trailing Z.
 
 from __future__ import annotations
 
+import glob
 import json
 import os
 import shutil
@@ -1489,9 +1490,15 @@ def _gpu_block() -> dict[str, Any]:
         "vram_mb": {"total": None, "used": None},
         "util_pct": None,
         "apps": [],
+        # The Adreno's clock (``_adreno_block``); a card with VRAM reports
+        # none, and the key is there so the two blocks keep one shape.
+        "clock_mhz": {"cur": None, "max": None},
     }
     binary = _nvidia_smi()
     if binary is None:
+        adreno = _adreno_block()
+        if adreno is not None:
+            block = adreno
         _GPU_CACHE = (now, block)
         return block
     try:
@@ -1514,11 +1521,155 @@ def _gpu_block() -> dict[str, Any]:
                 "vram_mb": {"total": float(total), "used": float(used)},
                 "util_pct": float(util),
                 "apps": _gpu_apps(binary),
+                "clock_mhz": {"cur": None, "max": None},
             }
     except (OSError, ValueError, subprocess.SubprocessError):
         pass
     _GPU_CACHE = (now, block)
     return block
+
+
+# ---------------------------------------------------------------------------
+# An Adreno (the Retroid Flip 2): no nvidia-smi, no busy file, but the kernel
+# says what it knows
+# ---------------------------------------------------------------------------
+
+#: The msm GPU's devfreq node: ``cur_freq`` and ``max_freq`` in Hz. There is
+#: no ``load`` file on this kernel (ollamadreno Handoff_20261001: "no GPU busy
+#: figure"), so busy is computed from the clients instead.
+ADRENO_DEVFREQ_GLOB = "/sys/class/devfreq/*.gpu"
+#: debugfs, readable as root (which ROCKNIX runs everything as): the line
+#: ``revision: 650 (06050002)`` is the only place the kernel names the part.
+ADRENO_DEBUGFS = "/sys/kernel/debug/dri/0/gpu"
+#: What a DRM client's fdinfo carries on msm (read 2026-10-09 on the Flip):
+#: ``drm-engine-gpu`` in ns, which is the GPU time this client has been
+#: charged, and ``drm-resident-memory`` in KiB. Busy per process is the
+#: engine's growth between two console samples over the wall time between
+#: them, the same arithmetic ``top`` does with CPU ticks. A second GPU in the
+#: same process is not a case here.
+_ADRENO_LAST: tuple[float, dict[int, int]] | None = None
+
+
+def _adreno_present() -> str | None:
+    """The devfreq directory of the msm GPU, or None on a box without one."""
+    found = sorted(glob.glob(ADRENO_DEVFREQ_GLOB))
+    return found[0] if found else None
+
+
+def _adreno_name() -> str:
+    try:
+        with open(ADRENO_DEBUGFS, encoding="utf-8") as handle:
+            for line in handle:
+                if line.startswith("revision:"):
+                    return "Adreno " + line.split(":", 1)[1].split("(")[0].strip()
+    except OSError:
+        pass
+    return "Adreno (msm)"
+
+
+def _read_int(path: str) -> int | None:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _adreno_clients(proc: str = "/proc") -> dict[int, dict[str, Any]]:
+    """Every process holding the msm render node, with its engine time (ns) and
+    resident memory (KiB): one fdinfo per process, the first that says msm."""
+    clients: dict[int, dict[str, Any]] = {}
+    try:
+        pids = [name for name in os.listdir(proc) if name.isdigit()]
+    except OSError:
+        return clients
+    for name in pids:
+        pid = int(name)
+        base = f"{proc}/{name}/fdinfo"
+        try:
+            fds = os.listdir(base)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                with open(f"{base}/{fd}", encoding="utf-8") as handle:
+                    text = handle.read()
+            except OSError:
+                continue
+            if "drm-driver:\tmsm" not in text and "drm-driver: msm" not in text:
+                continue
+            fields: dict[str, str] = {}
+            for line in text.splitlines():
+                key, sep, value = line.partition(":")
+                if sep:
+                    fields[key.strip()] = value.strip()
+            try:
+                engine = int(fields.get("drm-engine-gpu", "0").split()[0])
+            except (ValueError, IndexError):
+                engine = 0
+            try:
+                resident = int(fields.get("drm-resident-memory", "0").split()[0])
+            except (ValueError, IndexError):
+                resident = 0
+            clients[pid] = {"engine_ns": engine, "resident_kib": resident}
+            break
+    return clients
+
+
+def _adreno_block(proc: str = "/proc") -> dict[str, Any] | None:
+    """The GPU block for an Adreno, in the nvidia block's shape plus
+    ``clock_mhz``; None on a box that has no msm GPU.
+
+    ``vram_mb.total`` stays None: the Adreno has no memory of its own, and the
+    card's "how full is it" question has no answer here. ``vram_mb.used`` is
+    what the clients hold resident, which is what the OpenCL build keeps the
+    vision projector in. ``util_pct`` is the clients' engine time summed over
+    the interval since the previous sample, None on the first call.
+    """
+    global _ADRENO_LAST
+    devfreq = _adreno_present()
+    if devfreq is None:
+        return None
+    now = time.monotonic()
+    clients = _adreno_clients(proc)
+    cur = _read_int(f"{devfreq}/cur_freq")
+    top = _read_int(f"{devfreq}/max_freq")
+    busy: dict[int, float] = {}
+    if _ADRENO_LAST is not None and now - _ADRENO_LAST[0] > 0:
+        span = now - _ADRENO_LAST[0]
+        for pid, client in clients.items():
+            then = _ADRENO_LAST[1].get(pid)
+            if then is not None:
+                busy[pid] = max(0.0, 100.0 * (client["engine_ns"] - then) / 1e9 / span)
+    _ADRENO_LAST = (now, {pid: c["engine_ns"] for pid, c in clients.items()})
+    apps: list[dict[str, Any]] = []
+    for pid, client in clients.items():
+        try:
+            with open(f"{proc}/{pid}/comm", encoding="utf-8") as handle:
+                comm = handle.read().strip()
+        except OSError:
+            comm = "?"
+        try:
+            exe = os.readlink(f"{proc}/{pid}/exe")
+        except OSError:
+            exe = comm
+        apps.append({
+            "pid": pid,
+            "name": comm,
+            "role": pair.classify(exe),
+            "used_mb": round(client["resident_kib"] / 1024.0, 1),
+            "busy_pct": round(busy[pid], 1) if pid in busy else None,
+        })
+    apps.sort(key=lambda app: (-(app["busy_pct"] or 0.0), -(app["used_mb"] or 0.0)))
+    return {
+        "name": _adreno_name(),
+        "vram_mb": {"total": None,
+                    "used": round(sum(a["used_mb"] or 0.0 for a in apps), 1)},
+        "util_pct": round(min(100.0, sum(busy.values())), 1) if busy else None,
+        "apps": apps,
+        "clock_mhz": {"cur": cur // 1_000_000 if cur else None,
+                      "max": top // 1_000_000 if top else None},
+    }
 
 
 def _gpu_apps(binary: str) -> list[dict[str, Any]]:
@@ -1557,6 +1708,9 @@ def _gpu_apps(binary: str) -> list[dict[str, Any]]:
             "name": os.path.basename(path) or path,
             "role": pair.classify(path),
             "used_mb": used,
+            # Per-process busy is an Adreno figure (fdinfo engine time);
+            # nvidia-smi gives memory per process and busy for the card only.
+            "busy_pct": None,
         })
     apps.sort(key=lambda app: -(app["used_mb"] or 0.0))
     return apps

@@ -2158,6 +2158,33 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
                 ratio_bar(doc, "node.gpu.vram_mb.used", "node.gpu.vram_mb.total"),
             )
         )
+    elif _dig(doc, "node.gpu.name") is not None:
+        # An Adreno (the Flip 2, 2026-10-09): no VRAM of its own, so the bar is
+        # the clock against its ceiling, and the text says who is on it and how
+        # busy each one keeps it — the question there is whether the vision
+        # encoder and Chromium are using the GPU at all, not how full it is.
+        holders = []
+        for index, app in enumerate(_dig(doc, "node.gpu.apps", []) or []):
+            if index >= 3:
+                break
+            base = f"node.gpu.apps.{index}"
+            busy = field(doc, base + ".busy_pct", "pct")
+            holders.append(
+                f"{esc(app.get('name') or '?')} "
+                f"{field(doc, base + '.used_mb', 'gb')} GB"
+                + (f", {busy} busy" if app.get("busy_pct") is not None else "")
+            )
+        meter_list.append(
+            _meter(
+                "gpu",
+                f"{field(doc, 'node.gpu.clock_mhz.cur', 'int')} of "
+                f"{field(doc, 'node.gpu.clock_mhz.max', 'int')} MHz, "
+                f"{field(doc, 'node.gpu.util_pct', 'pct')} busy — "
+                f"{field(doc, 'node.gpu.name')}"
+                + (": " + "; ".join(holders) if holders else ": nobody on it"),
+                ratio_bar(doc, "node.gpu.clock_mhz.cur", "node.gpu.clock_mhz.max"),
+            )
+        )
 
     meter_list.append(
         _meter(

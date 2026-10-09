@@ -23,7 +23,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from unittest import mock  # noqa: E402
+
 from sketchgen import console  # noqa: E402
+from sketchgen import web  # noqa: E402
 from sketchgen import db  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "console" / "sample.json"
@@ -533,3 +536,85 @@ class TestStorage(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class AdrenoBlockTests(unittest.TestCase):
+    """The GPU block on a box with an Adreno and no nvidia-smi (the Flip 2,
+    2026-10-09): the clock from devfreq, the clients from fdinfo, busy from
+    the growth of their engine time between two samples."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.devfreq = root / "devfreq" / "3d00000.gpu"
+        self.devfreq.mkdir(parents=True)
+        (self.devfreq / "cur_freq").write_text("305000000\n")
+        (self.devfreq / "max_freq").write_text("925000000\n")
+        self.debugfs = root / "gpu"
+        self.debugfs.write_text("06050002 Status:\ngpu-initialized: 1\nrevision: 650 (06050002)\n")
+        self.proc = root / "proc"
+        self._client(4242, "llama-server", engine_ns=1_000_000_000, resident_kib=1_430_940)
+        self._client(77, "chrome", engine_ns=50_000_000, resident_kib=20_480)
+        (self.proc / "1").mkdir(parents=True)  # a process with no fds at all
+        console._ADRENO_LAST = None
+        self.addCleanup(setattr, console, "_ADRENO_LAST", None)
+
+    def _client(self, pid, comm, *, engine_ns, resident_kib):
+        d = self.proc / str(pid)
+        (d / "fdinfo").mkdir(parents=True, exist_ok=True)
+        (d / "comm").write_text(comm + "\n")
+        (d / "fdinfo" / "3").write_text("pos:\t0\nflags:\t02\n")
+        (d / "fdinfo" / "9").write_text(
+            "pos:\t0\ndrm-driver:\tmsm\ndrm-client-id:\t77\n"
+            f"drm-engine-gpu:\t{engine_ns} ns\ndrm-maxfreq-gpu:\t925000000 Hz\n"
+            f"drm-total-memory:\t2063560 KiB\ndrm-resident-memory:\t{resident_kib} KiB\n")
+
+    def _block(self):
+        with mock.patch.object(console, "ADRENO_DEVFREQ_GLOB", str(self.devfreq)), \
+                mock.patch.object(console, "ADRENO_DEBUGFS", str(self.debugfs)):
+            return console._adreno_block(proc=str(self.proc))
+
+    def test_the_first_sample_has_the_clock_and_the_clients_but_no_busy(self):
+        block = self._block()
+        self.assertEqual(block["name"], "Adreno 650")
+        self.assertEqual(block["clock_mhz"], {"cur": 305, "max": 925})
+        self.assertIsNone(block["vram_mb"]["total"])
+        self.assertEqual(block["vram_mb"]["used"], round(1_430_940 / 1024 + 20_480 / 1024, 1))
+        self.assertIsNone(block["util_pct"])
+        self.assertEqual([a["name"] for a in block["apps"]], ["llama-server", "chrome"])
+        self.assertIsNone(block["apps"][0]["busy_pct"])
+        # One shape with the nvidia block, which the fixture test holds the
+        # document to.
+        self.assertEqual(set(block), {"name", "vram_mb", "util_pct", "apps", "clock_mhz"})
+
+    def test_the_second_sample_charges_engine_growth_to_each_client(self):
+        self._block()
+        # One second later the model has used 400 ms of GPU, Chrome 10 ms.
+        console._ADRENO_LAST = (console._ADRENO_LAST[0] - 1.0, console._ADRENO_LAST[1])
+        self._client(4242, "llama-server", engine_ns=1_400_000_000, resident_kib=1_430_940)
+        self._client(77, "chrome", engine_ns=60_000_000, resident_kib=20_480)
+        block = self._block()
+        self.assertAlmostEqual(block["apps"][0]["busy_pct"], 40.0, delta=1.0)
+        self.assertAlmostEqual(block["apps"][1]["busy_pct"], 1.0, delta=0.5)
+        self.assertAlmostEqual(block["util_pct"], 41.0, delta=1.5)
+
+    def test_a_box_without_an_adreno_answers_none(self):
+        with mock.patch.object(console, "ADRENO_DEVFREQ_GLOB", str(self.tmp.name) + "/none/*.gpu"):
+            self.assertIsNone(console._adreno_block(proc=str(self.proc)))
+
+    def test_the_node_card_draws_the_clock_when_there_is_no_vram(self):
+        doc = json.loads(FIXTURE.read_text())
+        doc["node"]["gpu"] = {
+            "name": "Adreno 650", "vram_mb": {"total": None, "used": 1.4},
+            "util_pct": 41.0, "clock_mhz": {"cur": 305, "max": 925},
+            "apps": [{"pid": 4242, "name": "llama-server", "role": None,
+                      "used_mb": 1397.4, "busy_pct": 40.0}],
+        }
+        html = web.console_page(doc)
+        # The page wraps every number in a data-k span, so look for the keys.
+        self.assertIn('data-k="node.gpu.clock_mhz.cur"', html)
+        self.assertIn("MHz", html)
+        self.assertIn("Adreno 650", html)
+        self.assertIn("llama-server", html)
+        self.assertIn('data-k="node.gpu.apps.0.busy_pct"', html)
