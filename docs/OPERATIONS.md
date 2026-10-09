@@ -1794,6 +1794,20 @@ ssh d12-node-flux 'systemctl --user enable --now sketchgen-worker.service sketch
 - **Not Ollama or the driver.** Both are pinned to the other nodes' versions,
   as in *A rented GPU node*, steps 2 and 5.
 
+## A handheld node: rocknix/install.sh
+
+The Retroid Pocket Flip 2 (12 GB, ROCKNIX) runs the generator with three substitutions,
+all in `rocknix/README.md`: the model is Gemma under llama.cpp's `llama-server` behind
+`sketchgen llama-shim`, which serves the five Ollama endpoints the pipeline uses on
+127.0.0.1:11434 over one llama-server (`/api/generate`, `/api/chat` with images, `/api/ps`,
+`/api/tags`, `/api/show`; any other model name is Ollama's own 404); the executor's model
+is on another node, named by `SKETCHGEN_EXECUTOR_HOST` (the worker's `--executor-host`,
+install.sh's `--executor-url`), which only the executor, its warm-up load and the New job
+page's executor menu read — the fence and every other step keep `OLLAMA_HOST_URL`; and the
+app is a tarball with an `app/BUILD` stamp, since ROCKNIX has no git. The kit's units are
+system units under `/storage/.config/system.d`, with one `node.env` for the device's
+settings, and `rocknix/publish-local.sh` renders the gallery the device's own Firefox shows.
+
 ## The D12 kiosk Mac
 
 The gallery wall in the D12 lab, set up 2026-09-24 with `kiosk-mac/` (its README

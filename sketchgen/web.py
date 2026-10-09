@@ -2158,6 +2158,33 @@ def console_page(doc: dict[str, Any], tokens: dict[str, Any] | None = None,
                 ratio_bar(doc, "node.gpu.vram_mb.used", "node.gpu.vram_mb.total"),
             )
         )
+    elif _dig(doc, "node.gpu.name") is not None:
+        # An Adreno (the Flip 2, 2026-10-09): no VRAM of its own, so the bar is
+        # the clock against its ceiling, and the text says who is on it and how
+        # busy each one keeps it — the question there is whether the vision
+        # encoder and Chromium are using the GPU at all, not how full it is.
+        holders = []
+        for index, app in enumerate(_dig(doc, "node.gpu.apps", []) or []):
+            if index >= 3:
+                break
+            base = f"node.gpu.apps.{index}"
+            busy = field(doc, base + ".busy_pct", "pct")
+            holders.append(
+                f"{esc(app.get('name') or '?')} "
+                f"{field(doc, base + '.used_mb', 'gb')} GB"
+                + (f", {busy} busy" if app.get("busy_pct") is not None else "")
+            )
+        meter_list.append(
+            _meter(
+                "gpu",
+                f"{field(doc, 'node.gpu.clock_mhz.cur', 'int')} of "
+                f"{field(doc, 'node.gpu.clock_mhz.max', 'int')} MHz, "
+                f"{field(doc, 'node.gpu.util_pct', 'pct')} busy — "
+                f"{field(doc, 'node.gpu.name')}"
+                + (": " + "; ".join(holders) if holders else ": nobody on it"),
+                ratio_bar(doc, "node.gpu.clock_mhz.cur", "node.gpu.clock_mhz.max"),
+            )
+        )
 
     meter_list.append(
         _meter(
@@ -2601,6 +2628,12 @@ def queue_page(conn: sqlite3.Connection, doc: dict[str, Any], control) -> str:
 #: environment variable as the worker's, because it is the same Ollama: a UI
 #: offering a model the worker cannot reach would be a menu of lies.
 OLLAMA_HOST = models.DEFAULT_HOST
+#: Where the executor menu looks instead, when the coder is on another box
+#: (``SKETCHGEN_EXECUTOR_HOST``, the Flip 2's case; see
+#: :data:`sketchgen.worker.DEFAULT_EXECUTOR_HOST`). The same variable the
+#: worker reads, for the same reason as :data:`OLLAMA_HOST`: the menu must
+#: offer what the step will actually reach.
+EXECUTOR_HOST = worker.DEFAULT_EXECUTOR_HOST
 
 #: The planner choice that means "whatever the worker is configured with". It
 #: was the only local choice until 2026-09-19 and is still what a saved default,
@@ -2831,19 +2864,19 @@ def planner_column(value: str) -> str:
 
 
 def executor_groups(host: str | None = None) -> list[tuple[str, list[tuple[str, str]]]]:
-    return menu_groups(EXECUTOR_MENU, host)
+    return menu_groups(EXECUTOR_MENU, host or EXECUTOR_HOST)
 
 
 def executor_values(host: str | None = None) -> set[str]:
-    return menu_values(EXECUTOR_MENU, host)
+    return menu_values(EXECUTOR_MENU, host or EXECUTOR_HOST)
 
 
 def executor_selected(value: str, host: str | None = None) -> str:
-    return menu_selected(EXECUTOR_MENU, value, host)
+    return menu_selected(EXECUTOR_MENU, value, host or EXECUTOR_HOST)
 
 
 def check_executor(value: str, host: str | None = None) -> str:
-    return check_menu(EXECUTOR_MENU, value, host)
+    return check_menu(EXECUTOR_MENU, value, host or EXECUTOR_HOST)
 
 
 def executor_column(value: str) -> str:

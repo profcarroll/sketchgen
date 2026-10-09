@@ -113,6 +113,10 @@ def checkout(root: str | os.PathLike[str]) -> dict[str, Any]:
     do not stop a fast-forward, so they are not what the word means here.
     """
     sha = git(root, "rev-parse", "HEAD")
+    if sha is None:
+        stamped = archive_build(root)
+        if stamped is not None:
+            return stamped
     branch = git(root, "symbolic-ref", "--quiet", "--short", "HEAD")
     porcelain = git(root, "status", "--porcelain", "--untracked-files=no")
     return {
@@ -122,6 +126,31 @@ def checkout(root: str | os.PathLike[str]) -> dict[str, Any]:
         "detached": sha is not None and not branch,
         "dirty": bool(porcelain) if porcelain is not None else None,
         "build": describe(sha, bool(porcelain)),
+    }
+
+
+#: A tree that is not a checkout: rocknix/install.sh unpacks a tarball (ROCKNIX
+#: has no git) and writes this file beside bin/, first line "github OWNER/REPO REF"
+#: or "archive NAME". It is what the attempts' build column and the Console get
+#: there, instead of nothing.
+BUILD_FILE = "BUILD"
+
+
+def archive_build(root: str | os.PathLike[str]) -> dict[str, Any] | None:
+    """The checkout facts for a tree stamped by :data:`BUILD_FILE`, or None."""
+    try:
+        first = Path(root, BUILD_FILE).read_text(encoding="utf-8").splitlines()[0].strip()
+    except (OSError, IndexError, UnicodeDecodeError):
+        return None
+    if not first:
+        return None
+    return {
+        "sha": None,
+        "subject": first,
+        "branch": None,
+        "detached": False,
+        "dirty": None,
+        "build": first,
     }
 
 
