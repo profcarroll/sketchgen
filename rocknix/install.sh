@@ -135,7 +135,11 @@ green "✓ $APP: $(head -1 "$APP/BUILD")"
 
 # --- 3. The venv and Chromium -------------------------------------------------
 step "3. The venv, the pinned packages, Chromium"
-[[ -x "$PY" ]] || python3 -m venv "$VENV_DIR"
+# ROCKNIX's venv exits 1 from its `ensurepip --upgrade` step and leaves pip installed
+# anyway (2026-10-09, Python 3.14.7): the exit status is ignored and pip is asked instead.
+[[ -x "$PY" ]] || python3 -m venv "$VENV_DIR" 2>/dev/null || true
+[[ -x "$PY" ]] || die "python3 -m venv left no interpreter at $PY"
+"$PY" -m pip --version >/dev/null 2>&1 || die "the venv at $VENV_DIR has no pip (python3 -m ensurepip?)"
 "$PY" -m pip install -q --disable-pip-version-check --no-compile -r "$APP/requirements.txt"
 "$PY" -m playwright install chromium
 want=$(sed -n 's/^playwright==//p' "$APP/requirements.txt")
