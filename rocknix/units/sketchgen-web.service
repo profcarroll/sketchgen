@@ -1,6 +1,8 @@
 [Unit]
 Description=sketchgen operator UI on 127.0.0.1:8081 (console, queue, jobs, held)
 Documentation=file:/storage/sketchgen/app/rocknix/README.md
+# Started by sketchgen.target and its power keeper, never at boot: no [Install].
+PartOf=sketchgen.target
 After=network-online.target
 
 [Service]
@@ -14,6 +16,3 @@ Environment=OLLAMA_HOST_URL=http://127.0.0.1:11434
 ExecStart=/storage/sketchgen/.venv/bin/python3 /storage/sketchgen/app/bin/sketchgen web --bind 127.0.0.1 --port 8081
 Restart=on-failure
 RestartSec=10
-
-[Install]
-WantedBy=multi-user.target

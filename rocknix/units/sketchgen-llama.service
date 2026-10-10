@@ -1,6 +1,8 @@
 [Unit]
 Description=sketchgen's model on this handheld: llama-server with Gemma and its vision projector
 Documentation=file:/storage/sketchgen/app/rocknix/README.md
+# Started by sketchgen.target and its power keeper, never at boot: no [Install].
+PartOf=sketchgen.target
 After=network.target
 
 [Service]
@@ -16,7 +18,8 @@ ExecStart=/bin/sh -c '. ${LLAMA_ENV}; exec taskset -c ${LLAMA_CPUS} ${LLAMA_SERV
 Restart=on-failure
 RestartSec=15
 # A 5 GB gguf takes about a minute to come up on the SD card (66 s measured 2026-10-09).
+# Started means answering: the shim and the worker are ordered after this unit, and
+# without the wait a worker turned on from the console would plan against a model still
+# loading.
+ExecStartPost=/bin/sh -c 'until curl -fs -o /dev/null http://127.0.0.1:${LLAMA_PORT}/health; do sleep 2; done'
 TimeoutStartSec=300
-
-[Install]
-WantedBy=multi-user.target

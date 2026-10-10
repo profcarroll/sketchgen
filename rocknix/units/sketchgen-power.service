@@ -1,0 +1,12 @@
+[Unit]
+Description=sketchgen power keeper: the model and the worker only while the console's switch is on
+Documentation=file:/storage/sketchgen/app/rocknix/README.md
+PartOf=sketchgen.target
+After=sketchgen-web.service
+
+[Service]
+Type=simple
+WorkingDirectory=/storage/sketchgen/app
+ExecStart=/storage/sketchgen/.venv/bin/python3 /storage/sketchgen/app/rocknix/power.py --db /storage/sketchgen/sketchgen.db
+Restart=on-failure
+RestartSec=10

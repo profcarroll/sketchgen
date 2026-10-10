@@ -8,7 +8,8 @@
 # ~/sketchgen is /storage/sketchgen and the layout matches every other node's
 # (AGENTS.md → Where things run). Python is the system 3.14; pip must not byte-compile
 # (--no-compile: a wheel install asserts on a missing .pyc otherwise, 2026-10-09); units go
-# in /storage/.config/system.d as system units, enabled with plain systemctl.
+# in /storage/.config/system.d as system units, and none of them is enabled: the handheld's
+# sketchgen runs only while its operator has it on, from the Ports entry (README.md).
 #
 # Flags:
 #   --ref REF            branch, tag or commit of profcarroll/sketchgen to fetch as a tarball
@@ -33,9 +34,11 @@
 #   3. The venv: pip --no-compile of requirements.txt, playwright's Chromium (the node's
 #      build; every library it links is already in ROCKNIX), one launch.
 #   4. db init (paused on a fresh database: bench first).
-#   5. node.env from the flags, never overwritten; the units into /storage/.config/system.d.
-#   6. Prints the enable lines and how to open the console and the gallery in Firefox.
-# It enables nothing and starts nothing: that is a decision about what this device does.
+#   5. node.env from the flags, never overwritten; the units into /storage/.config/system.d,
+#      the Sketchgen Console entry into /storage/roms/ports. A unit an earlier kit left
+#      enabled at boot is disabled and stopped.
+#   6. Prints how the operator turns it on: Ports → Sketchgen Console, Resume.
+# It enables nothing and starts nothing: the operator does, from the console.
 
 set -euo pipefail
 
@@ -46,6 +49,7 @@ PY="$VENV_DIR/bin/python3"
 DB="$NODE_HOME/sketchgen.db"
 ENV_FILE="$NODE_HOME/node.env"
 UNIT_DIR="/storage/.config/system.d"
+PORTS_DIR="/storage/roms/ports"
 REPO="profcarroll/sketchgen"
 MODELS="/storage/games-external/models"
 MMPROJ_URL="https://huggingface.co/google/gemma-4-E4B-it-qat-q4_0-gguf/resolve/main/gemma-4-E4B-it-mmproj.gguf"
@@ -182,22 +186,34 @@ elif ! diff -q <(printf '%s\n' "$conf" | grep -v '^#') <(grep -v '^#' "$ENV_FILE
     red "kept the existing $ENV_FILE; these flags would have written it differently:"
     diff <(grep -v '^#' "$ENV_FILE") <(printf '%s\n' "$conf" | grep -v '^#') | sed 's/^/    /' || true
 fi
+# The kit before 2026-10-09 told the operator to `enable --now` these, which kept the model
+# resident through every boot and the device from sleeping. Nothing here runs at boot now.
+for unit in sketchgen-llama sketchgen-shim sketchgen-web sketchgen-worker; do
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+        systemctl disable --now "$unit" >/dev/null 2>&1 || true
+        dim "disabled and stopped $unit: it starts from the console now"
+    fi
+done
 mkdir -p "$UNIT_DIR"
-for unit in "$APP"/rocknix/units/*.service; do
+for unit in "$APP"/rocknix/units/*.service "$APP"/rocknix/units/*.target; do
     cp "$unit" "$UNIT_DIR/$(basename "$unit")"
 done
 systemctl daemon-reload
-green "✓ $(ls "$APP"/rocknix/units/*.service | xargs -n1 basename | tr '\n' ' ')in $UNIT_DIR"
+green "✓ $(ls "$APP"/rocknix/units/ | tr '\n' ' ')in $UNIT_DIR"
+mkdir -p "$PORTS_DIR"
+install -m 755 "$APP/rocknix/ports/Sketchgen Console.sh" "$PORTS_DIR/Sketchgen Console.sh"
+green "✓ Sketchgen Console in $PORTS_DIR"
 
 # --- 6. What is left to a person -----------------------------------------------
-step "6. Done. Nothing is enabled."
+step "6. Done. Nothing is enabled; nothing starts at boot."
 cat <<EOF
-  systemctl enable --now sketchgen-llama sketchgen-shim sketchgen-web     # the model, its Ollama face, the console
-  systemctl enable --now sketchgen-worker                                 # then the generator (resume it: sketchgen control resume)
-  systemctl enable --now sketchgen-gallery                                # after the first rocknix/publish-local.sh
+  On the device, from the gamepad:
+    Ports → Sketchgen Console          the console in Firefox; no model is loaded yet
+    Resume                             the generator on: the model loads (about a minute), jobs run
+    Pause                              the generator off: the model and the worker stop
+    Guide                              close Firefox; with the generator off, everything stops
 
-  /storage/apps/firefox-rocknix/launch.sh http://127.0.0.1:8081/          # the console, on the device
-  SKETCHGEN_URL=http://127.0.0.1:8090 /storage/apps/firefox-rocknix/launch.sh --sketchgen kiosk
-
-  SG="$PY $APP/bin/sketchgen"; \$SG control resume --db $DB
+  A fresh database starts paused ("bench first"). After the first rocknix/publish-local.sh:
+    systemctl enable --now sketchgen-gallery                                # the local gallery
+    SKETCHGEN_URL=http://127.0.0.1:8090 /storage/apps/firefox-rocknix/launch.sh --sketchgen kiosk
 EOF
