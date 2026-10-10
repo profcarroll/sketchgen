@@ -424,3 +424,43 @@ rules-file A/B reads `WHERE origin_node IS NULL`. Traps:
   a stranger holding the slot. `sketchgen.pair.classify` is the one test.
 - Match the house style: comments say *why*, with the incident or date that
   made it necessary; commit messages are prose, not bullet lists.
+
+## Git identity firewall
+
+The maintainer has two GitHub identities that must never cross. Each repo belongs to exactly
+one of them, and the owner of its `origin` remote decides which. Every commit, push, issue,
+PR and doc in this repo uses this repo's identity only.
+
+**Lane: `profcarroll` (public, under the maintainer's own name; teaching and research).**
+This repo is `profcarroll/sketchgen` (public).
+
+- Commit as `profcarroll`, using the institutional address that is already this repo's
+  `user.email`. Don't copy that address into files.
+- Never commit, push, or open issues or PRs here as any other identity, and never name
+  the maintainer's other GitHub account or its email anywhere in this repo: not in docs,
+  comments, commit messages, issues or PRs. A public mention links the two identities
+  for good. Say "the other account" if you need to refer to it.
+- `profcarroll` is normally the active `gh` account. Run `gh auth status` before pushing.
+
+On the maintainer's machines, a Claude Code `PreToolUse` hook enforces this:
+`~/.claude/hooks/git-identity-firewall.py`, registered on `Bash` in `~/.claude/settings.json`
+(self-tests: `python3 ~/.claude/hooks/test_git_identity_firewall.py`). It runs before
+`git commit|merge|rebase|cherry-pick|am|revert|push`, including inside `ssh HOST '...'`, and
+before `gh repo create --push` and `gh pr create`. It reads the origin owner, the configured
+`user.email`, and any `-c user.*`, `--author` or `GIT_*_EMAIL` override. It denies the command
+when that identity doesn't belong to the owner's lane. The owner-to-email map is `RULES` in the
+script. A repo with no remote is allowed.
+
+If the hook denies a command, the identity is wrong. Fix `user.email`, or ask the maintainer.
+Don't route around the hook: no overrides, no other shells, no rewriting the remote. Agents
+other than Claude Code aren't covered by that hook, but they are covered by the next one.
+
+A second firewall runs inside git itself, so it covers every tool (Claude Code, gemini, copilot,
+a plain shell): the global `core.hooksPath` is `~/.config/git/identity-firewall/hooks`, the
+logic is in `firewall.py`, and the self-tests are in `test_firewall.py`. `pre-commit` and
+`commit-msg` block the other lane's names and email addresses in staged changes, file paths
+and commit messages, and check the commit identity. `pre-push` checks every outgoing commit.
+Git has no global identity (`user.useConfigOnly`), so each repo needs its own `user.name`
+and `user.email` (`git config --local`). The repo's own hooks in `.git/hooks` still run after
+the firewall. Never pass `--no-verify` or change `core.hooksPath`; only the maintainer may
+bypass a block.
