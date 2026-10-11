@@ -830,7 +830,7 @@ class CritiqueTests(PaidTestCase):
                          lineage.critique_prompt(row, row["statement"], row["brief"]))
         self.assertEqual(item["images"], [row["strip_path"]])
         self.assertEqual(item["guard"], paid.sha256_file(row["strip_path"]))
-        self.assertEqual(item["prompt_version"], "critic-v4")
+        self.assertEqual(item["prompt_version"], "critic-v5")
 
     def give_every_entry_a_ghost(self):
         """The gate's second picture in each entry's attempt directory.

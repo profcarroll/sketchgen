@@ -190,7 +190,7 @@ class LineageTestCase(unittest.TestCase):
         ).fetchone()
         return (Path(row["source_dir"]) / ".gate" / "ghost.png").read_bytes()
 
-    def critic_file(self, images="strip ghost", version="critic-v4"):
+    def critic_file(self, images="strip ghost", version="critic-v5"):
         """The real prompt file with a header of this test's choosing.
 
         The body is copied rather than invented so that what these tests switch
@@ -650,8 +650,8 @@ class TestTheLinePage(LineageTestCase):
 
 
 class TestCritique(LineageTestCase):
-    def test_prompts_critic_md_is_v4_and_leaves_no_placeholders(self):
-        self.assertEqual("critic-v4", lineage.prompt_version())
+    def test_prompts_critic_md_is_v5_and_leaves_no_placeholders(self):
+        self.assertEqual("critic-v5", lineage.prompt_version())
         row = self.conn.execute(
             "SELECT * FROM entries WHERE id = ?", (self.root_entry,)
         ).fetchone()
@@ -664,7 +664,7 @@ class TestCritique(LineageTestCase):
         self.assertIn("motion(idle)", rendered)
         # a root has no history, and says so rather than leaving a blank
         self.assertIn("this sketch is where the line starts", rendered)
-        self.assertIn("revised 0 times", rendered)
+        self.assertIn("prompted 0 times", rendered)
 
     def test_the_line_history_is_shown_apart_from_its_root(self):
         """critic-v4: lineage 1405 was asked to "spiral inward from the edges"
@@ -678,12 +678,39 @@ class TestCritique(LineageTestCase):
         row = {"prompt": prompt, "assertions_json": '["motion(idle)"]'}
         rendered = lineage.critique_prompt(row, "rings", "a brief")
         started = rendered.index("WHERE THIS LINE STARTED")
-        history = rendered.index("WHAT THIS LINE HAS ALREADY ASKED FOR")
+        history = rendered.index("WHAT THIS LINE HAS ALREADY TRIED")
         self.assertIn("rings of concentric circles", rendered[started:history])
         self.assertNotIn("Revise:", rendered)
-        self.assertIn("1. the same rings, and this time spiral inward.\n"
-                      "2. the same rings, and this time pulse.", rendered)
-        self.assertIn("revised 2 times", rendered)
+        self.assertIn("1. spiral inward.\n2. pulse.", rendered)
+        self.assertIn("prompted 2 times", rendered)
+
+    def test_the_history_drops_the_same_frame_and_keeps_the_change(self):
+        """critic-v5, 2026-10-10: 99% of the node's critiques opened "the same
+        <X>, and this time", so a deep line's history was that phrase eight
+        times over, in front of a 4B model that copies its context."""
+        cases = {
+            "the same radar sweep, and this time pulse": "pulse",
+            "the same vast, rolling hills, and this time add clouds": "add clouds",
+            "the same field and this time let one circle fall": "let one circle fall",
+            "refine: the same rings, and this time spiral inward.": "refine: spiral inward.",
+            "The same hexagons, with a slower turn": "with a slower turn",
+            "depart: take orbits into blood cells": "depart: take orbits into blood cells",
+            "the same": "the same",
+        }
+        for revision, shown in cases.items():
+            self.assertEqual(shown, lineage.history_line(revision), revision)
+
+    def test_the_prompt_never_asks_for_the_same_sketch(self):
+        """The ask is a fresh prompt for the next sketch, so nothing in the
+        file the critic reads frames it as this one made again."""
+        row = {"id": 1910, "assertions_json": '["motion(idle)"]',
+               "prompt": lineage.compose_prompt(
+                   "radar images", "the same radar sweep, and this time pulse")}
+        rendered = lineage.critique_prompt(row, "a statement", "a brief").lower()
+        for phrase in ("the same", "this time", "made again", "revision of"):
+            self.assertNotIn(phrase, rendered)
+        for move in ("zoom:", "carry:", "flip:", "depart:"):
+            self.assertIn(move, rendered)
 
     def test_each_entry_gets_one_lens_and_keeps_it(self):
         """critic-v4, 2026-10-03: a list of recent critiques primed the 4B
@@ -693,7 +720,7 @@ class TestCritique(LineageTestCase):
         rendered = lineage.critique_prompt(row, "", "")
         lens = lineage.critic_lens(1862, lineage.prompt_version())
         self.assertIn(lens, lineage.CRITIC_LENSES)
-        self.assertIn(f"A LENS FOR THIS ONE\n{lens}\n", rendered)
+        self.assertIn(f"A LENS FOR THE NEXT ONE\n{lens}\n", rendered)
         self.assertNotIn("{lens}", rendered)
         self.assertEqual(rendered, lineage.critique_prompt(row, "", ""))
         # another version is another draw over the same entries
@@ -751,7 +778,7 @@ class TestCritique(LineageTestCase):
             result.text,
         )
         self.assertEqual("gemma4:e4b", result.model)
-        self.assertEqual("critic-v4", result.prompt_version)
+        self.assertEqual("critic-v5", result.prompt_version)
 
     def test_a_saved_two_sentence_output_is_refused(self):
         with self.assertRaises(lineage.CritiqueFailed) as caught:
@@ -862,7 +889,7 @@ class TestTheGhostImage(LineageTestCase):
         rendered = lineage.critique_prompt(row, row["statement"], row["brief"], path)
         self.assertNotIn("images:", rendered)
         self.assertNotIn("prompt_version:", rendered)
-        self.assertTrue(rendered.startswith("You are looking"), rendered[:40])
+        self.assertTrue(rendered.startswith("You are a teacher"), rendered[:40])
         # and it is the same prompt the version on disk renders, because the
         # body was copied: one header line is the whole difference
         self.assertEqual(
@@ -884,7 +911,7 @@ class TestTheGhostImage(LineageTestCase):
         self.assertEqual(
             hashlib.sha256(self.strip_of(entry)).hexdigest(), result.strip_sha256
         )
-        self.assertEqual("critic-v4", result.prompt_version)
+        self.assertEqual("critic-v5", result.prompt_version)
 
     def test_the_file_on_disk_never_switches_it_on_by_itself(self):
         """The whole of DECIDE-by-prompt-version: comparability, not coverage.
@@ -1011,7 +1038,7 @@ class TestCli(LineageTestCase):
         )
         self.assertEqual(0, done.returncode, done.stderr)
         document = json.loads(done.stdout)
-        self.assertEqual("critic-v4", document["prompt_version"])
+        self.assertEqual("critic-v5", document["prompt_version"])
         self.assertTrue(document["critique"].startswith("the same field"))
         self.assertTrue(
             (out / f"entry-{self.root_entry}-critique.json").is_file()

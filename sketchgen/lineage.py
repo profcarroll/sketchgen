@@ -765,6 +765,32 @@ def critic_lens(entry_id: Any, version: str) -> str:
     return CRITIC_LENSES[int.from_bytes(digest[:4], "big") % len(CRITIC_LENSES)]
 
 
+#: The frame every critic-v1 to v3 sentence was written in, and critic-v4's
+#: refine: "the same <subject>, and this time <change>". 1,450 of the node's
+#: 1,466 critiques up to 2026-10-10 open with it, so a generation-8 prompt says
+#: "the same" eight times over one subject (entry 1910: radar, sonar, sonar,
+#: sonar...). critic-v5 asks for a fresh prompt, and a 4B critic copies what is
+#: in its context (2026-10-03, the {recent} list), so the history it is shown
+#: keeps each line's change and drops the frame around it.
+_SAME_FRAME_RE = re.compile(
+    r"^(?P<move>[a-z]+:\s*)?the same\b(?:.*?\bthis time\b[\s,]*|[^,]*,\s*(?:and\s+)?)",
+    re.IGNORECASE,
+)
+
+
+def history_line(revision: str) -> str:
+    """One earlier revision as the critic sees it: the change, not the frame.
+
+    ``"the same rings, and this time spiral inward."`` is ``"spiral inward."``;
+    a move word in front stays in front, and a line written in any other shape
+    comes back as it was.
+    """
+    match = _SAME_FRAME_RE.match(revision)
+    if not match or match.end() == len(revision):
+        return revision
+    return (match.group("move") or "") + revision[match.end():]
+
+
 def critique_prompt(
     entry_row: Any,
     statement: str | None,
@@ -804,7 +830,8 @@ def critique_prompt(
     prompt = str(_get(entry_row, "prompt", "") or "").strip()
     root, revisions = split_prompt(prompt)
     history = "\n".join(
-        f"{n}. {revision}" for n, revision in enumerate(revisions, start=1)
+        f"{n}. {history_line(revision)}"
+        for n, revision in enumerate(revisions, start=1)
     ) or "(nothing yet: this sketch is where the line starts)"
     return (
         text.replace("{prompt}", prompt)

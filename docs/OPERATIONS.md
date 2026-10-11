@@ -599,6 +599,22 @@ refining after two revisions. The move word leads the sentence (`depart: take
 Before cutting it, read twenty of its sentences with `rig/critic_dryrun.py`,
 which runs a prompt file over real entries on the node and records nothing.
 
+**critic-v5 replaces it before it shipped, and drops "the same"** (2026-10-10).
+1,450 of the node's 1,466 critiques open "the same <X>", so a child's prompt
+re-asserts its subject once per generation: entry 1910, generation 8, says it
+eight times over radar, sonar, sonar, sonar. The words held the subject even
+when the executor could not see the code — a child brief shares about four
+times as many content words with its root's brief as two unrelated roots do
+(Jaccard 0.15 vs 0.03), flat from generation 1 to 6+ and the same before and
+after 09-22, while the code diff fell from 76% to 24% at 09-22 alone. The
+harness narrowed the code; the critique language held the idea. critic-v5 is
+written as a teacher asking for the *next* sketch, not this one again, with four
+moves — `zoom` (one part becomes the whole), `carry` (one quality, a new
+subject), `flip` (the opposite habit), `depart` — no `refine`, the lens on every
+move, and a sentence that has to stand on its own as a prompt. The history it
+shows drops the old frame (`lineage.history_line`) and keeps each change, so
+the phrase is nowhere in what the critic reads.
+
 ## When a job goes wrong
 
 Two things the worker does for itself, both written after job 5 spent a night
