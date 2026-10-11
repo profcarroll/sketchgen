@@ -725,6 +725,72 @@ def critic_images(path: str | Path | None = None) -> tuple[str, ...]:
     return tuple(out)
 
 
+#: One of these is handed to critic-v4 per entry, as a direction from outside
+#: the model. The second dry run (2026-10-03) showed the gallery's recent
+#: critiques to the critic so it would go somewhere else, and it went to the
+#: same places harder: "crystal" in 5 of 16, then four in a row underground
+#: (subterranean, molten iron, magma, lava tubes) once the first was in the
+#: list. A 4B model copies what is in its context. A lens is randomness it did
+#: not write. None of them is luminous, crystalline, cosmic, deep-sea or molten,
+#: because those are where it goes on its own, and none needs text, sound or an
+#: input the gate cannot test.
+CRITIC_LENSES = (
+    "material: cut paper", "material: woven thread", "material: chalk on slate",
+    "material: rubber bands", "material: wet ink on newsprint",
+    "material: corrugated cardboard", "material: poured concrete",
+    "material: folded origami", "material: knitted wool", "material: ceramic tile",
+    "material: rust on sheet steel", "material: beeswax",
+    "scale: seen from a satellite", "scale: under a microscope",
+    "scale: small enough to hold in one hand", "scale: one city block",
+    "scale: a single grain of sand", "scale: a mountain range",
+    "era: a 1920s Bauhaus exercise", "era: a Victorian botanical plate",
+    "era: a 1980s arcade cabinet", "era: an Edo woodblock print",
+    "era: a 1960s pen plotter drawing", "era: a medieval tapestry",
+    "mechanism: gears and cams", "mechanism: a flock following three rules",
+    "mechanism: a pendulum", "mechanism: a loom", "mechanism: tides",
+    "mechanism: a crack spreading", "mechanism: a slime mould searching",
+    "mechanism: a row of falling dominoes", "mechanism: a spring under tension",
+    "mechanism: erosion",
+)
+
+
+def critic_lens(entry_id: Any, version: str) -> str:
+    """The lens for one entry under one prompt version: a hash, not a coin.
+
+    The same entry asked again under the same version gets the same lens, so a
+    dry run, the idle critic and a paid critique packet all render one prompt,
+    and a critique can be read later beside the lens it was given.
+    """
+    digest = hashlib.sha256(f"{version}:{entry_id}".encode("utf-8")).digest()
+    return CRITIC_LENSES[int.from_bytes(digest[:4], "big") % len(CRITIC_LENSES)]
+
+
+#: The frame every critic-v1 to v3 sentence was written in, and critic-v4's
+#: refine: "the same <subject>, and this time <change>". 1,450 of the node's
+#: 1,466 critiques up to 2026-10-10 open with it, so a generation-8 prompt says
+#: "the same" eight times over one subject (entry 1910: radar, sonar, sonar,
+#: sonar...). critic-v5 asks for a fresh prompt, and a 4B critic copies what is
+#: in its context (2026-10-03, the {recent} list), so the history it is shown
+#: keeps each line's change and drops the frame around it.
+_SAME_FRAME_RE = re.compile(
+    r"^(?P<move>[a-z]+:\s*)?the same\b(?:.*?\bthis time\b[\s,]*|[^,]*,\s*(?:and\s+)?)",
+    re.IGNORECASE,
+)
+
+
+def history_line(revision: str) -> str:
+    """One earlier revision as the critic sees it: the change, not the frame.
+
+    ``"the same rings, and this time spiral inward."`` is ``"spiral inward."``;
+    a move word in front stays in front, and a line written in any other shape
+    comes back as it was.
+    """
+    match = _SAME_FRAME_RE.match(revision)
+    if not match or match.end() == len(revision):
+        return revision
+    return (match.group("move") or "") + revision[match.end():]
+
+
 def critique_prompt(
     entry_row: Any,
     statement: str | None,
@@ -747,6 +813,8 @@ def critique_prompt(
     the version line, because neither is anything to say to a model.
     """
     text = _read_prompt_file(path)
+    version_match = _PROMPT_VERSION_RE.search(text)
+    version = version_match.group(1) if version_match else ""
     text = _PROMPT_VERSION_RE.sub("", text, count=1)
     head, sep, body = text.partition("\n\n")
     text = (_IMAGES_RE.sub("", head, count=1) + sep + body).lstrip("\n")
@@ -755,8 +823,22 @@ def critique_prompt(
         words = json.loads(raw_assertions) if raw_assertions else []
     except (TypeError, ValueError):
         words = []
+    # critic-v4 shows the line's root and its revisions apart. Under critic-v3
+    # they arrived as one {prompt} with every Revise: line stapled on, and the
+    # critic asked lineage 1405 to "spiral inward from the edges" at generation
+    # 1 and again, word for word, at generation 5 (2026-10-02).
+    prompt = str(_get(entry_row, "prompt", "") or "").strip()
+    root, revisions = split_prompt(prompt)
+    history = "\n".join(
+        f"{n}. {history_line(revision)}"
+        for n, revision in enumerate(revisions, start=1)
+    ) or "(nothing yet: this sketch is where the line starts)"
     return (
-        text.replace("{prompt}", str(_get(entry_row, "prompt", "") or "").strip())
+        text.replace("{prompt}", prompt)
+        .replace("{lens}", critic_lens(_get(entry_row, "id"), version))
+        .replace("{root}", root or "(no prompt on record)")
+        .replace("{history}", history)
+        .replace("{generation}", str(len(revisions)))
         .replace("{brief}", str(brief or "").strip() or "(no brief on record)")
         .replace(
             "{statement}",
