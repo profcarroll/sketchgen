@@ -34,7 +34,10 @@ WHAT THE GATE ASKED OF IT
 
 A LENS FOR THE NEXT ONE
 {lens}
-Whatever move you choose, make the next sketch through this lens.
+Whatever move you choose, the next sketch is made through this lens, and your
+sentence ends by naming it: made of that material, seen at that scale, in that
+era, or driven by that mechanism. The lens comes from outside you, so it is
+how the next sketch goes somewhere you would not have gone.
 
 CHOOSE ONE MOVE
 zoom — one small part of this sketch (a detail, an accident, one behaviour) is
@@ -42,7 +45,8 @@ more interesting than the whole. Make that part the entire next sketch.
 carry — one quality here is worth more than the subject it is in. Name that
 quality in five words or fewer and give it a different subject.
 flip — the sketch has a habit: it rises, it is calm, it is crowded, it spins.
-Make the sketch that has the opposite habit.
+Make the sketch that has the opposite habit. Moving is not a habit to flip: if
+this one moves, the next one moves too.
 depart — the line has said what it can say. Take one idea from it into a form
 that looks nothing like it.
 
@@ -57,20 +61,21 @@ How to choose:
 
 WHAT THE NEXT SKETCH MUST STILL DO
 Every sketch here is tested in a browser with no keyboard, camera, microphone
-or speaker. If the gate asked for motion(idle), the next sketch moves with
-nobody touching it; if it asked for responds(click), a click changes what is
-seen. Do not ask for sound, a camera, a keyboard, or text (letters, numbers,
-equations, words); the gallery has no way to test them.
+or speaker. If the gate asked for motion(idle), the next sketch keeps moving
+with nobody touching it and never freezes or holds still; if it asked for
+responds(click), a click changes what is seen. Do not ask for sound, a camera, a
+keyboard, or text (letters, numbers, labels, equations, words); the gallery has
+no way to test them.
 
 OUTPUT
 One line: the move, a colon, then one sentence. Fewer than forty words in all.
 No code, no fences, no function or variable names, no preamble, no closing
 remark, no second sentence, no heading. One of these four shapes:
 
-  zoom: a whole sketch of <one part you can see>, <what it becomes at full size>
-  carry: <one quality, five words or fewer> given to <a different subject>
-  flip: <a sketch with the opposite habit, described in full>
-  depart: <one idea from this sketch> taken into <a form that looks nothing like it>
+  zoom: a whole sketch of <one part you can see>, <what it becomes at full size>, <the lens>
+  carry: <one quality, five words or fewer> given to <a different subject>, <the lens>
+  flip: <a sketch with the opposite habit, described in full>, <the lens>
+  depart: <one idea from this sketch> taken into <a form that looks nothing like it>, <the lens>
 
 Write it as a fresh prompt that stands on its own. Someone who has never seen
 this sketch should be able to make something from your sentence alone, so name
